@@ -7,9 +7,13 @@ use rusttype::{Font, Scale, point};
 use std::path::Path;
 
 // Iced UI for displaying the annotated image
-use iced::{Element, Length, Task};
-use iced::widget::{Column, Image as IcedImage, Container};
+use iced::{Element, Length, Task, Color, Point, Size, Rectangle, mouse, Pixels, alignment};
+use iced::Font as IcedFont;
+use iced::widget::{Container, Stack, Image as IcedImage};
 use iced::widget::image::Handle as IcedImageHandle;
+use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path as CanvasPath, Text as CanvasText};
+use iced::widget::canvas::Stroke as CanvasStroke;
+use iced::widget::canvas::LineCap as CanvasLineCap;
 // Constants matching the Kotlin implementation
 const DETECT_WIDTH: u32 = 960;
 const DETECT_HEIGHT: u32 = 544;
@@ -21,7 +25,7 @@ const REC_CONFIDENCE_THRESHOLD: f32 = 0.1;
 const X_OVERLAP_THRESHOLD: f32 = 0.3;
 
 // Box fill ratio when rendering glyphs inside detected boxes. 1.0 means match box height, <1.0 leave padding.
-const BOX_FILL_RATIO: f32 = 0.8;
+const BOX_FILL_RATIO: f32 = 0.9;
 
 // Simulated swapped pairs for text correction
 const MEIKI_SWAPPED_PAIRS: &[(&str, &str)] = &[
@@ -74,6 +78,12 @@ struct LineResult {
     alternatives: Vec<Vec<(char, f32)>>,
     is_vertical: bool,
     chunk_boxes: Vec<BoundingBox>,
+}
+
+#[derive(Debug, Clone)]
+struct DetectedAnnotation {
+    bbox: BoundingBox,
+    line: Option<LineResult>,
 }
 
 struct OcrEngine {
@@ -471,7 +481,7 @@ impl OcrEngine {
         }
     }
 
-    fn draw_text_small(img: &mut RgbaImage, mut x: i32, mut y: i32, text: &str, fg: Rgba<u8>, bg: Rgba<u8>, scale: u32) {
+    fn draw_text_small(img: &mut RgbaImage, x: i32, y: i32, text: &str, fg: Rgba<u8>, bg: Rgba<u8>, scale: u32) {
         // Tiny 3x5 font for digits and '.' only. Each entry is 5 rows, bits (2..0) left->right.
         fn glyph(c: char) -> Option<[u8; 5]> {
             match c {
@@ -814,7 +824,7 @@ impl OcrEngine {
                             // take top 15
                             let mut kv: Vec<(usize, f32)> = qlogits.iter().cloned().enumerate().collect();
                             kv.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                            for (j, &(_idx, val)) in kv.iter().enumerate().take(15) {
+                            for (j, &(_idx, _val)) in kv.iter().enumerate().take(15) {
                                 let class_idx = kv[j].0;
                                 let ch = self.char_vocab.get(class_idx).and_then(|c| std::char::from_u32(*c as u32)).unwrap_or(' ');
                                 alternatives.push((ch, kv[j].1));
@@ -890,7 +900,7 @@ impl OcrEngine {
         // For simplicity, stitch naively by concatenation of recognized chars in order
         let mut final_text = String::new();
         let mut final_char_boxes: Vec<BoundingBox> = Vec::new();
-        for (cands, offset_x, offset_y, chunk_w, chunk_h, eff_w, eff_h) in chunk_results.iter() {
+        for (cands, offset_x, offset_y, chunk_w, chunk_h, _eff_w, eff_h) in chunk_results.iter() {
             for cand in cands.iter() {
                 let global = {
                     // Convert cand.box_coords -> global rect
@@ -898,9 +908,9 @@ impl OcrEngine {
                     let ry1 = cand.box_coords[1];
                     let rx2 = cand.box_coords[2];
                     let ry2 = cand.box_coords[3];
-                    let x1 = (rx1 / 32.0) * (*chunk_w as f32) + (*offset_x as f32) + (crop_x as f32);
+                    let x1 = (rx1 / (VERT_REC_WIDTH as f32)) * (*chunk_w as f32) + (*offset_x as f32) + (crop_x as f32);
                     let y1 = (ry1 / (*eff_h as f32)) * (*chunk_h as f32) + (*offset_y as f32) + (crop_y as f32);
-                    let x2 = (rx2 / 32.0) * (*chunk_w as f32) + (*offset_x as f32) + (crop_x as f32);
+                    let x2 = (rx2 / (VERT_REC_WIDTH as f32)) * (*chunk_w as f32) + (*offset_x as f32) + (crop_x as f32);
                     let y2 = (ry2 / (*eff_h as f32)) * (*chunk_h as f32) + (*offset_y as f32) + (crop_y as f32);
                     BoundingBox::new(x1.round() as i32, y1.round() as i32, (x2 - x1).round() as i32, (y2 - y1).round() as i32, cand.score)
                 };
@@ -948,16 +958,16 @@ impl OcrEngine {
         // Naive stitching: concatenate in order
         let mut final_text = String::new();
         let mut final_char_boxes: Vec<BoundingBox> = Vec::new();
-        for (cands, offset_x, offset_y, chunk_w, chunk_h, eff_w, eff_h) in chunk_results.iter() {
+        for (cands, offset_x, offset_y, chunk_w, chunk_h, eff_w, _eff_h) in chunk_results.iter() {
             for cand in cands.iter() {
                 let rx1 = cand.box_coords[0];
                 let ry1 = cand.box_coords[1];
                 let rx2 = cand.box_coords[2];
                 let ry2 = cand.box_coords[3];
                 let x1 = (rx1 / (*eff_w as f32)) * (*chunk_w as f32) + (*offset_x as f32) + (crop_x as f32);
-                let y1 = (ry1 / 32.0) * (*chunk_h as f32) + (*offset_y as f32) + (crop_y as f32);
+                let y1 = (ry1 / (REC_HEIGHT as f32)) * (*chunk_h as f32) + (*offset_y as f32) + (crop_y as f32);
                 let x2 = (rx2 / (*eff_w as f32)) * (*chunk_w as f32) + (*offset_x as f32) + (crop_x as f32);
-                let y2 = (ry2 / 32.0) * (*chunk_h as f32) + (*offset_y as f32) + (crop_y as f32);
+                let y2 = (ry2 / (REC_HEIGHT as f32)) * (*chunk_h as f32) + (*offset_y as f32) + (crop_y as f32);
                 final_text.push(cand.char);
                 final_char_boxes.push(BoundingBox::new(x1.round() as i32, y1.round() as i32, (x2 - x1).round() as i32, (y2 - y1).round() as i32, cand.score));
             }
@@ -989,16 +999,16 @@ impl OcrEngine {
             for c in filtered.iter() {
                 // convert to global rect
                 if is_vertical {
-                    let x1 = (c.box_coords[0] / 32.0) * (crop_w as f32) + (crop_x as f32);
+                    let x1 = (c.box_coords[0] / (VERT_REC_WIDTH as f32)) * (crop_w as f32) + (crop_x as f32);
                     let y1 = (c.box_coords[1] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
-                    let x2 = (c.box_coords[2] / 32.0) * (crop_w as f32) + (crop_x as f32);
+                    let x2 = (c.box_coords[2] / (VERT_REC_WIDTH as f32)) * (crop_w as f32) + (crop_x as f32);
                     let y2 = (c.box_coords[3] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
                     char_boxes.push(BoundingBox::new(x1.round() as i32, y1.round() as i32, (x2 - x1).round() as i32, (y2 - y1).round() as i32, c.score));
                 } else {
                     let x1 = (c.box_coords[0] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
-                    let y1 = (c.box_coords[1] / 32.0) * (crop_h as f32) + (crop_y as f32);
+                    let y1 = (c.box_coords[1] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
                     let x2 = (c.box_coords[2] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
-                    let y2 = (c.box_coords[3] / 32.0) * (crop_h as f32) + (crop_y as f32);
+                    let y2 = (c.box_coords[3] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
                     char_boxes.push(BoundingBox::new(x1.round() as i32, y1.round() as i32, (x2 - x1).round() as i32, (y2 - y1).round() as i32, c.score));
                 }
             }
@@ -1009,7 +1019,7 @@ impl OcrEngine {
     }
 
     // Modified: return the annotated image in-memory when `render` is true
-    fn run_detection(&mut self, image: &DynamicImage, render: bool, font_path: Option<&str>) -> Result<Option<RgbaImage>> {
+    fn run_detection(&mut self, image: &DynamicImage, render: bool, font_path: Option<&str>) -> Result<(Vec<DetectedAnnotation>, Option<RgbaImage>)> {
         let boxes = self.detect(image)?;
         let merged = self.merge_overlapping_boxes(boxes);
         let sorted = self.sort_detected_boxes(merged);
@@ -1019,6 +1029,18 @@ impl OcrEngine {
             let b = bbox;
             println!("  Box {}: x={}, y={}, w={}, h={}, conf={:.2}",
                      i, b.x, b.y, b.w, b.h, b.confidence);
+        }
+
+        // Run recognition for each detected box so the GUI can overlay recognized text.
+        let mut annotations: Vec<DetectedAnnotation> = Vec::new();
+        for bbox in sorted.iter() {
+            match self.recognize_single_line(image, bbox) {
+                Ok(opt) => annotations.push(DetectedAnnotation { bbox: bbox.clone(), line: opt }),
+                Err(e) => {
+                    println!("Recognition failed for box at x={},y={}: {:?}", bbox.x, bbox.y, e);
+                    annotations.push(DetectedAnnotation { bbox: bbox.clone(), line: None });
+                }
+            }
         }
 
         // Prepare font if rendering and path provided or defaults
@@ -1060,11 +1082,10 @@ impl OcrEngine {
 
             // Precompute a reference glyph height for the loaded font (if any) using '本' like the Android implementation.
             // Measure at unit scale (1.0) so we can compute a direct px scale: scale_px = target_h / measured_unit_h.
-            let mut ref_glyph_unit_h = 0.0f32;
+            let _ref_glyph_unit_h = 0.0f32;
             if let Some(ref font) = font_opt {
                 let unit_scale = Scale::uniform(1.0);
-                let ref_pos = font.glyph('本').scaled(unit_scale).positioned(point(0.0, 0.0));
-                ref_glyph_unit_h = ref_pos.pixel_bounding_box().map(|r| (r.max.y - r.min.y) as f32).unwrap_or_else(|| {
+                let _ref_glyph_unit_h = font.glyph('本').scaled(unit_scale).positioned(point(0.0, 0.0)).pixel_bounding_box().map(|r| (r.max.y - r.min.y) as f32).unwrap_or_else(|| {
                     let vm = font.v_metrics(unit_scale);
                     vm.ascent - vm.descent
                 });
@@ -1080,8 +1101,8 @@ impl OcrEngine {
                 let scale = 2u32; // scale factor for the tiny font
                 Self::draw_text_small(&mut img_rgba, bbox.left(), bbox.top(), &label, fg, bg, scale);
 
-                // Run recognition for this box and render results if available
-                if let Ok(Some(line_result)) = self.recognize_single_line(image, bbox) {
+                // If we have recognition results, render them into the baked image as before (optional)
+                if let Some(ref line_result) = annotations.iter().find(|a| a.bbox.x == bbox.x && a.bbox.y == bbox.y).and_then(|a| a.line.clone()) {
                     if let Some(ref font) = font_opt {
                         // Render each detected character directly on top of its detection box.
                         // Follow Kotlin implementation: compute a fixed square size (based on max char width for
@@ -1139,7 +1160,7 @@ impl OcrEngine {
 
                             // Compute unit visual height for the font (ascent - descent at scale 1.0)
                             let unit_metrics = font.v_metrics(Scale::uniform(1.0));
-                            let unit_visual_height = unit_metrics.ascent - unit_metrics.descent;
+                            let _unit_visual_height = unit_metrics.ascent - unit_metrics.descent;
 
                             // Helper: find a scale (px) so that the reference glyph '本' visual height matches target (binary search)
                             let find_scale_for_target = |font: &Font, target_h: f32| -> f32 {
@@ -1186,9 +1207,9 @@ impl OcrEngine {
                                 let scale = Scale::uniform(scale_px);
                                 let v_metrics = font.v_metrics(scale);
 
-                                // Compute baseline so that the glyph's M-box center aligns with the box center.
+                                // Compute baseline so that the glyph's measured vertical box is centered in the display box.
                                 let box_center_y = db.top() as f32 + (db.h as f32) / 2.0;
-                                let baseline_y = box_center_y + (v_metrics.ascent + v_metrics.descent) / 2.0;
+                                let baseline_y = box_center_y + (v_metrics.ascent - v_metrics.descent) / 2.0;
                                 let y_top = baseline_y - v_metrics.ascent;
 
                                 // Measure advance (width) at this scale for horizontal centering
@@ -1236,33 +1257,180 @@ impl OcrEngine {
                 }
             }
 
-            // Return the annotated image
-            return Ok(Some(img_rgba));
+            // Return the annotated image as well as the annotations
+            return Ok((annotations, Some(img_rgba)));
         } else {
-            println!("Render disabled; not returning annotated image.");
-            return Ok(None);
+            println!("Render disabled; returning annotations without a baked image.");
+            return Ok((annotations, None));
         }
     }
 }
 
 // Simple Iced application showing the annotated image produced above.
+#[derive(Clone)]
 struct OcrViewer {
     image_handle: IcedImageHandle,
     img_w: u32,
     img_h: u32,
+    annotations: Vec<DetectedAnnotation>,
 }
 
 #[derive(Debug, Clone)]
 enum Message {}
 
+// Canvas program that draws overlays (boxes + text)
+#[derive(Clone)]
+struct OverlayProgram {
+    annotations: Vec<DetectedAnnotation>,
+    img_w: u32,
+    img_h: u32,
+}
+
+impl<Message> canvas::Program<Message> for OverlayProgram {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry<iced::Renderer>> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+
+        let img_w = self.img_w as f32;
+        let img_h = self.img_h as f32;
+        // Use a uniform scale (contain) so aspect ratio is preserved and letterboxing is accounted for.
+        let scale_x = if img_w > 0.0 { bounds.width / img_w } else { 1.0 };
+        let scale_y = if img_h > 0.0 { bounds.height / img_h } else { 1.0 };
+        let scale = scale_x.min(scale_y);
+        let dest_w = img_w * scale;
+        let dest_h = img_h * scale;
+        let offset_x = (bounds.width - dest_w) / 2.0;
+        let offset_y = (bounds.height - dest_h) / 2.0;
+
+        for ann in self.annotations.iter() {
+            let b = &ann.bbox;
+            let x = offset_x + (b.left() as f32) * scale;
+            let y = offset_y + (b.top() as f32) * scale;
+            let w = (b.w as f32) * scale;
+            let h = (b.h as f32) * scale;
+
+            // Draw solid translucent grey overlay for the detected text box.
+            frame.fill_rectangle(
+                Point::new(x, y),
+                Size::new(w.max(1.0), h.max(1.0)),
+                Color::from_rgba(0.0, 0.0, 0.0, 0.40),
+            );
+
+            // Recognition text: render one character box over each OCR character box.
+            if let Some(ref line) = ann.line {
+                if !line.text.is_empty() {
+                    let chars: Vec<char> = line.text.chars().collect();
+                    if !chars.is_empty() && !line.char_boxes.is_empty() {
+                        let overlay_char_boxes = if line.is_vertical {
+                            line.char_boxes.clone()
+                        } else {
+                            Self::normalize_horizontal_char_boxes(&line.char_boxes, &chars)
+                        };
+                        for (ch, cb) in chars.iter().zip(overlay_char_boxes.iter()) {
+                            let cb_x = offset_x + (cb.left() as f32) * scale;
+                            let cb_y = offset_y + (cb.top() as f32) * scale;
+                            let cb_w = (cb.w as f32) * scale;
+                            let cb_h = (cb.h as f32) * scale;
+                            if cb_w <= 0.0 || cb_h <= 0.0 {
+                                continue;
+                            }
+
+                            let bg_w = cb_w.max(1.0);
+                            let bg_h = cb_h.max(1.0);
+
+                            let text_size = (bg_h * BOX_FILL_RATIO).max(4.0);
+                            let t = CanvasText {
+                                content: ch.to_string(),
+                                position: Point::new(cb_x + (bg_w / 2.0), cb_y),
+                                max_width: bg_w,
+                                color: Color::from_rgb(0.0, 1.0, 0.0),
+                                size: Pixels(text_size * 0.9),
+                                align_x: alignment::Horizontal::Center.into(),
+                                align_y: alignment::Vertical::Top,
+                                font: IcedFont::with_name("NotoSansJP"),
+                                ..Default::default()
+                            };
+                            frame.fill_text(t);
+                        }
+                    } else {
+                        let text_size = (h * BOX_FILL_RATIO * 0.98).max(4.0);
+                        let t = CanvasText {
+                            content: line.text.clone(),
+                            position: Point::new(x, y + ((h - text_size).max(0.0) / 2.0)),
+                            max_width: w.max(1.0),
+                            color: Color::from_rgb(0.0, 1.0, 0.0),
+                            size: Pixels(text_size * 0.9),
+                            align_x: alignment::Horizontal::Center.into(),
+                            align_y: alignment::Vertical::Top,
+                            font: IcedFont::with_name("NotoSansJP"),
+                            ..Default::default()
+                        };
+                        frame.fill_text(t);
+                    }
+                }
+            }
+        }
+
+        vec![frame.into_geometry()]
+    }
+}
+
+impl OverlayProgram {
+    fn normalize_horizontal_char_boxes(boxes: &[BoundingBox], chars: &[char]) -> Vec<BoundingBox> {
+        let mut normalized = boxes.to_vec();
+        for i in 0..normalized.len() {
+            let left = normalized[i].left();
+            let top = normalized[i].top();
+            let height = normalized[i].h.max(1);
+            let target_width = if chars.get(i).is_some_and(|ch| ch.is_ascii()) {
+                height / 2
+            } else {
+                height
+            };
+            if normalized[i].w >= target_width {
+                continue;
+            }
+
+            let target_right = left + target_width;
+            let next_left = (i + 1..normalized.len())
+                .map(|j| normalized[j].left())
+                .find(|&x| x > left);
+            let limited_right = next_left.map_or(target_right, |x| x.min(target_right));
+            let new_w = (limited_right - left).max(1).max(normalized[i].w);
+            normalized[i] = BoundingBox::new(left, top, new_w, height, normalized[i].confidence);
+        }
+        normalized
+    }
+}
+
 impl OcrViewer {
     fn view<'a>(&'a self) -> Element<'a, Message> {
-        let max_w = (self.img_w).min(16384) as f32;
-        let max_h = (self.img_h).min(16384) as f32;
-        let img = IcedImage::new(self.image_handle.clone())
-            .width(Length::Fixed(max_w))
-            .height(Length::Fixed(max_h));
-        Container::new(Column::new().push(img)).width(Length::Shrink).height(Length::Shrink).into()
+        // Let the widgets fill available space so the canvas bounds change as the window is resized.
+        let overlay = OverlayProgram {
+            annotations: self.annotations.clone(),
+            img_w: self.img_w,
+            img_h: self.img_h,
+        };
+
+        let image = IcedImage::new(self.image_handle.clone())
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        let canvas = Canvas::new(overlay)
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        let stack = Stack::new().push(image).push(canvas);
+
+        Container::new(stack).width(Length::Fill).height(Length::Fill).into()
     }
 }
 
@@ -1298,11 +1466,11 @@ fn main() -> Result<()> {
         .context(format!("Failed to open image: {}", image_path))?;
     println!("Image loaded successfully: {} ({}x{})", image_path, image.width(), image.height());
 
-    // Run detection + recognition and request an in-memory annotated image
-    let annotated_opt = engine.run_detection(&image, true, font_path.as_deref())?;
-    let display_img = annotated_opt.unwrap_or_else(|| image.to_rgba8());
+    // Run detection + recognition and request annotations (no baked image)
+    let (annotations, _annotated_opt) = engine.run_detection(&image, false, font_path.as_deref())?;
 
-    // Encode annotated image to PNG bytes for Iced
+    // Encode original image to PNG bytes for Canvas
+    let display_img = image.to_rgba8();
     let dynimg = DynamicImage::ImageRgba8(display_img.clone());
     use std::io::Cursor;
     use std::sync::Arc;
@@ -1319,6 +1487,7 @@ fn main() -> Result<()> {
             image_handle: IcedImageHandle::from_bytes(bytes_arc.as_ref().clone()),
             img_w: w,
             img_h: h,
+            annotations: annotations.clone(),
         }
     };
     let update = |_state: &mut OcrViewer, _message: Message| -> Task<Message> { Task::none() };
