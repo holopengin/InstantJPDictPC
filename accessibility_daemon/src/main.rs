@@ -6,6 +6,10 @@ use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use rusttype::{Font, Scale, point};
 use std::path::Path;
 
+// Iced UI for displaying the annotated image
+use iced::{Element, Length, Task};
+use iced::widget::{Column, Image as IcedImage, Container};
+use iced::widget::image::Handle as IcedImageHandle;
 // Constants matching the Kotlin implementation
 const DETECT_WIDTH: u32 = 960;
 const DETECT_HEIGHT: u32 = 544;
@@ -210,10 +214,6 @@ impl OcrEngine {
 
             (boxes_arr, scores_arr)
         };
-
-
-
-
 
         // boxes shape: [batch, num_boxes, 4] or [num_boxes, 4]
         // scores shape: [batch, num_boxes] or [num_boxes]
@@ -549,7 +549,7 @@ impl OcrEngine {
     }
 
     fn image_to_nchw(&self, img: &RgbaImage, width: u32, height: u32) -> Vec<f32> {
-        let mut img_data = vec![0.0f32; (3 * width as usize * height as usize)];
+        let mut img_data = vec![0.0f32; 3 * width as usize * height as usize];
         let w_usize = width as usize;
         let h_usize = height as usize;
         for y in 0..height {
@@ -1008,7 +1008,8 @@ impl OcrEngine {
         Ok(result)
     }
 
-    fn run_detection(&mut self, image: &DynamicImage, render: bool, font_path: Option<&str>) -> Result<()> {
+    // Modified: return the annotated image in-memory when `render` is true
+    fn run_detection(&mut self, image: &DynamicImage, render: bool, font_path: Option<&str>) -> Result<Option<RgbaImage>> {
         let boxes = self.detect(image)?;
         let merged = self.merge_overlapping_boxes(boxes);
         let sorted = self.sort_detected_boxes(merged);
@@ -1052,7 +1053,7 @@ impl OcrEngine {
         }
 
         if render {
-            // Render detected boxes onto the image and save
+            // Render detected boxes onto the image in-memory and return the annotated image
             let mut img_rgba = image.to_rgba8();
             let color = Rgba([255u8, 0u8, 0u8, 255u8]);
             let thickness = 2u32;
@@ -1235,14 +1236,33 @@ impl OcrEngine {
                 }
             }
 
-            let out_path = "test_image_detected.png";
-            img_rgba.save(out_path).context(format!("Failed to save detected image: {}", out_path))?;
-            println!("Saved detected image to {}", out_path);
+            // Return the annotated image
+            return Ok(Some(img_rgba));
         } else {
-            println!("Render disabled; not saving detected image.");
+            println!("Render disabled; not returning annotated image.");
+            return Ok(None);
         }
+    }
+}
 
-        Ok(())
+// Simple Iced application showing the annotated image produced above.
+struct OcrViewer {
+    image_handle: IcedImageHandle,
+    img_w: u32,
+    img_h: u32,
+}
+
+#[derive(Debug, Clone)]
+enum Message {}
+
+impl OcrViewer {
+    fn view<'a>(&'a self) -> Element<'a, Message> {
+        let max_w = (self.img_w).min(16384) as f32;
+        let max_h = (self.img_h).min(16384) as f32;
+        let img = IcedImage::new(self.image_handle.clone())
+            .width(Length::Fixed(max_w))
+            .height(Length::Fixed(max_h));
+        Container::new(Column::new().push(img)).width(Length::Shrink).height(Length::Shrink).into()
     }
 }
 
@@ -1254,10 +1274,15 @@ fn main() -> Result<()> {
     println!("Models loaded successfully.");
     println!("Character vocabulary loaded: {} chars", engine.char_vocab.len());
 
-    // Parse args: enable rendering when --render-detected, --render, or -r is present
-    // Optional font path via --font=PATH or --font PATH
     let args: Vec<String> = std::env::args().collect();
-    let render = args.iter().any(|a| a == "--render-detected" || a == "--render" || a == "-r");
+    if args.len() < 2 {
+        println!("Usage: {} <image_path> [--font /path/to.ttf]", args.get(0).map(|s| s.as_str()).unwrap_or("accessibility_daemon"));
+        return Ok(());
+    }
+
+    let image_path = args[1].clone();
+
+    // Optional font path parsing (same as before)
     let mut font_path: Option<String> = None;
     for i in 0..args.len() {
         if args[i].starts_with("--font=") {
@@ -1269,21 +1294,39 @@ fn main() -> Result<()> {
         }
     }
 
-    if render {
-        println!("Render flag detected: will save detected image output.");
-        if let Some(ref p) = font_path {
-            println!("Font path: {}", p);
-        } else {
-            println!("No font path provided; attempting defaults. Put a TTF at 'fonts/NotoSansJP-Regular.ttf' or pass --font /path/to.ttf");
+    let image = image::open(&image_path)
+        .context(format!("Failed to open image: {}", image_path))?;
+    println!("Image loaded successfully: {} ({}x{})", image_path, image.width(), image.height());
+
+    // Run detection + recognition and request an in-memory annotated image
+    let annotated_opt = engine.run_detection(&image, true, font_path.as_deref())?;
+    let display_img = annotated_opt.unwrap_or_else(|| image.to_rgba8());
+
+    // Encode annotated image to PNG bytes for Iced
+    let dynimg = DynamicImage::ImageRgba8(display_img.clone());
+    use std::io::Cursor;
+    use std::sync::Arc;
+    let mut buf = Cursor::new(Vec::new());
+    dynimg.write_to(&mut buf, image::ImageFormat::Png).context("Failed to encode annotated image to PNG")?;
+    let bytes_vec: Vec<u8> = buf.into_inner();
+    let bytes_arc = Arc::new(bytes_vec);
+    let w = display_img.width();
+    let h = display_img.height();
+
+    // Launch Iced window with the annotated image using the application helper
+    let boot = move || {
+        OcrViewer {
+            image_handle: IcedImageHandle::from_bytes(bytes_arc.as_ref().clone()),
+            img_w: w,
+            img_h: h,
         }
+    };
+    let update = |_state: &mut OcrViewer, _message: Message| -> Task<Message> { Task::none() };
+    let view = OcrViewer::view;
+    let app = iced::application(boot, update, view);
+    if let Err(e) = app.run() {
+        println!("Failed to run GUI: {:?}", e);
     }
-
-    let test_image_path = "test_image.png";
-    let image = image::open(test_image_path)
-        .context(format!("Failed to open test image: {}", test_image_path))?;
-    println!("Test image loaded successfully: {} ({}x{})", test_image_path, image.width(), image.height());
-
-    engine.run_detection(&image, render, font_path.as_deref())?;
 
     Ok(())
 }
