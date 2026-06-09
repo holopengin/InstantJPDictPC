@@ -11,6 +11,9 @@ ort = { version = "2.0.0-rc.3", features = ["webgpu"] }
 image = "0.25"
 ndarray = "0.15"
 
+# Font rendering for labels (TTF)
+rusttype = "0.9"
+
 # Utilities
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
