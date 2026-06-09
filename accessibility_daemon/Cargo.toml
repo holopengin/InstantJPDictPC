@@ -23,7 +23,7 @@ anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 
 # GUI: Iced for displaying the annotated image
-iced = { version= "0.14.0", features = ["image"] }
+iced = { version= "0.14.0", features = ["image", "canvas"] }
 
 [profile.release]
 opt-level = 3
