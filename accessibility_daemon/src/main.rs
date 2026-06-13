@@ -7,9 +7,9 @@ use rusttype::{Font, Scale, point};
 use std::path::Path;
 
 // Iced UI for displaying the annotated image
-use iced::{Element, Length, Task, Color, Point, Size, Rectangle, mouse, Pixels, alignment};
+use iced::{Element, Length, Task, Color, Point, Size, Rectangle, mouse, Pixels, alignment, Background, Border, Shadow, Vector};
 use iced::Font as IcedFont;
-use iced::widget::{Container, Stack, Image as IcedImage};
+use iced::widget::{Container, Stack, Image as IcedImage, Column, Row, Text, Scrollable, Button, Space, container, button};
 use iced::widget::image::Handle as IcedImageHandle;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path as CanvasPath, Text as CanvasText};
 use iced::widget::canvas::Stroke as CanvasStroke;
@@ -1267,157 +1267,571 @@ impl OcrEngine {
 }
 
 // Simple Iced application showing the annotated image produced above.
+#[derive(Debug, Clone)]
+enum DefinitionNode {
+    Text(String),
+    Ruby { term: String, reading: String, is_mini: bool },
+    Tag { text: String, category: String },
+}
+
+#[derive(Debug, Clone)]
+struct FormattedSense {
+    index: usize,
+    nodes: Vec<DefinitionNode>,
+}
+
+#[derive(Debug, Clone)]
+struct FormattedSenseGroup {
+    tags: Vec<String>,
+    senses: Vec<FormattedSense>,
+    is_forms: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FormattedHeadword {
+    kanji: String,
+    onyomi: Option<String>,
+    kunyomi: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FormattedReadingGroup {
+    reading: String,
+    headwords: Vec<FormattedHeadword>,
+    sense_groups: Vec<FormattedSenseGroup>,
+    is_kanji_entry: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FormattedEntry {
+    term: String,
+    reading_groups: Vec<FormattedReadingGroup>,
+}
+
+#[derive(Debug, Clone)]
+struct NeighborChar {
+    text: String,
+    is_selected: bool,
+    line_idx: usize,
+    char_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct NeighborLine {
+    chars: Vec<NeighborChar>,
+    line_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AlternativeChar {
+    char: char,
+    is_selected: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AlternativesUiState {
+    candidates: Vec<AlternativeChar>,
+    show_manual_input: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gravity {
+    Start,
+    End,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GamepadAction {
+    None,
+    NavigateLeft,
+    NavigateRight,
+    NavigateUp,
+    NavigateDown,
+    Confirm,
+    Back,
+    ScrollUp,
+    ScrollDown,
+}
+
+struct OcrOverlayState {
+    current_scale: f32,
+    current_trans_x: f32,
+    current_trans_y: f32,
+    current_word_length: usize,
+    active_line_boxes: Vec<BoundingBox>,
+    active_all_chars: Vec<String>,
+    active_all_alternatives: Vec<Vec<(char, f32)>>,
+    current_tapped_idx: isize,
+    current_tapped_line_idx: isize,
+    current_tapped_char_idx_in_line: isize,
+    active_line_results: Vec<Option<LineResult>>,
+    last_highlighted_coords: Vec<(usize, usize)>,
+    last_landscape_gravity: Gravity,
+    last_portrait_gravity: Gravity,
+    is_controller_navigation: bool,
+    is_dictionary_visible: bool,
+    is_alternatives_visible: bool,
+}
+
+impl OcrOverlayState {
+    fn new() -> Self {
+        Self {
+            current_scale: 1.0,
+            current_trans_x: 0.0,
+            current_trans_y: 0.0,
+            current_word_length: 0,
+            active_line_boxes: Vec::new(),
+            active_all_chars: Vec::new(),
+            active_all_alternatives: Vec::new(),
+            current_tapped_idx: -1,
+            current_tapped_line_idx: -1,
+            current_tapped_char_idx_in_line: -1,
+            active_line_results: Vec::new(),
+            last_highlighted_coords: Vec::new(),
+            last_landscape_gravity: Gravity::End,
+            last_portrait_gravity: Gravity::Bottom,
+            is_controller_navigation: false,
+            is_dictionary_visible: false,
+            is_alternatives_visible: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn update_global_data(&mut self) {
+        self.active_all_chars.clear();
+        self.active_all_alternatives.clear();
+        self.active_line_results.iter().flatten().for_each(|line| {
+            self.active_all_chars.extend(line.text.chars().map(|c| c.to_string()));
+            self.active_all_alternatives.extend(line.alternatives.clone());
+        });
+    }
+
+    fn set_line_results(&mut self, lines: Vec<Option<LineResult>>) {
+        self.active_line_results = lines;
+        self.active_line_boxes.clear();
+        self.active_line_boxes.extend(self.active_line_results.iter().flatten().flat_map(|line| line.chunk_boxes.clone()));
+        self.update_global_data();
+    }
+
+    fn get_global_idx(&self, line_idx: usize, char_idx_in_line: usize) -> usize {
+        self.active_line_results
+            .iter()
+            .take(line_idx)
+            .flatten()
+            .map(|line| line.text.chars().count())
+            .sum::<usize>() + char_idx_in_line
+    }
+
+    fn get_coords_from_global_idx(&self, global_idx: usize) -> Option<(usize, usize)> {
+        let mut count = 0;
+        for (line_idx, line_opt) in self.active_line_results.iter().enumerate() {
+            let line = line_opt.as_ref()?;
+            let line_len = line.text.chars().count();
+            if global_idx < count + line_len {
+                return Some((line_idx, global_idx - count));
+            }
+            count += line_len;
+        }
+        None
+    }
+
+    fn ensure_cursor_position(&mut self) {
+        if self.current_tapped_line_idx == -1 || self.current_tapped_char_idx_in_line == -1 {
+            for (line_idx, line_opt) in self.active_line_results.iter().enumerate() {
+                let Some(line) = line_opt else { continue };
+                if !line.text.is_empty() {
+                    self.current_tapped_line_idx = line_idx as isize;
+                    self.current_tapped_char_idx_in_line = 0;
+                    self.current_tapped_idx = self.get_global_idx(line_idx, 0) as isize;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn update_character(&mut self, line_idx: usize, char_idx: usize, new_char: char) {
+        let Some(line) = self.active_line_results.get_mut(line_idx).and_then(|line| line.as_mut()) else {
+            return;
+        };
+        let mut chars: Vec<char> = line.text.chars().collect();
+        if let Some(slot) = chars.get_mut(char_idx) {
+            *slot = new_char;
+            line.text = chars.into_iter().collect();
+            self.update_global_data();
+        }
+    }
+
+    fn navigate(&mut self, action: GamepadAction, root_width: f32, root_height: f32) -> bool {
+        let (line_idx, char_idx) = match self.current_cursor() {
+            Some(coords) => coords,
+            None => return false,
+        };
+        let Some(line) = self.active_line_results.get(line_idx).and_then(|line| line.as_ref()) else {
+            return false;
+        };
+        let Some(box_item) = line.char_boxes.get(char_idx) else {
+            return false;
+        };
+        let center_x = box_item.left() as f32 + (box_item.w as f32 / 2.0);
+        let center_y = box_item.top() as f32 + (box_item.h as f32 / 2.0);
+
+        let mut best_dist = f32::MAX;
+        let mut best_idx = None;
+        let mut best_char_idx = None;
+
+        match action {
+            GamepadAction::NavigateRight | GamepadAction::NavigateLeft => {
+                let dir = if action == GamepadAction::NavigateRight { 1 } else { -1 };
+                let next_char_idx = char_idx as isize + dir;
+                if next_char_idx >= 0 && (next_char_idx as usize) < line.char_boxes.len() {
+                    self.current_tapped_char_idx_in_line = next_char_idx;
+                    self.current_tapped_idx = self.get_global_idx(line_idx, next_char_idx as usize) as isize;
+                    return true;
+                }
+
+                for (i, other_line_opt) in self.active_line_results.iter().enumerate() {
+                    let Some(other_line) = other_line_opt else { continue };
+                    for (c, c_box) in other_line.char_boxes.iter().enumerate() {
+                        let mut dx = c_box.left() as f32 + (c_box.w as f32 / 2.0) - center_x;
+                        let dy = c_box.top() as f32 + (c_box.h as f32 / 2.0) - center_y;
+
+                        if dir == 1 && dx <= 5.0 {
+                            dx += root_width;
+                        } else if dir == -1 && dx >= -5.0 {
+                            dx -= root_width;
+                        }
+
+                        if (dir == 1 && dx <= 5.0) || (dir == -1 && dx >= -5.0) {
+                            continue;
+                        }
+
+                        let dist = (dx * dx) + (dy * dy * 64.0);
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_idx = Some(i);
+                            best_char_idx = Some(c);
+                        }
+                    }
+                }
+            }
+            GamepadAction::NavigateDown | GamepadAction::NavigateUp => {
+                let dir = if action == GamepadAction::NavigateDown { 1 } else { -1 };
+                for (i, other_line_opt) in self.active_line_results.iter().enumerate() {
+                    let Some(other_line) = other_line_opt else { continue };
+                    for (c, c_box) in other_line.char_boxes.iter().enumerate() {
+                        let dx = c_box.left() as f32 + (c_box.w as f32 / 2.0) - center_x;
+                        let mut dy = c_box.top() as f32 + (c_box.h as f32 / 2.0) - center_y;
+
+                        if dir == 1 && dy <= 5.0 {
+                            dy += root_height;
+                        } else if dir == -1 && dy >= -5.0 {
+                            dy -= root_height;
+                        }
+
+                        if (dir == 1 && dy <= 5.0) || (dir == -1 && dy >= -5.0) {
+                            continue;
+                        }
+
+                        let dist = (dx * dx * 64.0) + (dy * dy);
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_idx = Some(i);
+                            best_char_idx = Some(c);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if let (Some(i), Some(c)) = (best_idx, best_char_idx) {
+            self.current_tapped_line_idx = i as isize;
+            self.current_tapped_char_idx_in_line = c as isize;
+            self.current_tapped_idx = self.get_global_idx(i, c) as isize;
+            return true;
+        }
+        false
+    }
+
+    fn current_cursor(&self) -> Option<(usize, usize)> {
+        let line_idx = self.current_tapped_line_idx;
+        let char_idx = self.current_tapped_char_idx_in_line;
+        if line_idx < 0 || char_idx < 0 {
+            return None;
+        }
+        Some((line_idx as usize, char_idx as usize))
+    }
+
+    fn get_neighbor_ui_state(&self) -> Vec<NeighborLine> {
+        self.active_line_results
+            .iter()
+            .enumerate()
+            .map(|(line_idx, line_opt)| {
+                let chars = line_opt
+                    .as_ref()
+                    .map(|line| {
+                        line.text
+                            .chars()
+                            .enumerate()
+                            .map(|(char_idx, ch)| NeighborChar {
+                                text: ch.to_string(),
+                                is_selected: line_idx as isize == self.current_tapped_line_idx
+                                    && char_idx as isize == self.current_tapped_char_idx_in_line,
+                                line_idx,
+                                char_idx,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                NeighborLine { chars, line_idx }
+            })
+            .collect()
+    }
+
+    fn get_alternatives_ui_state(&self) -> Option<AlternativesUiState> {
+        let (line_idx, char_idx) = self.current_cursor()?;
+        let line = self.active_line_results.get(line_idx).and_then(|line| line.as_ref())?;
+        let alts = line.alternatives.get(char_idx)?;
+        let current_char = line.text.chars().nth(char_idx)?;
+
+        Some(AlternativesUiState {
+            candidates: alts
+                .iter()
+                .take(15)
+                .map(|(ch, _)| AlternativeChar { char: *ch, is_selected: *ch == current_char })
+                .collect(),
+            show_manual_input: true,
+        })
+    }
+
+    fn panel_dimensions(&self, root_width: f32, root_height: f32) -> (f32, f32) {
+        let is_landscape = root_width > root_height;
+        let panel_width = if is_landscape { root_width * 0.4 } else { root_width };
+        let panel_height = if is_landscape { root_height } else { root_height * 0.4 };
+        (panel_width, panel_height)
+    }
+
+    fn update_gravity(&mut self, root_width: f32, root_height: f32, tapped_box: &BoundingBox) {
+        let is_landscape = root_width > root_height;
+        let screen_center_x = tapped_box.left() as f32 * self.current_scale + self.current_trans_x + (tapped_box.w as f32 / 2.0) * self.current_scale;
+        let screen_center_y = tapped_box.top() as f32 * self.current_scale + self.current_trans_y + (tapped_box.h as f32 / 2.0) * self.current_scale;
+
+        if is_landscape {
+            self.last_landscape_gravity = if screen_center_x < root_width / 2.0 {
+                Gravity::End
+            } else {
+                Gravity::Start
+            };
+        } else {
+            self.last_portrait_gravity = if screen_center_y < root_height / 2.0 {
+                Gravity::Bottom
+            } else {
+                Gravity::Top
+            };
+        }
+    }
+
+    fn update_highlight_coords(&mut self, line_idx: usize, char_idx: usize, word_length: usize) {
+        self.last_highlighted_coords.clear();
+        self.last_highlighted_coords.push((line_idx, char_idx));
+        let global_idx = self.get_global_idx(line_idx, char_idx);
+        for i in 1..word_length.max(1) {
+            if let Some(coords) = self.get_coords_from_global_idx(global_idx + i) {
+                self.last_highlighted_coords.push(coords);
+            }
+        }
+    }
+
+    fn calculate_display_boxes(&self, line: &LineResult) -> Vec<BoundingBox> {
+        let fixed_size = if line.is_vertical {
+            line.char_boxes.iter().map(|b| b.w).max().unwrap_or(0)
+        } else {
+            line.char_boxes.iter().map(|b| b.h).max().unwrap_or(0)
+        };
+
+        let mut refined_boxes = Vec::new();
+        if let Some(first) = line.char_boxes.first() {
+            refined_boxes.push(first.clone());
+        }
+        for i in 1..line.char_boxes.len() {
+            let prev_original = &line.char_boxes[i - 1];
+            let cur_original = &line.char_boxes[i];
+            let advance = fixed_size;
+
+            if line.is_vertical {
+                let new_top = prev_original.top().saturating_add(advance).max(cur_original.top());
+                refined_boxes.push(BoundingBox::new(cur_original.left(), new_top, cur_original.w, cur_original.h, cur_original.confidence));
+            } else {
+                let new_left = prev_original.left().saturating_add(advance).max(cur_original.left());
+                refined_boxes.push(BoundingBox::new(new_left, cur_original.top(), cur_original.w, cur_original.h, cur_original.confidence));
+            }
+        }
+
+        refined_boxes
+            .iter()
+            .map(|box_item| {
+                let center_x = box_item.left() as f32 + (box_item.w as f32 / 2.0);
+                let center_y = box_item.top() as f32 + (box_item.h as f32 / 2.0);
+                let left = (center_x - (fixed_size as f32 / 2.0)).round() as i32;
+                let top = (center_y - (fixed_size as f32 / 2.0)).round() as i32;
+                BoundingBox::new(left, top, fixed_size, fixed_size, 1.0)
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SelectedWord {
+    line_idx: usize,
+    char_idx: usize,
+    text: String,
+    box_item: BoundingBox,
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    SelectCharacter(usize, usize),
+    SelectAlternative(char),
+    ToggleAlternatives,
+    Back,
+}
+
 #[derive(Clone)]
 struct OcrViewer {
     image_handle: IcedImageHandle,
     img_w: u32,
     img_h: u32,
     annotations: Vec<DetectedAnnotation>,
-}
-
-#[derive(Debug, Clone)]
-enum Message {}
-
-// Canvas program that draws overlays (boxes + text)
-#[derive(Clone)]
-struct OverlayProgram {
-    annotations: Vec<DetectedAnnotation>,
-    img_w: u32,
-    img_h: u32,
-}
-
-impl<Message> canvas::Program<Message> for OverlayProgram {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &Self::State,
-        renderer: &iced::Renderer,
-        _theme: &iced::Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<canvas::Geometry<iced::Renderer>> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-
-        let img_w = self.img_w as f32;
-        let img_h = self.img_h as f32;
-        // Use a uniform scale (contain) so aspect ratio is preserved and letterboxing is accounted for.
-        let scale_x = if img_w > 0.0 { bounds.width / img_w } else { 1.0 };
-        let scale_y = if img_h > 0.0 { bounds.height / img_h } else { 1.0 };
-        let scale = scale_x.min(scale_y);
-        let dest_w = img_w * scale;
-        let dest_h = img_h * scale;
-        let offset_x = (bounds.width - dest_w) / 2.0;
-        let offset_y = (bounds.height - dest_h) / 2.0;
-
-        for ann in self.annotations.iter() {
-            let b = &ann.bbox;
-            let x = offset_x + (b.left() as f32) * scale;
-            let y = offset_y + (b.top() as f32) * scale;
-            let w = (b.w as f32) * scale;
-            let h = (b.h as f32) * scale;
-
-            // Draw solid translucent grey overlay for the detected text box.
-            frame.fill_rectangle(
-                Point::new(x, y),
-                Size::new(w.max(1.0), h.max(1.0)),
-                Color::from_rgba(0.0, 0.0, 0.0, 0.40),
-            );
-
-            // Recognition text: render one character box over each OCR character box.
-            if let Some(ref line) = ann.line {
-                if !line.text.is_empty() {
-                    let chars: Vec<char> = line.text.chars().collect();
-                    if !chars.is_empty() && !line.char_boxes.is_empty() {
-                        let overlay_char_boxes = if line.is_vertical {
-                            line.char_boxes.clone()
-                        } else {
-                            Self::normalize_horizontal_char_boxes(&line.char_boxes, &chars)
-                        };
-                        for (ch, cb) in chars.iter().zip(overlay_char_boxes.iter()) {
-                            let cb_x = offset_x + (cb.left() as f32) * scale;
-                            let cb_y = offset_y + (cb.top() as f32) * scale;
-                            let cb_w = (cb.w as f32) * scale;
-                            let cb_h = (cb.h as f32) * scale;
-                            if cb_w <= 0.0 || cb_h <= 0.0 {
-                                continue;
-                            }
-
-                            let bg_w = cb_w.max(1.0);
-                            let bg_h = cb_h.max(1.0);
-
-                            let text_size = (bg_h * BOX_FILL_RATIO).max(4.0);
-                            let t = CanvasText {
-                                content: ch.to_string(),
-                                position: Point::new(cb_x + (bg_w / 2.0), cb_y),
-                                max_width: bg_w,
-                                color: Color::from_rgb(0.0, 1.0, 0.0),
-                                size: Pixels(text_size * 0.9),
-                                align_x: alignment::Horizontal::Center.into(),
-                                align_y: alignment::Vertical::Top,
-                                font: IcedFont::with_name("NotoSansJP"),
-                                ..Default::default()
-                            };
-                            frame.fill_text(t);
-                        }
-                    } else {
-                        let text_size = (h * BOX_FILL_RATIO * 0.98).max(4.0);
-                        let t = CanvasText {
-                            content: line.text.clone(),
-                            position: Point::new(x, y + ((h - text_size).max(0.0) / 2.0)),
-                            max_width: w.max(1.0),
-                            color: Color::from_rgb(0.0, 1.0, 0.0),
-                            size: Pixels(text_size * 0.9),
-                            align_x: alignment::Horizontal::Center.into(),
-                            align_y: alignment::Vertical::Top,
-                            font: IcedFont::with_name("NotoSansJP"),
-                            ..Default::default()
-                        };
-                        frame.fill_text(t);
-                    }
-                }
-            }
-        }
-
-        vec![frame.into_geometry()]
-    }
-}
-
-impl OverlayProgram {
-    fn normalize_horizontal_char_boxes(boxes: &[BoundingBox], chars: &[char]) -> Vec<BoundingBox> {
-        let mut normalized = boxes.to_vec();
-        for i in 0..normalized.len() {
-            let left = normalized[i].left();
-            let top = normalized[i].top();
-            let height = normalized[i].h.max(1);
-            let target_width = if chars.get(i).is_some_and(|ch| ch.is_ascii()) {
-                height / 2
-            } else {
-                height
-            };
-            if normalized[i].w >= target_width {
-                continue;
-            }
-
-            let target_right = left + target_width;
-            let next_left = (i + 1..normalized.len())
-                .map(|j| normalized[j].left())
-                .find(|&x| x > left);
-            let limited_right = next_left.map_or(target_right, |x| x.min(target_right));
-            let new_w = (limited_right - left).max(1).max(normalized[i].w);
-            normalized[i] = BoundingBox::new(left, top, new_w, height, normalized[i].confidence);
-        }
-        normalized
-    }
+    state: OcrOverlayState,
+    selected_word: Option<SelectedWord>,
+    alternatives_visible: bool,
 }
 
 impl OcrViewer {
+    fn new(image_handle: IcedImageHandle, img_w: u32, img_h: u32, annotations: Vec<DetectedAnnotation>) -> Self {
+        let mut state = OcrOverlayState::new();
+        let line_results = annotations
+            .iter()
+            .map(|annotation| annotation.line.clone())
+            .collect::<Vec<_>>();
+        state.set_line_results(line_results);
+        state.ensure_cursor_position();
+
+        Self {
+            image_handle,
+            img_w,
+            img_h,
+            annotations,
+            state,
+            selected_word: None,
+            alternatives_visible: false,
+        }
+    }
+
+    fn select_character(&mut self, line_idx: usize, char_idx: usize) {
+        self.state.current_tapped_line_idx = line_idx as isize;
+        self.state.current_tapped_char_idx_in_line = char_idx as isize;
+        self.state.current_tapped_idx = self.state.get_global_idx(line_idx, char_idx) as isize;
+        self.state.update_highlight_coords(line_idx, char_idx, 1);
+        self.state.is_dictionary_visible = true;
+        self.alternatives_visible = false;
+
+        let Some(line) = self.state.active_line_results.get(line_idx).and_then(|line| line.as_ref()) else {
+            return;
+        };
+        let Some(box_item) = line.char_boxes.get(char_idx) else {
+            return;
+        };
+        let text = line.text.chars().skip(char_idx).take(3).collect::<String>();
+        self.selected_word = Some(SelectedWord {
+            line_idx,
+            char_idx,
+            text,
+            box_item: box_item.clone(),
+        });
+    }
+
+    fn dummy_dictionary_entries() -> Vec<FormattedEntry> {
+        vec![
+            FormattedEntry {
+                term: "テスト".to_string(),
+                reading_groups: vec![FormattedReadingGroup {
+                    reading: "テスト".to_string(),
+                    headwords: vec![FormattedHeadword {
+                        kanji: "テスト".to_string(),
+                        onyomi: None,
+                        kunyomi: None,
+                    }],
+                    sense_groups: vec![FormattedSenseGroup {
+                        tags: vec!["n".to_string(), "dummy".to_string()],
+                        senses: vec![FormattedSense {
+                            index: 1,
+                            nodes: vec![
+                                DefinitionNode::Text("Dummy dictionary entry for layout testing.".to_string()),
+                                DefinitionNode::Text(" This row intentionally contains enough text to exercise wrapping and scrolling.".to_string()),
+                                DefinitionNode::Ruby { term: "漢字".to_string(), reading: "かんじ".to_string(), is_mini: false },
+                                DefinitionNode::Text(" can appear inline.".to_string()),
+                            ],
+                        }],
+                        is_forms: false,
+                    }],
+                    is_kanji_entry: false,
+                }],
+            },
+            FormattedEntry {
+                term: "確認".to_string(),
+                reading_groups: vec![FormattedReadingGroup {
+                    reading: "カクニン".to_string(),
+                    headwords: vec![FormattedHeadword {
+                        kanji: "確認".to_string(),
+                        onyomi: Some("カク ニン".to_string()),
+                        kunyomi: None,
+                    }],
+                    sense_groups: vec![FormattedSenseGroup {
+                        tags: vec!["suru".to_string(), "vt".to_string()],
+                        senses: vec![FormattedSense {
+                            index: 1,
+                            nodes: vec![DefinitionNode::Text("Dummy sense 1: check, verify, confirm.".to_string())],
+                        }],
+                        is_forms: false,
+                    }],
+                    is_kanji_entry: false,
+                }],
+            },
+            FormattedEntry {
+                term: "本日".to_string(),
+                reading_groups: vec![FormattedReadingGroup {
+                    reading: "ホンジツ".to_string(),
+                    headwords: vec![FormattedHeadword {
+                        kanji: "本日".to_string(),
+                        onyomi: Some("ホン ジツ".to_string()),
+                        kunyomi: Some("もとじつ".to_string()),
+                    }],
+                    sense_groups: vec![FormattedSenseGroup {
+                        tags: vec!["n".to_string(), "adj-no".to_string()],
+                        senses: vec![FormattedSense {
+                            index: 1,
+                            nodes: vec![DefinitionNode::Text("Dummy sense 2: today; the present day.".to_string())],
+                        }],
+                        is_forms: false,
+                    }],
+                    is_kanji_entry: false,
+                }],
+            },
+        ]
+    }
+
     fn view<'a>(&'a self) -> Element<'a, Message> {
-        // Let the widgets fill available space so the canvas bounds change as the window is resized.
         let overlay = OverlayProgram {
             annotations: self.annotations.clone(),
             img_w: self.img_w,
             img_h: self.img_h,
+            highlighted_coords: self.state.last_highlighted_coords.clone(),
         };
 
         let image = IcedImage::new(self.image_handle.clone())
@@ -1428,9 +1842,159 @@ impl OcrViewer {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        let stack = Stack::new().push(image).push(canvas);
+        let image_stack = Stack::new().push(image).push(canvas);
+        let mut root = Container::new(image_stack).width(Length::Fill).height(Length::Fill);
 
-        Container::new(stack).width(Length::Fill).height(Length::Fill).into()
+        if let Some(selected_word) = &self.selected_word {
+            let (root_width, root_height) = (800.0_f32, 480.0_f32);
+            let is_landscape = true;
+            self.state.update_gravity(root_width, root_height, &selected_word.box_item);
+            let (panel_width, panel_height) = self.state.panel_dimensions(root_width, root_height);
+
+            let dictionary_entries = Self::dummy_dictionary_entries();
+            let dictionary_panel = self.dictionary_panel(&dictionary_entries, panel_width, panel_height);
+            let neighbor_panel = self.neighbor_panel();
+            let alternatives_panel = if self.alternatives_visible {
+                self.alternatives_panel()
+            } else {
+                Container::new(Text::new(""))
+            };
+
+            let correction = Row::new().push(neighbor_panel);
+            let dictionary = Column::new().push(dictionary_panel);
+            let alternatives = Column::new().push(alternatives_panel);
+
+            let content = if is_landscape {
+                match self.state.last_landscape_gravity {
+                    Gravity::End => Row::new().push(alternatives).push(correction).push(dictionary),
+                    Gravity::Start => Row::new().push(dictionary).push(correction).push(alternatives),
+                    Gravity::Top | Gravity::Bottom => Row::new().push(dictionary).push(correction).push(alternatives),
+                }
+            } else {
+                Column::new().push(dictionary).push(correction).push(alternatives)
+            };
+
+            let panel = Container::new(content)
+                .padding(10)
+                .style(ContainerStyle::Panel)
+                .width(Length::Fill)
+                .height(Length::Fill);
+            root = Container::new(root).push(panel);
+        }
+
+        root.into()
+    }
+
+    fn dictionary_panel(&self, entries: &[FormattedEntry], _panel_width: f32, _panel_height: f32) -> Container<'a, Message> {
+        let mut content = Column::new().padding(10).spacing(12);
+
+        for entry in entries {
+            let mut entry_column = Column::new().spacing(8);
+            for group in &entry.reading_groups {
+                entry_column = entry_column.push(self.headword_section(group));
+                for sense_group in &group.sense_groups {
+                    entry_column = entry_column.push(self.sense_group(sense_group));
+                }
+                entry_column = entry_column.push(Space::with_height(8));
+            }
+            content = content.push(entry_column);
+        }
+
+        Container::new(Scrollable::new(content))
+            .padding(12)
+            .style(ContainerStyle::Dictionary)
+    }
+
+    fn headword_section(&self, group: &FormattedReadingGroup) -> Container<'a, Message> {
+        let mut content = Column::new().spacing(4);
+        if group.is_kanji_entry {
+            for headword in &group.headwords {
+                let mut row = Row::new().spacing(10).align_y(alignment::Vertical::Center);
+                row = row.push(Text::new(&headword.kanji).size(48).style(TextStyle::Headword));
+                if let Some(onyomi) = &headword.onyomi {
+                    row = row.push(Text::new(format!("ON: {onyomi}")));
+                }
+                if let Some(kunyomi) = &headword.kunyomi {
+                    row = row.push(Text::new(format!("KUN: {kunyomi}")));
+                }
+                content = content.push(row);
+            }
+        } else {
+            let mut row = Row::new().spacing(8).align_y(alignment::Vertical::Center);
+            for (idx, headword) in group.headwords.iter().enumerate() {
+                row = row.push(Text::new(&headword.kanji).size(32).style(TextStyle::Headword));
+                if idx + 1 < group.headwords.len() {
+                    row = row.push(Text::new("、"));
+                }
+            }
+            content = content.push(row);
+        }
+        Container::new(content)
+    }
+
+    fn sense_group(&self, sense_group: &FormattedSenseGroup) -> Container<'a, Message> {
+        let mut content = Column::new().spacing(6);
+        if !sense_group.tags.is_empty() {
+            let tags = Row::new()
+                .spacing(6)
+                .push_all(sense_group.tags.iter().map(|tag| Text::new(tag).style(TextStyle::Tag)));
+            content = content.push(tags);
+        }
+        for sense in &sense_group.senses {
+            let text = format!("{}. ", sense.index) + &sense.nodes.iter().map(|node| match node {
+                DefinitionNode::Text(text) => text.clone(),
+                DefinitionNode::Ruby { term, reading, .. } => format!("{term}【{reading}】"),
+                DefinitionNode::Tag { text, .. } => format!("[{text}]"),
+            }).collect::<Vec<_>>().join(" ");
+            content = content.push(Text::new(text).width(Length::Fill));
+        }
+        Container::new(content)
+    }
+
+    fn neighbor_panel(&self) -> Container<'a, Message> {
+        let state = self.state.get_neighbor_ui_state();
+        let mut content = Column::new().padding(6).spacing(4);
+        for line in state {
+            let mut row = Row::new().spacing(4);
+            for char_state in line.chars {
+                let button = Button::new(Text::new(char_state.text.clone()).size(24))
+                    .style(if char_state.is_selected {
+                        ButtonStyle::Selected
+                    } else {
+                        ButtonStyle::Character
+                    })
+                    .on_press(Message::SelectCharacter(line.line_idx, char_state.char_idx));
+                row = row.push(button);
+            }
+            content = content.push(row);
+        }
+        Container::new(Scrollable::new(content))
+            .width(Length::Shrink)
+            .height(Length::Fill)
+            .padding(6)
+            .style(ContainerStyle::Panel)
+    }
+
+    fn alternatives_panel(&self) -> Container<'a, Message> {
+        let Some(alt_state) = self.state.get_alternatives_ui_state() else {
+            return Container::new(Text::new(""));
+        };
+        let mut content = Column::new().padding(6).spacing(4);
+        for candidate in alt_state.candidates {
+            let button = Button::new(Text::new(candidate.char.to_string()).size(28))
+                .style(if candidate.is_selected {
+                    ButtonStyle::Selected
+                } else {
+                    ButtonStyle::Character
+                })
+                .on_press(Message::SelectAlternative(candidate.char));
+            content = content.push(button);
+        }
+        Container::new(Scrollable::new(content))
+            .width(Length::Shrink)
+            .height(Length::Fill)
+            .padding(6)
+            .style(ContainerStyle::Panel)
     }
 }
 
@@ -1483,14 +2047,35 @@ fn main() -> Result<()> {
 
     // Launch Iced window with the annotated image using the application helper
     let boot = move || {
-        OcrViewer {
-            image_handle: IcedImageHandle::from_bytes(bytes_arc.as_ref().clone()),
-            img_w: w,
-            img_h: h,
-            annotations: annotations.clone(),
-        }
+        OcrViewer::new(
+            IcedImageHandle::from_bytes(bytes_arc.as_ref().clone()),
+            w,
+            h,
+            annotations.clone(),
+        )
     };
-    let update = |_state: &mut OcrViewer, _message: Message| -> Task<Message> { Task::none() };
+    let update = |state: &mut OcrViewer, message: Message| -> Task<Message> {
+        match message {
+            Message::SelectCharacter(line_idx, char_idx) => {
+                state.select_character(line_idx, char_idx);
+            }
+            Message::SelectAlternative(new_char) => {
+                if let Some(selected) = state.selected_word.as_ref() {
+                    state.state.update_character(selected.line_idx, selected.char_idx, new_char);
+                    state.select_character(selected.line_idx, selected.char_idx);
+                }
+            }
+            Message::ToggleAlternatives => {
+                state.alternatives_visible = !state.alternatives_visible;
+            }
+            Message::Back => {
+                state.selected_word = None;
+                state.alternatives_visible = false;
+                state.state.is_dictionary_visible = false;
+            }
+        }
+        Task::none()
+    };
     let view = OcrViewer::view;
     let app = iced::application(boot, update, view);
     if let Err(e) = app.run() {
