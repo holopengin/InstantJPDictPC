@@ -1,19 +1,27 @@
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 
+use iced::widget::container::rounded_box;
+use iced::widget::space;
+use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use ort::session::Session;
 use ort::value::Tensor;
-use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
-use rusttype::{Font, Scale, point};
+use rusttype::{point, Font, Scale};
 use std::path::Path;
 
 // Iced UI for displaying the annotated image
-use iced::{Element, Length, Task, Color, Point, Size, Rectangle, mouse, Pixels, alignment, Background, Border, Shadow, Vector};
-use iced::Font as IcedFont;
-use iced::widget::{Container, Stack, Image as IcedImage, Column, Row, Text, Scrollable, Button, Space, container, button};
-use iced::widget::image::Handle as IcedImageHandle;
-use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path as CanvasPath, Text as CanvasText};
-use iced::widget::canvas::Stroke as CanvasStroke;
 use iced::widget::canvas::LineCap as CanvasLineCap;
+use iced::widget::canvas::Stroke as CanvasStroke;
+use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path as CanvasPath, Text as CanvasText};
+use iced::widget::image::Handle as IcedImageHandle;
+use iced::widget::{
+    button, column, container, row, text, Button, Column, Container, Image as IcedImage, Row,
+    Scrollable, Space, Stack, Text, Theme,
+};
+use iced::Font as IcedFont;
+use iced::{
+    alignment, mouse, Background, Border, Color, Element, Length, Pixels, Point, Rectangle, Shadow,
+    Size, Task, Vector,
+};
 // Constants matching the Kotlin implementation
 const DETECT_WIDTH: u32 = 960;
 const DETECT_HEIGHT: u32 = 544;
@@ -28,7 +36,7 @@ const X_OVERLAP_THRESHOLD: f32 = 0.3;
 const BOX_FILL_RATIO: f32 = 0.9;
 
 // Simulated swapped pairs for text correction
-const MEIKI_SWAPPED_PAIRS: &[(&str, &str)] = &[
+const MEIKI_SWAPPED_PAIRS: &[(&str, &str); 5] = &[
     ("は", "ば"),
     ("ひ", "び"),
     ("ふ", "ぶ"),
@@ -48,19 +56,32 @@ struct BoundingBox {
 
 impl BoundingBox {
     fn new(x: i32, y: i32, w: i32, h: i32, confidence: f32) -> Self {
-        BoundingBox { x, y, w, h, confidence }
+        BoundingBox {
+            x,
+            y,
+            w,
+            h,
+            confidence,
+        }
     }
 
-    fn left(&self) -> i32 { self.x }
-    fn top(&self) -> i32 { self.y }
-    fn right(&self) -> i32 { self.x + self.w }
-    fn bottom(&self) -> i32 { self.y + self.h }
+    fn left(&self) -> i32 {
+        self.x
+    }
+    fn top(&self) -> i32 {
+        self.y
+    }
+    fn right(&self) -> i32 {
+        self.x + self.w
+    }
+    fn bottom(&self) -> i32 {
+        self.y + self.h
+    }
 
     fn area(&self) -> i32 {
         self.w * self.h
     }
 }
-
 
 // Candidate character predicted by the recognition model
 #[derive(Debug, Clone)]
@@ -93,13 +114,24 @@ struct OcrEngine {
     char_vocab: Vec<i64>,
 }
 
+struct OverlayProgram {
+    annotations: Vec<DetectedAnnotation>,
+    img_w: u32,
+    img_h: u32,
+    //highlighted_coords...?
+}
+
 impl OcrEngine {
     fn new(model_dir: &str) -> Result<Self> {
         let model_path = Path::new(model_dir);
 
-        let detect_session = Session::builder()?.commit_from_file(model_path.join("meiki.text.detect.v0.1.960x544.onnx"))?;
-        let recognize_session = Session::builder()?.commit_from_file(model_path.join("meiki.text.rec.v0.960x32.with_logits.onnx"))?;
-        let recognize_session_vertical = Session::builder()?.commit_from_file(model_path.join("meiki.text.rec.v0.vertical.32x480.with_logits.onnx"))?;
+        let detect_session = Session::builder()?
+            .commit_from_file(model_path.join("meiki.text.detect.v0.1.960x544.onnx"))?;
+        let recognize_session = Session::builder()?
+            .commit_from_file(model_path.join("meiki.text.rec.v0.960x32.with_logits.onnx"))?;
+        let recognize_session_vertical = Session::builder()?.commit_from_file(
+            model_path.join("meiki.text.rec.v0.vertical.32x480.with_logits.onnx"),
+        )?;
 
         // Load character vocabulary
         let vocab_path = model_path.join("char_vocab.json");
@@ -158,7 +190,8 @@ impl OcrEngine {
 
         // 3. Build inputs map using the named map form of ort::inputs!
         // Collect input names to avoid holding borrows into `self.detect_session` across a mutable run() call.
-        let session_input_names: Vec<String> = self.detect_session
+        let session_input_names: Vec<String> = self
+            .detect_session
             .inputs()
             .iter()
             .map(|o| o.name().to_string())
@@ -189,7 +222,8 @@ impl OcrEngine {
         };
 
         // Collect output names before calling run() so we don't hold borrows from the session across the mutable call.
-        let output_names: Vec<String> = self.detect_session
+        let output_names: Vec<String> = self
+            .detect_session
             .outputs()
             .iter()
             .map(|o| o.name().to_string())
@@ -481,7 +515,15 @@ impl OcrEngine {
         }
     }
 
-    fn draw_text_small(img: &mut RgbaImage, x: i32, y: i32, text: &str, fg: Rgba<u8>, bg: Rgba<u8>, scale: u32) {
+    fn draw_text_small(
+        img: &mut RgbaImage,
+        x: i32,
+        y: i32,
+        text: &str,
+        fg: Rgba<u8>,
+        bg: Rgba<u8>,
+        scale: u32,
+    ) {
         // Tiny 3x5 font for digits and '.' only. Each entry is 5 rows, bits (2..0) left->right.
         fn glyph(c: char) -> Option<[u8; 5]> {
             match c {
@@ -536,7 +578,14 @@ impl OcrEngine {
         }
 
         // Draw background
-        Self::draw_filled_rect(img, label_x, label_y, total_w + 2 * padding, total_h + 2 * padding, bg);
+        Self::draw_filled_rect(
+            img,
+            label_x,
+            label_y,
+            total_w + 2 * padding,
+            total_h + 2 * padding,
+            bg,
+        );
 
         // Draw each glyph
         let mut cx = label_x + padding;
@@ -578,13 +627,23 @@ impl OcrEngine {
         img_data
     }
 
-    fn draw_text_ttf(img: &mut RgbaImage, font: &Font, text: &str, x: i32, y: i32, size_px: f32, color: Rgba<u8>) {
+    fn draw_text_ttf(
+        img: &mut RgbaImage,
+        font: &Font,
+        text: &str,
+        x: i32,
+        y: i32,
+        size_px: f32,
+        color: Rgba<u8>,
+    ) {
         use rusttype::PositionedGlyph;
         let scale = Scale::uniform(size_px);
         let v_metrics = font.v_metrics(scale);
         // Layout glyphs with a baseline at (x, y + ascent)
         let baseline_y = y as f32 + v_metrics.ascent;
-        let glyphs: Vec<PositionedGlyph> = font.layout(text, scale, point(x as f32, baseline_y)).collect();
+        let glyphs: Vec<PositionedGlyph> = font
+            .layout(text, scale, point(x as f32, baseline_y))
+            .collect();
 
         let img_w = img.width() as i32;
         let img_h = img.height() as i32;
@@ -596,9 +655,17 @@ impl OcrEngine {
                     let py = gy as i32 + bb.min.y;
                     if px >= 0 && px < img_w && py >= 0 && py < img_h {
                         // Clamp coverage to [0.0, 1.0] and convert to an integer alpha in 0..=255
-                        let cov = if v.is_finite() { v.max(0.0).min(1.0) } else { 0.0 };
+                        let cov = if v.is_finite() {
+                            v.max(0.0).min(1.0)
+                        } else {
+                            0.0
+                        };
                         let mut alpha = (cov * 255.0).round() as i32;
-                        if alpha < 0 { alpha = 0; } else if alpha > 255 { alpha = 255; }
+                        if alpha < 0 {
+                            alpha = 0;
+                        } else if alpha > 255 {
+                            alpha = 255;
+                        }
 
                         let existing = img.get_pixel(px as u32, py as u32);
                         let mut out = [0u8; 4];
@@ -617,7 +684,7 @@ impl OcrEngine {
         }
     }
 
-    fn calculate_x_overlap(&self, box1: &[f32;4], box2: &[f32;4]) -> f32 {
+    fn calculate_x_overlap(&self, box1: &[f32; 4], box2: &[f32; 4]) -> f32 {
         let x1_min = box1[0];
         let x1_max = box1[2];
         let x2_min = box2[0];
@@ -631,7 +698,7 @@ impl OcrEngine {
         intersection / w1.min(w2)
     }
 
-    fn calculate_y_overlap(&self, box1: &[f32;4], box2: &[f32;4]) -> f32 {
+    fn calculate_y_overlap(&self, box1: &[f32; 4], box2: &[f32; 4]) -> f32 {
         let y1_min = box1[1];
         let y1_max = box1[3];
         let y2_min = box2[1];
@@ -645,17 +712,35 @@ impl OcrEngine {
         intersection / h1.min(h2)
     }
 
-    fn recognize_single_chunk(&mut self, chunk: &DynamicImage, is_vertical: bool) -> Result<(Vec<CharCandidate>, i32, i32)> {
-        let target_w = if is_vertical { VERT_REC_WIDTH as u32 } else { REC_WIDTH as u32 };
-        let target_h = if is_vertical { VERT_REC_HEIGHT as u32 } else { REC_HEIGHT as u32 };
+    fn recognize_single_chunk(
+        &mut self,
+        chunk: &DynamicImage,
+        is_vertical: bool,
+    ) -> Result<(Vec<CharCandidate>, i32, i32)> {
+        let target_w = if is_vertical {
+            VERT_REC_WIDTH as u32
+        } else {
+            REC_WIDTH as u32
+        };
+        let target_h = if is_vertical {
+            VERT_REC_HEIGHT as u32
+        } else {
+            REC_HEIGHT as u32
+        };
 
         // Compute effective sizes matching Kotlin logic
         let (effective_w, effective_h) = if is_vertical {
             let scale_factor = 32.0f32 / (chunk.width() as f32);
-            (32i32, (chunk.height() as f32 * scale_factor).min(VERT_REC_HEIGHT as f32) as i32)
+            (
+                32i32,
+                (chunk.height() as f32 * scale_factor).min(VERT_REC_HEIGHT as f32) as i32,
+            )
         } else {
             let scale_factor = 32.0f32 / (chunk.height() as f32);
-            ((chunk.width() as f32 * scale_factor).min(REC_WIDTH as f32) as i32, 32i32)
+            (
+                (chunk.width() as f32 * scale_factor).min(REC_WIDTH as f32) as i32,
+                32i32,
+            )
         };
 
         if effective_w <= 0 || effective_h <= 0 {
@@ -663,7 +748,11 @@ impl OcrEngine {
         }
 
         // Resize chunk and pad to target
-        let resized = chunk.resize_exact(effective_w as u32, effective_h as u32, image::imageops::FilterType::Triangle);
+        let resized = chunk.resize_exact(
+            effective_w as u32,
+            effective_h as u32,
+            image::imageops::FilterType::Triangle,
+        );
         let mut padded = RgbaImage::from_pixel(target_w, target_h, Rgba([0u8, 0u8, 0u8, 255u8]));
         let resized_rgba = resized.to_rgba8();
         for y in 0..(effective_h as u32) {
@@ -675,19 +764,39 @@ impl OcrEngine {
 
         // Convert to NCHW float tensor
         let img_data = self.image_to_nchw(&padded, target_w, target_h);
-        let input_tensor = Tensor::from_array(([1i64, 3, target_h as i64, target_w as i64], img_data.into_boxed_slice()))?;
+        let input_tensor = Tensor::from_array((
+            [1i64, 3, target_h as i64, target_w as i64],
+            img_data.into_boxed_slice(),
+        ))?;
 
         // Run the session and extract outputs inside a limited scope to avoid holding a mutable borrow on self
         let (labels_arr_opt, boxes_arr_opt, scores_arr_opt, indices_arr_opt, raw_logits_opt) = {
             // Build inputs
-            let active_session = if is_vertical { &mut self.recognize_session_vertical } else { &mut self.recognize_session };
-            let session_input_names: Vec<String> = active_session.inputs().iter().map(|o| o.name().to_string()).collect();
-            let image_input_name = session_input_names.iter().find(|n| n.contains("image") || n.contains("input")).or_else(|| session_input_names.first()).map(|s| s.to_string()).context("Recognition model has no inputs")?;
+            let active_session = if is_vertical {
+                &mut self.recognize_session_vertical
+            } else {
+                &mut self.recognize_session
+            };
+            let session_input_names: Vec<String> = active_session
+                .inputs()
+                .iter()
+                .map(|o| o.name().to_string())
+                .collect();
+            let image_input_name = session_input_names
+                .iter()
+                .find(|n| n.contains("image") || n.contains("input"))
+                .or_else(|| session_input_names.first())
+                .map(|s| s.to_string())
+                .context("Recognition model has no inputs")?;
 
-            let has_orig_target_sizes = session_input_names.iter().any(|n| n == "orig_target_sizes");
+            let has_orig_target_sizes =
+                session_input_names.iter().any(|n| n == "orig_target_sizes");
 
             let inputs = if has_orig_target_sizes {
-                let size_tensor = Tensor::from_array(([1i64, 2], vec![target_w as i64, target_h as i64].into_boxed_slice()))?;
+                let size_tensor = Tensor::from_array((
+                    [1i64, 2],
+                    vec![target_w as i64, target_h as i64].into_boxed_slice(),
+                ))?;
                 ort::inputs! {
                     image_input_name.as_str() => input_tensor,
                     "orig_target_sizes" => size_tensor
@@ -697,57 +806,89 @@ impl OcrEngine {
             };
 
             // Run session and collect outputs
-            let output_names: Vec<String> = active_session.outputs().iter().map(|o| o.name().to_string()).collect();
+            let output_names: Vec<String> = active_session
+                .outputs()
+                .iter()
+                .map(|o| o.name().to_string())
+                .collect();
             let run_outputs = active_session.run(inputs)?;
 
             // Helper closures to extract arrays
-            let try_extract_f32 = |val: &ort::value::Value| {
-                val.try_extract_array::<f32>().ok().map(|a| a.to_owned())
-            };
-            let try_extract_i64 = |val: &ort::value::Value| {
-                val.try_extract_array::<i64>().ok().map(|a| a.to_owned())
-            };
+            let try_extract_f32 =
+                |val: &ort::value::Value| val.try_extract_array::<f32>().ok().map(|a| a.to_owned());
+            let try_extract_i64 =
+                |val: &ort::value::Value| val.try_extract_array::<i64>().ok().map(|a| a.to_owned());
 
-            let labels_name = output_names.iter().find(|n| n.contains("labels") || n.contains("char_codes"));
+            let labels_name = output_names
+                .iter()
+                .find(|n| n.contains("labels") || n.contains("char_codes"));
             let boxes_name = output_names.iter().find(|n| n.contains("boxes"));
             let scores_name = output_names.iter().find(|n| n.contains("scores"));
             let logits_name = output_names.iter().find(|n| n.contains("logits"));
             let indices_name = output_names.iter().find(|n| n.contains("indices"));
 
-            let labels_val = labels_name.and_then(|n| run_outputs.get(n.as_str())).or_else(|| run_outputs.get(output_names.get(0).map(|s| s.as_str()).unwrap_or("")));
-            let boxes_val = boxes_name.and_then(|n| run_outputs.get(n.as_str())).or_else(|| run_outputs.get(output_names.get(1).map(|s| s.as_str()).unwrap_or("")));
-            let scores_val = scores_name.and_then(|n| run_outputs.get(n.as_str())).or_else(|| run_outputs.get(output_names.get(2).map(|s| s.as_str()).unwrap_or("")));
+            let labels_val = labels_name
+                .and_then(|n| run_outputs.get(n.as_str()))
+                .or_else(|| run_outputs.get(output_names.get(0).map(|s| s.as_str()).unwrap_or("")));
+            let boxes_val = boxes_name
+                .and_then(|n| run_outputs.get(n.as_str()))
+                .or_else(|| run_outputs.get(output_names.get(1).map(|s| s.as_str()).unwrap_or("")));
+            let scores_val = scores_name
+                .and_then(|n| run_outputs.get(n.as_str()))
+                .or_else(|| run_outputs.get(output_names.get(2).map(|s| s.as_str()).unwrap_or("")));
             let logits_val = logits_name.and_then(|n| run_outputs.get(n.as_str()));
             let indices_val = indices_name.and_then(|n| run_outputs.get(n.as_str()));
 
             // Extract arrays
             let labels_arr_opt: Option<Vec<i64>> = labels_val.and_then(|v| {
-                try_extract_i64(v).map(|a| a.iter().cloned().collect()).or_else(|| {
-                    // try i32
-                    v.try_extract_array::<i32>().ok().map(|a| a.to_owned().iter().map(|x| *x as i64).collect())
-                })
+                try_extract_i64(v)
+                    .map(|a| a.iter().cloned().collect())
+                    .or_else(|| {
+                        // try i32
+                        v.try_extract_array::<i32>()
+                            .ok()
+                            .map(|a| a.to_owned().iter().map(|x| *x as i64).collect())
+                    })
             });
 
             let boxes_arr_opt = boxes_val.and_then(|v| try_extract_f32(v));
             let scores_arr_opt: Option<Vec<f32>> = scores_val.and_then(|v| {
-                try_extract_f32(v).map(|a| a.iter().cloned().collect()).or_else(|| {
-                    v.try_extract_array::<f64>().ok().map(|a| a.to_owned().iter().map(|x| *x as f32).collect())
-                })
+                try_extract_f32(v)
+                    .map(|a| a.iter().cloned().collect())
+                    .or_else(|| {
+                        v.try_extract_array::<f64>()
+                            .ok()
+                            .map(|a| a.to_owned().iter().map(|x| *x as f32).collect())
+                    })
             });
 
             let indices_arr_opt: Option<Vec<i64>> = indices_val.and_then(|v| {
-                try_extract_i64(v).map(|a| a.iter().cloned().collect()).or_else(|| {
-                    v.try_extract_array::<i32>().ok().map(|a| a.to_owned().iter().map(|x| *x as i64).collect())
-                })
+                try_extract_i64(v)
+                    .map(|a| a.iter().cloned().collect())
+                    .or_else(|| {
+                        v.try_extract_array::<i32>()
+                            .ok()
+                            .map(|a| a.to_owned().iter().map(|x| *x as i64).collect())
+                    })
             });
 
             let raw_logits_opt: Option<Vec<f32>> = logits_val.and_then(|v| {
-                try_extract_f32(v).map(|a| a.iter().cloned().collect()).or_else(|| {
-                    v.try_extract_array::<f64>().ok().map(|a| a.to_owned().iter().map(|x| *x as f32).collect())
-                })
+                try_extract_f32(v)
+                    .map(|a| a.iter().cloned().collect())
+                    .or_else(|| {
+                        v.try_extract_array::<f64>()
+                            .ok()
+                            .map(|a| a.to_owned().iter().map(|x| *x as f32).collect())
+                    })
             });
 
-            (labels_arr_opt, boxes_arr_opt, scores_arr_opt, indices_arr_opt, raw_logits_opt)
+            (
+                labels_arr_opt,
+                boxes_arr_opt,
+                scores_arr_opt,
+                indices_arr_opt,
+                raw_logits_opt,
+            )
         };
 
         // Basic validation
@@ -782,7 +923,7 @@ impl OcrEngine {
         });
 
         // Parse boxes and scores
-        let mut parsed_boxes: Vec<[f32;4]> = Vec::new();
+        let mut parsed_boxes: Vec<[f32; 4]> = Vec::new();
         if boxes_arr.ndim() == 3 {
             let num = boxes_arr.shape()[1];
             for i in 0..num {
@@ -822,56 +963,96 @@ impl OcrEngine {
                         if query_idx < mat.len() {
                             let qlogits = &mat[query_idx];
                             // take top 15
-                            let mut kv: Vec<(usize, f32)> = qlogits.iter().cloned().enumerate().collect();
-                            kv.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                            let mut kv: Vec<(usize, f32)> =
+                                qlogits.iter().cloned().enumerate().collect();
+                            kv.sort_by(|a, b| {
+                                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                            });
                             for (j, &(_idx, _val)) in kv.iter().enumerate().take(15) {
                                 let class_idx = kv[j].0;
-                                let ch = self.char_vocab.get(class_idx).and_then(|c| std::char::from_u32(*c as u32)).unwrap_or(' ');
+                                let ch = self
+                                    .char_vocab
+                                    .get(class_idx)
+                                    .and_then(|c| std::char::from_u32(*c as u32))
+                                    .unwrap_or(' ');
                                 alternatives.push((ch, kv[j].1));
                             }
                         }
                     }
                 }
 
-                let label_char = labels_arr.get(i).and_then(|v| std::char::from_u32(*v as u32)).unwrap_or(' ');
-                let box_coords = parsed_boxes.get(i).cloned().unwrap_or([0.0,0.0,0.0,0.0]);
-                candidates.push(CharCandidate { char: label_char, score: parsed_scores[i], box_coords, alternatives });
+                let label_char = labels_arr
+                    .get(i)
+                    .and_then(|v| std::char::from_u32(*v as u32))
+                    .unwrap_or(' ');
+                let box_coords = parsed_boxes.get(i).cloned().unwrap_or([0.0, 0.0, 0.0, 0.0]);
+                candidates.push(CharCandidate {
+                    char: label_char,
+                    score: parsed_scores[i],
+                    box_coords,
+                    alternatives,
+                });
             }
         }
 
         // Sort and filter overlaps
-        candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut filtered: Vec<CharCandidate> = Vec::new();
         for cand in candidates.into_iter() {
             let mut keep = true;
             for f in filtered.iter() {
-                let overlap = if is_vertical { self.calculate_y_overlap(&cand.box_coords, &f.box_coords) } else { self.calculate_x_overlap(&cand.box_coords, &f.box_coords) };
+                let overlap = if is_vertical {
+                    self.calculate_y_overlap(&cand.box_coords, &f.box_coords)
+                } else {
+                    self.calculate_x_overlap(&cand.box_coords, &f.box_coords)
+                };
                 if overlap > X_OVERLAP_THRESHOLD {
                     keep = false;
                     break;
                 }
             }
-            if keep { filtered.push(cand); }
+            if keep {
+                filtered.push(cand);
+            }
         }
 
         // Sort final
         if is_vertical {
-            filtered.sort_by(|a,b| a.box_coords[1].partial_cmp(&b.box_coords[1]).unwrap_or(std::cmp::Ordering::Equal));
+            filtered.sort_by(|a, b| {
+                a.box_coords[1]
+                    .partial_cmp(&b.box_coords[1])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         } else {
-            filtered.sort_by(|a,b| a.box_coords[0].partial_cmp(&b.box_coords[0]).unwrap_or(std::cmp::Ordering::Equal));
+            filtered.sort_by(|a, b| {
+                a.box_coords[0]
+                    .partial_cmp(&b.box_coords[0])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
 
         Ok((filtered, effective_w as i32, effective_h as i32))
     }
 
-    fn recognize_vertical_long_line(&mut self, crop: &DynamicImage, crop_x: i32, crop_y: i32) -> Result<LineResult> {
+    fn recognize_vertical_long_line(
+        &mut self,
+        crop: &DynamicImage,
+        crop_x: i32,
+        crop_y: i32,
+    ) -> Result<LineResult> {
         let scale_factor = 32f32 / (crop.width() as f32);
         let max_chunk_height = (350f32 / scale_factor) as i32;
         let mut chunk_results: Vec<(Vec<CharCandidate>, i32, i32, i32, i32, i32, i32)> = Vec::new();
         let mut current_y = 0i32;
         while current_y < crop.height() as i32 {
             let remaining_h = crop.height() as i32 - current_y;
-            if remaining_h < 10 { break; }
+            if remaining_h < 10 {
+                break;
+            }
             let h = std::cmp::min(max_chunk_height, remaining_h);
             let chunk_bitmap = crop.crop_imm(0, current_y as u32, crop.width() as u32, h as u32);
             let (candidates, eff_w, eff_h) = self.recognize_single_chunk(&chunk_bitmap, true)?;
@@ -879,19 +1060,49 @@ impl OcrEngine {
                 current_y += ((h as f32) * 0.8f32) as i32;
                 continue;
             }
-            chunk_results.push((candidates.clone(), 0, current_y, crop.width() as i32, h, eff_w, eff_h));
-            if current_y + h >= crop.height() as i32 { break; }
+            chunk_results.push((
+                candidates.clone(),
+                0,
+                current_y,
+                crop.width() as i32,
+                h,
+                eff_w,
+                eff_h,
+            ));
+            if current_y + h >= crop.height() as i32 {
+                break;
+            }
 
             if !candidates.is_empty() {
                 let mut sorted_candidates = candidates.clone();
-                sorted_candidates.sort_by(|a, b| a.box_coords[1].partial_cmp(&b.box_coords[1]).unwrap_or(std::cmp::Ordering::Equal));
+                sorted_candidates.sort_by(|a, b| {
+                    a.box_coords[1]
+                        .partial_cmp(&b.box_coords[1])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 let overlap_start_threshold = (h as f32) * 0.6f32;
-                let anchor_options: Vec<_> = sorted_candidates.iter().filter(|it| { let local_y_top = (it.box_coords[1] / eff_h as f32) * (h as f32); local_y_top > overlap_start_threshold }).collect();
-                let anchor_candidate = if anchor_options.len() >= 2 { anchor_options[anchor_options.len()-2].clone() } else if !anchor_options.is_empty() { anchor_options[0].clone() } else { sorted_candidates.last().unwrap().clone() };
+                let anchor_options: Vec<_> = sorted_candidates
+                    .iter()
+                    .filter(|it| {
+                        let local_y_top = (it.box_coords[1] / eff_h as f32) * (h as f32);
+                        local_y_top > overlap_start_threshold
+                    })
+                    .collect();
+                let anchor_candidate = if anchor_options.len() >= 2 {
+                    anchor_options[anchor_options.len() - 2].clone()
+                } else if !anchor_options.is_empty() {
+                    anchor_options[0].clone()
+                } else {
+                    sorted_candidates.last().unwrap().clone()
+                };
                 let local_y_top = (anchor_candidate.box_coords[1] / eff_h as f32) * (h as f32);
                 let chunk_margin = (crop.width() as f32 * 0.1f32).max(2.0) as i32;
                 let next_y = (current_y + local_y_top as i32 - chunk_margin).max(0);
-                if next_y <= current_y || next_y >= current_y + h - 10 { current_y += ((h as f32) * 0.8f32) as i32; } else { current_y = next_y; }
+                if next_y <= current_y || next_y >= current_y + h - 10 {
+                    current_y += ((h as f32) * 0.8f32) as i32;
+                } else {
+                    current_y = next_y;
+                }
             } else {
                 current_y += ((h as f32) * 0.8f32) as i32;
             }
@@ -908,28 +1119,55 @@ impl OcrEngine {
                     let ry1 = cand.box_coords[1];
                     let rx2 = cand.box_coords[2];
                     let ry2 = cand.box_coords[3];
-                    let x1 = (rx1 / (VERT_REC_WIDTH as f32)) * (*chunk_w as f32) + (*offset_x as f32) + (crop_x as f32);
-                    let y1 = (ry1 / (*eff_h as f32)) * (*chunk_h as f32) + (*offset_y as f32) + (crop_y as f32);
-                    let x2 = (rx2 / (VERT_REC_WIDTH as f32)) * (*chunk_w as f32) + (*offset_x as f32) + (crop_x as f32);
-                    let y2 = (ry2 / (*eff_h as f32)) * (*chunk_h as f32) + (*offset_y as f32) + (crop_y as f32);
-                    BoundingBox::new(x1.round() as i32, y1.round() as i32, (x2 - x1).round() as i32, (y2 - y1).round() as i32, cand.score)
+                    let x1 = (rx1 / (VERT_REC_WIDTH as f32)) * (*chunk_w as f32)
+                        + (*offset_x as f32)
+                        + (crop_x as f32);
+                    let y1 = (ry1 / (*eff_h as f32)) * (*chunk_h as f32)
+                        + (*offset_y as f32)
+                        + (crop_y as f32);
+                    let x2 = (rx2 / (VERT_REC_WIDTH as f32)) * (*chunk_w as f32)
+                        + (*offset_x as f32)
+                        + (crop_x as f32);
+                    let y2 = (ry2 / (*eff_h as f32)) * (*chunk_h as f32)
+                        + (*offset_y as f32)
+                        + (crop_y as f32);
+                    BoundingBox::new(
+                        x1.round() as i32,
+                        y1.round() as i32,
+                        (x2 - x1).round() as i32,
+                        (y2 - y1).round() as i32,
+                        cand.score,
+                    )
                 };
                 final_text.push(cand.char);
                 final_char_boxes.push(global);
             }
         }
 
-        Ok(LineResult { text: final_text, char_boxes: final_char_boxes, alternatives: Vec::new(), is_vertical: true, chunk_boxes: Vec::new() })
+        Ok(LineResult {
+            text: final_text,
+            char_boxes: final_char_boxes,
+            alternatives: Vec::new(),
+            is_vertical: true,
+            chunk_boxes: Vec::new(),
+        })
     }
 
-    fn recognize_horizontal_long_line(&mut self, crop: &DynamicImage, crop_x: i32, crop_y: i32) -> Result<LineResult> {
+    fn recognize_horizontal_long_line(
+        &mut self,
+        crop: &DynamicImage,
+        crop_x: i32,
+        crop_y: i32,
+    ) -> Result<LineResult> {
         let scale_factor = 32f32 / (crop.height() as f32);
         let max_chunk_width = (960f32 / scale_factor) as i32;
         let mut chunk_results: Vec<(Vec<CharCandidate>, i32, i32, i32, i32, i32, i32)> = Vec::new();
         let mut current_x = 0i32;
         while current_x < crop.width() as i32 {
             let remaining_w = crop.width() as i32 - current_x;
-            if remaining_w < 10 { break; }
+            if remaining_w < 10 {
+                break;
+            }
             let w = std::cmp::min(max_chunk_width, remaining_w);
             let chunk_bitmap = crop.crop_imm(current_x as u32, 0, w as u32, crop.height() as u32);
             let (candidates, eff_w, eff_h) = self.recognize_single_chunk(&chunk_bitmap, false)?;
@@ -937,19 +1175,49 @@ impl OcrEngine {
                 current_x += ((w as f32) * 0.8f32) as i32;
                 continue;
             }
-            chunk_results.push((candidates.clone(), current_x, 0, w, crop.height() as i32, eff_w, eff_h));
-            if current_x + w >= crop.width() as i32 { break; }
+            chunk_results.push((
+                candidates.clone(),
+                current_x,
+                0,
+                w,
+                crop.height() as i32,
+                eff_w,
+                eff_h,
+            ));
+            if current_x + w >= crop.width() as i32 {
+                break;
+            }
 
             if !candidates.is_empty() {
                 let mut sorted_candidates = candidates.clone();
-                sorted_candidates.sort_by(|a, b| a.box_coords[0].partial_cmp(&b.box_coords[0]).unwrap_or(std::cmp::Ordering::Equal));
+                sorted_candidates.sort_by(|a, b| {
+                    a.box_coords[0]
+                        .partial_cmp(&b.box_coords[0])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 let overlap_start_threshold = (w as f32) * 0.6f32;
-                let anchor_options: Vec<_> = sorted_candidates.iter().filter(|it| { let local_x_left = (it.box_coords[0] / eff_w as f32) * (w as f32); local_x_left > overlap_start_threshold }).collect();
-                let anchor_candidate = if anchor_options.len() >= 2 { anchor_options[anchor_options.len()-2].clone() } else if !anchor_options.is_empty() { anchor_options[0].clone() } else { sorted_candidates.last().unwrap().clone() };
+                let anchor_options: Vec<_> = sorted_candidates
+                    .iter()
+                    .filter(|it| {
+                        let local_x_left = (it.box_coords[0] / eff_w as f32) * (w as f32);
+                        local_x_left > overlap_start_threshold
+                    })
+                    .collect();
+                let anchor_candidate = if anchor_options.len() >= 2 {
+                    anchor_options[anchor_options.len() - 2].clone()
+                } else if !anchor_options.is_empty() {
+                    anchor_options[0].clone()
+                } else {
+                    sorted_candidates.last().unwrap().clone()
+                };
                 let local_x_left = (anchor_candidate.box_coords[0] / eff_w as f32) * (w as f32);
                 let chunk_margin = (crop.height() as f32 * 0.1f32).max(2.0) as i32;
                 let next_x = (current_x + local_x_left as i32 - chunk_margin).max(0);
-                if next_x <= current_x || next_x >= current_x + w - 10 { current_x += ((w as f32) * 0.8f32) as i32; } else { current_x = next_x; }
+                if next_x <= current_x || next_x >= current_x + w - 10 {
+                    current_x += ((w as f32) * 0.8f32) as i32;
+                } else {
+                    current_x = next_x;
+                }
             } else {
                 current_x += ((w as f32) * 0.8f32) as i32;
             }
@@ -964,62 +1232,124 @@ impl OcrEngine {
                 let ry1 = cand.box_coords[1];
                 let rx2 = cand.box_coords[2];
                 let ry2 = cand.box_coords[3];
-                let x1 = (rx1 / (*eff_w as f32)) * (*chunk_w as f32) + (*offset_x as f32) + (crop_x as f32);
-                let y1 = (ry1 / (REC_HEIGHT as f32)) * (*chunk_h as f32) + (*offset_y as f32) + (crop_y as f32);
-                let x2 = (rx2 / (*eff_w as f32)) * (*chunk_w as f32) + (*offset_x as f32) + (crop_x as f32);
-                let y2 = (ry2 / (REC_HEIGHT as f32)) * (*chunk_h as f32) + (*offset_y as f32) + (crop_y as f32);
+                let x1 = (rx1 / (*eff_w as f32)) * (*chunk_w as f32)
+                    + (*offset_x as f32)
+                    + (crop_x as f32);
+                let y1 = (ry1 / (REC_HEIGHT as f32)) * (*chunk_h as f32)
+                    + (*offset_y as f32)
+                    + (crop_y as f32);
+                let x2 = (rx2 / (*eff_w as f32)) * (*chunk_w as f32)
+                    + (*offset_x as f32)
+                    + (crop_x as f32);
+                let y2 = (ry2 / (REC_HEIGHT as f32)) * (*chunk_h as f32)
+                    + (*offset_y as f32)
+                    + (crop_y as f32);
                 final_text.push(cand.char);
-                final_char_boxes.push(BoundingBox::new(x1.round() as i32, y1.round() as i32, (x2 - x1).round() as i32, (y2 - y1).round() as i32, cand.score));
+                final_char_boxes.push(BoundingBox::new(
+                    x1.round() as i32,
+                    y1.round() as i32,
+                    (x2 - x1).round() as i32,
+                    (y2 - y1).round() as i32,
+                    cand.score,
+                ));
             }
         }
 
-        Ok(LineResult { text: final_text, char_boxes: final_char_boxes, alternatives: Vec::new(), is_vertical: false, chunk_boxes: Vec::new() })
+        Ok(LineResult {
+            text: final_text,
+            char_boxes: final_char_boxes,
+            alternatives: Vec::new(),
+            is_vertical: false,
+            chunk_boxes: Vec::new(),
+        })
     }
 
-    fn recognize_single_line(&mut self, image: &DynamicImage, bbox: &BoundingBox) -> Result<Option<LineResult>> {
+    fn recognize_single_line(
+        &mut self,
+        image: &DynamicImage,
+        bbox: &BoundingBox,
+    ) -> Result<Option<LineResult>> {
         // Similar to Kotlin: decide between short chunk, horizontal long line, vertical long line
         let is_vertical = bbox.h > bbox.w;
         let crop_x = bbox.x.max(0) as u32;
         let crop_y = bbox.y.max(0) as u32;
         let crop_w = bbox.w.max(0) as u32;
         let crop_h = bbox.h.max(0) as u32;
-        if crop_w == 0 || crop_h == 0 { return Ok(None); }
+        if crop_w == 0 || crop_h == 0 {
+            return Ok(None);
+        }
         let crop = image.crop_imm(crop_x, crop_y, crop_w, crop_h);
 
         let result: Option<LineResult>;
         if is_vertical && ((crop_h as f32) * (32.0f32 / crop_w as f32) > 350.0f32) {
-            result = Some(self.recognize_vertical_long_line(&crop, crop_x as i32, crop_y as i32)?);
+            result =
+                Some(self.recognize_vertical_long_line(&crop, crop_x as i32, crop_y as i32)?);
         } else if !is_vertical && ((crop_w as f32) * (32.0f32 / crop_h as f32) > REC_WIDTH as f32) {
-            result = Some(self.recognize_horizontal_long_line(&crop, crop_x as i32, crop_y as i32)?);
+            result =
+                Some(self.recognize_horizontal_long_line(&crop, crop_x as i32, crop_y as i32)?);
         } else {
             let (filtered, eff_w, eff_h) = self.recognize_single_chunk(&crop, is_vertical)?;
             let text: String = filtered.iter().map(|c| c.char).collect();
-            let alternatives: Vec<Vec<(char,f32)>> = filtered.iter().map(|c| c.alternatives.clone()).collect();
+            let alternatives: Vec<Vec<(char, f32)>> =
+                filtered.iter().map(|c| c.alternatives.clone()).collect();
             let mut char_boxes: Vec<BoundingBox> = Vec::new();
             for c in filtered.iter() {
                 // convert to global rect
                 if is_vertical {
-                    let x1 = (c.box_coords[0] / (VERT_REC_WIDTH as f32)) * (crop_w as f32) + (crop_x as f32);
+                    let x1 = (c.box_coords[0] / (VERT_REC_WIDTH as f32)) * (crop_w as f32)
+                        + (crop_x as f32);
                     let y1 = (c.box_coords[1] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
-                    let x2 = (c.box_coords[2] / (VERT_REC_WIDTH as f32)) * (crop_w as f32) + (crop_x as f32);
+                    let x2 = (c.box_coords[2] / (VERT_REC_WIDTH as f32)) * (crop_w as f32)
+                        + (crop_x as f32);
                     let y2 = (c.box_coords[3] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
-                    char_boxes.push(BoundingBox::new(x1.round() as i32, y1.round() as i32, (x2 - x1).round() as i32, (y2 - y1).round() as i32, c.score));
+                    char_boxes.push(BoundingBox::new(
+                        x1.round() as i32,
+                        y1.round() as i32,
+                        (x2 - x1).round() as i32,
+                        (y2 - y1).round() as i32,
+                        c.score,
+                    ));
                 } else {
                     let x1 = (c.box_coords[0] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
-                    let y1 = (c.box_coords[1] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
+                    let y1 =
+                        (c.box_coords[1] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
                     let x2 = (c.box_coords[2] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
-                    let y2 = (c.box_coords[3] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
-                    char_boxes.push(BoundingBox::new(x1.round() as i32, y1.round() as i32, (x2 - x1).round() as i32, (y2 - y1).round() as i32, c.score));
+                    let y2 =
+                        (c.box_coords[3] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
+                    char_boxes.push(BoundingBox::new(
+                        x1.round() as i32,
+                        y1.round() as i32,
+                        (x2 - x1).round() as i32,
+                        (y2 - y1).round() as i32,
+                        c.score,
+                    ));
                 }
             }
-            result = Some(LineResult { text, char_boxes, alternatives, is_vertical, chunk_boxes: vec![BoundingBox::new(crop_x as i32, crop_y as i32, crop_w as i32, crop_h as i32, 1.0)] });
+            result = Some(LineResult {
+                text,
+                char_boxes,
+                alternatives,
+                is_vertical,
+                chunk_boxes: vec![BoundingBox::new(
+                    crop_x as i32,
+                    crop_y as i32,
+                    crop_w as i32,
+                    crop_h as i32,
+                    1.0,
+                )],
+            });
         }
 
         Ok(result)
     }
 
     // Modified: return the annotated image in-memory when `render` is true
-    fn run_detection(&mut self, image: &DynamicImage, render: bool, font_path: Option<&str>) -> Result<(Vec<DetectedAnnotation>, Option<RgbaImage>)> {
+    fn run_detection(
+        &mut self,
+        image: &DynamicImage,
+        render: bool,
+        font_path: Option<&str>,
+    ) -> Result<(Vec<DetectedAnnotation>, Option<RgbaImage>)> {
         let boxes = self.detect(image)?;
         let merged = self.merge_overlapping_boxes(boxes);
         let sorted = self.sort_detected_boxes(merged);
@@ -1027,18 +1357,29 @@ impl OcrEngine {
         println!("Detected {} bounding boxes.", sorted.len());
         for (i, bbox) in sorted.iter().enumerate() {
             let b = bbox;
-            println!("  Box {}: x={}, y={}, w={}, h={}, conf={:.2}",
-                     i, b.x, b.y, b.w, b.h, b.confidence);
+            println!(
+                "  Box {}: x={}, y={}, w={}, h={}, conf={:.2}",
+                i, b.x, b.y, b.w, b.h, b.confidence
+            );
         }
 
         // Run recognition for each detected box so the GUI can overlay recognized text.
         let mut annotations: Vec<DetectedAnnotation> = Vec::new();
         for bbox in sorted.iter() {
             match self.recognize_single_line(image, bbox) {
-                Ok(opt) => annotations.push(DetectedAnnotation { bbox: bbox.clone(), line: opt }),
+                Ok(opt) => annotations.push(DetectedAnnotation {
+                    bbox: bbox.clone(),
+                    line: opt,
+                }),
                 Err(e) => {
-                    println!("Recognition failed for box at x={},y={}: {:?}", bbox.x, bbox.y, e);
-                    annotations.push(DetectedAnnotation { bbox: bbox.clone(), line: None });
+                    println!(
+                        "Recognition failed for box at x={},y={}: {:?}",
+                        bbox.x, bbox.y, e
+                    );
+                    annotations.push(DetectedAnnotation {
+                        bbox: bbox.clone(),
+                        line: None,
+                    });
                 }
             }
         }
@@ -1061,7 +1402,12 @@ impl OcrEngine {
 
             // Try common default
             if font_opt.is_none() {
-                let candidates = ["fonts/NotoSansJP-Regular.ttf", "fonts/NotoSansJP-Regular.otf", "font.ttf", "NotoSansJP-Regular.ttf"];
+                let candidates = [
+                    "fonts/NotoSansJP-Regular.ttf",
+                    "fonts/NotoSansJP-Regular.otf",
+                    "font.ttf",
+                    "NotoSansJP-Regular.ttf",
+                ];
                 for cand in candidates.iter() {
                     if let Ok(bytes) = std::fs::read(cand) {
                         if let Some(f) = Font::try_from_vec(bytes) {
@@ -1085,10 +1431,16 @@ impl OcrEngine {
             let _ref_glyph_unit_h = 0.0f32;
             if let Some(ref font) = font_opt {
                 let unit_scale = Scale::uniform(1.0);
-                let _ref_glyph_unit_h = font.glyph('本').scaled(unit_scale).positioned(point(0.0, 0.0)).pixel_bounding_box().map(|r| (r.max.y - r.min.y) as f32).unwrap_or_else(|| {
-                    let vm = font.v_metrics(unit_scale);
-                    vm.ascent - vm.descent
-                });
+                let _ref_glyph_unit_h = font
+                    .glyph('本')
+                    .scaled(unit_scale)
+                    .positioned(point(0.0, 0.0))
+                    .pixel_bounding_box()
+                    .map(|r| (r.max.y - r.min.y) as f32)
+                    .unwrap_or_else(|| {
+                        let vm = font.v_metrics(unit_scale);
+                        vm.ascent - vm.descent
+                    });
             }
 
             for bbox in sorted.iter() {
@@ -1099,10 +1451,22 @@ impl OcrEngine {
                 let fg = Rgba([255u8, 255u8, 255u8, 255u8]); // white text
                 let bg = Rgba([0u8, 0u8, 0u8, 200u8]); // semi-opaque black background
                 let scale = 2u32; // scale factor for the tiny font
-                Self::draw_text_small(&mut img_rgba, bbox.left(), bbox.top(), &label, fg, bg, scale);
+                Self::draw_text_small(
+                    &mut img_rgba,
+                    bbox.left(),
+                    bbox.top(),
+                    &label,
+                    fg,
+                    bg,
+                    scale,
+                );
 
                 // If we have recognition results, render them into the baked image as before (optional)
-                if let Some(ref line_result) = annotations.iter().find(|a| a.bbox.x == bbox.x && a.bbox.y == bbox.y).and_then(|a| a.line.clone()) {
+                if let Some(ref line_result) = annotations
+                    .iter()
+                    .find(|a| a.bbox.x == bbox.x && a.bbox.y == bbox.y)
+                    .and_then(|a| a.line.clone())
+                {
                     if let Some(ref font) = font_opt {
                         // Render each detected character directly on top of its detection box.
                         // Follow Kotlin implementation: compute a fixed square size (based on max char width for
@@ -1113,9 +1477,19 @@ impl OcrEngine {
                         if !chars.is_empty() && !line_result.char_boxes.is_empty() {
                             // fixed size: max width (vertical) or max height (horizontal)
                             let fixed_size = if line_result.is_vertical {
-                                line_result.char_boxes.iter().map(|b| b.w).max().unwrap_or(0)
+                                line_result
+                                    .char_boxes
+                                    .iter()
+                                    .map(|b| b.w)
+                                    .max()
+                                    .unwrap_or(0)
                             } else {
-                                line_result.char_boxes.iter().map(|b| b.h).max().unwrap_or(0)
+                                line_result
+                                    .char_boxes
+                                    .iter()
+                                    .map(|b| b.h)
+                                    .max()
+                                    .unwrap_or(0)
                             };
 
                             // Measure per-character advances using the same fixed_size as text size when possible.
@@ -1141,10 +1515,23 @@ impl OcrEngine {
                                 let adv = advances.get(i - 1).cloned().unwrap_or(fixed_size);
                                 if line_result.is_vertical {
                                     let new_top = (prev.top().saturating_add(adv)).max(cur.top());
-                                    refined.push(BoundingBox::new(cur.left(), new_top, cur.w, cur.h, cur.confidence));
+                                    refined.push(BoundingBox::new(
+                                        cur.left(),
+                                        new_top,
+                                        cur.w,
+                                        cur.h,
+                                        cur.confidence,
+                                    ));
                                 } else {
-                                    let new_left = (prev.left().saturating_add(adv)).max(cur.left());
-                                    refined.push(BoundingBox::new(new_left, cur.top(), cur.w, cur.h, cur.confidence));
+                                    let new_left =
+                                        (prev.left().saturating_add(adv)).max(cur.left());
+                                    refined.push(BoundingBox::new(
+                                        new_left,
+                                        cur.top(),
+                                        cur.w,
+                                        cur.h,
+                                        cur.confidence,
+                                    ));
                                 }
                             }
 
@@ -1155,7 +1542,8 @@ impl OcrEngine {
                                 let center_y = b.top() + b.h / 2;
                                 let left = center_x - fixed_size / 2;
                                 let top = center_y - fixed_size / 2;
-                                display_boxes.push(BoundingBox::new(left, top, fixed_size, fixed_size, 1.0));
+                                display_boxes
+                                    .push(BoundingBox::new(left, top, fixed_size, fixed_size, 1.0));
                             }
 
                             // Compute unit visual height for the font (ascent - descent at scale 1.0)
@@ -1169,10 +1557,20 @@ impl OcrEngine {
                                 let mut hi = (target_h.max(1.0) * 8.0).max(64.0);
                                 // Expand until hi produces measurement >= target_h (or until a cap)
                                 for _ in 0..10 {
-                                    let ref_pos_hi = font.glyph('本').scaled(Scale::uniform(hi)).positioned(point(0.0, 0.0));
-                                    let measured_hi = ref_pos_hi.pixel_bounding_box().map(|r| (r.max.y - r.min.y) as f32)
-                                        .unwrap_or_else(|| font.v_metrics(Scale::uniform(hi)).ascent - font.v_metrics(Scale::uniform(hi)).descent);
-                                    if measured_hi >= target_h || hi > 4096.0 { break; }
+                                    let ref_pos_hi = font
+                                        .glyph('本')
+                                        .scaled(Scale::uniform(hi))
+                                        .positioned(point(0.0, 0.0));
+                                    let measured_hi = ref_pos_hi
+                                        .pixel_bounding_box()
+                                        .map(|r| (r.max.y - r.min.y) as f32)
+                                        .unwrap_or_else(|| {
+                                            font.v_metrics(Scale::uniform(hi)).ascent
+                                                - font.v_metrics(Scale::uniform(hi)).descent
+                                        });
+                                    if measured_hi >= target_h || hi > 4096.0 {
+                                        break;
+                                    }
                                     hi *= 2.0;
                                 }
 
@@ -1180,15 +1578,31 @@ impl OcrEngine {
                                 let mut s = lo;
                                 for _ in 0..12 {
                                     let mid = (lo + hi) / 2.0;
-                                    let ref_pos = font.glyph('本').scaled(Scale::uniform(mid)).positioned(point(0.0, 0.0));
-                                    let measured = ref_pos.pixel_bounding_box().map(|r| (r.max.y - r.min.y) as f32)
-                                        .unwrap_or_else(|| font.v_metrics(Scale::uniform(mid)).ascent - font.v_metrics(Scale::uniform(mid)).descent);
+                                    let ref_pos = font
+                                        .glyph('本')
+                                        .scaled(Scale::uniform(mid))
+                                        .positioned(point(0.0, 0.0));
+                                    let measured = ref_pos
+                                        .pixel_bounding_box()
+                                        .map(|r| (r.max.y - r.min.y) as f32)
+                                        .unwrap_or_else(|| {
+                                            font.v_metrics(Scale::uniform(mid)).ascent
+                                                - font.v_metrics(Scale::uniform(mid)).descent
+                                        });
                                     if measured == 0.0 {
-                                        lo = mid; s = mid; continue;
+                                        lo = mid;
+                                        s = mid;
+                                        continue;
                                     }
                                     s = mid;
-                                    if measured < target_h { lo = mid; } else { hi = mid; }
-                                    if (measured - target_h).abs() < 0.5 { break; }
+                                    if measured < target_h {
+                                        lo = mid;
+                                    } else {
+                                        hi = mid;
+                                    }
+                                    if (measured - target_h).abs() < 0.5 {
+                                        break;
+                                    }
                                 }
                                 s
                             };
@@ -1200,7 +1614,9 @@ impl OcrEngine {
                             // Draw each char using the same scale_for_line and center M-box
                             let mut dbg_printed = 0usize;
                             for (i, db) in display_boxes.iter().enumerate() {
-                                if i >= chars.len() { break; }
+                                if i >= chars.len() {
+                                    break;
+                                }
                                 let ch = chars[i];
 
                                 let scale_px = scale_for_line.max(4.0).min(4096.0);
@@ -1209,35 +1625,63 @@ impl OcrEngine {
 
                                 // Compute baseline so that the glyph's measured vertical box is centered in the display box.
                                 let box_center_y = db.top() as f32 + (db.h as f32) / 2.0;
-                                let baseline_y = box_center_y + (v_metrics.ascent - v_metrics.descent) / 2.0;
+                                let baseline_y =
+                                    box_center_y + (v_metrics.ascent - v_metrics.descent) / 2.0;
                                 let y_top = baseline_y - v_metrics.ascent;
 
                                 // Measure advance (width) at this scale for horizontal centering
                                 let g = font.glyph(ch).scaled(scale);
                                 let text_width = g.h_metrics().advance_width;
-                                let x = db.left() as f32 + ((db.w as f32 - text_width).max(0.0) / 2.0);
+                                let x =
+                                    db.left() as f32 + ((db.w as f32 - text_width).max(0.0) / 2.0);
 
                                 // Debug: measure final glyph bbox at this scale to verify visual height
-                                let final_pos = font.glyph(ch).scaled(scale).positioned(point(x, baseline_y));
+                                let final_pos = font
+                                    .glyph(ch)
+                                    .scaled(scale)
+                                    .positioned(point(x, baseline_y));
                                 let final_bbox = final_pos.pixel_bounding_box();
-                                let final_h = final_bbox.map(|r| (r.max.y - r.min.y) as f32).unwrap_or(v_metrics.ascent - v_metrics.descent);
+                                let final_h = final_bbox
+                                    .map(|r| (r.max.y - r.min.y) as f32)
+                                    .unwrap_or(v_metrics.ascent - v_metrics.descent);
 
                                 if dbg_printed < 8 {
                                     dbg_printed += 1;
                                     println!("DBG glyph='{}' box_h={} target_h={:.1} scale_px={:.2} final_h={:.1} adv_w={:.1}", ch, db.h, target_for_line, scale_px, final_h, text_width);
                                 }
 
-                                Self::draw_text_ttf(&mut img_rgba, font, &ch.to_string(), x.round() as i32, y_top.round() as i32, scale_px, Rgba([0u8,255u8,0u8,255u8]));
+                                Self::draw_text_ttf(
+                                    &mut img_rgba,
+                                    font,
+                                    &ch.to_string(),
+                                    x.round() as i32,
+                                    y_top.round() as i32,
+                                    scale_px,
+                                    Rgba([0u8, 255u8, 0u8, 255u8]),
+                                );
 
                                 // Draw the display box for debugging/visibility
-                                Self::draw_rectangle(&mut img_rgba, db, Rgba([0u8,255u8,0u8,255u8]), 1);
+                                Self::draw_rectangle(
+                                    &mut img_rgba,
+                                    db,
+                                    Rgba([0u8, 255u8, 0u8, 255u8]),
+                                    1,
+                                );
                             }
                         } else {
                             // Fallback: draw the whole line text above the box like before
                             let font_size = (bbox.h.max(12) as f32) * 0.6f32;
                             let text_x = bbox.left();
                             let text_y = bbox.top() - (font_size as i32) - 2;
-                            Self::draw_text_ttf(&mut img_rgba, font, &line_result.text, text_x, text_y.max(0), font_size, Rgba([0u8,255u8,0u8,255u8]));
+                            Self::draw_text_ttf(
+                                &mut img_rgba,
+                                font,
+                                &line_result.text,
+                                text_x,
+                                text_y.max(0),
+                                font_size,
+                                Rgba([0u8, 255u8, 0u8, 255u8]),
+                            );
 
                             // Draw character boxes in green
                             let char_color = Rgba([0u8, 255u8, 0u8, 255u8]);
@@ -1270,8 +1714,15 @@ impl OcrEngine {
 #[derive(Debug, Clone)]
 enum DefinitionNode {
     Text(String),
-    Ruby { term: String, reading: String, is_mini: bool },
-    Tag { text: String, category: String },
+    Ruby {
+        term: String,
+        reading: String,
+        is_mini: bool,
+    },
+    Tag {
+        text: String,
+        category: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1406,15 +1857,22 @@ impl OcrOverlayState {
         self.active_all_chars.clear();
         self.active_all_alternatives.clear();
         self.active_line_results.iter().flatten().for_each(|line| {
-            self.active_all_chars.extend(line.text.chars().map(|c| c.to_string()));
-            self.active_all_alternatives.extend(line.alternatives.clone());
+            self.active_all_chars
+                .extend(line.text.chars().map(|c| c.to_string()));
+            self.active_all_alternatives
+                .extend(line.alternatives.clone());
         });
     }
 
     fn set_line_results(&mut self, lines: Vec<Option<LineResult>>) {
         self.active_line_results = lines;
         self.active_line_boxes.clear();
-        self.active_line_boxes.extend(self.active_line_results.iter().flatten().flat_map(|line| line.chunk_boxes.clone()));
+        self.active_line_boxes.extend(
+            self.active_line_results
+                .iter()
+                .flatten()
+                .flat_map(|line| line.chunk_boxes.clone()),
+        );
         self.update_global_data();
     }
 
@@ -1424,7 +1882,8 @@ impl OcrOverlayState {
             .take(line_idx)
             .flatten()
             .map(|line| line.text.chars().count())
-            .sum::<usize>() + char_idx_in_line
+            .sum::<usize>()
+            + char_idx_in_line
     }
 
     fn get_coords_from_global_idx(&self, global_idx: usize) -> Option<(usize, usize)> {
@@ -1455,7 +1914,11 @@ impl OcrOverlayState {
     }
 
     fn update_character(&mut self, line_idx: usize, char_idx: usize, new_char: char) {
-        let Some(line) = self.active_line_results.get_mut(line_idx).and_then(|line| line.as_mut()) else {
+        let Some(line) = self
+            .active_line_results
+            .get_mut(line_idx)
+            .and_then(|line| line.as_mut())
+        else {
             return;
         };
         let mut chars: Vec<char> = line.text.chars().collect();
@@ -1471,7 +1934,11 @@ impl OcrOverlayState {
             Some(coords) => coords,
             None => return false,
         };
-        let Some(line) = self.active_line_results.get(line_idx).and_then(|line| line.as_ref()) else {
+        let Some(line) = self
+            .active_line_results
+            .get(line_idx)
+            .and_then(|line| line.as_ref())
+        else {
             return false;
         };
         let Some(box_item) = line.char_boxes.get(char_idx) else {
@@ -1486,16 +1953,23 @@ impl OcrOverlayState {
 
         match action {
             GamepadAction::NavigateRight | GamepadAction::NavigateLeft => {
-                let dir = if action == GamepadAction::NavigateRight { 1 } else { -1 };
+                let dir = if action == GamepadAction::NavigateRight {
+                    1
+                } else {
+                    -1
+                };
                 let next_char_idx = char_idx as isize + dir;
                 if next_char_idx >= 0 && (next_char_idx as usize) < line.char_boxes.len() {
                     self.current_tapped_char_idx_in_line = next_char_idx;
-                    self.current_tapped_idx = self.get_global_idx(line_idx, next_char_idx as usize) as isize;
+                    self.current_tapped_idx =
+                        self.get_global_idx(line_idx, next_char_idx as usize) as isize;
                     return true;
                 }
 
                 for (i, other_line_opt) in self.active_line_results.iter().enumerate() {
-                    let Some(other_line) = other_line_opt else { continue };
+                    let Some(other_line) = other_line_opt else {
+                        continue;
+                    };
                     for (c, c_box) in other_line.char_boxes.iter().enumerate() {
                         let mut dx = c_box.left() as f32 + (c_box.w as f32 / 2.0) - center_x;
                         let dy = c_box.top() as f32 + (c_box.h as f32 / 2.0) - center_y;
@@ -1520,9 +1994,15 @@ impl OcrOverlayState {
                 }
             }
             GamepadAction::NavigateDown | GamepadAction::NavigateUp => {
-                let dir = if action == GamepadAction::NavigateDown { 1 } else { -1 };
+                let dir = if action == GamepadAction::NavigateDown {
+                    1
+                } else {
+                    -1
+                };
                 for (i, other_line_opt) in self.active_line_results.iter().enumerate() {
-                    let Some(other_line) = other_line_opt else { continue };
+                    let Some(other_line) = other_line_opt else {
+                        continue;
+                    };
                     for (c, c_box) in other_line.char_boxes.iter().enumerate() {
                         let dx = c_box.left() as f32 + (c_box.w as f32 / 2.0) - center_x;
                         let mut dy = c_box.top() as f32 + (c_box.h as f32 / 2.0) - center_y;
@@ -1595,7 +2075,10 @@ impl OcrOverlayState {
 
     fn get_alternatives_ui_state(&self) -> Option<AlternativesUiState> {
         let (line_idx, char_idx) = self.current_cursor()?;
-        let line = self.active_line_results.get(line_idx).and_then(|line| line.as_ref())?;
+        let line = self
+            .active_line_results
+            .get(line_idx)
+            .and_then(|line| line.as_ref())?;
         let alts = line.alternatives.get(char_idx)?;
         let current_char = line.text.chars().nth(char_idx)?;
 
@@ -1603,7 +2086,10 @@ impl OcrOverlayState {
             candidates: alts
                 .iter()
                 .take(15)
-                .map(|(ch, _)| AlternativeChar { char: *ch, is_selected: *ch == current_char })
+                .map(|(ch, _)| AlternativeChar {
+                    char: *ch,
+                    is_selected: *ch == current_char,
+                })
                 .collect(),
             show_manual_input: true,
         })
@@ -1611,15 +2097,27 @@ impl OcrOverlayState {
 
     fn panel_dimensions(&self, root_width: f32, root_height: f32) -> (f32, f32) {
         let is_landscape = root_width > root_height;
-        let panel_width = if is_landscape { root_width * 0.4 } else { root_width };
-        let panel_height = if is_landscape { root_height } else { root_height * 0.4 };
+        let panel_width = if is_landscape {
+            root_width * 0.4
+        } else {
+            root_width
+        };
+        let panel_height = if is_landscape {
+            root_height
+        } else {
+            root_height * 0.4
+        };
         (panel_width, panel_height)
     }
 
     fn update_gravity(&mut self, root_width: f32, root_height: f32, tapped_box: &BoundingBox) {
         let is_landscape = root_width > root_height;
-        let screen_center_x = tapped_box.left() as f32 * self.current_scale + self.current_trans_x + (tapped_box.w as f32 / 2.0) * self.current_scale;
-        let screen_center_y = tapped_box.top() as f32 * self.current_scale + self.current_trans_y + (tapped_box.h as f32 / 2.0) * self.current_scale;
+        let screen_center_x = tapped_box.left() as f32 * self.current_scale
+            + self.current_trans_x
+            + (tapped_box.w as f32 / 2.0) * self.current_scale;
+        let screen_center_y = tapped_box.top() as f32 * self.current_scale
+            + self.current_trans_y
+            + (tapped_box.h as f32 / 2.0) * self.current_scale;
 
         if is_landscape {
             self.last_landscape_gravity = if screen_center_x < root_width / 2.0 {
@@ -1664,11 +2162,29 @@ impl OcrOverlayState {
             let advance = fixed_size;
 
             if line.is_vertical {
-                let new_top = prev_original.top().saturating_add(advance).max(cur_original.top());
-                refined_boxes.push(BoundingBox::new(cur_original.left(), new_top, cur_original.w, cur_original.h, cur_original.confidence));
+                let new_top = prev_original
+                    .top()
+                    .saturating_add(advance)
+                    .max(cur_original.top());
+                refined_boxes.push(BoundingBox::new(
+                    cur_original.left(),
+                    new_top,
+                    cur_original.w,
+                    cur_original.h,
+                    cur_original.confidence,
+                ));
             } else {
-                let new_left = prev_original.left().saturating_add(advance).max(cur_original.left());
-                refined_boxes.push(BoundingBox::new(new_left, cur_original.top(), cur_original.w, cur_original.h, cur_original.confidence));
+                let new_left = prev_original
+                    .left()
+                    .saturating_add(advance)
+                    .max(cur_original.left());
+                refined_boxes.push(BoundingBox::new(
+                    new_left,
+                    cur_original.top(),
+                    cur_original.w,
+                    cur_original.h,
+                    cur_original.confidence,
+                ));
             }
         }
 
@@ -1701,7 +2217,6 @@ enum Message {
     Back,
 }
 
-#[derive(Clone)]
 struct OcrViewer {
     image_handle: IcedImageHandle,
     img_w: u32,
@@ -1713,7 +2228,12 @@ struct OcrViewer {
 }
 
 impl OcrViewer {
-    fn new(image_handle: IcedImageHandle, img_w: u32, img_h: u32, annotations: Vec<DetectedAnnotation>) -> Self {
+    fn new(
+        image_handle: IcedImageHandle,
+        img_w: u32,
+        img_h: u32,
+        annotations: Vec<DetectedAnnotation>,
+    ) -> Self {
         let mut state = OcrOverlayState::new();
         let line_results = annotations
             .iter()
@@ -1741,7 +2261,12 @@ impl OcrViewer {
         self.state.is_dictionary_visible = true;
         self.alternatives_visible = false;
 
-        let Some(line) = self.state.active_line_results.get(line_idx).and_then(|line| line.as_ref()) else {
+        let Some(line) = self
+            .state
+            .active_line_results
+            .get(line_idx)
+            .and_then(|line| line.as_ref())
+        else {
             return;
         };
         let Some(box_item) = line.char_boxes.get(char_idx) else {
@@ -1831,28 +2356,37 @@ impl OcrViewer {
             annotations: self.annotations.clone(),
             img_w: self.img_w,
             img_h: self.img_h,
-            highlighted_coords: self.state.last_highlighted_coords.clone(),
+            //highlighted_coords: self.state.last_highlighted_coords.clone(),
         };
 
         let image = IcedImage::new(self.image_handle.clone())
             .width(Length::Fill)
             .height(Length::Fill);
 
-        let canvas = Canvas::new(overlay)
+        let rect = canvas::Path::rectangle(
+            Point { x: 0.0, y: 0.0 },
+            Size {
+                width: 300.0,
+                height: 500.0,
+            },
+        );
+
+        let image_stack = Stack::new().push(image); //.push(canvas);
+        let mut root = Container::new(image_stack)
             .width(Length::Fill)
             .height(Length::Fill);
-
-        let image_stack = Stack::new().push(image).push(canvas);
-        let mut root = Container::new(image_stack).width(Length::Fill).height(Length::Fill);
 
         if let Some(selected_word) = &self.selected_word {
             let (root_width, root_height) = (800.0_f32, 480.0_f32);
             let is_landscape = true;
-            self.state.update_gravity(root_width, root_height, &selected_word.box_item);
+            //&self
+            //.state
+            //.update_gravity(root_width, root_height, &selected_word.box_item);
             let (panel_width, panel_height) = self.state.panel_dimensions(root_width, root_height);
 
             let dictionary_entries = Self::dummy_dictionary_entries();
-            let dictionary_panel = self.dictionary_panel(&dictionary_entries, panel_width, panel_height);
+            let dictionary_panel =
+                self.dictionary_panel(dictionary_entries, panel_width, panel_height);
             let neighbor_panel = self.neighbor_panel();
             let alternatives_panel = if self.alternatives_visible {
                 self.alternatives_panel()
@@ -1864,57 +2398,86 @@ impl OcrViewer {
             let dictionary = Column::new().push(dictionary_panel);
             let alternatives = Column::new().push(alternatives_panel);
 
-            let content = if is_landscape {
+            let content: Container<'a, Message> = if is_landscape {
                 match self.state.last_landscape_gravity {
-                    Gravity::End => Row::new().push(alternatives).push(correction).push(dictionary),
-                    Gravity::Start => Row::new().push(dictionary).push(correction).push(alternatives),
-                    Gravity::Top | Gravity::Bottom => Row::new().push(dictionary).push(correction).push(alternatives),
+                    Gravity::End => container(
+                        Row::new()
+                            .push(alternatives)
+                            .push(correction)
+                            .push(dictionary),
+                    ),
+                    Gravity::Start => container(
+                        Row::new()
+                            .push(dictionary)
+                            .push(correction)
+                            .push(alternatives),
+                    ),
+                    Gravity::Top | Gravity::Bottom => container(
+                        Row::new()
+                            .push(dictionary)
+                            .push(correction)
+                            .push(alternatives),
+                    ),
                 }
             } else {
-                Column::new().push(dictionary).push(correction).push(alternatives)
+                container(
+                    Column::new()
+                        .push(dictionary)
+                        .push(correction)
+                        .push(alternatives),
+                )
             };
 
             let panel = Container::new(content)
                 .padding(10)
-                .style(ContainerStyle::Panel)
+                .style(container::rounded_box)
                 .width(Length::Fill)
                 .height(Length::Fill);
-            root = Container::new(root).push(panel);
+            root = container(panel);
         }
 
         root.into()
     }
 
-    fn dictionary_panel(&self, entries: &[FormattedEntry], _panel_width: f32, _panel_height: f32) -> Container<'a, Message> {
+    fn dictionary_panel<'a>(
+        &self,
+        entries: Vec<FormattedEntry>,
+        _panel_width: f32,
+        _panel_height: f32,
+    ) -> Container<'a, Message> {
         let mut content = Column::new().padding(10).spacing(12);
 
         for entry in entries {
             let mut entry_column = Column::new().spacing(8);
-            for group in &entry.reading_groups {
-                entry_column = entry_column.push(self.headword_section(group));
-                for sense_group in &group.sense_groups {
+            for group in entry.reading_groups {
+                entry_column = entry_column.push(self.headword_section(group.clone()));
+                for sense_group in group.sense_groups {
                     entry_column = entry_column.push(self.sense_group(sense_group));
                 }
-                entry_column = entry_column.push(Space::with_height(8));
+                entry_column = entry_column.push(space());
             }
             content = content.push(entry_column);
         }
 
         Container::new(Scrollable::new(content))
             .padding(12)
-            .style(ContainerStyle::Dictionary)
+            .style(container::rounded_box)
     }
 
-    fn headword_section(&self, group: &FormattedReadingGroup) -> Container<'a, Message> {
+    fn headword_section<'a>(&self, group: FormattedReadingGroup) -> Container<'a, Message> {
         let mut content = Column::new().spacing(4);
         if group.is_kanji_entry {
-            for headword in &group.headwords {
+            for headword in group.headwords {
                 let mut row = Row::new().spacing(10).align_y(alignment::Vertical::Center);
-                row = row.push(Text::new(&headword.kanji).size(48).style(TextStyle::Headword));
+                row = row.push(
+                    Text::new(headword.kanji.clone())
+                        .size(48)
+                        .style(text::primary),
+                );
                 if let Some(onyomi) = &headword.onyomi {
                     row = row.push(Text::new(format!("ON: {onyomi}")));
                 }
-                if let Some(kunyomi) = &headword.kunyomi {
+                if let Some(kunyomi) = headword.kunyomi {
                     row = row.push(Text::new(format!("KUN: {kunyomi}")));
                 }
                 content = content.push(row);
@@ -1922,7 +2485,11 @@ impl OcrViewer {
         } else {
             let mut row = Row::new().spacing(8).align_y(alignment::Vertical::Center);
             for (idx, headword) in group.headwords.iter().enumerate() {
-                row = row.push(Text::new(&headword.kanji).size(32).style(TextStyle::Headword));
+                row = row.push(
+                    Text::new(headword.kanji.clone())
+                        .size(32)
+                        .style(text::primary),
+                );
                 if idx + 1 < group.headwords.len() {
                     row = row.push(Text::new("、"));
                 }
@@ -1932,26 +2499,33 @@ impl OcrViewer {
         Container::new(content)
     }
 
-    fn sense_group(&self, sense_group: &FormattedSenseGroup) -> Container<'a, Message> {
+    fn sense_group<'a>(&self, sense_group: FormattedSenseGroup) -> Container<'a, Message> {
         let mut content = Column::new().spacing(6);
         if !sense_group.tags.is_empty() {
-            let tags = Row::new()
-                .spacing(6)
-                .push_all(sense_group.tags.iter().map(|tag| Text::new(tag).style(TextStyle::Tag)));
-            content = content.push(tags);
+            for tag in sense_group.tags {
+                content = content.push(text(tag));
+            }
         }
-        for sense in &sense_group.senses {
-            let text = format!("{}. ", sense.index) + &sense.nodes.iter().map(|node| match node {
-                DefinitionNode::Text(text) => text.clone(),
-                DefinitionNode::Ruby { term, reading, .. } => format!("{term}【{reading}】"),
-                DefinitionNode::Tag { text, .. } => format!("[{text}]"),
-            }).collect::<Vec<_>>().join(" ");
+        for sense in sense_group.senses {
+            let text = format!("{}. ", sense.index)
+                + &sense
+                    .nodes
+                    .iter()
+                    .map(|node| match node {
+                        DefinitionNode::Text(text) => text.clone(),
+                        DefinitionNode::Ruby { term, reading, .. } => {
+                            format!("{term}【{reading}】")
+                        }
+                        DefinitionNode::Tag { text, .. } => format!("[{text}]"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
             content = content.push(Text::new(text).width(Length::Fill));
         }
         Container::new(content)
     }
 
-    fn neighbor_panel(&self) -> Container<'a, Message> {
+    fn neighbor_panel(&self) -> Container<'_, Message> {
         let state = self.state.get_neighbor_ui_state();
         let mut content = Column::new().padding(6).spacing(4);
         for line in state {
@@ -1959,9 +2533,9 @@ impl OcrViewer {
             for char_state in line.chars {
                 let button = Button::new(Text::new(char_state.text.clone()).size(24))
                     .style(if char_state.is_selected {
-                        ButtonStyle::Selected
+                        button::primary
                     } else {
-                        ButtonStyle::Character
+                        button::secondary
                     })
                     .on_press(Message::SelectCharacter(line.line_idx, char_state.char_idx));
                 row = row.push(button);
@@ -1972,10 +2546,10 @@ impl OcrViewer {
             .width(Length::Shrink)
             .height(Length::Fill)
             .padding(6)
-            .style(ContainerStyle::Panel)
+            .style(container::rounded_box)
     }
 
-    fn alternatives_panel(&self) -> Container<'a, Message> {
+    fn alternatives_panel(&self) -> Container<'_, Message> {
         let Some(alt_state) = self.state.get_alternatives_ui_state() else {
             return Container::new(Text::new(""));
         };
@@ -1983,9 +2557,9 @@ impl OcrViewer {
         for candidate in alt_state.candidates {
             let button = Button::new(Text::new(candidate.char.to_string()).size(28))
                 .style(if candidate.is_selected {
-                    ButtonStyle::Selected
+                    button::primary
                 } else {
-                    ButtonStyle::Character
+                    button::secondary
                 })
                 .on_press(Message::SelectAlternative(candidate.char));
             content = content.push(button);
@@ -1994,7 +2568,7 @@ impl OcrViewer {
             .width(Length::Shrink)
             .height(Length::Fill)
             .padding(6)
-            .style(ContainerStyle::Panel)
+            .style(container::rounded_box)
     }
 }
 
@@ -2004,11 +2578,19 @@ fn main() -> Result<()> {
 
     let mut engine = OcrEngine::new("./models")?;
     println!("Models loaded successfully.");
-    println!("Character vocabulary loaded: {} chars", engine.char_vocab.len());
+    println!(
+        "Character vocabulary loaded: {} chars",
+        engine.char_vocab.len()
+    );
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        println!("Usage: {} <image_path> [--font /path/to.ttf]", args.get(0).map(|s| s.as_str()).unwrap_or("accessibility_daemon"));
+        println!(
+            "Usage: {} <image_path> [--font /path/to.ttf]",
+            args.get(0)
+                .map(|s| s.as_str())
+                .unwrap_or("accessibility_daemon")
+        );
         return Ok(());
     }
 
@@ -2021,17 +2603,23 @@ fn main() -> Result<()> {
             font_path = Some(args[i].trim_start_matches("--font=").to_string());
         } else if args[i] == "--font" || args[i] == "-f" {
             if i + 1 < args.len() {
-                font_path = Some(args[i+1].clone());
+                font_path = Some(args[i + 1].clone());
             }
         }
     }
 
-    let image = image::open(&image_path)
-        .context(format!("Failed to open image: {}", image_path))?;
-    println!("Image loaded successfully: {} ({}x{})", image_path, image.width(), image.height());
+    let image =
+        image::open(&image_path).context(format!("Failed to open image: {}", image_path))?;
+    println!(
+        "Image loaded successfully: {} ({}x{})",
+        image_path,
+        image.width(),
+        image.height()
+    );
 
     // Run detection + recognition and request annotations (no baked image)
-    let (annotations, _annotated_opt) = engine.run_detection(&image, false, font_path.as_deref())?;
+    let (annotations, _annotated_opt) =
+        engine.run_detection(&image, false, font_path.as_deref())?;
 
     // Encode original image to PNG bytes for Canvas
     let display_img = image.to_rgba8();
@@ -2039,7 +2627,9 @@ fn main() -> Result<()> {
     use std::io::Cursor;
     use std::sync::Arc;
     let mut buf = Cursor::new(Vec::new());
-    dynimg.write_to(&mut buf, image::ImageFormat::Png).context("Failed to encode annotated image to PNG")?;
+    dynimg
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .context("Failed to encode annotated image to PNG")?;
     let bytes_vec: Vec<u8> = buf.into_inner();
     let bytes_arc = Arc::new(bytes_vec);
     let w = display_img.width();
@@ -2061,7 +2651,9 @@ fn main() -> Result<()> {
             }
             Message::SelectAlternative(new_char) => {
                 if let Some(selected) = state.selected_word.as_ref() {
-                    state.state.update_character(selected.line_idx, selected.char_idx, new_char);
+                    state
+                        .state
+                        .update_character(selected.line_idx, selected.char_idx, new_char);
                     state.select_character(selected.line_idx, selected.char_idx);
                 }
             }
