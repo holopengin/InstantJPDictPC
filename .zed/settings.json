@@ -1,0 +1,21 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "linkedProjects": [
+          "accessibility_daemon/Cargo.toml"
+        ],
+        "check": {
+          "overrideCommand": [
+            "cargo",
+            "check",
+            "--manifest-path",
+            "accessibility_daemon/Cargo.toml",
+            "--all-targets",
+            "--message-format=json"
+          ]
+        }
+      }
+    }
+  }
+}
