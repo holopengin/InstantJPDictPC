@@ -25,6 +25,7 @@ dependencies = [
  "anyhow",
  "env_logger",
  "iced",
+ "iced_futures",
  "image",
  "log",
  "ndarray 0.15.6",
