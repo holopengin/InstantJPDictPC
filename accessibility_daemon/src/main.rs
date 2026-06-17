@@ -157,17 +157,71 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                     .with_width(2.0);
                 frame.stroke(&path, stroke);
 
-                // Character boxes in green if available
-                if let Some(line) = &annotation.line {
-                    for char_box in &line.char_boxes {
-                        let (pt_c, sz_c) = transform(char_box);
-                        let char_path = CanvasPath::rectangle(pt_c, sz_c);
-                        let char_stroke = CanvasStroke::default()
-                            .with_color(Color::from_rgb(0.0, 1.0, 0.0))
-                            .with_width(1.0);
-                        frame.stroke(&char_path, char_stroke);
-                    }
-                }
+                // Character boxes and characters in green if available
+                            if let Some(line) = &annotation.line {
+                                // Compute display boxes (square) for characters
+                                // Compute display boxes similar to OcrOverlayState::calculate_display_boxes
+                                                                let fixed_size = if line.is_vertical {
+                                                                    line.char_boxes.iter().map(|b| b.w).max().unwrap_or(0)
+                                                                } else {
+                                                                    line.char_boxes.iter().map(|b| b.h).max().unwrap_or(0)
+                                                                };
+                                                                // Refine boxes using fixed_size as advance
+                                                                let mut refined: Vec<BoundingBox> = Vec::new();
+                                                                if let Some(first) = line.char_boxes.first() {
+                                                                    refined.push(first.clone());
+                                                                }
+                                                                for i in 1..line.char_boxes.len() {
+                                                                    let prev = &line.char_boxes[i - 1];
+                                                                    let cur = &line.char_boxes[i];
+                                                                    if line.is_vertical {
+                                                                        let new_top = prev.top().saturating_add(fixed_size).max(cur.top());
+                                                                        refined.push(BoundingBox::new(cur.left(), new_top, cur.w, cur.h, cur.confidence));
+                                                                    } else {
+                                                                        let new_left = prev.left().saturating_add(fixed_size).max(cur.left());
+                                                                        refined.push(BoundingBox::new(new_left, cur.top(), cur.w, cur.h, cur.confidence));
+                                                                    }
+                                                                }
+                                                                let display_boxes: Vec<BoundingBox> = refined.iter().map(|b| {
+                                                                    let center_x = b.left() + b.w / 2;
+                                                                    let center_y = b.top() + b.h / 2;
+                                                                    let left = center_x - fixed_size / 2;
+                                                                    let top = center_y - fixed_size / 2;
+                                                                    BoundingBox::new(left, top, fixed_size, fixed_size, 1.0)
+                                                                }).collect();
+                                for (i, char_box) in line.char_boxes.iter().enumerate() {
+                                    // Draw box outline
+                                    let (pt_c, sz_c) = transform(char_box);
+                                    let char_path = CanvasPath::rectangle(pt_c, sz_c);
+                                    let char_stroke = CanvasStroke::default()
+                                        .with_color(Color::from_rgb(0.0, 1.0, 0.0))
+                                        .with_width(1.0);
+                                    frame.stroke(&char_path, char_stroke);
+
+                                    // Draw character glyph inside the corresponding display box if we have it
+                                    if let Some(ch) = line.text.chars().nth(i) {
+                                        if i < display_boxes.len() {
+                                            let db = &display_boxes[i];
+                                            let (pt_db, sz_db) = transform(db);
+                                            // Approximate font size to fill the box
+                                            let font_size = sz_db.height * BOX_FILL_RATIO;
+                                            let canvas_text = CanvasText {
+                                                                                        content: ch.to_string(),
+                                                                                        position: Point::new(pt_db.x + sz_db.width / 2.0, pt_db.y + sz_db.height / 2.0),
+                                                                                        max_width: 0.0,
+                                                                                        color: Color::from_rgb(0.0, 1.0, 0.0),
+                                                                                        size: Pixels(font_size as f32),
+                                                                                        line_height: Default::default(),
+                                                                                        font: IcedFont::default(),
+                                                                                        align_x: iced::widget::text::Alignment::Center,
+                                                                                        align_y: iced::alignment::Vertical::Center,
+                                                                                        shaping: Default::default(),
+                                                                                    };
+                                                                                    frame.fill_text(canvas_text);
+                                        }
+                                    }
+                                }
+                            }
             }
 
             vec![frame.into_geometry()]
