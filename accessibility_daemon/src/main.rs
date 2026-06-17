@@ -8,14 +8,14 @@ use rusttype::{point, Font, Scale};
 use std::path::Path;
 
 // Iced UI for displaying the annotated image
-use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path as CanvasPath, Text as CanvasText, Program, Stroke as CanvasStroke};
-use iced::event;
+use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path as CanvasPath, Text as CanvasText, Stroke as CanvasStroke};
+
 use iced::widget::image::Handle as IcedImageHandle;
 use iced::widget::{
-    button, column, container, row, text, Button, Column, Container, Image as IcedImage, Row,
-    Scrollable, Space, Stack, Text,
+    button, text, Button, Column, Container, Image as IcedImage, Row, Scrollable, Stack, Text,
 };
-use iced::{Renderer, Theme, alignment, Background, Border, Color, Element, Length, Pixels, Point, Rectangle, Shadow, Size, Task, Vector, Font as IcedFont, mouse};
+use iced::{Renderer, Theme, alignment, Color, Element, Length, Pixels, Point, Rectangle, Size, Task, Font as IcedFont, mouse};
+use iced::widget::container;
 // Constants matching the Kotlin implementation
 const DETECT_WIDTH: u32 = 960;
 const DETECT_HEIGHT: u32 = 544;
@@ -135,64 +135,78 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<iced::widget::Action<Message>> {
-        if let iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
-            if let Some(cursor_position) = cursor.position_in(bounds) {
-                // Compute scaling factors
-                let img_w_f = self.img_w as f32;
-                let img_h_f = self.img_h as f32;
-                let scale = f32::min(bounds.width / img_w_f, bounds.height / img_h_f);
-                let offset_x = (bounds.width - img_w_f * scale) / 2.0;
-                let offset_y = (bounds.height - img_h_f * scale) / 2.0;
+        match event {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) => {
+                println!("[Canvas] KeyPressed event received: {:?}", key);
+                if *key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) {
+                    println!("[Canvas] Escape detected, publishing Back");
+                    return Some(iced::widget::Action::publish(Message::Back));
+                }
+            }
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                println!("[Canvas] Right-click detected, publishing Back");
+                return Some(iced::widget::Action::publish(Message::Back));
+            }
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if let Some(cursor_position) = cursor.position_in(bounds) {
+                    // Compute scaling factors
+                    let img_w_f = self.img_w as f32;
+                    let img_h_f = self.img_h as f32;
+                    let scale = f32::min(bounds.width / img_w_f, bounds.height / img_h_f);
+                    let offset_x = (bounds.width - img_w_f * scale) / 2.0;
+                    let offset_y = (bounds.height - img_h_f * scale) / 2.0;
 
-                for (line_idx, annotation) in self.annotations.iter().enumerate() {
-                    if let Some(line) = &annotation.line {
-                        let fixed_size = if line.is_vertical {
-                            line.char_boxes.iter().map(|b| b.w).max().unwrap_or(0)
-                        } else {
-                            line.char_boxes.iter().map(|b| b.h).max().unwrap_or(0)
-                        };
-
-                        let mut refined: Vec<BoundingBox> = Vec::new();
-                        if let Some(first) = line.char_boxes.first() {
-                            refined.push(first.clone());
-                        }
-                        for i in 1..line.char_boxes.len() {
-                            let prev = &line.char_boxes[i - 1];
-                            let cur = &line.char_boxes[i];
-                            if line.is_vertical {
-                                let new_top = prev.top().saturating_add(fixed_size).max(cur.top());
-                                refined.push(BoundingBox::new(cur.left(), new_top, cur.w, cur.h, cur.confidence));
+                    for (line_idx, annotation) in self.annotations.iter().enumerate() {
+                        if let Some(line) = &annotation.line {
+                            let fixed_size = if line.is_vertical {
+                                line.char_boxes.iter().map(|b| b.w).max().unwrap_or(0)
                             } else {
-                                let new_left = prev.left().saturating_add(fixed_size).max(cur.left());
-                                refined.push(BoundingBox::new(new_left, cur.top(), cur.w, cur.h, cur.confidence));
+                                line.char_boxes.iter().map(|b| b.h).max().unwrap_or(0)
+                            };
+
+                            let mut refined: Vec<BoundingBox> = Vec::new();
+                            if let Some(first) = line.char_boxes.first() {
+                                refined.push(first.clone());
                             }
-                        }
+                            for i in 1..line.char_boxes.len() {
+                                let prev = &line.char_boxes[i - 1];
+                                let cur = &line.char_boxes[i];
+                                if line.is_vertical {
+                                    let new_top = prev.top().saturating_add(fixed_size).max(cur.top());
+                                    refined.push(BoundingBox::new(cur.left(), new_top, cur.w, cur.h, cur.confidence));
+                                } else {
+                                    let new_left = prev.left().saturating_add(fixed_size).max(cur.left());
+                                    refined.push(BoundingBox::new(new_left, cur.top(), cur.w, cur.h, cur.confidence));
+                                }
+                            }
 
-                        let display_boxes: Vec<BoundingBox> = refined.iter().map(|b| {
-                            let center_x = b.left() + b.w / 2;
-                            let center_y = b.top() + b.h / 2;
-                            let left = center_x - fixed_size / 2;
-                            let top = center_y - fixed_size / 2;
-                            BoundingBox::new(left, top, fixed_size, fixed_size, 1.0)
-                        }).collect();
+                            let display_boxes: Vec<BoundingBox> = refined.iter().map(|b| {
+                                let center_x = b.left() + b.w / 2;
+                                let center_y = b.top() + b.h / 2;
+                                let left = center_x - fixed_size / 2;
+                                let top = center_y - fixed_size / 2;
+                                BoundingBox::new(left, top, fixed_size, fixed_size, 1.0)
+                            }).collect();
 
-                        for (char_idx, db) in display_boxes.iter().enumerate() {
-                            let x = db.x as f32 * scale + offset_x;
-                            let y = db.y as f32 * scale + offset_y;
-                            let w = db.w as f32 * scale;
-                            let h = db.h as f32 * scale;
-                            let rect = Rectangle::new(Point::new(x, y), Size::new(w, h));
+                            for (char_idx, db) in display_boxes.iter().enumerate() {
+                                let x = db.x as f32 * scale + offset_x;
+                                let y = db.y as f32 * scale + offset_y;
+                                let w = db.w as f32 * scale;
+                                let h = db.h as f32 * scale;
+                                let rect = Rectangle::new(Point::new(x, y), Size::new(w, h));
 
-                            if rect.contains(cursor_position) {
-                                if let Some(ch) = line.text.chars().nth(char_idx) {
-                                    println!("Clicked character: {}", ch);
-                                    return Some(iced::widget::Action::publish(Message::SelectCharacter(line_idx, char_idx)));
+                                if rect.contains(cursor_position) {
+                                    if let Some(ch) = line.text.chars().nth(char_idx) {
+                                        println!("Clicked character: {}", ch);
+                                        return Some(iced::widget::Action::publish(Message::SelectCharacter(line_idx, char_idx)));
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+            _ => {}
         }
         None
     }
@@ -2538,30 +2552,27 @@ impl OcrViewer {
         };
 
         let image = IcedImage::new(self.image_handle.clone())
-            .width(Length::Fill)
-            .height(Length::Fill);
-
-        // Rectangle placeholder (unused)
-
-        let canvas = Canvas::new(overlay.clone())
                     .width(Length::Fill)
                     .height(Length::Fill);
+
+                // Rectangle placeholder (unused)
+
+                let canvas = Canvas::new(overlay.clone())
+                            .width(Length::Fill)
+                            .height(Length::Fill);
                 let image_stack = Stack::new().push(image).push(canvas);
-        let mut root = Container::new(image_stack)
-            .width(Length::Fill)
-            .height(Length::Fill);
+                let mut root = Container::new(image_stack)
+                    .width(Length::Fill)
+                    .height(Length::Fill);
 
         if let Some(selected_word) = &self.selected_word {
             let (root_width, root_height) = (800.0_f32, 480.0_f32);
             let is_landscape = true;
-            //&self
-            //.state
-            //.update_gravity(root_width, root_height, &selected_word.box_item);
             let (panel_width, panel_height) = self.state.panel_dimensions(root_width, root_height);
 
             let dictionary_entries = Self::dummy_dictionary_entries();
             let dictionary_panel =
-                self.dictionary_panel(dictionary_entries, panel_width, panel_height);
+                self.dictionary_panel(dictionary_entries, panel_width, panel_height).width(Length::Fill);
             let neighbor_panel = self.neighbor_panel();
             let alternatives_panel = if self.alternatives_visible {
                 self.alternatives_panel()
@@ -2608,7 +2619,15 @@ impl OcrViewer {
                 .style(container::rounded_box)
                 .width(Length::Fill)
                 .height(Length::Fill);
-            root = container(panel);
+
+            // Stack the dictionary panel on top of the image+canvas so the Canvas
+            // still receives mouse/keyboard events (e.g. right-click, Escape).
+            let overlay_stack = Stack::new()
+                .push(root)
+                .push(panel);
+            root = Container::new(overlay_stack)
+                .width(Length::Fill)
+                .height(Length::Fill);
         }
 
         root.into()
@@ -2844,7 +2863,36 @@ fn main() -> Result<()> {
         Task::none()
     };
     let view = OcrViewer::view;
-    let app = iced::application(boot, update, view);
+    let app = iced::application(boot, update, view)
+        .subscription(|_state: &OcrViewer| {
+            iced_futures::subscription::filter_map(
+                "global-events",
+                |event: iced_futures::subscription::Event| {
+                    match &event {
+                        iced_futures::subscription::Event::Interaction {
+                            event: iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }),
+                            ..
+                        } => {
+                            println!("[Subscription] KeyPressed: {:?}", key);
+                            if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) {
+                                println!("[Subscription] Escape -> Back");
+                                Some(Message::Back)
+                            } else {
+                                None
+                            }
+                        }
+                        iced_futures::subscription::Event::Interaction {
+                            event: iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+                            ..
+                        } => {
+                            println!("[Subscription] Right-click -> Back");
+                            Some(Message::Back)
+                        }
+                        _ => None,
+                    }
+                },
+            )
+        });
     if let Err(e) = app.run() {
         println!("Failed to run GUI: {:?}", e);
     }

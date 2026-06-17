@@ -24,6 +24,7 @@ tokio = { version = "1.0", features = ["full"] }
 
 # GUI: Iced for displaying the annotated image
 iced = { version= "0.14.0", features = ["image", "canvas"] }
+iced_futures = "0.14.0"
 
 [profile.release]
 opt-level = 3
