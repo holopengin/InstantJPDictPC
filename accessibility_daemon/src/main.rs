@@ -1,21 +1,40 @@
+mod data;
 mod models;
 mod ocr_engine;
 mod overlay_state;
+mod util;
 mod viewer;
 
 use anyhow::{Context, Result};
-use image::{DynamicImage, GenericImageView};
+use image::DynamicImage;
 use std::io::Cursor;
 use std::sync::Arc;
 
+use crate::data::db::DictionaryDatabase;
 use crate::models::*;
 use crate::ocr_engine::OcrEngine;
+use crate::util::deinflector::Deinflector;
 use crate::viewer::OcrViewer;
 
 fn main() -> Result<()> {
     env_logger::init();
     println!("Accessibility Daemon Starting...");
 
+    // Initialize dictionary database
+    let db = Arc::new(DictionaryDatabase::open("dictionary.sqlite")?);
+    let entry_count = db.get_entry_count()?;
+    println!("Dictionary database loaded: {} entries", entry_count);
+
+    // Initialize deinflector
+    let deinflector = Arc::new(
+        Deinflector::from_json_file("data/deinflection.json").unwrap_or_else(|e| {
+            println!("Warning: Could not load deinflection rules: {}", e);
+            Deinflector::empty()
+        }),
+    );
+    println!("Deinflector loaded: {} rules", deinflector.rule_count());
+
+    // Initialize OCR engine
     let mut engine = OcrEngine::new("./models")?;
     println!("Models loaded successfully.");
     println!(
@@ -74,13 +93,19 @@ fn main() -> Result<()> {
     let h = display_img.height();
 
     // Launch Iced application
-    let boot = move || {
-        OcrViewer::new(
-            iced::widget::image::Handle::from_bytes(bytes_arc.as_ref().clone()),
-            w,
-            h,
-            annotations.clone(),
-        )
+    let boot = {
+        let db = Arc::clone(&db);
+        let deinflector = Arc::clone(&deinflector);
+        move || {
+            OcrViewer::new(
+                iced::widget::image::Handle::from_bytes(bytes_arc.as_ref().clone()),
+                w,
+                h,
+                annotations.clone(),
+                Arc::clone(&db),
+                Arc::clone(&deinflector),
+            )
+        }
     };
 
     let update = |state: &mut OcrViewer, message: Message| -> iced::Task<Message> {
