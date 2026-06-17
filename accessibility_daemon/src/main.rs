@@ -12,10 +12,11 @@ use std::path::Path;
 use iced::widget::canvas::LineCap as CanvasLineCap;
 use iced::widget::canvas::Stroke as CanvasStroke;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path as CanvasPath, Text as CanvasText};
+use iced::{Renderer, Theme};
 use iced::widget::image::Handle as IcedImageHandle;
 use iced::widget::{
     button, column, container, row, text, Button, Column, Container, Image as IcedImage, Row,
-    Scrollable, Space, Stack, Text, Theme,
+    Scrollable, Space, Stack, Text,
 };
 use iced::Font as IcedFont;
 use iced::{
@@ -114,11 +115,63 @@ struct OcrEngine {
     char_vocab: Vec<i64>,
 }
 
+#[derive(Clone)]
 struct OverlayProgram {
     annotations: Vec<DetectedAnnotation>,
     img_w: u32,
     img_h: u32,
-    //highlighted_coords...?
+}
+
+impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
+    type State = ();
+
+
+    fn draw(&self, _state: &Self::State, renderer: &Renderer, _theme: &Theme, bounds: Rectangle, _cursor: mouse::Cursor) -> Vec<Geometry> {
+            // Create a frame for the given bounds
+            let mut frame = Frame::new(renderer, bounds.size());
+
+            // Compute scaling factors to map original image coordinates to the displayed size.
+            // Preserve aspect ratio and center the image within the canvas bounds.
+            let img_w_f = self.img_w as f32;
+            let img_h_f = self.img_h as f32;
+            let scale = f32::min(bounds.width / img_w_f, bounds.height / img_h_f);
+            let offset_x = (bounds.width - img_w_f * scale) / 2.0;
+            let offset_y = (bounds.height - img_h_f * scale) / 2.0;
+
+            // Helper to transform a bounding box from image space to canvas space.
+            let transform = |bbox: &BoundingBox| -> (Point, Size) {
+                let x = bbox.x as f32 * scale + offset_x;
+                let y = bbox.y as f32 * scale + offset_y;
+                let w = bbox.w as f32 * scale;
+                let h = bbox.h as f32 * scale;
+                (Point::new(x, y), Size::new(w, h))
+            };
+
+            // Draw each annotation's bounding box and character boxes
+            for annotation in &self.annotations {
+                // Main detection box in red
+                let (pt, sz) = transform(&annotation.bbox);
+                let path = CanvasPath::rectangle(pt, sz);
+                let stroke = CanvasStroke::default()
+                    .with_color(Color::from_rgb(1.0, 0.0, 0.0))
+                    .with_width(2.0);
+                frame.stroke(&path, stroke);
+
+                // Character boxes in green if available
+                if let Some(line) = &annotation.line {
+                    for char_box in &line.char_boxes {
+                        let (pt_c, sz_c) = transform(char_box);
+                        let char_path = CanvasPath::rectangle(pt_c, sz_c);
+                        let char_stroke = CanvasStroke::default()
+                            .with_color(Color::from_rgb(0.0, 1.0, 0.0))
+                            .with_width(1.0);
+                        frame.stroke(&char_path, char_stroke);
+                    }
+                }
+            }
+
+            vec![frame.into_geometry()]
+        }
 }
 
 impl OcrEngine {
@@ -2363,15 +2416,12 @@ impl OcrViewer {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        let rect = canvas::Path::rectangle(
-            Point { x: 0.0, y: 0.0 },
-            Size {
-                width: 300.0,
-                height: 500.0,
-            },
-        );
+        // Rectangle placeholder (unused)
 
-        let image_stack = Stack::new().push(image); //.push(canvas);
+        let canvas = Canvas::new(overlay.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill);
+                let image_stack = Stack::new().push(image).push(canvas);
         let mut root = Container::new(image_stack)
             .width(Length::Fill)
             .height(Length::Fill);
