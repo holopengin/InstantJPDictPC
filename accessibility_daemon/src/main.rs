@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 
-use iced::widget::container::rounded_box;
 use iced::widget::space;
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use ort::session::Session;
@@ -9,20 +8,14 @@ use rusttype::{point, Font, Scale};
 use std::path::Path;
 
 // Iced UI for displaying the annotated image
-use iced::widget::canvas::LineCap as CanvasLineCap;
-use iced::widget::canvas::Stroke as CanvasStroke;
-use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path as CanvasPath, Text as CanvasText};
-use iced::{Renderer, Theme};
+use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path as CanvasPath, Text as CanvasText, Program, Stroke as CanvasStroke};
+use iced::event;
 use iced::widget::image::Handle as IcedImageHandle;
 use iced::widget::{
     button, column, container, row, text, Button, Column, Container, Image as IcedImage, Row,
     Scrollable, Space, Stack, Text,
 };
-use iced::Font as IcedFont;
-use iced::{
-    alignment, mouse, Background, Border, Color, Element, Length, Pixels, Point, Rectangle, Shadow,
-    Size, Task, Vector,
-};
+use iced::{Renderer, Theme, alignment, Background, Border, Color, Element, Length, Pixels, Point, Rectangle, Shadow, Size, Task, Vector, Font as IcedFont, mouse};
 // Constants matching the Kotlin implementation
 const DETECT_WIDTH: u32 = 960;
 const DETECT_HEIGHT: u32 = 544;
@@ -125,6 +118,84 @@ struct OverlayProgram {
 impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
     type State = ();
 
+
+    fn mouse_interaction(
+        &self,
+        _state: &Self::State,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        mouse::Interaction::Pointer
+    }
+
+    fn update(
+        &self,
+        _state: &mut Self::State,
+        event: &iced::Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<iced::widget::Action<Message>> {
+        if let iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
+            if let Some(cursor_position) = cursor.position_in(bounds) {
+                // Compute scaling factors
+                let img_w_f = self.img_w as f32;
+                let img_h_f = self.img_h as f32;
+                let scale = f32::min(bounds.width / img_w_f, bounds.height / img_h_f);
+                let offset_x = (bounds.width - img_w_f * scale) / 2.0;
+                let offset_y = (bounds.height - img_h_f * scale) / 2.0;
+
+                for (line_idx, annotation) in self.annotations.iter().enumerate() {
+                    if let Some(line) = &annotation.line {
+                        let fixed_size = if line.is_vertical {
+                            line.char_boxes.iter().map(|b| b.w).max().unwrap_or(0)
+                        } else {
+                            line.char_boxes.iter().map(|b| b.h).max().unwrap_or(0)
+                        };
+
+                        let mut refined: Vec<BoundingBox> = Vec::new();
+                        if let Some(first) = line.char_boxes.first() {
+                            refined.push(first.clone());
+                        }
+                        for i in 1..line.char_boxes.len() {
+                            let prev = &line.char_boxes[i - 1];
+                            let cur = &line.char_boxes[i];
+                            if line.is_vertical {
+                                let new_top = prev.top().saturating_add(fixed_size).max(cur.top());
+                                refined.push(BoundingBox::new(cur.left(), new_top, cur.w, cur.h, cur.confidence));
+                            } else {
+                                let new_left = prev.left().saturating_add(fixed_size).max(cur.left());
+                                refined.push(BoundingBox::new(new_left, cur.top(), cur.w, cur.h, cur.confidence));
+                            }
+                        }
+
+                        let display_boxes: Vec<BoundingBox> = refined.iter().map(|b| {
+                            let center_x = b.left() + b.w / 2;
+                            let center_y = b.top() + b.h / 2;
+                            let left = center_x - fixed_size / 2;
+                            let top = center_y - fixed_size / 2;
+                            BoundingBox::new(left, top, fixed_size, fixed_size, 1.0)
+                        }).collect();
+
+                        for (char_idx, db) in display_boxes.iter().enumerate() {
+                            let x = db.x as f32 * scale + offset_x;
+                            let y = db.y as f32 * scale + offset_y;
+                            let w = db.w as f32 * scale;
+                            let h = db.h as f32 * scale;
+                            let rect = Rectangle::new(Point::new(x, y), Size::new(w, h));
+
+                            if rect.contains(cursor_position) {
+                                if let Some(ch) = line.text.chars().nth(char_idx) {
+                                    println!("Clicked character: {}", ch);
+                                    return Some(iced::widget::Action::publish(Message::SelectCharacter(line_idx, char_idx)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
 
     fn draw(&self, _state: &Self::State, renderer: &Renderer, _theme: &Theme, bounds: Rectangle, _cursor: mouse::Cursor) -> Vec<Geometry> {
             // Create a frame for the given bounds
