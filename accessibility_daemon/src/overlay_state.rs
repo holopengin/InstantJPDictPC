@@ -1,4 +1,17 @@
+use std::collections::{HashMap, HashSet};
+
+use crate::data::db::DictionaryDatabase;
+use crate::data::models::DictionaryEntry;
 use crate::models::*;
+use crate::util::deinflector::Deinflector;
+use crate::util::japanese;
+
+/// Result of a dictionary lookup.
+pub struct LookupResult {
+    pub matches: Vec<FormattedEntry>,
+    pub max_len: usize,
+    pub tapped_box: BoundingBox,
+}
 
 pub struct OcrOverlayState {
     pub current_scale: f32,
@@ -18,6 +31,10 @@ pub struct OcrOverlayState {
     pub is_controller_navigation: bool,
     pub is_dictionary_visible: bool,
     pub is_alternatives_visible: bool,
+    /// Cached formatted entries from the last lookup.
+    pub cached_entries: Vec<FormattedEntry>,
+    /// The term that was looked up (for cache invalidation).
+    pub cached_lookup_term: String,
 }
 
 impl OcrOverlayState {
@@ -40,6 +57,8 @@ impl OcrOverlayState {
             is_controller_navigation: false,
             is_dictionary_visible: false,
             is_alternatives_visible: false,
+            cached_entries: Vec::new(),
+            cached_lookup_term: String::new(),
         }
     }
 
@@ -50,12 +69,12 @@ impl OcrOverlayState {
     pub fn update_global_data(&mut self) {
         self.active_all_chars.clear();
         self.active_all_alternatives.clear();
-        self.active_line_results.iter().flatten().for_each(|line| {
+        for line in self.active_line_results.iter().flatten() {
             self.active_all_chars
                 .extend(line.text.chars().map(|c| c.to_string()));
             self.active_all_alternatives
                 .extend(line.alternatives.clone());
-        });
+        }
     }
 
     pub fn set_line_results(&mut self, lines: Vec<Option<LineResult>>) {
@@ -147,12 +166,8 @@ impl OcrOverlayState {
 
         match action {
             GamepadAction::NavigateRight | GamepadAction::NavigateLeft => {
-                let dir = if action == GamepadAction::NavigateRight {
-                    1
-                } else {
-                    -1
-                };
-                let next_char_idx = char_idx as isize + dir;
+                let dir: i32 = if action == GamepadAction::NavigateRight { 1 } else { -1 };
+                let next_char_idx = char_idx as isize + dir as isize;
                 if next_char_idx >= 0 && (next_char_idx as usize) < line.char_boxes.len() {
                     self.current_tapped_char_idx_in_line = next_char_idx;
                     self.current_tapped_idx =
@@ -161,9 +176,7 @@ impl OcrOverlayState {
                 }
 
                 for (i, other_line_opt) in self.active_line_results.iter().enumerate() {
-                    let Some(other_line) = other_line_opt else {
-                        continue;
-                    };
+                    let Some(other_line) = other_line_opt else { continue; };
                     for (c, c_box) in other_line.char_boxes.iter().enumerate() {
                         let mut dx = c_box.left() as f32 + (c_box.w as f32 / 2.0) - center_x;
                         let dy = c_box.top() as f32 + (c_box.h as f32 / 2.0) - center_y;
@@ -188,15 +201,9 @@ impl OcrOverlayState {
                 }
             }
             GamepadAction::NavigateDown | GamepadAction::NavigateUp => {
-                let dir = if action == GamepadAction::NavigateDown {
-                    1
-                } else {
-                    -1
-                };
+                let dir: i32 = if action == GamepadAction::NavigateDown { 1 } else { -1 };
                 for (i, other_line_opt) in self.active_line_results.iter().enumerate() {
-                    let Some(other_line) = other_line_opt else {
-                        continue;
-                    };
+                    let Some(other_line) = other_line_opt else { continue; };
                     for (c, c_box) in other_line.char_boxes.iter().enumerate() {
                         let dx = c_box.left() as f32 + (c_box.w as f32 / 2.0) - center_x;
                         let mut dy = c_box.top() as f32 + (c_box.h as f32 / 2.0) - center_y;
@@ -387,10 +394,496 @@ impl OcrOverlayState {
             .map(|box_item| {
                 let center_x = box_item.left() as f32 + (box_item.w as f32 / 2.0);
                 let center_y = box_item.top() as f32 + (box_item.h as f32 / 2.0);
-                let left = (center_x - (fixed_size as f32 / 2.0)).round() as i32;
-                let top = (center_y - (fixed_size as f32 / 2.0)).round() as i32;
+                let left = (center_x - fixed_size as f32 / 2.0).round() as i32;
+                let top = (center_y - fixed_size as f32 / 2.0).round() as i32;
                 BoundingBox::new(left, top, fixed_size, fixed_size, 1.0)
             })
             .collect()
+    }
+
+    // -------------------------------------------------------------------------
+    // Dictionary lookup
+    // -------------------------------------------------------------------------
+
+    /// Perform a dictionary lookup at the given character position.
+    /// Returns formatted entries if found, or None if no database/deinflector is available.
+    pub fn lookup(
+        &mut self,
+        line_idx: usize,
+        char_idx: usize,
+        db: &DictionaryDatabase,
+        deinflector: &Deinflector,
+    ) -> Option<LookupResult> {
+        let global_idx = self.get_global_idx(line_idx, char_idx);
+        self.current_tapped_idx = global_idx as isize;
+        self.current_tapped_line_idx = line_idx as isize;
+        self.current_tapped_char_idx_in_line = char_idx as isize;
+
+        let line = self.active_line_results.get(line_idx)?.as_ref()?;
+        let tapped_box = line.char_boxes.get(char_idx)?.clone();
+
+        let end_idx = (global_idx + 20).min(self.active_all_chars.len());
+        let following_text: String = self.active_all_chars[global_idx..end_idx].join("");
+
+        if following_text.is_empty() {
+            return None;
+        }
+
+        // Build search candidates
+        let (all_terms, candidates_by_length) =
+            self.prepare_search_candidates(&following_text, deinflector);
+
+        if all_terms.is_empty() {
+            return None;
+        }
+
+        // Query database
+        let all_terms_vec: Vec<String> = all_terms.into_iter().collect();
+        let db_results = db.find_by_texts(&all_terms_vec).unwrap_or_default();
+
+        // Process results
+        let (matches, max_len) =
+            self.process_results(&db_results, &candidates_by_length, &all_terms_vec, &following_text);
+
+        if matches.is_empty() {
+            return None;
+        }
+
+        // Format results
+        let formatted = self.format_dictionary_results(&matches);
+        self.current_word_length = max_len;
+        self.cached_entries = formatted.clone();
+        self.cached_lookup_term = following_text;
+
+        Some(LookupResult {
+            matches: formatted,
+            max_len,
+            tapped_box,
+        })
+    }
+
+    /// Prepare search candidates from the following text.
+    /// Returns (set of all terms to search, candidates grouped by length).
+    fn prepare_search_candidates(
+        &self,
+        following_text: &str,
+        deinflector: &Deinflector,
+    ) -> (HashSet<String>, Vec<(usize, Vec<(String, Option<Vec<String>>)>)>) {
+        let mut all_terms = HashSet::new();
+        let mut candidates_by_length = Vec::new();
+
+        let max_len = following_text.chars().count();
+        for len in (1..=max_len).rev() {
+            let query_text_raw: String = following_text.chars().take(len).collect();
+            let query_text = japanese::normalize(&query_text_raw);
+
+            let variants = vec![
+                query_text.clone(),
+                japanese::katakana_to_hiragana(&query_text),
+                japanese::collapse_emphatic(&query_text),
+            ];
+            let variants: Vec<String> = variants.into_iter().collect();
+
+            let deinflections = deinflector.deinflect(&query_text);
+            let mut length_candidates: Vec<(String, Option<Vec<String>>)> = Vec::new();
+
+            for v in &variants {
+                length_candidates.push((v.clone(), None));
+                all_terms.insert(v.clone());
+            }
+
+            for d in &deinflections {
+                if d.term != query_text {
+                    let types = if d.rule_types.is_empty() {
+                        None
+                    } else {
+                        Some(d.rule_types.clone())
+                    };
+                    length_candidates.push((d.term.clone(), types));
+                    all_terms.insert(d.term.clone());
+                }
+            }
+
+            candidates_by_length.push((len, length_candidates));
+        }
+
+        (all_terms, candidates_by_length)
+    }
+
+    /// Process database results to find matching entries.
+    fn process_results(
+        &self,
+        db_results: &[DictionaryEntry],
+        candidates_by_length: &[(usize, Vec<(String, Option<Vec<String>>)>)],
+        _all_terms: &[String],
+        following_text: &str,
+    ) -> (Vec<(String, Vec<DictionaryEntry>)>, usize) {
+        let mut results_by_term: HashMap<String, Vec<DictionaryEntry>> = HashMap::new();
+
+        for entry in db_results {
+            results_by_term
+                .entry(entry.kanji.clone())
+                .or_default()
+                .push(entry.clone());
+            if entry.reading != entry.kanji {
+                results_by_term
+                    .entry(entry.reading.clone())
+                    .or_default()
+                    .push(entry.clone());
+            }
+        }
+
+        let mut matches: Vec<(String, Vec<DictionaryEntry>)> = Vec::new();
+        let mut max_len = 0;
+
+        for (len, candidates) in candidates_by_length {
+            let mut found = false;
+            for (term, required_types) in candidates {
+                let term_entries = match results_by_term.get(term.as_str()) {
+                    Some(e) => e,
+                    None => continue,
+                };
+
+                let filtered: Vec<DictionaryEntry> = if let Some(types) = required_types {
+                    // Deinflected match — filter by rule type
+                    term_entries
+                        .iter()
+                        .filter(|entry| {
+                            let entry_tags: Vec<&str> = entry.rules.split_whitespace().collect();
+                            types.is_empty()
+                                || types.iter().any(|t: &String| entry_tags.iter().any(|et| *et == t.as_str()))
+                                || (entry_tags.iter().any(|t: &&str| t.starts_with("v"))
+                                    && types.iter().any(|t: &String| t.starts_with("v")))
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    // Direct match — filter out kanji entries that don't match the query text
+                    let query_text = japanese::normalize(
+                        &following_text.chars().take(*len).collect::<String>(),
+                    );
+                    term_entries
+                        .iter()
+                        .filter(|entry| {
+                            let is_kanji_entry = entry.onyomi.is_some() || entry.kunyomi.is_some();
+                            !is_kanji_entry || entry.kanji == query_text
+                        })
+                        .cloned()
+                        .collect()
+                };
+
+                if !filtered.is_empty() {
+                    matches.push((term.clone(), filtered));
+                    found = true;
+                }
+            }
+            if found && max_len == 0 {
+                max_len = *len;
+            }
+        }
+
+        // Deduplicate by term
+        let mut seen = HashSet::new();
+        matches.retain(|(term, _)| seen.insert(term.clone()));
+
+        (matches, max_len)
+    }
+
+    /// Format dictionary results into displayable entries.
+    fn format_dictionary_results(
+        &self,
+        matches: &[(String, Vec<DictionaryEntry>)],
+    ) -> Vec<FormattedEntry> {
+        matches
+            .iter()
+            .map(|(term, entries)| {
+                let mut reading_groups: Vec<FormattedReadingGroup> = Vec::new();
+                let mut grouped: HashMap<String, Vec<&DictionaryEntry>> = HashMap::new();
+
+                for entry in entries {
+                    grouped
+                        .entry(entry.reading.clone())
+                        .or_default()
+                        .push(entry);
+                }
+
+                for (reading, reading_entries) in grouped {
+                    let is_kanji_entry = reading_entries
+                        .first()
+                        .map(|e| e.onyomi.is_some() || e.kunyomi.is_some())
+                        .unwrap_or(false);
+
+                    let kanji_variants: Vec<String> =
+                        reading_entries.iter().map(|e| e.kanji.clone()).collect();
+
+                    let headwords: Vec<FormattedHeadword> = kanji_variants
+                        .iter()
+                        .map(|kanji| {
+                            let entry = reading_entries
+                                .iter()
+                                .find(|e| e.kanji == *kanji)
+                                .unwrap_or(&reading_entries[0]);
+                            FormattedHeadword {
+                                kanji: kanji.clone(),
+                                onyomi: entry.onyomi.clone(),
+                                kunyomi: entry.kunyomi.clone(),
+                            }
+                        })
+                        .collect();
+
+                    let mut sense_groups: Vec<FormattedSenseGroup> = Vec::new();
+                    let mut global_sense_num = 1;
+                    let mut group_seen_tags: HashSet<String> = HashSet::new();
+                    let mut current_group_tags: Option<Vec<String>> = None;
+                    let mut current_group_senses: Vec<FormattedSense> = Vec::new();
+
+                    for e in &reading_entries {
+                        let definitions_list: Vec<serde_json::Value> =
+                            serde_json::from_str(&e.definitions).unwrap_or_default();
+
+                        let mut meta_tags = Vec::new();
+                        let mut sense_tags_map: HashMap<usize, Vec<String>> = HashMap::new();
+
+                        if let Some(jlpt) = &e.jlpt {
+                            if !jlpt.is_empty() {
+                                meta_tags.push(format!("jlpt: N{}", jlpt));
+                            }
+                        }
+
+                        for segment in e.rules.split(" | ") {
+                            let mut current_sense: Option<usize> = None;
+                            for tag in segment.split_whitespace() {
+                                if let Ok(n) = tag.parse::<usize>() {
+                                    current_sense = Some(n);
+                                } else if !tag.starts_with("grade:") {
+                                    if let Some(sense) = current_sense {
+                                        sense_tags_map
+                                            .entry(sense)
+                                            .or_default()
+                                            .push(tag.to_string());
+                                    } else {
+                                        meta_tags.push(tag.to_string());
+                                    }
+                                }
+                            }
+                        }
+
+                        let sense_idx = global_sense_num;
+                        global_sense_num += 1;
+                        let tags: Vec<String> =
+                            meta_tags.clone().into_iter().chain(
+                                sense_tags_map.get(&1).cloned().unwrap_or_default()
+                            ).collect::<Vec<_>>();
+
+                        let nodes = Self::parse_definition(&definitions_list);
+
+                        if current_group_tags.is_none() || Some(&tags) == current_group_tags.as_ref() {
+                            current_group_tags = Some(tags.clone());
+                            current_group_senses.push(FormattedSense {
+                                index: sense_idx,
+                                nodes,
+                            });
+                        } else {
+                            let tags_to_render = current_group_tags.take().unwrap();
+                            let is_forms = tags_to_render.iter().any(|t| {
+                                t.eq_ignore_ascii_case("Forms") || t.eq_ignore_ascii_case("Other forms")
+                            });
+                            let filtered_tags: Vec<String> = tags_to_render
+                                .into_iter()
+                                .filter(|t| group_seen_tags.insert(t.clone()))
+                                .collect();
+                            sense_groups.push(FormattedSenseGroup {
+                                tags: filtered_tags,
+                                senses: current_group_senses.clone(),
+                                is_forms,
+                            });
+                            current_group_tags = Some(tags);
+                            current_group_senses = vec![FormattedSense {
+                                index: sense_idx,
+                                nodes,
+                            }];
+                        }
+                    }
+
+                    if let Some(tags_to_render) = current_group_tags.take() {
+                        let is_forms = tags_to_render.iter().any(|t| {
+                            t.eq_ignore_ascii_case("Forms") || t.eq_ignore_ascii_case("Other forms")
+                        });
+                        let filtered_tags: Vec<String> = tags_to_render
+                            .into_iter()
+                            .filter(|t| group_seen_tags.insert(t.clone()))
+                            .collect();
+                        sense_groups.push(FormattedSenseGroup {
+                            tags: filtered_tags,
+                            senses: current_group_senses,
+                            is_forms,
+                        });
+                    }
+
+                    reading_groups.push(FormattedReadingGroup {
+                        reading,
+                        headwords,
+                        sense_groups,
+                        is_kanji_entry,
+                    });
+                }
+
+                FormattedEntry {
+                    term: term.clone(),
+                    reading_groups,
+                }
+            })
+            .collect()
+    }
+
+    /// Parse Yomitan definition JSON into displayable nodes.
+    fn parse_definition(data: &[serde_json::Value]) -> Vec<DefinitionNode> {
+        let mut nodes = Vec::new();
+        for item in data {
+            Self::parse_definition_item(item, false, &mut nodes);
+        }
+        nodes
+    }
+
+    fn parse_definition_item(
+        data: &serde_json::Value,
+        in_example: bool,
+        nodes: &mut Vec<DefinitionNode>,
+    ) {
+        match data {
+            serde_json::Value::String(s) => {
+                let replaced = s
+                    .replace("\r\n", " ")
+                    .replace('\n', " ")
+                    .replace('\r', " ")
+                    .replace(';', "; ")
+                    .replace(";  ", "; ");
+                let trimmed = replaced.trim().split_whitespace().collect::<Vec<_>>().join(" ");
+                if !trimmed.is_empty() {
+                    nodes.push(DefinitionNode::Text(trimmed));
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for (idx, item) in arr.iter().enumerate() {
+                    let item_nodes = {
+                        let mut sub = Vec::new();
+                        Self::parse_definition_item(item, in_example, &mut sub);
+                        sub
+                    };
+                    if !item_nodes.is_empty() {
+                        if !nodes.is_empty() && idx > 0 {
+                            let last = nodes.last().unwrap();
+                            let first = item_nodes.first().unwrap();
+                            if Self::is_inline_node(last) && Self::is_inline_node(first) {
+                                let separator = if in_example { "\n" } else { ", " };
+                                if let DefinitionNode::Text(ref t) = nodes.last().unwrap() {
+                                    let new_text = format!("{}{}", t, separator);
+                                    let last_idx = nodes.len() - 1;
+                                    nodes[last_idx] = DefinitionNode::Text(new_text);
+                                } else {
+                                    nodes.push(DefinitionNode::Text(separator.to_string()));
+                                }
+                            }
+                        }
+                        nodes.extend(item_nodes);
+                    }
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let tag = map.get("tag").and_then(|v| v.as_str());
+                let content = map.get("content").or_else(|| map.get("list"));
+                let sc_content = Self::get_attr(map, "content");
+                let sc_class = Self::get_attr(map, "class");
+
+                if Self::is_example(map) {
+                    let jp = map
+                        .get("japanese")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| content.and_then(|v| v.as_str()));
+                    let _en = map.get("english").and_then(|v| v.as_str());
+                    if jp.is_some() {
+                        // Example with direct text — skip for now (would need Example variant)
+                    } else {
+                        let mut sub = Vec::new();
+                        if let Some(c) = content {
+                            Self::parse_definition_item(c, true, &mut sub);
+                        }
+                        nodes.extend(sub);
+                    }
+                } else if sc_class.as_deref() == Some("tag")
+                    || (tag == Some("span") && sc_content.as_deref().map_or(false, |s| s.ends_with("-info")))
+                {
+                    let text = content.and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    nodes.push(DefinitionNode::Tag {
+                        text,
+                        category: String::new(),
+                    });
+                } else if tag == Some("ruby") {
+                    if let Some(serde_json::Value::Array(ruby_list)) = content {
+                        if ruby_list.len() >= 2 {
+                            let term = ruby_list[0].as_str().unwrap_or("").to_string();
+                            let reading = ruby_list
+                                .get(1)
+                                .and_then(|v| v.as_object())
+                                .and_then(|m| m.get("content"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            nodes.push(DefinitionNode::Ruby {
+                                term,
+                                reading,
+                                is_mini: true,
+                            });
+                        }
+                    }
+                } else if tag == Some("table") {
+                    // Table placeholder — skip for now
+                } else if tag == Some("ul") || tag == Some("ol") {
+                    let is_inline_list = matches!(
+                        sc_content.as_deref(),
+                        Some("glossary") | Some("infoGlossary") | Some("sourceLanguages") | Some("info-gloss") | Some("sense-note")
+                    );
+                    if is_inline_list {
+                        if let Some(c) = content {
+                            Self::parse_definition_item(c, in_example, nodes);
+                        }
+                    } else {
+                        // Block list — skip for now
+                    }
+                } else if let Some(c) = content {
+                    Self::parse_definition_item(c, in_example, nodes);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn get_attr(data: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+        data.get("data")
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get(key))
+            .or_else(|| data.get(&format!("data-{}", key)))
+            .or_else(|| data.get(key))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    fn is_example(data: &serde_json::Map<String, serde_json::Value>) -> bool {
+        data.get("type")
+            .and_then(|v| v.as_str())
+            .map_or(false, |t| t == "sentence" || t == "example")
+            || data.contains_key("japanese")
+            || Self::get_attr(data, "content").map_or(false, |c| {
+                c.contains("example") || c == "examples"
+            })
+            || Self::get_attr(data, "class")
+                .map_or(false, |c| c.contains("example"))
+    }
+
+    fn is_inline_node(node: &DefinitionNode) -> bool {
+        matches!(
+            node,
+            DefinitionNode::Text(_) | DefinitionNode::Ruby { .. } | DefinitionNode::Tag { .. }
+        )
     }
 }
