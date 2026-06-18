@@ -62,6 +62,8 @@ pub struct SettingsWindow {
     pub busy: bool,
     /// Name of the dictionary currently being deleted (for status display).
     pub deleting_name: Option<String>,
+    /// Whether the native file picker dialog is open.
+    pub picker_open: bool,
 }
 
 impl SettingsWindow {
@@ -78,6 +80,7 @@ impl SettingsWindow {
             import_shared: Arc::new(Mutex::new(None)),
             busy: false,
             deleting_name: None,
+            picker_open: false,
         }
     }
 
@@ -89,15 +92,17 @@ impl SettingsWindow {
             }
 
             SettingsMessage::ImportDictionary => {
-                if self.busy {
+                if self.busy || self.picker_open {
                     return Task::none();
                 }
+                self.picker_open = true;
                 self.status_text = "Selecting file...".to_string();
                 self.import_progress = None;
                 Task::perform(
                     async {
                         rfd::AsyncFileDialog::new()
                             .add_filter("ZIP archive", &["zip"])
+                            .set_title("Import Yomitan Dictionary")
                             .pick_file()
                             .await
                             .map(|handle| handle.path().to_path_buf())
@@ -107,6 +112,7 @@ impl SettingsWindow {
             }
 
             SettingsMessage::FilePicked(Some(path)) => {
+                self.picker_open = false;
                 self.import_running = true;
                 self.busy = true;
                 self.status_text = "Importing...".to_string();
@@ -161,6 +167,7 @@ impl SettingsWindow {
             }
 
             SettingsMessage::FilePicked(None) => {
+                self.picker_open = false;
                 self.status_text = "Import cancelled.".to_string();
                 self.import_running = false;
                 self.busy = false;
@@ -480,10 +487,31 @@ impl SettingsWindow {
             }
         }
 
-        container(scrollable(content))
+        let main_content = container(scrollable(content))
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+            .height(Length::Fill);
+
+        if self.picker_open {
+            // Dim the main window and block all input while the file picker is open.
+            // The Button intercepts and swallows all mouse/click events.
+            iced::widget::Stack::new()
+                .push(main_content)
+                .push(
+                    iced::widget::Button::new(
+                        iced::widget::Text::new("")
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .on_press(SettingsMessage::RefreshStatus)
+                    .style(|_, _| {
+                        iced::widget::button::Style::default()
+                            .with_background(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5))
+                    }),
+                )
+                .into()
+        } else {
+            main_content.into()
+        }
     }
 
     fn dict_row<'a>(
