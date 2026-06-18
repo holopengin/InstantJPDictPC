@@ -2,6 +2,7 @@ mod data;
 mod models;
 mod ocr_engine;
 mod overlay_state;
+mod settings_window;
 mod util;
 mod viewer;
 
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use crate::data::db::DictionaryDatabase;
 use crate::models::*;
 use crate::ocr_engine::OcrEngine;
+use crate::settings_window::SettingsWindow;
 use crate::util::deinflector::Deinflector;
 use crate::viewer::OcrViewer;
 
@@ -34,6 +36,43 @@ fn main() -> Result<()> {
     );
     println!("Deinflector loaded: {} rules", deinflector.rule_count());
 
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() < 2 {
+        // No image argument — open the settings / management window
+        println!("No image argument provided. Opening settings window...");
+        run_settings_window(db)?;
+        return Ok(());
+    }
+
+    // Image argument provided — run the OCR viewer
+    run_ocr_viewer(args, db, deinflector)
+}
+
+// ---------------------------------------------------------------------------
+// Settings window (no image argument)
+// ---------------------------------------------------------------------------
+
+fn run_settings_window(db: Arc<DictionaryDatabase>) -> Result<()> {
+    let settings_app = iced::application(
+        move || SettingsWindow::new(Arc::clone(&db)),
+        SettingsWindow::update,
+        SettingsWindow::view,
+    );
+
+    settings_app.run().context("Failed to run settings window")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// OCR viewer (image argument provided)
+// ---------------------------------------------------------------------------
+
+fn run_ocr_viewer(
+    args: Vec<String>,
+    db: Arc<DictionaryDatabase>,
+    deinflector: Arc<Deinflector>,
+) -> Result<()> {
     // Initialize OCR engine
     let mut engine = OcrEngine::new("./models")?;
     println!("Models loaded successfully.");
@@ -41,17 +80,6 @@ fn main() -> Result<()> {
         "Character vocabulary loaded: {} chars",
         engine.char_vocab.len()
     );
-
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        println!(
-            "Usage: {} <image_path> [--font /path/to.ttf]",
-            args.get(0)
-                .map(|s| s.as_str())
-                .unwrap_or("accessibility_daemon")
-        );
-        return Ok(());
-    }
 
     let image_path = args[1].clone();
 

@@ -5,13 +5,15 @@
         "linkedProjects": [
           "accessibility_daemon/Cargo.toml"
         ],
+        "checkOnSave": true,
         "check": {
+          "command": "check",
+          "invocationStrategy": "once",
           "overrideCommand": [
             "cargo",
             "check",
             "--manifest-path",
             "accessibility_daemon/Cargo.toml",
-            "--all-targets",
             "--message-format=json"
           ]
         }

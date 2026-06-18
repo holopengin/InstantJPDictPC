@@ -35,6 +35,15 @@ zip = "0.6"
 # Lazy static initialization
 lazy_static = "1.4"
 
+# File dialogs
+rfd = "0.14"
+
+# Open URLs in browser
+open = "5.0"
+
+# Async timers (works with Iced's executor)
+futures-timer = "3.0"
+
 [profile.release]
 opt-level = 3
 lto = true

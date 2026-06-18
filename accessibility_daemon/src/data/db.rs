@@ -148,13 +148,25 @@ impl DictionaryDatabase {
         Ok(())
     }
 
+    pub fn set_dictionary_enabled(&self, dictionary_id: i64, enabled: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE dictionary_meta SET enabled = ?1 WHERE id = ?2",
+            [&enabled as &dyn rusqlite::ToSql, &dictionary_id as &dyn rusqlite::ToSql],
+        )?;
+        Ok(())
+    }
+
     pub fn get_max_priority(&self) -> Result<Option<i32>> {
         let conn = self.conn.lock().unwrap();
         let val: Option<i32> = conn
             .query_row("SELECT MAX(priority) FROM dictionary_meta", [], |row| {
-                row.get(0)
+                // MAX() returns NULL when table is empty; handle as None
+                let val: Option<i64> = row.get(0)?;
+                Ok(val.map(|v| v as i32))
             })
-            .optional()?;
+            .optional()?
+            .and_then(|x| x);
         Ok(val)
     }
 
