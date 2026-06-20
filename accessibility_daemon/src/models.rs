@@ -187,4 +187,16 @@ pub enum Message {
     SelectAlternative(char),
     Back,
     Navigate(GamepadAction),
+    /// Zoom the image by a delta (positive = zoom in), centered on the given cursor position.
+    ZoomOnCursor { delta: f32, cursor_x: f32, cursor_y: f32 },
+    /// Start panning — record the initial cursor position.
+    PanStart { start_x: f32, start_y: f32 },
+    /// Pan by the given delta.
+    PanDelta { dx: f32, dy: f32 },
+    /// End panning.
+    PanEnd,
+    /// Set the zoom scale directly (for pinch zoom).
+    SetScale { scale: f32 },
+    /// Pinch zoom gesture: new scale + pan delta around focus point.
+    PinchZoom { scale_factor: f32, focus_x: f32, focus_y: f32, prev_focus_x: f32, prev_focus_y: f32, base_offset_y: f32 },
 }
