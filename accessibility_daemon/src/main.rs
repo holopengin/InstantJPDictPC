@@ -177,6 +177,45 @@ fn run_ocr_viewer(
                     std::process::exit(0);
                 }
             }
+            Message::ZoomOnCursor { delta, cursor_x, cursor_y } => {
+                let zoom_factor = if delta > 0.0 { 1.1 } else { 0.9 };
+                state.state.current_scale = (state.state.current_scale * zoom_factor).clamp(0.5, 5.0);
+                // Adjust translation to zoom toward cursor position
+                state.state.current_trans_x = cursor_x - (cursor_x - state.state.current_trans_x) * zoom_factor;
+                state.state.current_trans_y = cursor_y - (cursor_y - state.state.current_trans_y) * zoom_factor;
+            }
+            Message::PanDelta { dx, dy } => {
+                state.state.current_trans_x += dx;
+                state.state.current_trans_y += dy;
+            }
+            Message::PanStart { .. } => {
+                // Pan start is handled by the canvas state; nothing to do here
+            }
+            Message::PanEnd => {
+                // Pan end is handled by the canvas state; nothing to do here
+            }
+            Message::SetScale { scale } => {
+                state.state.current_scale = scale.clamp(0.5, 5.0);
+            }
+            Message::PinchZoom { scale_factor, focus_x, focus_y, prev_focus_x, prev_focus_y, base_offset_y } => {
+                let old_scale = state.state.current_scale;
+                let new_scale = (old_scale * scale_factor).clamp(0.5, 5.0);
+                state.state.current_scale = new_scale;
+                let actual_factor = if old_scale > 0.0 { new_scale / old_scale } else { 1.0 };
+                // Work in "effective" coordinates: eff = trans + base_offset
+                // This centers the zoom around the actual image position, not the canvas origin.
+                let eff_x = state.state.current_trans_x + 0.0; // base_offset_x is always 0 (left-aligned)
+                let eff_y = state.state.current_trans_y + base_offset_y;
+                println!("[Pinch] scale={:.3} factor={:.4} focus=({:.1},{:.1}) prev_focus=({:.1},{:.1}) base_off_y={:.1} eff_before=({:.1},{:.1})",
+                    new_scale, actual_factor, focus_x, focus_y, prev_focus_x, prev_focus_y, base_offset_y, eff_x, eff_y);
+                // Zoom around previous focus: new_eff = new_focus - (old_focus - old_eff) * factor
+                let new_eff_x = focus_x - (prev_focus_x - eff_x) * actual_factor;
+                let new_eff_y = focus_y - (prev_focus_y - eff_y) * actual_factor;
+                // Convert back to trans coordinates
+                state.state.current_trans_x = new_eff_x - 0.0;
+                state.state.current_trans_y = new_eff_y - base_offset_y;
+                println!("[Pinch] eff_after=({:.1},{:.1}) trans_after=({:.1},{:.1})", new_eff_x, new_eff_y, state.state.current_trans_x, state.state.current_trans_y);
+            }
         }
 
         // Return scroll tasks to auto-scroll neighbor/alt panels to the selected character

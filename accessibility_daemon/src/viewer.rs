@@ -5,7 +5,7 @@ use iced::widget::canvas::{
     Text as CanvasText,
 };
 use iced::widget::{
-    button, Button, Column, Container, Image as IcedImage, Row, Scrollable, Stack, Text,
+    Column, Container, Image as IcedImage, Row, Scrollable, Stack, Text,
 };
 use iced::widget::container;
 use iced::advanced::widget::operation::scrollable::{scroll_to, AbsoluteOffset};
@@ -13,7 +13,7 @@ use iced::widget::Id;
 use iced::advanced::widget::operate;
 use iced::{
     alignment, Color, Element, Font as IcedFont, Length, Pixels, Point, Rectangle, Renderer,
-    Size, Theme, mouse,
+    Size, Theme, mouse, touch,
 };
 
 use crate::data::db::DictionaryDatabase;
@@ -24,14 +24,60 @@ use crate::util::deinflector::Deinflector;
 const BOX_FILL_RATIO: f32 = 0.9;
 
 // ---------------------------------------------------------------------------
+// Pan state (used by OverlayProgram::State)
+// ---------------------------------------------------------------------------
+
+const TAP_THRESHOLD: f32 = 5.0;
+/// Dead zone for drag start in the TapOrDrag widget.
+/// The first few pixels of movement don't count as drag, preventing
+/// accidental drags from taps.
+const DRAG_DEAD_ZONE: f32 = 3.0;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PanState {
+    pub is_panning: bool,
+    pub start_x: f32,
+    pub start_y: f32,
+    pub trans_x_at_start: f32,
+    pub trans_y_at_start: f32,
+    /// Whether the current interaction is a tap (short press without movement).
+    /// Set to true on press, moved to false once movement exceeds TAP_THRESHOLD.
+    pub is_tap: bool,
+    /// Last cursor position during pan, used to compute incremental deltas.
+    pub last_x: f32,
+    pub last_y: f32,
+    /// Accumulated movement since press. Used for dead zone:
+    /// drag only starts after this exceeds DRAG_DEAD_ZONE.
+    pub accumulated_dx: f32,
+    pub accumulated_dy: f32,
+    /// Whether the drag dead zone has been exceeded.
+    pub drag_started: bool,
+    /// Pinch zoom: the ID and position of the first finger.
+    pub pinch_finger1: Option<(touch::Finger, Point)>,
+    /// Pinch zoom: the ID and position of the second finger.
+    pub pinch_finger2: Option<(touch::Finger, Point)>,
+    /// Pinch zoom: previous frame's distance between fingers.
+    pub pinch_prev_dist: f32,
+    /// Pinch zoom: previous frame's midpoint X.
+    pub pinch_prev_focus_x: f32,
+    /// Pinch zoom: previous frame's midpoint Y.
+    pub pinch_prev_focus_y: f32,
+
+}
+
+// ---------------------------------------------------------------------------
 // OverlayProgram
 // ---------------------------------------------------------------------------
+
+use iced::widget::image::Handle as ImageHandle;
 
 #[derive(Clone)]
 pub struct OverlayProgram {
     pub annotations: Vec<DetectedAnnotation>,
     pub img_w: u32,
     pub img_h: u32,
+    /// The screenshot image to draw on the canvas.
+    pub image: Option<ImageHandle>,
     /// Whether the panel is visible.
     pub panel_visible: bool,
     /// Which side the panel is on.
@@ -42,110 +88,346 @@ pub struct OverlayProgram {
     pub alternatives_visible: bool,
     /// Current cursor position (line_idx, char_idx) for keyboard navigation.
     pub cursor_pos: Option<(usize, usize)>,
+    /// Current zoom scale.
+    pub current_scale: f32,
+    /// Current translation X.
+    pub current_trans_x: f32,
+    /// Current translation Y.
+    pub current_trans_y: f32,
+}
+
+impl OverlayProgram {
+    /// Compute the base scale (fit image to bounds) and offset (center in bounds).
+    fn base_transform(&self, bounds: Rectangle) -> (f32, f32, f32) {
+        let img_w_f = self.img_w as f32;
+        let img_h_f = self.img_h as f32;
+        let base_scale = f32::min(bounds.width / img_w_f, bounds.height / img_h_f);
+        let offset_x = (bounds.width - img_w_f * base_scale) / 2.0;
+        let offset_y = (bounds.height - img_h_f * base_scale) / 2.0;
+        (base_scale, offset_x, offset_y)
+    }
+
+    /// Transform a point from image-space to screen-space, applying zoom/pan.
+    fn image_to_screen(&self, bounds: Rectangle, img_x: f32, img_y: f32) -> Point {
+        let (base_scale, offset_x, offset_y) = self.base_transform(bounds);
+        let total_scale = base_scale * self.current_scale;
+        Point::new(
+            img_x * total_scale + offset_x + self.current_trans_x,
+            img_y * total_scale + offset_y + self.current_trans_y,
+        )
+    }
+
+    /// Transform a screen-space point back to image-space (inverse of image_to_screen).
+    fn screen_to_image(&self, bounds: Rectangle, screen_x: f32, screen_y: f32) -> (f32, f32) {
+        let (base_scale, offset_x, offset_y) = self.base_transform(bounds);
+        let total_scale = base_scale * self.current_scale;
+        (
+            (screen_x - offset_x - self.current_trans_x) / total_scale,
+            (screen_y - offset_y - self.current_trans_y) / total_scale,
+        )
+    }
+
+    /// Check whether a screen-space point is over the panel area.
+    /// The panel is positioned at the correct edge of the screen.
+    fn is_over_panel(&self, bounds: Rectangle, screen_x: f32, screen_y: f32) -> bool {
+        if !self.panel_visible {
+            return false;
+        }
+        let panel_w = self.dict_width + 42.0 + 42.0 + 6.0; // dict + neighbors + alt + spacing
+        if self.panel_on_right {
+            screen_x >= bounds.width - panel_w
+        } else {
+            screen_x <= panel_w
+        }
+    }
+
+    /// Check whether a screen-space point hits any character bounding box.
+    /// Returns `Some((line_idx, char_idx))` if a hit is found.
+    fn hit_test(&self, bounds: Rectangle, screen_x: f32, screen_y: f32) -> Option<(usize, usize)> {
+        let (img_x, img_y) = self.screen_to_image(bounds, screen_x, screen_y);
+        for (line_idx, annotation) in self.annotations.iter().enumerate() {
+            if let Some(line) = &annotation.line {
+                for (char_idx, char_box) in line.char_boxes.iter().enumerate() {
+                    if img_x >= char_box.left() as f32
+                        && img_x <= char_box.right() as f32
+                        && img_y >= char_box.top() as f32
+                        && img_y <= char_box.bottom() as f32
+                    {
+                        return Some((line_idx, char_idx));
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
-    type State = ();
+    type State = PanState;
 
     fn mouse_interaction(
         &self,
-        _state: &Self::State,
+        state: &Self::State,
         _bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        mouse::Interaction::Pointer
+        if state.is_panning {
+            mouse::Interaction::Grabbing
+        } else {
+            mouse::Interaction::Grab
+        }
     }
 
     fn update(
         &self,
-        _state: &mut Self::State,
+        state: &mut Self::State,
         event: &iced::Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<iced::widget::Action<Message>> {
-        if let iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
-            if let Some(cursor_position) = cursor.position_in(bounds) {
-                // If panel is visible, ignore clicks within the panel area.
-                // Panel width = dict_width + neighbors(40) + alternatives(40, if visible)
-                if self.panel_visible {
-                    let win_w = bounds.width;
-                    let win_h = bounds.height;
-                    let panel_w = self.dict_width + 40.0 + if self.alternatives_visible { 40.0 } else { 0.0 };
-                    let panel_rect = if self.panel_on_right {
-                        Rectangle { x: win_w - panel_w, y: 0.0, width: panel_w, height: win_h }
-                    } else {
-                        Rectangle { x: 0.0, y: 0.0, width: panel_w, height: win_h }
+        // Check if cursor is over the panel area — if so, don't handle pan/zoom
+        let over_panel = self.panel_visible
+            && cursor.position().map_or(false, |p| self.is_over_panel(bounds, p.x, p.y));
+
+        match event {
+            // --- Scroll wheel zoom (only when NOT over panel) ---
+            iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                if over_panel { return None; }
+                if let Some(cursor_position) = cursor.position_in(bounds) {
+                    let (dy, _dx) = match delta {
+                        mouse::ScrollDelta::Lines { y, x } => (*y, *x),
+                        mouse::ScrollDelta::Pixels { y, x } => (*y / 100.0, *x / 100.0),
                     };
-                    if panel_rect.contains(cursor_position) {
-                        return None;
+                    if dy != 0.0 {
+                        return Some(iced::widget::Action::publish(
+                            Message::ZoomOnCursor {
+                                delta: dy,
+                                cursor_x: cursor_position.x,
+                                cursor_y: cursor_position.y,
+                            },
+                        ));
                     }
                 }
-
-                // Process click on image characters
-                let img_w_f = self.img_w as f32;
-                let img_h_f = self.img_h as f32;
-                let scale = f32::min(bounds.width / img_w_f, bounds.height / img_h_f);
-                let offset_x = (bounds.width - img_w_f * scale) / 2.0;
-                let offset_y = (bounds.height - img_h_f * scale) / 2.0;
-
-                for (line_idx, annotation) in self.annotations.iter().enumerate() {
-                    if let Some(line) = &annotation.line {
-                        let fixed_size = if line.is_vertical {
-                            line.char_boxes.iter().map(|b| b.w).max().unwrap_or(0)
-                        } else {
-                            line.char_boxes.iter().map(|b| b.h).max().unwrap_or(0)
-                        };
-
-                        let mut refined: Vec<BoundingBox> = Vec::new();
-                        if let Some(first) = line.char_boxes.first() {
-                            refined.push(first.clone());
-                        }
-                        for i in 1..line.char_boxes.len() {
-                            let prev = &line.char_boxes[i - 1];
-                            let cur = &line.char_boxes[i];
-                            if line.is_vertical {
-                                let new_top =
-                                    prev.top().saturating_add(fixed_size).max(cur.top());
-                                refined.push(BoundingBox::new(
-                                    cur.left(), new_top, cur.w, cur.h, cur.confidence,
-                                ));
-                            } else {
-                                let new_left =
-                                    prev.left().saturating_add(fixed_size).max(cur.left());
-                                refined.push(BoundingBox::new(
-                                    new_left, cur.top(), cur.w, cur.h, cur.confidence,
-                                ));
-                            }
-                        }
-
-                        let display_boxes: Vec<BoundingBox> = refined
-                            .iter()
-                            .map(|b| {
-                                let cx = b.left() + b.w / 2;
-                                let cy = b.top() + b.h / 2;
-                                BoundingBox::new(cx - fixed_size / 2, cy - fixed_size / 2, fixed_size, fixed_size, 1.0)
-                            })
-                            .collect();
-
-                        for (char_idx, db) in display_boxes.iter().enumerate() {
-                            let x = db.x as f32 * scale + offset_x;
-                            let y = db.y as f32 * scale + offset_y;
-                            let w = db.w as f32 * scale;
-                            let h = db.h as f32 * scale;
-                            let rect = Rectangle::new(Point::new(x, y), Size::new(w, h));
-
-                            if rect.contains(cursor_position) {
-                                if let Some(_ch) = line.text.chars().nth(char_idx) {
-                                    return Some(iced::widget::Action::publish(
-                                        Message::SelectCharacter(line_idx, char_idx),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                return Some(iced::widget::Action::publish(Message::Back));
             }
+
+            // --- Mouse: left button pressed (pan start or tap) ---
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if over_panel { return None; } // Let panel handle it
+                if let Some(cursor_position) = cursor.position_in(bounds) {
+                    state.is_panning = true;
+                    state.start_x = cursor_position.x;
+                    state.start_y = cursor_position.y;
+                    state.last_x = cursor_position.x;
+                    state.last_y = cursor_position.y;
+                    state.trans_x_at_start = self.current_trans_x;
+                    state.trans_y_at_start = self.current_trans_y;
+                    state.is_tap = true;
+                    state.accumulated_dx = 0.0;
+                    state.accumulated_dy = 0.0;
+                    state.drag_started = false;
+                }
+                return None;
+            }
+
+            // --- Mouse: cursor moved (pan with dead zone) ---
+            iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                // If cursor moved over panel during pan, cancel the pan
+                if over_panel && state.is_panning {
+                    state.is_panning = false;
+                    state.is_tap = false;
+                    state.drag_started = false;
+                    state.accumulated_dx = 0.0;
+                    state.accumulated_dy = 0.0;
+                    return None;
+                }
+                if state.is_panning {
+                    let dx = position.x - state.last_x;
+                    let dy = position.y - state.last_y;
+                    state.last_x = position.x;
+                    state.last_y = position.y;
+
+                    state.accumulated_dx += dx;
+                    state.accumulated_dy += dy;
+                    let total = (state.accumulated_dx.powi(2) + state.accumulated_dy.powi(2)).sqrt();
+
+                    if !state.drag_started && total > DRAG_DEAD_ZONE {
+                        state.drag_started = true;
+                        state.is_tap = false;
+                    }
+
+                    if state.drag_started && (dx != 0.0 || dy != 0.0) {
+                        return Some(iced::widget::Action::publish(Message::PanDelta { dx, dy }));
+                    }
+                }
+            }
+
+            // --- Mouse: left button released (pan end or tap) ---
+            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                // If over panel, don't process — let the panel handle it
+                if over_panel {
+                    state.is_panning = false;
+                    state.is_tap = false;
+                    state.drag_started = false;
+                    return None;
+                }
+                let was_tap = state.is_tap;
+                state.is_panning = false;
+                state.is_tap = false;
+                state.drag_started = false;
+                state.accumulated_dx = 0.0;
+                state.accumulated_dy = 0.0;
+
+                if was_tap {
+                    if let Some(cursor_position) = cursor.position_in(bounds) {
+                        return Some(iced::widget::Action::publish(
+                            match self.hit_test(bounds, cursor_position.x, cursor_position.y) {
+                                Some((li, ci)) => Message::SelectCharacter(li, ci),
+                                None => Message::Back,
+                            },
+                        ));
+                    }
+                }
+            }
+
+            // --- Touch: finger pressed ---
+            iced::Event::Touch(touch::Event::FingerPressed { id, position }) => {
+                if state.is_panning {
+                    // Second finger — switch to pinch zoom mode
+                    state.pinch_finger2 = Some((*id, *position));
+                    // Compute initial distance and midpoint
+                    if let Some((_, f1_pos)) = state.pinch_finger1 {
+                        let dx = position.x - f1_pos.x;
+                        let dy = position.y - f1_pos.y;
+                        state.pinch_prev_dist = (dx * dx + dy * dy).sqrt().max(10.0);
+                        // Initialize prev_focus to the current midpoint
+                        state.pinch_prev_focus_x = (f1_pos.x + position.x) / 2.0;
+                        state.pinch_prev_focus_y = (f1_pos.y + position.y) / 2.0;
+                    }
+                    state.is_tap = false;
+                    state.drag_started = true;
+                } else if !over_panel {
+                    // First finger — start pan (only if not over panel)
+                    state.is_panning = true;
+                    state.pinch_finger1 = Some((*id, *position));
+                    state.start_x = position.x;
+                    state.start_y = position.y;
+                    state.last_x = position.x;
+                    state.last_y = position.y;
+                    state.trans_x_at_start = self.current_trans_x;
+                    state.trans_y_at_start = self.current_trans_y;
+                    state.is_tap = true;
+                    state.accumulated_dx = 0.0;
+                    state.accumulated_dy = 0.0;
+                    state.drag_started = false;
+                    state.pinch_finger2 = None;
+                    state.pinch_prev_dist = 0.0;
+                }
+                return None;
+            }
+
+            // --- Touch: finger moved (pan or pinch) ---
+            iced::Event::Touch(touch::Event::FingerMoved { id, position }) => {
+                if state.is_panning {
+                    // Update the stored position for this finger
+                    if let Some((fid, _)) = state.pinch_finger1 {
+                        if fid == *id { state.pinch_finger1 = Some((*id, *position)); }
+                    }
+                    if let Some((fid, _)) = state.pinch_finger2 {
+                        if fid == *id { state.pinch_finger2 = Some((*id, *position)); }
+                    }
+
+                    if state.pinch_finger2.is_some() {
+                        // Pinch zoom: both fingers active
+                        if let (Some((_, f1)), Some((_, f2))) = (state.pinch_finger1, state.pinch_finger2) {
+                            let dx = f2.x - f1.x;
+                            let dy = f2.y - f1.y;
+                            let current_dist = (dx * dx + dy * dy).sqrt();
+                            let scale_factor = if state.pinch_prev_dist > 0.0 { current_dist / state.pinch_prev_dist } else { 1.0 };
+                            let focus_x = (f1.x + f2.x) / 2.0;
+                            let focus_y = (f1.y + f2.y) / 2.0;
+                            let prev_focus_x = state.pinch_prev_focus_x;
+                            let prev_focus_y = state.pinch_prev_focus_y;
+
+                            println!("[Canvas] f1=({:.1},{:.1}) f2=({:.1},{:.1}) dist={:.1} factor={:.4} focus=({:.1},{:.1}) prev_focus=({:.1},{:.1}) canvas_bounds=({:.0},{:.0},{:.0},{:.0})",
+                                f1.x, f1.y, f2.x, f2.y, current_dist, scale_factor, focus_x, focus_y, prev_focus_x, prev_focus_y,
+                                bounds.x, bounds.y, bounds.width, bounds.height);
+
+                            // Update prev for next frame
+                            state.pinch_prev_dist = current_dist;
+                            state.pinch_prev_focus_x = focus_x;
+                            state.pinch_prev_focus_y = focus_y;
+
+                            // Compute base_offset for the Y axis so the handler can
+                            // correctly account for the image centering.
+                            let img_h_f = self.img_h as f32;
+                            let base_scale = f32::min(bounds.width / self.img_w as f32, bounds.height / img_h_f);
+                            let base_offset_y = (bounds.height - img_h_f * base_scale) / 2.0;
+
+                            return Some(iced::widget::Action::publish(
+                                Message::PinchZoom {
+                                    scale_factor,
+                                    focus_x,
+                                    focus_y,
+                                    prev_focus_x,
+                                    prev_focus_y,
+                                    base_offset_y,
+                                },
+                            ));
+                        }
+                    } else {
+                        // Single finger pan with dead zone
+                        let dx = position.x - state.last_x;
+                        let dy = position.y - state.last_y;
+                        state.last_x = position.x;
+                        state.last_y = position.y;
+
+                        state.accumulated_dx += dx;
+                        state.accumulated_dy += dy;
+                        let total = (state.accumulated_dx.powi(2) + state.accumulated_dy.powi(2)).sqrt();
+
+                        if !state.drag_started && total > DRAG_DEAD_ZONE {
+                            state.drag_started = true;
+                            state.is_tap = false;
+                        }
+
+                        if state.drag_started && (dx != 0.0 || dy != 0.0) {
+                            return Some(iced::widget::Action::publish(Message::PanDelta { dx, dy }));
+                        }
+                    }
+                }
+            }
+
+            // --- Touch: finger lifted (pan end) — detect taps ---
+            iced::Event::Touch(touch::Event::FingerLifted { id, position }) => {
+                // Remove the lifted finger from tracking
+                if let Some((fid, _)) = state.pinch_finger1 {
+                    if fid == *id { state.pinch_finger1 = None; }
+                }
+                if let Some((fid, _)) = state.pinch_finger2 {
+                    if fid == *id { state.pinch_finger2 = None; }
+                }
+
+                let was_tap = state.is_tap;
+                state.is_panning = false;
+                state.is_tap = false;
+                state.drag_started = false;
+                state.accumulated_dx = 0.0;
+                state.accumulated_dy = 0.0;
+                state.pinch_prev_dist = 0.0;
+                state.pinch_prev_focus_x = 0.0;
+                state.pinch_prev_focus_y = 0.0;
+
+                if was_tap {
+                    return Some(iced::widget::Action::publish(
+                        match self.hit_test(bounds, position.x, position.y) {
+                            Some((li, ci)) => Message::SelectCharacter(li, ci),
+                            None => Message::Back,
+                        },
+                    ));
+                }
+            }
+
+            _ => {}
         }
         None
     }
@@ -159,15 +441,34 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
-        let img_w_f = self.img_w as f32;
-        let img_h_f = self.img_h as f32;
-        let scale = f32::min(bounds.width / img_w_f, bounds.height / img_h_f);
-        let offset_x = (bounds.width - img_w_f * scale) / 2.0;
-        let offset_y = (bounds.height - img_h_f * scale) / 2.0;
+        let (base_scale, base_offset_x, base_offset_y) = self.base_transform(bounds);
+        println!("[Draw] bounds=({:.0},{:.0},{:.0},{:.0}) base_scale={:.3} base_offset=({:.1},{:.1}) total_scale={:.3} total_offset=({:.1},{:.1})",
+            bounds.x, bounds.y, bounds.width, bounds.height, base_scale, base_offset_x, base_offset_y,
+            base_scale * self.current_scale, base_offset_x + self.current_trans_x, base_offset_y + self.current_trans_y);
+        let total_scale = base_scale * self.current_scale;
+        let total_offset_x = base_offset_x + self.current_trans_x;
+        let total_offset_y = base_offset_y + self.current_trans_y;
+
+        // Draw the screenshot image with the same zoom/pan transform
+        if let Some(image) = self.image.as_ref() {
+            let img_w = self.img_w as f32;
+            let img_h = self.img_h as f32;
+            let dest_size = Size::new(img_w * total_scale, img_h * total_scale);
+            let dest_pos = Point::new(total_offset_x, total_offset_y);
+            frame.draw_image(
+                Rectangle::new(dest_pos, dest_size),
+                image,
+            );
+        }
 
         let transform = |bbox: &BoundingBox| -> (Point, Size) {
-            (Point::new(bbox.x as f32 * scale + offset_x, bbox.y as f32 * scale + offset_y),
-             Size::new(bbox.w as f32 * scale, bbox.h as f32 * scale))
+            (Point::new(
+                bbox.x as f32 * total_scale + total_offset_x,
+                bbox.y as f32 * total_scale + total_offset_y,
+            ), Size::new(
+                bbox.w as f32 * total_scale,
+                bbox.h as f32 * total_scale,
+            ))
         };
 
         for (line_idx, annotation) in self.annotations.iter().enumerate() {
@@ -336,11 +637,10 @@ impl OcrViewer {
         self.state.update_highlight_coords(line_idx, char_idx, 1);
         self.state.is_dictionary_visible = true;
 
-        if is_same && !self.alternatives_visible {
-            // Clicking the already-selected character opens alternatives
-            // (only if not already open — closing is handled by Back/Escape
-            // or by clicking the selected alternative)
-            self.alternatives_visible = true;
+        if is_same {
+            // Clicking the already-selected character toggles the
+            // alternatives panel: open if closed, close if open.
+            self.alternatives_visible = !self.alternatives_visible;
         }
         // Always do the lookup for the newly selected character.
         // If alternatives were already open (or just toggled open), they stay
@@ -426,19 +726,22 @@ impl OcrViewer {
             annotations: self.annotations.clone(),
             img_w: self.img_w,
             img_h: self.img_h,
+            image: Some(self.image_handle.clone()),
             panel_visible: has_panel,
             panel_on_right,
             dict_width: 300.0,
             alternatives_visible: self.alternatives_visible,
             cursor_pos: self.state.current_cursor(),
+            current_scale: self.state.current_scale,
+            current_trans_x: self.state.current_trans_x,
+            current_trans_y: self.state.current_trans_y,
         };
 
-        let image = IcedImage::new(self.image_handle.clone()).width(Length::Fill).height(Length::Fill);
+        // The canvas draws both the image and annotations with zoom/pan
         let canvas = Canvas::new(overlay).width(Length::Fill).height(Length::Fill);
-        let image_stack = Stack::new().push(image).push(canvas);
 
         if !has_panel {
-            return Container::new(image_stack).width(Length::Fill).height(Length::Fill).into();
+            return Container::new(canvas).width(Length::Fill).height(Length::Fill).into();
         }
 
         // Build panel components
@@ -541,10 +844,10 @@ impl OcrViewer {
             content_stack = content_stack.push(alt_positioned);
         }
 
-        // Root Stack: image on bottom, content stack on top.
+        // Root Stack: canvas (image + annotations) on bottom, panel content on top.
         Container::new(
             Stack::new()
-                .push(image_stack)
+                .push(canvas)
                 .push(content_stack)
         )
         .width(Length::Fill)
@@ -630,7 +933,7 @@ impl OcrViewer {
                 tag_row = tag_row.push(
                     Container::new(Text::new(tag.clone()).size(9).color(white)
                         .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }))
-                    .padding([4.0, 1.0])
+                    .padding([1.0, 1.0])
                     .style(move |_t: &Theme| container::Style {
                         background: Some(iced::Background::Color(bg)),
                         border: iced::Border { radius: 3.0.into(), ..Default::default() },
@@ -682,16 +985,54 @@ impl OcrViewer {
         let mut content = Column::new().padding(2).spacing(2);
         for line in state {
             for cs in line.chars {
+                let msg = Message::SelectNeighbor(line.line_idx, cs.char_idx);
+                let is_selected = cs.is_selected;
+                let text = cs.text.clone();
+
+                // Use a styled Container + MouseArea instead of Button.
+                // Button captures drag events, preventing the parent Scrollable
+                // from scrolling when the drag starts on a button.
+                // MouseArea with on_release (no on_press) does NOT capture the
+                // press event, so the Scrollable can initiate a scroll gesture.
+                let btn: Element<'a, Message> = Container::new(
+                    Text::new(text)
+                        .size(20)
+                        .align_x(alignment::Horizontal::Center)
+                        .align_y(alignment::Vertical::Center),
+                )
+                .width(Pixels(32.0))
+                .height(Pixels(32.0))
+                .align_x(alignment::Horizontal::Center)
+                .align_y(alignment::Vertical::Center)
+                .style(move |_t: &Theme| {
+                    if is_selected {
+                        container::Style {
+                            background: Some(iced::Background::Color(
+                                Color::from_rgb(0.2, 0.4, 0.8),
+                            )),
+                            border: iced::Border {
+                                radius: 4.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    } else {
+                        container::Style {
+                            background: Some(iced::Background::Color(
+                                Color::from_rgb(0.27, 0.27, 0.27),
+                            )),
+                            border: iced::Border {
+                                radius: 4.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    }
+                })
+                .into();
+
                 content = content.push(
-                    Button::new(
-                        Text::new(cs.text.clone())
-                            .size(20)
-                            .align_x(alignment::Horizontal::Center)
-                    )
-                    .width(Pixels(32.0))
-                    .height(Pixels(32.0))
-                    .style(if cs.is_selected { button::primary } else { button::secondary })
-                    .on_press(Message::SelectNeighbor(line.line_idx, cs.char_idx)),
+                    TapOrDrag::new(btn, msg),
                 );
             }
         }
@@ -726,16 +1067,49 @@ impl OcrViewer {
 
         if let Some(alt_state) = self.state.get_alternatives_ui_state() {
             for c in alt_state.candidates {
+                let msg = Message::SelectAlternative(c.char);
+                let is_selected = c.is_selected;
+                let ch = c.char;
+
+                let btn: Element<'a, Message> = Container::new(
+                    Text::new(ch.to_string())
+                        .size(20)
+                        .align_x(alignment::Horizontal::Center)
+                        .align_y(alignment::Vertical::Center),
+                )
+                .width(Pixels(32.0))
+                .height(Pixels(32.0))
+                .align_x(alignment::Horizontal::Center)
+                .align_y(alignment::Vertical::Center)
+                .style(move |_t: &Theme| {
+                    if is_selected {
+                        container::Style {
+                            background: Some(iced::Background::Color(
+                                Color::from_rgb(0.2, 0.4, 0.8),
+                            )),
+                            border: iced::Border {
+                                radius: 4.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    } else {
+                        container::Style {
+                            background: Some(iced::Background::Color(
+                                Color::from_rgb(0.27, 0.27, 0.27),
+                            )),
+                            border: iced::Border {
+                                radius: 4.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    }
+                })
+                .into();
+
                 content = content.push(
-                    Button::new(
-                        Text::new(c.char.to_string())
-                            .size(20)
-                            .align_x(alignment::Horizontal::Center)
-                    )
-                    .width(Pixels(32.0))
-                    .height(Pixels(32.0))
-                    .style(if c.is_selected { button::primary } else { button::secondary })
-                    .on_press(Message::SelectAlternative(c.char)),
+                    TapOrDrag::new(btn, msg),
                 );
             }
         }
@@ -749,5 +1123,229 @@ impl OcrViewer {
         .height(Length::Fill)
         .padding(2)
         .style(container::rounded_box)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TapOrDrag — fires tap only if pointer didn't move between press and release
+// ---------------------------------------------------------------------------
+
+use iced::advanced::widget::tree::{self, Tree};
+use iced::advanced::{self, layout, Layout, Widget};
+use iced::advanced::widget::Operation;
+use iced::advanced::Clipboard;
+
+/// A widget that distinguishes taps from drags.
+/// Only fires `on_tap` if the pointer moved less than the threshold
+/// between press and release. This allows the parent Scrollable to
+/// handle drag-to-scroll while still supporting tap-to-activate.
+pub struct TapOrDrag<'a, Message> {
+    content: Element<'a, Message>,
+    on_tap: Message,
+    threshold: f32,
+}
+
+impl<'a, Message: Clone> TapOrDrag<'a, Message> {
+    pub fn new(content: impl Into<Element<'a, Message>>, on_tap: Message) -> Self {
+        Self {
+            content: content.into(),
+            on_tap,
+            threshold: 5.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TapState {
+    pressed: bool,
+    start_x: f32,
+    start_y: f32,
+    is_tap: bool,
+    /// Accumulated movement distance since press.
+    accumulated: f32,
+}
+
+impl<'a, Message: Clone + 'static> Widget<Message, Theme, Renderer> for TapOrDrag<'a, Message> {
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &iced::advanced::layout::Limits,
+    ) -> iced::advanced::layout::Node {
+        self.content.as_widget_mut().layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &iced::advanced::renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<TapState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(TapState::default())
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &iced::Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut advanced::Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let state = tree.state.downcast_mut::<TapState>();
+
+        match event {
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if cursor.position_over(layout.bounds()).is_some() {
+                    state.pressed = true;
+                    // Use the actual cursor position, not clamped to bounds
+                    if let Some(pos) = cursor.position() {
+                        state.start_x = pos.x;
+                        state.start_y = pos.y;
+                    }
+                    state.accumulated = 0.0;
+                    state.is_tap = true;
+                }
+            }
+            iced::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if state.pressed {
+                    if let Some(pos) = cursor.position() {
+                        let dx = pos.x - state.start_x;
+                        let dy = pos.y - state.start_y;
+                        state.accumulated += (dx * dx + dy * dy).sqrt();
+                        if state.accumulated > self.threshold {
+                            state.is_tap = false;
+                        }
+                    }
+                }
+            }
+            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                let was_tap = state.is_tap;
+                state.pressed = false;
+                state.is_tap = false;
+                state.accumulated = 0.0;
+                if was_tap {
+                    shell.publish(self.on_tap.clone());
+                }
+            }
+            iced::Event::Touch(touch::Event::FingerPressed { .. }) => {
+                if cursor.position_over(layout.bounds()).is_some() {
+                    state.pressed = true;
+                    if let Some(pos) = cursor.position() {
+                        state.start_x = pos.x;
+                        state.start_y = pos.y;
+                    }
+                    state.accumulated = 0.0;
+                    state.is_tap = true;
+                }
+            }
+            iced::Event::Touch(touch::Event::FingerMoved { .. }) => {
+                if state.pressed {
+                    if let Some(pos) = cursor.position() {
+                        let dx = pos.x - state.start_x;
+                        let dy = pos.y - state.start_y;
+                        state.accumulated += (dx * dx + dy * dy).sqrt();
+                        if state.accumulated > self.threshold {
+                            state.is_tap = false;
+                        }
+                    }
+                }
+            }
+            iced::Event::Touch(touch::Event::FingerLifted { .. }) => {
+                let was_tap = state.is_tap;
+                state.pressed = false;
+                state.is_tap = false;
+                state.accumulated = 0.0;
+                if was_tap {
+                    shell.publish(self.on_tap.clone());
+                }
+            }
+            _ => {}
+        }
+
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+}
+
+impl<'a, Message: Clone + 'static> From<TapOrDrag<'a, Message>> for Element<'a, Message> {
+    fn from(widget: TapOrDrag<'a, Message>) -> Self {
+        Element::new(widget)
     }
 }
