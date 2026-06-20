@@ -285,22 +285,10 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
 
             // --- Touch: finger pressed ---
             iced::Event::Touch(touch::Event::FingerPressed { id, position }) => {
-                if state.is_panning {
-                    // Second finger — switch to pinch zoom mode
-                    state.pinch_finger2 = Some((*id, *position));
-                    // Compute initial distance and midpoint
-                    if let Some((_, f1_pos)) = state.pinch_finger1 {
-                        let dx = position.x - f1_pos.x;
-                        let dy = position.y - f1_pos.y;
-                        state.pinch_prev_dist = (dx * dx + dy * dy).sqrt().max(10.0);
-                        // Initialize prev_focus to the current midpoint
-                        state.pinch_prev_focus_x = (f1_pos.x + position.x) / 2.0;
-                        state.pinch_prev_focus_y = (f1_pos.y + position.y) / 2.0;
-                    }
-                    state.is_tap = false;
-                    state.drag_started = true;
-                } else if !over_panel {
-                    // First finger — start pan (only if not over panel)
+                let already_tracking = state.pinch_finger1.is_some() || state.pinch_finger2.is_some();
+
+                if !already_tracking && !over_panel {
+                    // First finger — start pan
                     state.is_panning = true;
                     state.pinch_finger1 = Some((*id, *position));
                     state.start_x = position.x;
@@ -315,14 +303,28 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                     state.drag_started = false;
                     state.pinch_finger2 = None;
                     state.pinch_prev_dist = 0.0;
+                } else if already_tracking && state.pinch_finger1.is_some() && state.pinch_finger2.is_none() {
+                    // Second finger — switch to pinch zoom mode
+                    state.pinch_finger2 = Some((*id, *position));
+                    // Compute initial distance and midpoint
+                    if let Some((_, f1_pos)) = state.pinch_finger1 {
+                        let dx = position.x - f1_pos.x;
+                        let dy = position.y - f1_pos.y;
+                        state.pinch_prev_dist = (dx * dx + dy * dy).sqrt().max(10.0);
+                        state.pinch_prev_focus_x = (f1_pos.x + position.x) / 2.0;
+                        state.pinch_prev_focus_y = (f1_pos.y + position.y) / 2.0;
+                    }
+                    state.is_tap = false;
+                    state.drag_started = true;
                 }
+                // Third and subsequent fingers — ignore entirely
                 return None;
             }
 
             // --- Touch: finger moved (pan or pinch) ---
             iced::Event::Touch(touch::Event::FingerMoved { id, position }) => {
                 if state.is_panning {
-                    // Update the stored position for this finger
+                    // Only update positions for our two tracked fingers — ignore any others
                     if let Some((fid, _)) = state.pinch_finger1 {
                         if fid == *id { state.pinch_finger1 = Some((*id, *position)); }
                     }
@@ -389,17 +391,24 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
 
             // --- Touch: finger lifted (pan end) — detect taps ---
             iced::Event::Touch(touch::Event::FingerLifted { id, position }) => {
-                // Check if we were in pinch zoom before removing the finger
+                // Only process lifts for our two tracked fingers
+                let tracked_f1 = state.pinch_finger1.map(|(fid, _)| fid) == Some(*id);
+                let tracked_f2 = state.pinch_finger2.map(|(fid, _)| fid) == Some(*id);
+
+                if !tracked_f1 && !tracked_f2 {
+                    // Unknown finger (3rd+) — ignore entirely
+                    return None;
+                }
+
                 let was_pinch = state.pinch_finger2.is_some();
 
                 // Remove the lifted finger from tracking
-                if let Some((fid, _)) = state.pinch_finger1 {
-                    if fid == *id { state.pinch_finger1 = None; }
-                }
-                if let Some((fid, _)) = state.pinch_finger2 {
-                    if fid == *id { state.pinch_finger2 = None; }
-                }
+                if tracked_f1 { state.pinch_finger1 = None; }
+                if tracked_f2 { state.pinch_finger2 = None; }
 
+                // If either tracked finger lifted, end the gesture entirely.
+                // Don't try to continue pinch/pan with remaining fingers — this
+                // prevents flickering when 3+ fingers are involved.
                 let was_tap = state.is_tap;
                 state.is_panning = false;
                 state.is_tap = false;
@@ -410,7 +419,6 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 state.pinch_prev_focus_x = 0.0;
                 state.pinch_prev_focus_y = 0.0;
 
-                // If we were in pinch zoom, notify the app so it can re-enable annotations
                 if was_pinch {
                     return Some(iced::widget::Action::publish(Message::PinchEnd));
                 }
