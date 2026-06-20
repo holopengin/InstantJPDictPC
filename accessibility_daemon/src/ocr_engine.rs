@@ -5,6 +5,7 @@ use ort::value::Tensor;
 use rayon::prelude::*;
 use rusttype::{point, Font, Scale};
 use std::path::Path;
+use std::time::Instant;
 
 use crate::models::*;
 use crate::ocr_parallel;
@@ -36,8 +37,8 @@ const MEIKI_SWAPPED_PAIRS: &[(&str, &str); 8] = &[
 
 pub struct OcrEngine {
     detect_session: Session,
-    recognize_session: Session,
-    recognize_session_vertical: Session,
+    recognize_session: std::sync::Arc<std::sync::Mutex<Session>>,
+    recognize_session_vertical: std::sync::Arc<std::sync::Mutex<Session>>,
     pub char_vocab: Vec<i64>,
     model_dir: String,
 }
@@ -64,8 +65,8 @@ impl OcrEngine {
 
         Ok(OcrEngine {
             detect_session,
-            recognize_session,
-            recognize_session_vertical,
+            recognize_session: std::sync::Arc::new(std::sync::Mutex::new(recognize_session)),
+            recognize_session_vertical: std::sync::Arc::new(std::sync::Mutex::new(recognize_session_vertical)),
             char_vocab: vocab_json,
             model_dir: model_dir.to_string(),
         })
@@ -491,10 +492,10 @@ impl OcrEngine {
         // Run the session and extract outputs inside a limited scope to avoid holding a mutable borrow on self
         let (labels_arr_opt, boxes_arr_opt, scores_arr_opt, indices_arr_opt, raw_logits_opt) = {
             // Build inputs
-            let active_session = if is_vertical {
-                &mut self.recognize_session_vertical
+            let mut active_session = if is_vertical {
+                self.recognize_session_vertical.lock().unwrap()
             } else {
-                &mut self.recognize_session
+                self.recognize_session.lock().unwrap()
             };
             let session_input_names: Vec<String> = active_session
                 .inputs()
@@ -1049,9 +1050,19 @@ impl OcrEngine {
         render: bool,
         font_path: Option<&str>,
     ) -> Result<(Vec<DetectedAnnotation>, Option<RgbaImage>)> {
+        let t_total = Instant::now();
+
+        // --- Line detection ---
+        let t_detect = Instant::now();
         let boxes = self.detect(image)?;
+        let detect_ms = t_detect.elapsed().as_secs_f64() * 1000.0;
+        println!("[OCR timing] Line detection:       {:>8.2} ms", detect_ms);
+
+        let t_merge = Instant::now();
         let merged = self.merge_overlapping_boxes(boxes);
         let sorted = self.sort_detected_boxes(merged);
+        let merge_ms = t_merge.elapsed().as_secs_f64() * 1000.0;
+        println!("[OCR timing] Merge/sort boxes:     {:>8.2} ms", merge_ms);
 
         println!("Detected {} bounding boxes.", sorted.len());
         for (i, bbox) in sorted.iter().enumerate() {
@@ -1062,14 +1073,31 @@ impl OcrEngine {
             );
         }
 
-        // Run recognition for each detected box in parallel so the GUI can overlay recognized text.
-        // Each parallel worker creates its own ONNX sessions from the model files to avoid borrow issues.
-        let model_dir = self.model_dir.clone();
+        // --- Character recognition ---
+        let t_recognize = Instant::now();
+        // Clone the Arc handles so each parallel worker gets a reference
+        // to the same underlying sessions — no model reloading per box.
+        let rec_session = self.recognize_session.clone();
+        let rec_session_vert = self.recognize_session_vertical.clone();
         let char_vocab = self.char_vocab.clone();
         let annotations: Vec<DetectedAnnotation> = sorted
             .par_iter()
-            .map(|bbox| {
-                match ocr_parallel::recognize_single_line_static(&model_dir, &char_vocab, image, bbox) {
+            .enumerate()
+            .map(|(i, bbox)| {
+                let t_box = Instant::now();
+                let result = ocr_parallel::recognize_single_line_with_sessions(
+                    &rec_session,
+                    &rec_session_vert,
+                    &char_vocab,
+                    image,
+                    bbox,
+                );
+                let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "[OCR timing]   Box {:>3} ({}x{} @ {},{}): {:>8.2} ms",
+                    i, bbox.w, bbox.h, bbox.x, bbox.y, box_ms
+                );
+                match result {
                     Ok(opt) => DetectedAnnotation {
                         bbox: bbox.clone(),
                         line: opt,
@@ -1087,6 +1115,11 @@ impl OcrEngine {
                 }
             })
             .collect();
+        let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "[OCR timing] Character recognition: {:>8.2} ms  ({} boxes, parallel)",
+            recognize_ms, sorted.len()
+        );
 
         // Prepare font if rendering and path provided or defaults
         let mut font_opt: Option<Font<'static>> = None;
@@ -1124,6 +1157,7 @@ impl OcrEngine {
             }
         }
 
+        let t_render = Instant::now();
         if render {
             // Render detected boxes onto the image in-memory and return the annotated image
             let mut img_rgba = image.to_rgba8();
@@ -1406,8 +1440,18 @@ impl OcrEngine {
             }
 
             // Return the annotated image as well as the annotations
+            let render_ms = t_render.elapsed().as_secs_f64() * 1000.0;
+            println!("[OCR timing] Rendering:            {:>8.2} ms", render_ms);
+            let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+            println!("[OCR timing] ─────────────────────────────────────");
+            println!("[OCR timing] TOTAL:                {:>8.2} ms", total_ms);
             return Ok((annotations, Some(img_rgba)));
         } else {
+            let render_ms = t_render.elapsed().as_secs_f64() * 1000.0;
+            println!("[OCR timing] Rendering:            {:>8.2} ms (skipped)", render_ms);
+            let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+            println!("[OCR timing] ─────────────────────────────────────");
+            println!("[OCR timing] TOTAL:                {:>8.2} ms", total_ms);
             println!("Render disabled; returning annotations without a baked image.");
             return Ok((annotations, None));
         }
