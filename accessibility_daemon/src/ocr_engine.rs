@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use ort::session::Session;
 use ort::value::Tensor;
+use rayon::prelude::*;
 use rusttype::{point, Font, Scale};
 use std::path::Path;
 
 use crate::models::*;
+use crate::ocr_parallel;
 
 // Constants matching the Kotlin implementation
 const DETECT_WIDTH: u32 = 960;
@@ -34,6 +36,7 @@ pub struct OcrEngine {
     recognize_session: Session,
     recognize_session_vertical: Session,
     pub char_vocab: Vec<i64>,
+    model_dir: String,
 }
 
 impl OcrEngine {
@@ -61,6 +64,7 @@ impl OcrEngine {
             recognize_session,
             recognize_session_vertical,
             char_vocab: vocab_json,
+            model_dir: model_dir.to_string(),
         })
     }
 
@@ -1024,6 +1028,17 @@ impl OcrEngine {
         intersection / h1.min(h2)
     }
 
+    /// Static version of recognize_single_line that creates its own ONNX sessions.
+    /// Used for parallel recognition where each thread needs its own session.
+    fn recognize_single_line_static(
+        model_dir: &str,
+        char_vocab: &[i64],
+        image: &DynamicImage,
+        bbox: &BoundingBox,
+    ) -> Result<Option<LineResult>> {
+        ocr_parallel::recognize_single_line_static(model_dir, char_vocab, image, bbox)
+    }
+
     // Modified: return the annotated image in-memory when `render` is true
     pub fn run_detection(
         &mut self,
@@ -1044,26 +1059,31 @@ impl OcrEngine {
             );
         }
 
-        // Run recognition for each detected box so the GUI can overlay recognized text.
-        let mut annotations: Vec<DetectedAnnotation> = Vec::new();
-        for bbox in sorted.iter() {
-            match self.recognize_single_line(image, bbox) {
-                Ok(opt) => annotations.push(DetectedAnnotation {
-                    bbox: bbox.clone(),
-                    line: opt,
-                }),
-                Err(e) => {
-                    println!(
-                        "Recognition failed for box at x={},y={}: {:?}",
-                        bbox.x, bbox.y, e
-                    );
-                    annotations.push(DetectedAnnotation {
+        // Run recognition for each detected box in parallel so the GUI can overlay recognized text.
+        // Each parallel worker creates its own ONNX sessions from the model files to avoid borrow issues.
+        let model_dir = self.model_dir.clone();
+        let char_vocab = self.char_vocab.clone();
+        let annotations: Vec<DetectedAnnotation> = sorted
+            .par_iter()
+            .map(|bbox| {
+                match ocr_parallel::recognize_single_line_static(&model_dir, &char_vocab, image, bbox) {
+                    Ok(opt) => DetectedAnnotation {
                         bbox: bbox.clone(),
-                        line: None,
-                    });
+                        line: opt,
+                    },
+                    Err(e) => {
+                        println!(
+                            "Recognition failed for box at x={},y={}: {:?}",
+                            bbox.x, bbox.y, e
+                        );
+                        DetectedAnnotation {
+                            bbox: bbox.clone(),
+                            line: None,
+                        }
+                    }
                 }
-            }
-        }
+            })
+            .collect();
 
         // Prepare font if rendering and path provided or defaults
         let mut font_opt: Option<Font<'static>> = None;

@@ -33,6 +33,7 @@ dependencies = [
  "ndarray 0.15.6",
  "open",
  "ort",
+ "rayon",
  "rfd",
  "rusqlite",
  "rusttype",
@@ -1858,6 +1859,7 @@ dependencies = [
  "iced_core",
  "log",
  "rustc-hash 2.1.2",
+ "tokio",
  "wasm-bindgen-futures",
  "wasmtimer",
 ]
