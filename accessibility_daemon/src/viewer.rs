@@ -587,6 +587,9 @@ pub struct OcrViewer {
     pub is_zooming: bool,
     /// Frames since last zoom/pan event — used to re-enable annotations after zoom ends.
     pub zoom_idle_frames: u32,
+    /// Cached character preview image for the alternatives panel.
+    /// Stores (line_idx, char_idx, handle) so we only regenerate when the selection changes.
+    cached_preview: RefCell<Option<(usize, usize, iced::widget::image::Handle)>>,
 }
 
 impl OcrViewer {
@@ -603,7 +606,7 @@ impl OcrViewer {
         let line_results = annotations.iter().map(|a| a.line.clone()).collect::<Vec<_>>();
         state.set_line_results(line_results);
         state.ensure_cursor_position();
-        Self { image_handle, image_bytes, decoded_image: RefCell::new(None), img_w, img_h, annotations: Rc::new(annotations), state, selected_word: None, alternatives_visible: false, db, deinflector, scroll_neighbor_to: None, scroll_alt_to: None, is_zooming: false, zoom_idle_frames: 0 }
+        Self { image_handle, image_bytes, decoded_image: RefCell::new(None), img_w, img_h, annotations: Rc::new(annotations), state, selected_word: None, alternatives_visible: false, db, deinflector, scroll_neighbor_to: None, scroll_alt_to: None, is_zooming: false, zoom_idle_frames: 0, cached_preview: RefCell::new(None) }
     }
 
     /// Crop the screenshot to show the given character with padding.
@@ -787,9 +790,17 @@ impl OcrViewer {
         });
         let neigh_panel = self.neighbor_panel();
 
-        // Crop the character preview image from the screenshot
+        // Crop the character preview image from the screenshot (cached per selection)
         let preview_image = self.selected_word.as_ref().and_then(|sw| {
-            self.crop_character_image(sw.line_idx, sw.char_idx)
+            let mut cache = self.cached_preview.borrow_mut();
+            if let Some((cached_li, cached_ci, handle)) = cache.as_ref() {
+                if *cached_li == sw.line_idx && *cached_ci == sw.char_idx {
+                    return Some(handle.clone());
+                }
+            }
+            let handle = self.crop_character_image(sw.line_idx, sw.char_idx)?;
+            *cache = Some((sw.line_idx, sw.char_idx, handle.clone()));
+            Some(handle)
         });
         let alt_panel = self.alternatives_panel(preview_image.as_ref());
 

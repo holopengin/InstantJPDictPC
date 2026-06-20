@@ -314,7 +314,7 @@ fn run_ocr_viewer(
             );
 
             // Periodic timer to detect when scroll-wheel zoom has stopped
-            let zoom_timer = iced::time::every(iced::time::Duration::from_millis(20))
+            let zoom_timer = iced::time::every(iced::time::Duration::from_millis(30))
                 .map(|_| Message::ZoomTick);
 
             iced_futures::Subscription::batch(vec![global_events, zoom_timer])
