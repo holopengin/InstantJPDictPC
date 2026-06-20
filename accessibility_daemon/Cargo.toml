@@ -23,7 +23,7 @@ anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 
 # GUI: Iced for displaying the annotated image
-iced = { version= "0.14.0", features = ["image", "canvas"] }
+iced = { version= "0.14.0", features = ["image", "canvas", "advanced"] }
 iced_futures = "0.14.0"
 
 # Database: SQLite for dictionary storage

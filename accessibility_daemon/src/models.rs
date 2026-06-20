@@ -124,6 +124,22 @@ pub enum DefinitionNode {
     Text(String),
     Ruby { term: String, reading: String, is_mini: bool },
     Tag { text: String, category: String },
+    Example {
+        japanese: Option<String>,
+        english: Option<String>,
+        content: Option<Vec<DefinitionNode>>,
+    },
+    ListBlock {
+        items: Vec<Vec<DefinitionNode>>,
+        block_type: Option<String>,
+    },
+    Table {
+        rows: Vec<Vec<Vec<DefinitionNode>>>,
+    },
+    Group {
+        nodes: Vec<DefinitionNode>,
+        is_inline: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -167,7 +183,8 @@ pub struct FormattedEntry {
 #[derive(Debug, Clone)]
 pub enum Message {
     SelectCharacter(usize, usize),
+    SelectNeighbor(usize, usize),
     SelectAlternative(char),
-    ToggleAlternatives,
     Back,
+    Navigate(GamepadAction),
 }

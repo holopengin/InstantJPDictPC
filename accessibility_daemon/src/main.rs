@@ -141,24 +141,57 @@ fn run_ocr_viewer(
             Message::SelectCharacter(line_idx, char_idx) => {
                 state.select_character(line_idx, char_idx);
             }
+            Message::SelectNeighbor(line_idx, char_idx) => {
+                state.select_neighbor(line_idx, char_idx);
+            }
             Message::SelectAlternative(new_char) => {
                 if let Some(selected) = state.selected_word.as_ref() {
-                    state
-                        .state
-                        .update_character(selected.line_idx, selected.char_idx, new_char);
-                    state.select_character(selected.line_idx, selected.char_idx);
+                    let current_char = state.state.active_line_results
+                        .get(selected.line_idx)
+                        .and_then(|l| l.as_ref())
+                        .and_then(|line| line.text.chars().nth(selected.char_idx));
+                    if current_char == Some(new_char) {
+                        state.alternatives_visible = false;
+                    } else {
+                        state.state.update_character(selected.line_idx, selected.char_idx, new_char);
+                        let _ = state.state.lookup(selected.line_idx, selected.char_idx, &state.db, &state.deinflector);
+                    }
                 }
             }
-            Message::ToggleAlternatives => {
-                state.alternatives_visible = !state.alternatives_visible;
+            Message::Navigate(action) => {
+                let (root_width, root_height) = (800.0_f32, 480.0_f32);
+                state.state.navigate(action, root_width, root_height);
+                if let Some((line_idx, char_idx)) = state.state.current_cursor() {
+                    state.select_character(line_idx, char_idx);
+                }
             }
             Message::Back => {
-                state.selected_word = None;
-                state.alternatives_visible = false;
-                state.state.is_dictionary_visible = false;
+                if state.alternatives_visible {
+                    state.alternatives_visible = false;
+                } else if state.selected_word.is_some() {
+                    state.selected_word = None;
+                    state.state.is_dictionary_visible = false;
+                } else {
+                    println!("[App] Back with no selection — exiting");
+                    std::process::exit(0);
+                }
             }
         }
-        iced::Task::none()
+
+        // Return scroll tasks to auto-scroll neighbor/alt panels to the selected character
+        let mut tasks = Vec::new();
+        // Auto-scroll to selected character (only on initial select)
+        if let Some(task) = state.scroll_neighbor_task() {
+            tasks.push(task);
+        }
+        if let Some(task) = state.scroll_alt_task() {
+            tasks.push(task);
+        }
+        if tasks.is_empty() {
+            iced::Task::none()
+        } else {
+            iced::Task::batch(tasks)
+        }
     };
 
     let view = OcrViewer::view;
@@ -176,10 +209,37 @@ fn run_ocr_viewer(
                             println!("[Subscription] KeyPressed: {:?}", key);
                             if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) {
                                 println!("[Subscription] Escape -> Back");
-                                Some(Message::Back)
+                                return Some(Message::Back);
+                            }
+                            if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) {
+                                println!("[Subscription] Enter -> Confirm (SelectCharacter)");
+                                return Some(Message::SelectCharacter(0, 0));
+                            }
+                            // Arrow keys and hjkl navigation
+                            let action = if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight)
+                                || key == &iced::keyboard::Key::Character("l".into())
+                            {
+                                Some(GamepadAction::NavigateRight)
+                            } else if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft)
+                                || key == &iced::keyboard::Key::Character("h".into())
+                            {
+                                Some(GamepadAction::NavigateLeft)
+                            } else if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown)
+                                || key == &iced::keyboard::Key::Character("j".into())
+                            {
+                                Some(GamepadAction::NavigateDown)
+                            } else if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp)
+                                || key == &iced::keyboard::Key::Character("k".into())
+                            {
+                                Some(GamepadAction::NavigateUp)
                             } else {
                                 None
+                            };
+                            if let Some(nav_action) = action {
+                                println!("[Subscription] Navigation {:?}", nav_action);
+                                return Some(Message::Navigate(nav_action));
                             }
+                            None
                         }
                         iced_futures::subscription::Event::Interaction {
                             event: iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Right)),
