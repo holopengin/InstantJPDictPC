@@ -299,7 +299,7 @@ impl OcrOverlayState {
     pub fn panel_dimensions(&self, root_width: f32, root_height: f32) -> (f32, f32) {
         let is_landscape = root_width > root_height;
         let panel_width = if is_landscape {
-            root_width * 0.4
+            (root_width * 0.4).min(500.0)
         } else {
             root_width
         };
@@ -446,6 +446,10 @@ impl OcrOverlayState {
             self.process_results(&db_results, &candidates_by_length, &all_terms_vec, &following_text);
 
         if matches.is_empty() {
+            // No results — clear the cached entries so the UI shows "no results"
+            self.cached_entries.clear();
+            self.current_word_length = 0;
+            self.cached_lookup_term = following_text;
             return None;
         }
 
@@ -613,8 +617,14 @@ impl OcrOverlayState {
                         .map(|e| e.onyomi.is_some() || e.kunyomi.is_some())
                         .unwrap_or(false);
 
-                    let kanji_variants: Vec<String> =
-                        reading_entries.iter().map(|e| e.kanji.clone()).collect();
+                    let kanji_variants: Vec<String> = {
+                        let mut seen = HashSet::new();
+                        reading_entries
+                            .iter()
+                            .map(|e| e.kanji.clone())
+                            .filter(|k| seen.insert(k.clone()))
+                            .collect()
+                    };
 
                     let headwords: Vec<FormattedHeadword> = kanji_variants
                         .iter()
@@ -650,19 +660,24 @@ impl OcrOverlayState {
                             }
                         }
 
-                        for segment in e.rules.split(" | ") {
-                            let mut current_sense: Option<usize> = None;
-                            for tag in segment.split_whitespace() {
-                                if let Ok(n) = tag.parse::<usize>() {
-                                    current_sense = Some(n);
-                                } else if !tag.starts_with("grade:") {
-                                    if let Some(sense) = current_sense {
-                                        sense_tags_map
-                                            .entry(sense)
-                                            .or_default()
-                                            .push(tag.to_string());
-                                    } else {
-                                        meta_tags.push(tag.to_string());
+                        // Parse only the first and third segments (" | "-separated),
+                        // matching the Kotlin reference behaviour.
+                        let segments: Vec<&str> = e.rules.split(" | ").collect();
+                        for segment_idx in [0usize, 2] {
+                            if let Some(segment) = segments.get(segment_idx) {
+                                let mut current_sense: Option<usize> = None;
+                                for tag in segment.split_whitespace() {
+                                    if let Ok(n) = tag.parse::<usize>() {
+                                        current_sense = Some(n);
+                                    } else if !tag.starts_with("grade:") {
+                                        if let Some(sense) = current_sense {
+                                            sense_tags_map
+                                                .entry(sense)
+                                                .or_default()
+                                                .push(tag.to_string());
+                                        } else {
+                                            meta_tags.push(tag.to_string());
+                                        }
                                     }
                                 }
                             }
@@ -670,10 +685,13 @@ impl OcrOverlayState {
 
                         let sense_idx = global_sense_num;
                         global_sense_num += 1;
-                        let tags: Vec<String> =
+                        let tags: Vec<String> = {
+                            let mut seen = HashSet::new();
                             meta_tags.clone().into_iter().chain(
                                 sense_tags_map.get(&1).cloned().unwrap_or_default()
-                            ).collect::<Vec<_>>();
+                            ).filter(|t| seen.insert(t.clone()))
+                                .collect()
+                        };
 
                         let nodes = Self::parse_definition(&definitions_list);
 
@@ -764,14 +782,14 @@ impl OcrOverlayState {
                 }
             }
             serde_json::Value::Array(arr) => {
-                for (idx, item) in arr.iter().enumerate() {
+                for item in arr {
                     let item_nodes = {
                         let mut sub = Vec::new();
                         Self::parse_definition_item(item, in_example, &mut sub);
                         sub
                     };
                     if !item_nodes.is_empty() {
-                        if !nodes.is_empty() && idx > 0 {
+                        if !nodes.is_empty() && !Self::is_block(item) {
                             let last = nodes.last().unwrap();
                             let first = item_nodes.first().unwrap();
                             if Self::is_inline_node(last) && Self::is_inline_node(first) {
@@ -800,15 +818,23 @@ impl OcrOverlayState {
                         .get("japanese")
                         .and_then(|v| v.as_str())
                         .or_else(|| content.and_then(|v| v.as_str()));
-                    let _en = map.get("english").and_then(|v| v.as_str());
-                    if jp.is_some() {
-                        // Example with direct text — skip for now (would need Example variant)
+                    let en = map.get("english").and_then(|v| v.as_str());
+                    if let Some(jp_str) = jp {
+                        nodes.push(DefinitionNode::Example {
+                            japanese: Some(jp_str.to_string()),
+                            english: en.map(|s| s.to_string()),
+                            content: None,
+                        });
                     } else {
                         let mut sub = Vec::new();
                         if let Some(c) = content {
                             Self::parse_definition_item(c, true, &mut sub);
                         }
-                        nodes.extend(sub);
+                        nodes.push(DefinitionNode::Example {
+                            japanese: None,
+                            english: en.map(|s| s.to_string()),
+                            content: Some(sub),
+                        });
                     }
                 } else if sc_class.as_deref() == Some("tag")
                     || (tag == Some("span") && sc_content.as_deref().map_or(false, |s| s.ends_with("-info")))
@@ -837,7 +863,7 @@ impl OcrOverlayState {
                         }
                     }
                 } else if tag == Some("table") {
-                    // Table placeholder — skip for now
+                    nodes.push(DefinitionNode::Table { rows: Vec::new() });
                 } else if tag == Some("ul") || tag == Some("ol") {
                     let is_inline_list = matches!(
                         sc_content.as_deref(),
@@ -848,7 +874,21 @@ impl OcrOverlayState {
                             Self::parse_definition_item(c, in_example, nodes);
                         }
                     } else {
-                        // Block list — skip for now
+                        let items: Vec<Vec<DefinitionNode>> = match content {
+                            Some(serde_json::Value::Array(arr)) => arr
+                                .iter()
+                                .map(|item| {
+                                    let mut sub = Vec::new();
+                                    Self::parse_definition_item(item, in_example, &mut sub);
+                                    sub
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        nodes.push(DefinitionNode::ListBlock {
+                            items,
+                            block_type: sc_content.clone(),
+                        });
                     }
                 } else if let Some(c) = content {
                     Self::parse_definition_item(c, in_example, nodes);
@@ -883,7 +923,42 @@ impl OcrOverlayState {
     fn is_inline_node(node: &DefinitionNode) -> bool {
         matches!(
             node,
-            DefinitionNode::Text(_) | DefinitionNode::Ruby { .. } | DefinitionNode::Tag { .. }
+            DefinitionNode::Text(_)
+                | DefinitionNode::Ruby { .. }
+                | DefinitionNode::Tag { .. }
         )
+    }
+
+    /// Check whether a JSON value represents a block-level element (as opposed to
+    /// inline).  Mirrors the Kotlin `isBlock` helper: structural elements like
+    /// tables and non-glossary lists are blocks, as are example containers.
+    fn is_block(data: &serde_json::Value) -> bool {
+        match data {
+            serde_json::Value::Array(arr) => arr.iter().any(|item| Self::is_block(item)),
+            serde_json::Value::Object(map) => {
+                if Self::is_example(map) {
+                    return true;
+                }
+                let content = map.get("content").or_else(|| map.get("list"));
+                if let Some(c) = content {
+                    if Self::is_block(c) {
+                        return true;
+                    }
+                }
+                let tag = map.get("tag").and_then(|v| v.as_str());
+                let sc_content = Self::get_attr(map, "content");
+                tag == Some("table")
+                    || (tag == Some("ul") || tag == Some("ol"))
+                        && !matches!(
+                            sc_content.as_deref(),
+                            Some("glossary")
+                                | Some("infoGlossary")
+                                | Some("sourceLanguages")
+                                | Some("info-gloss")
+                                | Some("sense-note")
+                        )
+            }
+            _ => false,
+        }
     }
 }
