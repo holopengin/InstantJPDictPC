@@ -127,6 +127,7 @@ fn run_ocr_viewer(
         move || {
             OcrViewer::new(
                 iced::widget::image::Handle::from_bytes(bytes_arc.as_ref().clone()),
+                bytes_arc.as_ref().clone(),
                 w,
                 h,
                 annotations.clone(),

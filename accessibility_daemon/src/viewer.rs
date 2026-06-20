@@ -244,6 +244,8 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
 
 pub struct OcrViewer {
     pub image_handle: iced::widget::image::Handle,
+    /// Raw PNG bytes of the original screenshot, used for cropping character previews.
+    image_bytes: Vec<u8>,
     pub img_w: u32,
     pub img_h: u32,
     pub annotations: Vec<DetectedAnnotation>,
@@ -261,6 +263,7 @@ pub struct OcrViewer {
 impl OcrViewer {
     pub fn new(
         image_handle: iced::widget::image::Handle,
+        image_bytes: Vec<u8>,
         img_w: u32,
         img_h: u32,
         annotations: Vec<DetectedAnnotation>,
@@ -271,7 +274,35 @@ impl OcrViewer {
         let line_results = annotations.iter().map(|a| a.line.clone()).collect::<Vec<_>>();
         state.set_line_results(line_results);
         state.ensure_cursor_position();
-        Self { image_handle, img_w, img_h, annotations, state, selected_word: None, alternatives_visible: false, db, deinflector, scroll_neighbor_to: None, scroll_alt_to: None }
+        Self { image_handle, image_bytes, img_w, img_h, annotations, state, selected_word: None, alternatives_visible: false, db, deinflector, scroll_neighbor_to: None, scroll_alt_to: None }
+    }
+
+    /// Crop the screenshot to show the given character with padding.
+    /// Returns an image Handle for the cropped region.
+    pub fn crop_character_image(&self, line_idx: usize, char_idx: usize) -> Option<iced::widget::image::Handle> {
+        let line = self.state.active_line_results.get(line_idx).and_then(|l| l.as_ref())?;
+        let box_item = line.char_boxes.get(char_idx)?;
+
+        // Decode the original image
+        let img = image::load_from_memory(&self.image_bytes).ok()?;
+        let (img_w, img_h) = (img.width() as i32, img.height() as i32);
+
+        // Calculate crop rect with 20% padding
+        let pad = (box_item.h as f32 * 0.2) as i32;
+        let crop_left = (box_item.left() - pad).max(0);
+        let crop_top = (box_item.top() - pad).max(0);
+        let crop_right = (box_item.right() + pad).min(img_w);
+        let crop_bottom = (box_item.bottom() + pad).min(img_h);
+        let crop_w = (crop_right - crop_left).max(1) as u32;
+        let crop_h = (crop_bottom - crop_top).max(1) as u32;
+
+        // Crop and encode to PNG
+        let cropped = img.crop_imm(crop_left as u32, crop_top as u32, crop_w, crop_h);
+        let mut buf = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut buf);
+        cropped.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+
+        Some(iced::widget::image::Handle::from_bytes(buf))
     }
 
     pub fn select_character(&mut self, line_idx: usize, char_idx: usize) {
@@ -417,7 +448,12 @@ impl OcrViewer {
             Vec::new()
         });
         let neigh_panel = self.neighbor_panel();
-        let alt_panel = self.alternatives_panel();
+
+        // Crop the character preview image from the screenshot
+        let preview_image = self.selected_word.as_ref().and_then(|sw| {
+            self.crop_character_image(sw.line_idx, sw.char_idx)
+        });
+        let alt_panel = self.alternatives_panel(preview_image.as_ref());
 
         let dict_width = Pixels(300.0);
         let neigh_width = Pixels(42.0);
@@ -673,8 +709,21 @@ impl OcrViewer {
         .style(container::rounded_box)
     }
 
-    fn alternatives_panel<'a>(&'a self) -> Container<'a, Message> {
+    fn alternatives_panel<'a>(
+        &'a self,
+        preview_image: Option<&iced::widget::image::Handle>,
+    ) -> Container<'a, Message> {
         let mut content = Column::new().padding(2).spacing(2);
+
+        // Character preview image at the top
+        if let Some(img_handle) = preview_image {
+            content = content.push(
+                IcedImage::new(img_handle.clone())
+                    .width(Pixels(32.0))
+                    .height(Pixels(32.0)),
+            );
+        }
+
         if let Some(alt_state) = self.state.get_alternatives_ui_state() {
             for c in alt_state.candidates {
                 content = content.push(
