@@ -433,16 +433,33 @@ pub fn recognize_single_line_static(
     image: &DynamicImage,
     bbox: &BoundingBox,
 ) -> Result<Option<LineResult>> {
-    use std::path::Path;
     use ort::session::Session;
 
-    let model_path = Path::new(model_dir);
     let mut recognize_session = Session::builder()?
-        .commit_from_file(model_path.join("meiki.text.rec.v0.960x32.with_logits.onnx"))?;
+        .commit_from_file(format!("{}/meiki.text.rec.v0.960x32.with_logits.onnx", model_dir))?;
     let mut recognize_session_vertical = Session::builder()?.commit_from_file(
-        model_path.join("meiki.text.rec.v0.vertical.32x480.with_logits.onnx"),
+        format!("{}/meiki.text.rec.v0.vertical.32x480.with_logits.onnx", model_dir),
     )?;
 
+    let rec_session = std::sync::Arc::new(std::sync::Mutex::new(recognize_session));
+    let rec_session_vert = std::sync::Arc::new(std::sync::Mutex::new(recognize_session_vertical));
+    recognize_single_line_with_sessions(
+        &rec_session,
+        &rec_session_vert,
+        char_vocab,
+        image,
+        bbox,
+    )
+}
+
+/// Recognize a single line using pre-built ONNX sessions (avoids reloading models per box).
+pub fn recognize_single_line_with_sessions(
+    recognize_session: &std::sync::Arc<std::sync::Mutex<Session>>,
+    recognize_session_vertical: &std::sync::Arc<std::sync::Mutex<Session>>,
+    char_vocab: &[i64],
+    image: &DynamicImage,
+    bbox: &BoundingBox,
+) -> Result<Option<LineResult>> {
     let is_vertical = bbox.h > bbox.w;
     let crop_x = bbox.x.max(0) as u32;
     let crop_y = bbox.y.max(0) as u32;
@@ -453,11 +470,15 @@ pub fn recognize_single_line_static(
     }
     let crop = image.crop_imm(crop_x, crop_y, crop_w, crop_h);
 
+    // Lock both sessions for the duration of this box's recognition.
+    let mut rec_sess = recognize_session.lock().unwrap();
+    let mut rec_sess_vert = recognize_session_vertical.lock().unwrap();
+
     let result = if is_vertical
         && ((crop_h as f32) * (32.0f32 / crop_w as f32) > 350.0f32)
     {
         Some(recognize_long_line_static(
-            &mut recognize_session_vertical,
+            &mut rec_sess_vert,
             char_vocab,
             &crop,
             crop_x as i32,
@@ -468,7 +489,7 @@ pub fn recognize_single_line_static(
         && ((crop_w as f32) * (32.0f32 / crop_h as f32) > REC_WIDTH as f32)
     {
         Some(recognize_long_line_static(
-            &mut recognize_session,
+            &mut rec_sess,
             char_vocab,
             &crop,
             crop_x as i32,
@@ -478,14 +499,14 @@ pub fn recognize_single_line_static(
     } else {
         let (filtered, eff_w, eff_h) = if is_vertical {
             recognize_single_chunk_static(
-                &mut recognize_session_vertical,
+                &mut rec_sess_vert,
                 char_vocab,
                 &crop,
                 is_vertical,
             )?
         } else {
             recognize_single_chunk_static(
-                &mut recognize_session,
+                &mut rec_sess,
                 char_vocab,
                 &crop,
                 is_vertical,
