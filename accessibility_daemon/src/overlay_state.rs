@@ -429,6 +429,19 @@ impl OcrOverlayState {
             return None;
         }
 
+        // Check cache: if same term was already looked up, return cached result
+        if self.cached_lookup_term == following_text {
+            if self.cached_entries.is_empty() {
+                // Previously returned no results — return None without re-searching
+                return None;
+            }
+            return Some(LookupResult {
+                matches: self.cached_entries.clone(),
+                max_len: self.current_word_length,
+                tapped_box,
+            });
+        }
+
         // Build search candidates
         let (all_terms, candidates_by_length) =
             self.prepare_search_candidates(&following_text, deinflector);

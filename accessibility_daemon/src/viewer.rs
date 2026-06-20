@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use iced::widget::canvas::{
@@ -73,7 +75,7 @@ use iced::widget::image::Handle as ImageHandle;
 
 #[derive(Clone)]
 pub struct OverlayProgram {
-    pub annotations: Vec<DetectedAnnotation>,
+    pub annotations: Rc<Vec<DetectedAnnotation>>,
     pub img_w: u32,
     pub img_h: u32,
     /// The screenshot image to draw on the canvas.
@@ -94,6 +96,8 @@ pub struct OverlayProgram {
     pub current_trans_x: f32,
     /// Current translation Y.
     pub current_trans_y: f32,
+    /// When false, skip annotation drawing (used during active zoom/pan for performance).
+    pub draw_annotations: bool,
 }
 
 impl OverlayProgram {
@@ -107,17 +111,7 @@ impl OverlayProgram {
         (base_scale, offset_x, offset_y)
     }
 
-    /// Transform a point from image-space to screen-space, applying zoom/pan.
-    fn image_to_screen(&self, bounds: Rectangle, img_x: f32, img_y: f32) -> Point {
-        let (base_scale, offset_x, offset_y) = self.base_transform(bounds);
-        let total_scale = base_scale * self.current_scale;
-        Point::new(
-            img_x * total_scale + offset_x + self.current_trans_x,
-            img_y * total_scale + offset_y + self.current_trans_y,
-        )
-    }
-
-    /// Transform a screen-space point back to image-space (inverse of image_to_screen).
+    /// Transform a screen-space point back to image-space.
     fn screen_to_image(&self, bounds: Rectangle, screen_x: f32, screen_y: f32) -> (f32, f32) {
         let (base_scale, offset_x, offset_y) = self.base_transform(bounds);
         let total_scale = base_scale * self.current_scale;
@@ -129,7 +123,7 @@ impl OverlayProgram {
 
     /// Check whether a screen-space point is over the panel area.
     /// The panel is positioned at the correct edge of the screen.
-    fn is_over_panel(&self, bounds: Rectangle, screen_x: f32, screen_y: f32) -> bool {
+    fn is_over_panel(&self, bounds: Rectangle, screen_x: f32, _screen_y: f32) -> bool {
         if !self.panel_visible {
             return false;
         }
@@ -348,10 +342,6 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                             let prev_focus_x = state.pinch_prev_focus_x;
                             let prev_focus_y = state.pinch_prev_focus_y;
 
-                            println!("[Canvas] f1=({:.1},{:.1}) f2=({:.1},{:.1}) dist={:.1} factor={:.4} focus=({:.1},{:.1}) prev_focus=({:.1},{:.1}) canvas_bounds=({:.0},{:.0},{:.0},{:.0})",
-                                f1.x, f1.y, f2.x, f2.y, current_dist, scale_factor, focus_x, focus_y, prev_focus_x, prev_focus_y,
-                                bounds.x, bounds.y, bounds.width, bounds.height);
-
                             // Update prev for next frame
                             state.pinch_prev_dist = current_dist;
                             state.pinch_prev_focus_x = focus_x;
@@ -399,6 +389,9 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
 
             // --- Touch: finger lifted (pan end) — detect taps ---
             iced::Event::Touch(touch::Event::FingerLifted { id, position }) => {
+                // Check if we were in pinch zoom before removing the finger
+                let was_pinch = state.pinch_finger2.is_some();
+
                 // Remove the lifted finger from tracking
                 if let Some((fid, _)) = state.pinch_finger1 {
                     if fid == *id { state.pinch_finger1 = None; }
@@ -416,6 +409,11 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 state.pinch_prev_dist = 0.0;
                 state.pinch_prev_focus_x = 0.0;
                 state.pinch_prev_focus_y = 0.0;
+
+                // If we were in pinch zoom, notify the app so it can re-enable annotations
+                if was_pinch {
+                    return Some(iced::widget::Action::publish(Message::PinchEnd));
+                }
 
                 if was_tap {
                     return Some(iced::widget::Action::publish(
@@ -442,9 +440,6 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
         let (base_scale, base_offset_x, base_offset_y) = self.base_transform(bounds);
-        println!("[Draw] bounds=({:.0},{:.0},{:.0},{:.0}) base_scale={:.3} base_offset=({:.1},{:.1}) total_scale={:.3} total_offset=({:.1},{:.1})",
-            bounds.x, bounds.y, bounds.width, bounds.height, base_scale, base_offset_x, base_offset_y,
-            base_scale * self.current_scale, base_offset_x + self.current_trans_x, base_offset_y + self.current_trans_y);
         let total_scale = base_scale * self.current_scale;
         let total_offset_x = base_offset_x + self.current_trans_x;
         let total_offset_y = base_offset_y + self.current_trans_y;
@@ -471,65 +466,84 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
             ))
         };
 
-        for (line_idx, annotation) in self.annotations.iter().enumerate() {
-            let (pt, sz) = transform(&annotation.bbox);
-            frame.stroke(&CanvasPath::rectangle(pt, sz),
-                CanvasStroke::default().with_color(Color::from_rgb(1.0, 0.0, 0.0)).with_width(2.0));
+        if self.draw_annotations {
+            // Pre-compute visible screen bounds in image coordinates to skip off-screen annotations
+            let inv_scale = if total_scale > 0.0 { 1.0 / total_scale } else { 1.0 };
+            let vis_left = (-total_offset_x) * inv_scale - 100.0;
+            let vis_top = (-total_offset_y) * inv_scale - 100.0;
+            let vis_right = (bounds.width - total_offset_x) * inv_scale + 100.0;
+            let vis_bottom = (bounds.height - total_offset_y) * inv_scale + 100.0;
 
-            if let Some(line) = &annotation.line {
-                let fixed_size = if line.is_vertical {
-                    line.char_boxes.iter().map(|b| b.w).max().unwrap_or(0)
-                } else {
-                    line.char_boxes.iter().map(|b| b.h).max().unwrap_or(0)
-                };
-
-                let mut refined: Vec<BoundingBox> = Vec::new();
-                if let Some(first) = line.char_boxes.first() { refined.push(first.clone()); }
-                for i in 1..line.char_boxes.len() {
-                    let prev = &line.char_boxes[i - 1];
-                    let cur = &line.char_boxes[i];
-                    if line.is_vertical {
-                        refined.push(BoundingBox::new(cur.left(), prev.top().saturating_add(fixed_size).max(cur.top()), cur.w, cur.h, cur.confidence));
-                    } else {
-                        refined.push(BoundingBox::new(prev.left().saturating_add(fixed_size).max(cur.left()), cur.top(), cur.w, cur.h, cur.confidence));
-                    }
+            for (line_idx, annotation) in self.annotations.iter().enumerate() {
+                let bbox = &annotation.bbox;
+                // Skip annotations entirely off-screen
+                let bx2 = (bbox.x + bbox.w) as f32;
+                let by2 = (bbox.y + bbox.h) as f32;
+                let bx1 = bbox.x as f32;
+                let by1 = bbox.y as f32;
+                if bx2 < vis_left || bx1 > vis_right || by2 < vis_top || by1 > vis_bottom {
+                    continue;
                 }
 
-                let display_boxes: Vec<BoundingBox> = refined.iter().map(|b| {
-                    let cx = b.left() + b.w / 2;
-                    let cy = b.top() + b.h / 2;
-                    BoundingBox::new(cx - fixed_size / 2, cy - fixed_size / 2, fixed_size, fixed_size, 1.0)
-                }).collect();
+                let (pt, sz) = transform(bbox);
+                frame.stroke(&CanvasPath::rectangle(pt, sz),
+                    CanvasStroke::default().with_color(Color::from_rgb(1.0, 0.0, 0.0)).with_width(2.0));
 
-                for (i, char_box) in line.char_boxes.iter().enumerate() {
-                    let (pt_c, sz_c) = transform(char_box);
-                    frame.stroke(&CanvasPath::rectangle(pt_c, sz_c),
-                        CanvasStroke::default().with_color(Color::from_rgb(0.0, 1.0, 0.0)).with_width(1.0));
+                if let Some(line) = &annotation.line {
+                    let fixed_size = if line.is_vertical {
+                        line.char_boxes.iter().map(|b| b.w).max().unwrap_or(0)
+                    } else {
+                        line.char_boxes.iter().map(|b| b.h).max().unwrap_or(0)
+                    };
 
-                    // Draw cursor highlight if this is the selected character
-                    if self.cursor_pos == Some((line_idx, i)) {
-                        let cursor_rect = CanvasPath::rectangle(pt_c, sz_c);
-                        frame.fill(&cursor_rect, Color::from_rgba(0.0, 0.8, 1.0, 0.3));
-                        frame.stroke(&cursor_rect,
-                            CanvasStroke::default().with_color(Color::from_rgb(0.0, 0.8, 1.0)).with_width(2.0));
+                    let mut refined: Vec<BoundingBox> = Vec::new();
+                    if let Some(first) = line.char_boxes.first() { refined.push(first.clone()); }
+                    for i in 1..line.char_boxes.len() {
+                        let prev = &line.char_boxes[i - 1];
+                        let cur = &line.char_boxes[i];
+                        if line.is_vertical {
+                            refined.push(BoundingBox::new(cur.left(), prev.top().saturating_add(fixed_size).max(cur.top()), cur.w, cur.h, cur.confidence));
+                        } else {
+                            refined.push(BoundingBox::new(prev.left().saturating_add(fixed_size).max(cur.left()), cur.top(), cur.w, cur.h, cur.confidence));
+                        }
                     }
 
-                    if let Some(_ch) = line.text.chars().nth(i) {
-                        if i < display_boxes.len() {
-                            let db = &display_boxes[i];
-                            let (pt_db, sz_db) = transform(db);
-                            frame.fill_text(CanvasText {
-                                content: _ch.to_string(),
-                                position: Point::new(pt_db.x + sz_db.width / 2.0, pt_db.y + sz_db.height / 2.0),
-                                max_width: 0.0,
-                                color: Color::from_rgb(0.0, 1.0, 0.0),
-                                size: Pixels(sz_db.height * BOX_FILL_RATIO),
-                                line_height: Default::default(),
-                                font: IcedFont::default(),
-                                align_x: iced::widget::text::Alignment::Center,
-                                align_y: alignment::Vertical::Center,
-                                shaping: Default::default(),
-                            });
+                    let display_boxes: Vec<BoundingBox> = refined.iter().map(|b| {
+                        let cx = b.left() + b.w / 2;
+                        let cy = b.top() + b.h / 2;
+                        BoundingBox::new(cx - fixed_size / 2, cy - fixed_size / 2, fixed_size, fixed_size, 1.0)
+                    }).collect();
+
+                    for (i, char_box) in line.char_boxes.iter().enumerate() {
+                        let (pt_c, sz_c) = transform(char_box);
+                        frame.stroke(&CanvasPath::rectangle(pt_c, sz_c),
+                            CanvasStroke::default().with_color(Color::from_rgb(0.0, 1.0, 0.0)).with_width(1.0));
+
+                        // Draw cursor highlight if this is the selected character
+                        if self.cursor_pos == Some((line_idx, i)) {
+                            let cursor_rect = CanvasPath::rectangle(pt_c, sz_c);
+                            frame.fill(&cursor_rect, Color::from_rgba(0.0, 0.8, 1.0, 0.3));
+                            frame.stroke(&cursor_rect,
+                                CanvasStroke::default().with_color(Color::from_rgb(0.0, 0.8, 1.0)).with_width(2.0));
+                        }
+
+                        if let Some(_ch) = line.text.chars().nth(i) {
+                            if i < display_boxes.len() {
+                                let db = &display_boxes[i];
+                                let (pt_db, sz_db) = transform(db);
+                                frame.fill_text(CanvasText {
+                                    content: _ch.to_string(),
+                                    position: Point::new(pt_db.x + sz_db.width / 2.0, pt_db.y + sz_db.height / 2.0),
+                                    max_width: 0.0,
+                                    color: Color::from_rgb(0.0, 1.0, 0.0),
+                                    size: Pixels(sz_db.height * BOX_FILL_RATIO),
+                                    line_height: Default::default(),
+                                    font: IcedFont::default(),
+                                    align_x: iced::widget::text::Alignment::Center,
+                                    align_y: alignment::Vertical::Center,
+                                    shaping: Default::default(),
+                                });
+                            }
                         }
                     }
                 }
@@ -547,9 +561,11 @@ pub struct OcrViewer {
     pub image_handle: iced::widget::image::Handle,
     /// Raw PNG bytes of the original screenshot, used for cropping character previews.
     image_bytes: Vec<u8>,
+    /// Decoded image, cached to avoid re-decoding PNG on every crop_character_image call.
+    decoded_image: RefCell<Option<image::DynamicImage>>,
     pub img_w: u32,
     pub img_h: u32,
-    pub annotations: Vec<DetectedAnnotation>,
+    pub annotations: Rc<Vec<DetectedAnnotation>>,
     pub state: OcrOverlayState,
     pub selected_word: Option<SelectedWord>,
     pub alternatives_visible: bool,
@@ -559,6 +575,10 @@ pub struct OcrViewer {
     pub scroll_neighbor_to: Option<usize>,
     /// The index of the character that should be scrolled into view in the alt panel.
     pub scroll_alt_to: Option<usize>,
+    /// When true, the user is actively panning/zooming — annotation drawing is disabled.
+    pub is_zooming: bool,
+    /// Frames since last zoom/pan event — used to re-enable annotations after zoom ends.
+    pub zoom_idle_frames: u32,
 }
 
 impl OcrViewer {
@@ -575,7 +595,7 @@ impl OcrViewer {
         let line_results = annotations.iter().map(|a| a.line.clone()).collect::<Vec<_>>();
         state.set_line_results(line_results);
         state.ensure_cursor_position();
-        Self { image_handle, image_bytes, img_w, img_h, annotations, state, selected_word: None, alternatives_visible: false, db, deinflector, scroll_neighbor_to: None, scroll_alt_to: None }
+        Self { image_handle, image_bytes, decoded_image: RefCell::new(None), img_w, img_h, annotations: Rc::new(annotations), state, selected_word: None, alternatives_visible: false, db, deinflector, scroll_neighbor_to: None, scroll_alt_to: None, is_zooming: false, zoom_idle_frames: 0 }
     }
 
     /// Crop the screenshot to show the given character with padding.
@@ -584,8 +604,14 @@ impl OcrViewer {
         let line = self.state.active_line_results.get(line_idx).and_then(|l| l.as_ref())?;
         let box_item = line.char_boxes.get(char_idx)?;
 
-        // Decode the original image
-        let img = image::load_from_memory(&self.image_bytes).ok()?;
+        // Lazily decode and cache the original image
+        if self.decoded_image.borrow().is_none() {
+            if let Ok(img) = image::load_from_memory(&self.image_bytes) {
+                *self.decoded_image.borrow_mut() = Some(img);
+            }
+        }
+        let img = self.decoded_image.borrow();
+        let img = img.as_ref()?;
         let (img_w, img_h) = (img.width() as i32, img.height() as i32);
 
         // Calculate crop rect with 20% padding
@@ -721,9 +747,9 @@ impl OcrViewer {
 
         // Gravity tells us which side the PANEL goes on
         let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
-        let panel_on_bottom = self.state.last_portrait_gravity == Gravity::Bottom;
+        let _panel_on_bottom = self.state.last_portrait_gravity == Gravity::Bottom;
         let overlay = OverlayProgram {
-            annotations: self.annotations.clone(),
+            annotations: Rc::clone(&self.annotations),
             img_w: self.img_w,
             img_h: self.img_h,
             image: Some(self.image_handle.clone()),
@@ -735,6 +761,7 @@ impl OcrViewer {
             current_scale: self.state.current_scale,
             current_trans_x: self.state.current_trans_x,
             current_trans_y: self.state.current_trans_y,
+            draw_annotations: !self.is_zooming,
         };
 
         // The canvas draws both the image and annotations with zoom/pan
@@ -1131,7 +1158,7 @@ impl OcrViewer {
 // ---------------------------------------------------------------------------
 
 use iced::advanced::widget::tree::{self, Tree};
-use iced::advanced::{self, layout, Layout, Widget};
+use iced::advanced::{self, Layout, Widget};
 use iced::advanced::widget::Operation;
 use iced::advanced::Clipboard;
 

@@ -1,6 +1,7 @@
 mod data;
 mod models;
 mod ocr_engine;
+mod ocr_parallel;
 mod overlay_state;
 mod settings_window;
 mod util;
@@ -10,6 +11,7 @@ use anyhow::{Context, Result};
 use image::DynamicImage;
 use std::io::Cursor;
 use std::sync::Arc;
+
 
 use crate::data::db::DictionaryDatabase;
 use crate::models::*;
@@ -178,21 +180,29 @@ fn run_ocr_viewer(
                 }
             }
             Message::ZoomOnCursor { delta, cursor_x, cursor_y } => {
-                let zoom_factor = if delta > 0.0 { 1.1 } else { 0.9 };
-                state.state.current_scale = (state.state.current_scale * zoom_factor).clamp(0.5, 5.0);
-                // Adjust translation to zoom toward cursor position
-                state.state.current_trans_x = cursor_x - (cursor_x - state.state.current_trans_x) * zoom_factor;
-                state.state.current_trans_y = cursor_y - (cursor_y - state.state.current_trans_y) * zoom_factor;
+                let requested_factor = if delta > 0.0 { 1.1 } else { 0.9 };
+                let old_scale = state.state.current_scale;
+                let new_scale = (old_scale * requested_factor).clamp(0.5, 5.0);
+                // Use the actual factor after clamping so pan matches the real zoom change
+                let actual_factor = if old_scale > 0.0 { new_scale / old_scale } else { 1.0 };
+                state.state.current_scale = new_scale;
+                state.state.current_trans_x = cursor_x - (cursor_x - state.state.current_trans_x) * actual_factor;
+                state.state.current_trans_y = cursor_y - (cursor_y - state.state.current_trans_y) * actual_factor;
+                state.is_zooming = true;
+                state.zoom_idle_frames = 0;
             }
             Message::PanDelta { dx, dy } => {
                 state.state.current_trans_x += dx;
                 state.state.current_trans_y += dy;
+                state.zoom_idle_frames = 0;
             }
             Message::PanStart { .. } => {
-                // Pan start is handled by the canvas state; nothing to do here
+                state.is_zooming = true;
+                state.zoom_idle_frames = 0;
             }
             Message::PanEnd => {
-                // Pan end is handled by the canvas state; nothing to do here
+                state.is_zooming = false;
+                state.zoom_idle_frames = 0;
             }
             Message::SetScale { scale } => {
                 state.state.current_scale = scale.clamp(0.5, 5.0);
@@ -202,20 +212,30 @@ fn run_ocr_viewer(
                 let new_scale = (old_scale * scale_factor).clamp(0.5, 5.0);
                 state.state.current_scale = new_scale;
                 let actual_factor = if old_scale > 0.0 { new_scale / old_scale } else { 1.0 };
-                // Work in "effective" coordinates: eff = trans + base_offset
-                // This centers the zoom around the actual image position, not the canvas origin.
-                let eff_x = state.state.current_trans_x + 0.0; // base_offset_x is always 0 (left-aligned)
+                let eff_x = state.state.current_trans_x;
                 let eff_y = state.state.current_trans_y + base_offset_y;
-                println!("[Pinch] scale={:.3} factor={:.4} focus=({:.1},{:.1}) prev_focus=({:.1},{:.1}) base_off_y={:.1} eff_before=({:.1},{:.1})",
-                    new_scale, actual_factor, focus_x, focus_y, prev_focus_x, prev_focus_y, base_offset_y, eff_x, eff_y);
-                // Zoom around previous focus: new_eff = new_focus - (old_focus - old_eff) * factor
-                let new_eff_x = focus_x - (prev_focus_x - eff_x) * actual_factor;
-                let new_eff_y = focus_y - (prev_focus_y - eff_y) * actual_factor;
-                // Convert back to trans coordinates
-                state.state.current_trans_x = new_eff_x - 0.0;
-                state.state.current_trans_y = new_eff_y - base_offset_y;
-                println!("[Pinch] eff_after=({:.1},{:.1}) trans_after=({:.1},{:.1})", new_eff_x, new_eff_y, state.state.current_trans_x, state.state.current_trans_y);
+                state.state.current_trans_x = focus_x - (prev_focus_x - eff_x) * actual_factor;
+                state.state.current_trans_y = (focus_y - (prev_focus_y - eff_y) * actual_factor) - base_offset_y;
+                state.is_zooming = true;
+                state.zoom_idle_frames = 0;
             }
+            Message::PinchEnd => {
+                state.is_zooming = false;
+                state.zoom_idle_frames = 0;
+            }
+            Message::ZoomTick => {
+                // Re-enable annotations if no zoom/pan activity for a few ticks
+                if state.zoom_idle_frames > 3 {
+                    state.is_zooming = false;
+                }
+            }
+        }
+
+        // Increment idle counter every update; reset on zoom/pan activity
+        if matches!(message, Message::ZoomOnCursor { .. } | Message::PanDelta { .. } | Message::PanStart { .. } | Message::PinchZoom { .. }) {
+            state.zoom_idle_frames = 0;
+        } else {
+            state.zoom_idle_frames = state.zoom_idle_frames.saturating_add(1);
         }
 
         // Return scroll tasks to auto-scroll neighbor/alt panels to the selected character
@@ -238,7 +258,8 @@ fn run_ocr_viewer(
 
     let app = iced::application(boot, update, view)
         .subscription(|_state: &OcrViewer| {
-            iced_futures::subscription::filter_map(
+            // Merge global keyboard/mouse events with a periodic zoom-check timer
+            let global_events = iced_futures::subscription::filter_map(
                 "global-events",
                 |event: iced_futures::subscription::Event| {
                     match &event {
@@ -255,7 +276,6 @@ fn run_ocr_viewer(
                                 println!("[Subscription] Enter -> Confirm (SelectCharacter)");
                                 return Some(Message::SelectCharacter(0, 0));
                             }
-                            // Arrow keys and hjkl navigation
                             let action = if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight)
                                 || key == &iced::keyboard::Key::Character("l".into())
                             {
@@ -291,7 +311,13 @@ fn run_ocr_viewer(
                         _ => None,
                     }
                 },
-            )
+            );
+
+            // Periodic timer to detect when scroll-wheel zoom has stopped
+            let zoom_timer = iced::time::every(iced::time::Duration::from_millis(20))
+                .map(|_| Message::ZoomTick);
+
+            iced_futures::Subscription::batch(vec![global_events, zoom_timer])
         });
 
     if let Err(e) = app.run() {

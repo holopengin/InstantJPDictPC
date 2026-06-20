@@ -199,4 +199,8 @@ pub enum Message {
     SetScale { scale: f32 },
     /// Pinch zoom gesture: new scale + pan delta around focus point.
     PinchZoom { scale_factor: f32, focus_x: f32, focus_y: f32, prev_focus_x: f32, prev_focus_y: f32, base_offset_y: f32 },
+    /// Pinch zoom ended (finger lifted).
+    PinchEnd,
+    /// Periodic tick to detect when zoom/pan has stopped.
+    ZoomTick,
 }
