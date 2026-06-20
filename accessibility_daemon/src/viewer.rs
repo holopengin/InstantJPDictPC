@@ -165,10 +165,10 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
         _bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        if state.is_panning {
+        if state.drag_started {
             mouse::Interaction::Grabbing
         } else {
-            mouse::Interaction::Grab
+            mouse::Interaction::Idle
         }
     }
 
@@ -606,6 +606,8 @@ impl OcrViewer {
         let line_results = annotations.iter().map(|a| a.line.clone()).collect::<Vec<_>>();
         state.set_line_results(line_results);
         state.ensure_cursor_position();
+        state.img_w = img_w;
+        state.img_h = img_h;
         Self { image_handle, image_bytes, decoded_image: RefCell::new(None), img_w, img_h, annotations: Rc::new(annotations), state, selected_word: None, alternatives_visible: false, db, deinflector, scroll_neighbor_to: None, scroll_alt_to: None, is_zooming: false, zoom_idle_frames: 0, cached_preview: RefCell::new(None) }
     }
 
@@ -651,13 +653,15 @@ impl OcrViewer {
         self.state.is_dictionary_visible = true;
         self.alternatives_visible = false;
 
-        // Update gravity so panel opens on the opposite side of the character
+        // Update gravity so panel opens on the opposite side of the character.
+        // Uses the full transform (base fit-to-screen + pan/zoom) to compute
+        // the character's actual screen position.
         let box_item = self.state.active_line_results.get(line_idx)
             .and_then(|l| l.as_ref())
             .and_then(|line| line.char_boxes.get(char_idx))
             .cloned();
         if let Some(b) = box_item {
-            self.state.update_gravity(800.0, 480.0, &b);
+            self.state.update_gravity(&b, self.panel_width());
         }
         self.do_lookup(line_idx, char_idx);
 
@@ -673,6 +677,9 @@ impl OcrViewer {
         self.state.current_tapped_idx = self.state.get_global_idx(line_idx, char_idx) as isize;
         self.state.update_highlight_coords(line_idx, char_idx, 1);
         self.state.is_dictionary_visible = true;
+
+        // Don't change gravity when selecting from neighbor/alternative views —
+        // the panel is already open and positioned from the initial character click.
 
         if is_same {
             // Clicking the already-selected character toggles the
@@ -705,6 +712,17 @@ impl OcrViewer {
         }
     }
 
+    /// Total width of the panel (dict + neighbors + alt + spacing + padding).
+    /// Must match the values used in view().
+    fn panel_width(&self) -> f32 {
+        let dict_width: f32 = 300.0;
+        let neigh_width: f32 = 42.0;
+        let alt_width: f32 = 42.0;
+        let spacing: f32 = 2.0; // Row::new().spacing(2)
+        let padding: f32 = 4.0; // Container::padding(2) on each side
+        dict_width + neigh_width + alt_width + spacing + padding
+    }
+
     /// Compute the scroll targets for the neighbor and alternatives panels
     /// so the selected character is centered (or as close as possible).
     fn compute_scroll_targets(&mut self, line_idx: usize, char_idx: usize) {
@@ -721,6 +739,14 @@ impl OcrViewer {
         }
         self.scroll_neighbor_to = Some(global_idx);
         self.scroll_alt_to = Some(char_idx);
+    }
+
+    /// Scroll the dictionary panel to the top.
+    pub fn scroll_dict_to_top_task(&self) -> iced::Task<Message> {
+        operate(scroll_to(
+            Id::new("dict_scroll"),
+            AbsoluteOffset { x: Some(0.0), y: Some(0.0) },
+        ))
     }
 
     /// Create a scroll task for the neighbor panel to center the selected character.
@@ -756,7 +782,9 @@ impl OcrViewer {
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
         let has_panel = self.selected_word.is_some();
 
-        // Gravity tells us which side the PANEL goes on
+        // Gravity is computed in select_character/update_gravity with the full
+        // transform (base + pan/zoom), so the panel opens on the opposite side
+        // of the character's actual screen position.
         let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
         let _panel_on_bottom = self.state.last_portrait_gravity == Gravity::Bottom;
         let overlay = OverlayProgram {
@@ -917,8 +945,14 @@ impl OcrViewer {
             }
             content = content.push(entry_col);
         }
-        Container::new(Scrollable::new(content))
-            .width(Length::Fill).padding(4).style(container::rounded_box)
+        Container::new(
+            Scrollable::new(content)
+                .id(Id::new("dict_scroll"))
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    iced::widget::scrollable::Scrollbar::hidden(),
+                )),
+        )
+        .width(Length::Fill).padding(4).style(container::rounded_box)
     }
 
     fn headword_section<'a>(&'a self, group: FormattedReadingGroup) -> Container<'a, Message> {

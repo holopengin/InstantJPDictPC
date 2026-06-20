@@ -162,8 +162,7 @@ fn run_ocr_viewer(
                 }
             }
             Message::Navigate(action) => {
-                let (root_width, root_height) = (800.0_f32, 480.0_f32);
-                state.state.navigate(action, root_width, root_height);
+                state.state.navigate(action);
                 if let Some((line_idx, char_idx)) = state.state.current_cursor() {
                     state.select_character(line_idx, char_idx);
                 }
@@ -223,6 +222,10 @@ fn run_ocr_viewer(
                 state.is_zooming = false;
                 state.zoom_idle_frames = 0;
             }
+            Message::WindowResized { width, height } => {
+                state.state.window_width.set(width);
+                state.state.window_height.set(height);
+            }
             Message::ZoomTick => {
                 // Re-enable annotations if no zoom/pan activity for a few ticks
                 if state.zoom_idle_frames > 3 {
@@ -238,14 +241,21 @@ fn run_ocr_viewer(
             state.zoom_idle_frames = state.zoom_idle_frames.saturating_add(1);
         }
 
-        // Return scroll tasks to auto-scroll neighbor/alt panels to the selected character
+        // Return scroll tasks to auto-scroll panels when selection changes
         let mut tasks = Vec::new();
-        // Auto-scroll to selected character (only on initial select)
+        // Always scroll dictionary to top when content changes
+        if matches!(message, Message::SelectCharacter(_, _) | Message::SelectNeighbor(_, _) | Message::SelectAlternative(_)) {
+            tasks.push(state.scroll_dict_to_top_task());
+        }
+        // Scroll neighbor/alt panels to the selected character.
+        // Clear the targets after firing so they don't re-fire on every frame.
         if let Some(task) = state.scroll_neighbor_task() {
             tasks.push(task);
+            state.scroll_neighbor_to = None;
         }
         if let Some(task) = state.scroll_alt_task() {
             tasks.push(task);
+            state.scroll_alt_to = None;
         }
         if tasks.is_empty() {
             iced::Task::none()
@@ -317,7 +327,14 @@ fn run_ocr_viewer(
             let zoom_timer = iced::time::every(iced::time::Duration::from_millis(30))
                 .map(|_| Message::ZoomTick);
 
-            iced_futures::Subscription::batch(vec![global_events, zoom_timer])
+            // Window resize events to track actual window dimensions
+            let resize_events = iced::window::resize_events()
+                .map(|(_id, size)| Message::WindowResized {
+                    width: size.width,
+                    height: size.height,
+                });
+
+            iced_futures::Subscription::batch(vec![global_events, zoom_timer, resize_events])
         });
 
     if let Err(e) = app.run() {

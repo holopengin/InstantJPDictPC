@@ -203,4 +203,6 @@ pub enum Message {
     PinchEnd,
     /// Periodic tick to detect when zoom/pan has stopped.
     ZoomTick,
+    /// The window was resized.
+    WindowResized { width: f32, height: f32 },
 }

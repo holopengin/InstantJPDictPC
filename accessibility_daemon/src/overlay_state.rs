@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::data::db::DictionaryDatabase;
@@ -35,6 +36,15 @@ pub struct OcrOverlayState {
     pub cached_entries: Vec<FormattedEntry>,
     /// The term that was looked up (for cache invalidation).
     pub cached_lookup_term: String,
+    /// The bounding box of the tapped character, used to compute panel gravity.
+    pub tapped_box_for_gravity: Option<BoundingBox>,
+    /// Screenshot dimensions, needed to compute the base transform for gravity.
+    pub img_w: u32,
+    pub img_h: u32,
+    /// Current window dimensions, needed for gravity and navigation.
+    /// Use Cell so they can be updated from the canvas draw() which only has &self.
+    pub window_width: Cell<f32>,
+    pub window_height: Cell<f32>,
 }
 
 impl OcrOverlayState {
@@ -52,13 +62,18 @@ impl OcrOverlayState {
             current_tapped_char_idx_in_line: -1,
             active_line_results: Vec::new(),
             last_highlighted_coords: Vec::new(),
-            last_landscape_gravity: Gravity::End,
-            last_portrait_gravity: Gravity::Bottom,
+            last_landscape_gravity: Gravity::Start,
+            last_portrait_gravity: Gravity::Top,
             is_controller_navigation: false,
             is_dictionary_visible: false,
             is_alternatives_visible: false,
             cached_entries: Vec::new(),
             cached_lookup_term: String::new(),
+            tapped_box_for_gravity: None,
+            img_w: 0,
+            img_h: 0,
+            window_width: Cell::new(800.0),
+            window_height: Cell::new(480.0),
         }
     }
 
@@ -142,7 +157,9 @@ impl OcrOverlayState {
         }
     }
 
-    pub fn navigate(&mut self, action: GamepadAction, root_width: f32, root_height: f32) -> bool {
+    pub fn navigate(&mut self, action: GamepadAction) -> bool {
+        let root_width = self.window_width.get();
+        let root_height = self.window_height.get();
         let (line_idx, char_idx) = match self.current_cursor() {
             Some(coords) => coords,
             None => return false,
@@ -296,7 +313,9 @@ impl OcrOverlayState {
         })
     }
 
-    pub fn panel_dimensions(&self, root_width: f32, root_height: f32) -> (f32, f32) {
+    pub fn panel_dimensions(&self) -> (f32, f32) {
+        let root_width = self.window_width.get();
+        let root_height = self.window_height.get();
         let is_landscape = root_width > root_height;
         let panel_width = if is_landscape {
             (root_width * 0.4).min(500.0)
@@ -311,23 +330,60 @@ impl OcrOverlayState {
         (panel_width, panel_height)
     }
 
-    pub fn update_gravity(&mut self, root_width: f32, root_height: f32, tapped_box: &BoundingBox) {
+    /// Determine which side the panel should open on.
+    /// Default: left (Start) in landscape, top (Top) in portrait.
+    /// Only switch to the other side if the character would be overlapped by the panel.
+    /// The panel is on the left in landscape (dict + neighbors + alt = ~386px wide).
+    pub fn update_gravity(&mut self, tapped_box: &BoundingBox, panel_width: f32) {
+        let root_width = self.window_width.get();
+        let root_height = self.window_height.get();
         let is_landscape = root_width > root_height;
-        let screen_center_x = tapped_box.left() as f32 * self.current_scale
-            + self.current_trans_x
-            + (tapped_box.w as f32 / 2.0) * self.current_scale;
-        let screen_center_y = tapped_box.top() as f32 * self.current_scale
-            + self.current_trans_y
-            + (tapped_box.h as f32 / 2.0) * self.current_scale;
+        // Compute the base transform (fit image to window) that the canvas uses
+        let img_w_f = self.img_w as f32;
+        let img_h_f = self.img_h as f32;
+        let base_scale = if img_w_f > 0.0 && img_h_f > 0.0 {
+            f32::min(root_width / img_w_f, root_height / img_h_f)
+        } else {
+            1.0
+        };
+        let base_offset_x = (root_width - img_w_f * base_scale) / 2.0;
+        let base_offset_y = (root_height - img_h_f * base_scale) / 2.0;
+        // Total transform = base_transform + pan/zoom
+        let total_scale = base_scale * self.current_scale;
+        let total_offset_x = base_offset_x + self.current_trans_x;
+        let total_offset_y = base_offset_y + self.current_trans_y;
+        // Character's screen position (center of bounding box)
+        let char_center_x = tapped_box.left() as f32 * total_scale
+            + total_offset_x
+            + (tapped_box.w as f32 / 2.0) * total_scale;
+        let char_center_y = tapped_box.top() as f32 * total_scale
+            + total_offset_y
+            + (tapped_box.h as f32 / 2.0) * total_scale;
+        // Character's left edge in screen space (for overlap check)
+        let char_left = tapped_box.left() as f32 * total_scale + total_offset_x;
+        let char_top = tapped_box.top() as f32 * total_scale + total_offset_y;
+
+        // In portrait, panel takes roughly half the screen height
+        let panel_height = root_height * 0.5_f32;
 
         if is_landscape {
-            self.last_landscape_gravity = if screen_center_x < root_width / 2.0 {
+            // Default: panel on the left (Start)
+            // Switch to right (End) only if the character would be overlapped by the left panel.
+            // The panel occupies [0, panel_width] on the left side of the screen.
+            // Check if the character's screen-space bounding box overlaps that region.
+            let char_right = char_left + tapped_box.w as f32 * total_scale;
+            let overlaps_panel = char_right > 0.0 && char_left < panel_width;
+            self.last_landscape_gravity = if overlaps_panel {
                 Gravity::End
             } else {
                 Gravity::Start
             };
         } else {
-            self.last_portrait_gravity = if screen_center_y < root_height / 2.0 {
+            // Default: panel at top (Top)
+            // Switch to bottom (Bottom) only if the character would be overlapped by the top panel.
+            let char_bottom = char_top + tapped_box.h as f32 * total_scale;
+            let overlaps_panel = char_bottom > 0.0 && char_top < panel_height;
+            self.last_portrait_gravity = if overlaps_panel {
                 Gravity::Bottom
             } else {
                 Gravity::Top
