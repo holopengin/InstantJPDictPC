@@ -528,6 +528,7 @@ impl OcrOverlayState {
     }
 
     /// Process database results to find matching entries.
+    /// Preserves database result order (which is by dictionary priority ASC, popularity DESC).
     fn process_results(
         &self,
         db_results: &[DictionaryEntry],
@@ -535,18 +536,23 @@ impl OcrOverlayState {
         _all_terms: &[String],
         following_text: &str,
     ) -> (Vec<(String, Vec<DictionaryEntry>)>, usize) {
-        let mut results_by_term: HashMap<String, Vec<DictionaryEntry>> = HashMap::new();
+        // Use Vec-based grouping to preserve database result order (priority ASC, popularity DESC)
+        let mut results_by_term: Vec<(String, Vec<DictionaryEntry>)> = Vec::new();
 
         for entry in db_results {
-            results_by_term
-                .entry(entry.kanji.clone())
-                .or_default()
-                .push(entry.clone());
+            // Add under kanji key
+            if let Some(pos) = results_by_term.iter().position(|(k, _)| k == &entry.kanji) {
+                results_by_term[pos].1.push(entry.clone());
+            } else {
+                results_by_term.push((entry.kanji.clone(), vec![entry.clone()]));
+            }
+            // Add under reading key (if different from kanji)
             if entry.reading != entry.kanji {
-                results_by_term
-                    .entry(entry.reading.clone())
-                    .or_default()
-                    .push(entry.clone());
+                if let Some(pos) = results_by_term.iter().position(|(k, _)| k == &entry.reading) {
+                    results_by_term[pos].1.push(entry.clone());
+                } else {
+                    results_by_term.push((entry.reading.clone(), vec![entry.clone()]));
+                }
             }
         }
 
@@ -556,8 +562,8 @@ impl OcrOverlayState {
         for (len, candidates) in candidates_by_length {
             let mut found = false;
             for (term, required_types) in candidates {
-                let term_entries = match results_by_term.get(term.as_str()) {
-                    Some(e) => e,
+                let term_entries = match results_by_term.iter().find(|(k, _)| k == term) {
+                    Some((_, entries)) => entries,
                     None => continue,
                 };
 
@@ -615,13 +621,15 @@ impl OcrOverlayState {
             .iter()
             .map(|(term, entries)| {
                 let mut reading_groups: Vec<FormattedReadingGroup> = Vec::new();
-                let mut grouped: HashMap<String, Vec<&DictionaryEntry>> = HashMap::new();
+                // Preserve insertion order (matches database priority order)
+                let mut grouped: Vec<(String, Vec<&DictionaryEntry>)> = Vec::new();
 
                 for entry in entries {
-                    grouped
-                        .entry(entry.reading.clone())
-                        .or_default()
-                        .push(entry);
+                    if let Some(pos) = grouped.iter().position(|(r, _)| r == &entry.reading) {
+                        grouped[pos].1.push(entry);
+                    } else {
+                        grouped.push((entry.reading.clone(), vec![entry]));
+                    }
                 }
 
                 for (reading, reading_entries) in grouped {
