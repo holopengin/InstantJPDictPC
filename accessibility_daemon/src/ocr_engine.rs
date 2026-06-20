@@ -23,12 +23,15 @@ const X_OVERLAP_THRESHOLD: f32 = 0.3;
 const BOX_FILL_RATIO: f32 = 0.9;
 
 // Simulated swapped pairs for text correction
-const MEIKI_SWAPPED_PAIRS: &[(&str, &str); 5] = &[
-    ("は", "ば"),
-    ("ひ", "び"),
-    ("ふ", "ぶ"),
-    ("へ", "べ"),
-    ("ほ", "ぼ"),
+const MEIKI_SWAPPED_PAIRS: &[(&str, &str); 8] = &[
+    ("儡傀", "傀儡"),
+    ("談冗", "冗談"),
+    ("汰淘", "淘汰"),
+    ("沱滂", "滂沱"),
+    ("攣痙", "痙攣"),
+    ("酊酩", "酩酊"),
+    ("麭麺", "麺麭"),
+    ("哭慟", "慟哭"),
 ];
 
 pub struct OcrEngine {
