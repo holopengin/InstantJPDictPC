@@ -31,7 +31,7 @@ fn main() -> Result<()> {
 
     // Initialize deinflector
     let deinflector = Arc::new(
-        Deinflector::from_json_file("data/deinflection.json").unwrap_or_else(|e| {
+        Deinflector::from_json_file("assets/deinflect.json").unwrap_or_else(|e| {
             println!("Warning: Could not load deinflection rules: {}", e);
             Deinflector::empty()
         }),
@@ -76,7 +76,7 @@ fn run_ocr_viewer(
     deinflector: Arc<Deinflector>,
 ) -> Result<()> {
     // Initialize OCR engine
-    let mut engine = OcrEngine::new("./models")?;
+    let mut engine = OcrEngine::new("./assets")?;
     println!("Models loaded successfully.");
     println!(
         "Character vocabulary loaded: {} chars",
