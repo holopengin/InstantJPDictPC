@@ -37,11 +37,17 @@ const MEIKI_SWAPPED_PAIRS: &[(&str, &str); 8] = &[
 
 pub struct OcrEngine {
     detect_session: Session,
-    recognize_session: std::sync::Arc<std::sync::Mutex<Session>>,
-    recognize_session_vertical: std::sync::Arc<std::sync::Mutex<Session>>,
+    /// Pool of recognition sessions — each worker in the parallel loop takes one
+    /// to avoid serializing all inference through a single Mutex.
+    recognize_sessions: Vec<std::sync::Arc<std::sync::Mutex<Session>>>,
+    recognize_sessions_vertical: Vec<std::sync::Arc<std::sync::Mutex<Session>>>,
     pub char_vocab: Vec<i64>,
     model_dir: String,
 }
+
+/// Number of sessions in each orientation pool.
+/// More sessions = less contention, but each session costs ~31 MB of RAM.
+const SESSION_POOL_SIZE: usize = 3;
 
 impl OcrEngine {
     pub fn new(model_dir: &str) -> Result<Self> {
@@ -49,11 +55,28 @@ impl OcrEngine {
 
         let detect_session = Session::builder()?
             .commit_from_file(model_path.join("meiki.text.detect.v0.1.960x544.onnx"))?;
-        let recognize_session = Session::builder()?
-            .commit_from_file(model_path.join("meiki.text.rec.v0.960x32.with_logits.onnx"))?;
-        let recognize_session_vertical = Session::builder()?.commit_from_file(
-            model_path.join("meiki.text.rec.v0.vertical.32x480.with_logits.onnx"),
-        )?;
+
+        // Build a pool of recognition sessions so parallel workers don't all
+        // contend on a single Mutex.  Each session is ~31 MB, so 4 per
+        // orientation ≈ 250 MB extra — acceptable for the latency win.
+        println!(
+            "Building session pool ({} sessions × 2 orientations)…",
+            SESSION_POOL_SIZE
+        );
+        let mut recognize_sessions = Vec::with_capacity(SESSION_POOL_SIZE);
+        let mut recognize_sessions_vertical = Vec::with_capacity(SESSION_POOL_SIZE);
+        for i in 0..SESSION_POOL_SIZE {
+            println!("  Loading horizontal session {}/{}…", i + 1, SESSION_POOL_SIZE);
+            let s = Session::builder()?
+                .commit_from_file(model_path.join("meiki.text.rec.v0.960x32.with_logits.onnx"))?;
+            recognize_sessions.push(std::sync::Arc::new(std::sync::Mutex::new(s)));
+            println!("  Loading vertical session {}/{}…", i + 1, SESSION_POOL_SIZE);
+            let s = Session::builder()?.commit_from_file(
+                model_path.join("meiki.text.rec.v0.vertical.32x480.with_logits.onnx"),
+            )?;
+            recognize_sessions_vertical.push(std::sync::Arc::new(std::sync::Mutex::new(s)));
+        }
+        println!("Session pool ready.");
 
         // Load character vocabulary
         let vocab_path = model_path.join("char_vocab.json");
@@ -65,8 +88,8 @@ impl OcrEngine {
 
         Ok(OcrEngine {
             detect_session,
-            recognize_session: std::sync::Arc::new(std::sync::Mutex::new(recognize_session)),
-            recognize_session_vertical: std::sync::Arc::new(std::sync::Mutex::new(recognize_session_vertical)),
+            recognize_sessions,
+            recognize_sessions_vertical,
             char_vocab: vocab_json,
             model_dir: model_dir.to_string(),
         })
@@ -493,9 +516,9 @@ impl OcrEngine {
         let (labels_arr_opt, boxes_arr_opt, scores_arr_opt, indices_arr_opt, raw_logits_opt) = {
             // Build inputs
             let mut active_session = if is_vertical {
-                self.recognize_session_vertical.lock().unwrap()
+                self.recognize_sessions_vertical[0].lock().unwrap()
             } else {
-                self.recognize_session.lock().unwrap()
+                self.recognize_sessions[0].lock().unwrap()
             };
             let session_input_names: Vec<String> = active_session
                 .inputs()
@@ -1075,19 +1098,21 @@ impl OcrEngine {
 
         // --- Character recognition ---
         let t_recognize = Instant::now();
-        // Clone the Arc handles so each parallel worker gets a reference
-        // to the same underlying sessions — no model reloading per box.
-        let rec_session = self.recognize_session.clone();
-        let rec_session_vert = self.recognize_session_vertical.clone();
+        // Clone the Arc pool handles so each parallel worker can pick a session
+        // by index — avoids both model reloading AND Mutex contention.
+        let rec_sessions = self.recognize_sessions.clone();
+        let rec_sessions_vert = self.recognize_sessions_vertical.clone();
+        let pool_size = rec_sessions.len();
         let char_vocab = self.char_vocab.clone();
         let annotations: Vec<DetectedAnnotation> = sorted
             .par_iter()
             .enumerate()
             .map(|(i, bbox)| {
                 let t_box = Instant::now();
+                let pool_idx = i % pool_size;
                 let result = ocr_parallel::recognize_single_line_with_sessions(
-                    &rec_session,
-                    &rec_session_vert,
+                    &rec_sessions[pool_idx],
+                    &rec_sessions_vert[pool_idx],
                     &char_vocab,
                     image,
                     bbox,
