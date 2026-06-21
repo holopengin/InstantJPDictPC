@@ -3,7 +3,7 @@ use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use ort::session::Session;
 use ort::value::Tensor;
 use rayon::prelude::*;
-use rusttype::{point, Font, Scale};
+use fontdue::{Font, FontSettings, LineMetrics};
 use std::path::Path;
 use std::time::Instant;
 
@@ -1147,15 +1147,15 @@ impl OcrEngine {
         );
 
         // Prepare font if rendering and path provided or defaults
-        let mut font_opt: Option<Font<'static>> = None;
+        let mut font_opt: Option<Font> = None;
         if render {
+            let settings = FontSettings::default();
             // Try provided path first
             if let Some(fp) = font_path {
                 if let Ok(bytes) = std::fs::read(fp) {
-                    if let Some(f) = Font::try_from_vec(bytes) {
-                        font_opt = Some(f);
-                    } else {
-                        println!("Failed to parse font at {}", fp);
+                    match Font::from_bytes(bytes, settings) {
+                        Ok(f) => font_opt = Some(f),
+                        Err(e) => println!("Failed to parse font at {}: {}", fp, e),
                     }
                 } else {
                     println!("Failed to read font at {}", fp);
@@ -1172,10 +1172,13 @@ impl OcrEngine {
                 ];
                 for cand in candidates.iter() {
                     if let Ok(bytes) = std::fs::read(cand) {
-                        if let Some(f) = Font::try_from_vec(bytes) {
-                            println!("Loaded font from {}", cand);
-                            font_opt = Some(f);
-                            break;
+                        match Font::from_bytes(bytes, settings) {
+                            Ok(f) => {
+                                println!("Loaded font from {}", cand);
+                                font_opt = Some(f);
+                                break;
+                            }
+                            Err(_) => {}
                         }
                     }
                 }
@@ -1189,21 +1192,11 @@ impl OcrEngine {
             let color = Rgba([255u8, 0u8, 0u8, 255u8]);
             let thickness = 2u32;
 
-            // Precompute a reference glyph height for the loaded font (if any) using '本' like the Android implementation.
-            // Measure at unit scale (1.0) so we can compute a direct px scale: scale_px = target_h / measured_unit_h.
+            // Precompute a reference glyph height for the loaded font (if any) using '本'.
             let _ref_glyph_unit_h = 0.0f32;
             if let Some(ref font) = font_opt {
-                let unit_scale = Scale::uniform(1.0);
-                let _ref_glyph_unit_h = font
-                    .glyph('本')
-                    .scaled(unit_scale)
-                    .positioned(point(0.0, 0.0))
-                    .pixel_bounding_box()
-                    .map(|r| (r.max.y - r.min.y) as f32)
-                    .unwrap_or_else(|| {
-                        let vm = font.v_metrics(unit_scale);
-                        vm.ascent - vm.descent
-                    });
+                let (metrics, _) = font.rasterize('本', 1.0);
+                let _ref_glyph_unit_h = metrics.height as f32;
             }
 
             for bbox in sorted.iter() {
@@ -1255,15 +1248,19 @@ impl OcrEngine {
                                     .unwrap_or(0)
                             };
 
-                            // Measure per-character advances using the same fixed_size as text size when possible.
+                            // Measure per-character advances at the fixed_size.
                             // If measuring fails or yields zero, fall back to fixed_size.
                             let mut advances: Vec<i32> = Vec::new();
                             if fixed_size > 0 {
-                                let measure_scale = Scale::uniform(fixed_size as f32);
+                                let px = fixed_size as f32;
                                 for ch in chars.iter() {
-                                    let g = font.glyph(*ch).scaled(measure_scale);
-                                    let adv = g.h_metrics().advance_width.round() as i32;
-                                    advances.push(if adv > 0 { adv } else { fixed_size });
+                                    let (metrics, _) = font.rasterize(*ch, px);
+                                    let adv = if metrics.advance_width > 0.0 {
+                                        metrics.advance_width.round() as i32
+                                    } else {
+                                        fixed_size
+                                    };
+                                    advances.push(adv);
                                 }
                             } else {
                                 advances = vec![0; chars.len()];
@@ -1309,49 +1306,25 @@ impl OcrEngine {
                                     .push(BoundingBox::new(left, top, fixed_size, fixed_size, 1.0));
                             }
 
-                            // Compute unit visual height for the font (ascent - descent at scale 1.0)
-                            let unit_metrics = font.v_metrics(Scale::uniform(1.0));
-                            let _unit_visual_height = unit_metrics.ascent - unit_metrics.descent;
-
-                            // Helper: find a scale (px) so that the reference glyph '本' visual height matches target (binary search)
+                            // Helper: find a scale (px) so that the reference glyph '本' visual height
+                            // matches target_h via binary search.
                             let find_scale_for_target = |font: &Font, target_h: f32| -> f32 {
-                                // bracket search over reasonable scale range
                                 let mut lo = 1.0f32.max(target_h * 0.2);
                                 let mut hi = (target_h.max(1.0) * 8.0).max(64.0);
-                                // Expand until hi produces measurement >= target_h (or until a cap)
+                                // Expand upper bound until glyph height >= target
                                 for _ in 0..10 {
-                                    let ref_pos_hi = font
-                                        .glyph('本')
-                                        .scaled(Scale::uniform(hi))
-                                        .positioned(point(0.0, 0.0));
-                                    let measured_hi = ref_pos_hi
-                                        .pixel_bounding_box()
-                                        .map(|r| (r.max.y - r.min.y) as f32)
-                                        .unwrap_or_else(|| {
-                                            font.v_metrics(Scale::uniform(hi)).ascent
-                                                - font.v_metrics(Scale::uniform(hi)).descent
-                                        });
-                                    if measured_hi >= target_h || hi > 4096.0 {
+                                    let (m, _) = font.rasterize('本', hi);
+                                    if (m.height as f32) >= target_h || hi > 4096.0 {
                                         break;
                                     }
                                     hi *= 2.0;
                                 }
-
                                 // Binary refine
                                 let mut s = lo;
                                 for _ in 0..12 {
                                     let mid = (lo + hi) / 2.0;
-                                    let ref_pos = font
-                                        .glyph('本')
-                                        .scaled(Scale::uniform(mid))
-                                        .positioned(point(0.0, 0.0));
-                                    let measured = ref_pos
-                                        .pixel_bounding_box()
-                                        .map(|r| (r.max.y - r.min.y) as f32)
-                                        .unwrap_or_else(|| {
-                                            font.v_metrics(Scale::uniform(mid)).ascent
-                                                - font.v_metrics(Scale::uniform(mid)).descent
-                                        });
+                                    let (m, _) = font.rasterize('本', mid);
+                                    let measured = m.height as f32;
                                     if measured == 0.0 {
                                         lo = mid;
                                         s = mid;
@@ -1383,34 +1356,37 @@ impl OcrEngine {
                                 let ch = chars[i];
 
                                 let scale_px = scale_for_line.max(4.0).min(4096.0);
-                                let scale = Scale::uniform(scale_px);
-                                let v_metrics = font.v_metrics(scale);
+                                let line_metrics = font
+                                    .horizontal_line_metrics(scale_px)
+                                    .unwrap_or_else(|| fontdue::LineMetrics {
+                                        ascent: scale_px,
+                                        descent: 0.0,
+                                        line_gap: 0.0,
+                                        new_line_size: scale_px,
+                                    });
 
                                 // Compute baseline so that the glyph's measured vertical box is centered in the display box.
                                 let box_center_y = db.top() as f32 + (db.h as f32) / 2.0;
-                                let baseline_y =
-                                    box_center_y + (v_metrics.ascent - v_metrics.descent) / 2.0;
-                                let y_top = baseline_y - v_metrics.ascent;
+                                let baseline_y = box_center_y
+                                    + (line_metrics.ascent - line_metrics.descent) / 2.0;
+                                let y_top = baseline_y - line_metrics.ascent;
 
                                 // Measure advance (width) at this scale for horizontal centering
-                                let g = font.glyph(ch).scaled(scale);
-                                let text_width = g.h_metrics().advance_width;
+                                let (adv_metrics, _) = font.rasterize(ch, scale_px);
+                                let text_width = adv_metrics.advance_width;
                                 let x =
                                     db.left() as f32 + ((db.w as f32 - text_width).max(0.0) / 2.0);
 
                                 // Debug: measure final glyph bbox at this scale to verify visual height
-                                let final_pos = font
-                                    .glyph(ch)
-                                    .scaled(scale)
-                                    .positioned(point(x, baseline_y));
-                                let final_bbox = final_pos.pixel_bounding_box();
-                                let final_h = final_bbox
-                                    .map(|r| (r.max.y - r.min.y) as f32)
-                                    .unwrap_or(v_metrics.ascent - v_metrics.descent);
+                                let (final_metrics, _) = font.rasterize(ch, scale_px);
+                                let final_h = final_metrics.height as f32;
 
                                 if dbg_printed < 8 {
                                     dbg_printed += 1;
-                                    println!("DBG glyph='{}' box_h={} target_h={:.1} scale_px={:.2} final_h={:.1} adv_w={:.1}", ch, db.h, target_for_line, scale_px, final_h, text_width);
+                                    println!(
+                                        "DBG glyph='{}' box_h={} target_h={:.1} scale_px={:.2} final_h={:.1} adv_w={:.1}",
+                                        ch, db.h, target_for_line, scale_px, final_h, text_width
+                                    );
                                 }
 
                                 draw_text_ttf(
@@ -1673,50 +1649,53 @@ fn draw_text_ttf(
     size_px: f32,
     color: Rgba<u8>,
 ) {
-    use rusttype::PositionedGlyph;
-    let scale = Scale::uniform(size_px);
-    let v_metrics = font.v_metrics(scale);
-    // Layout glyphs with a baseline at (x, y + ascent)
-    let baseline_y = y as f32 + v_metrics.ascent;
-    let glyphs: Vec<PositionedGlyph> = font
-        .layout(text, scale, point(x as f32, baseline_y))
-        .collect();
-
     let img_w = img.width() as i32;
     let img_h = img.height() as i32;
-
-    for glyph in glyphs {
-        if let Some(bb) = glyph.pixel_bounding_box() {
-            glyph.draw(|gx, gy, v| {
-                let px = gx as i32 + bb.min.x;
-                let py = gy as i32 + bb.min.y;
-                if px >= 0 && px < img_w && py >= 0 && py < img_h {
-                    // Clamp coverage to [0.0, 1.0] and convert to an integer alpha in 0..=255
-                    let cov = if v.is_finite() {
-                        v.max(0.0).min(1.0)
-                    } else {
-                        0.0
-                    };
-                    let mut alpha = (cov * 255.0).round() as i32;
-                    if alpha < 0 {
-                        alpha = 0;
-                    } else if alpha > 255 {
-                        alpha = 255;
-                    }
-
-                    let existing = img.get_pixel(px as u32, py as u32);
-                    let mut out = [0u8; 4];
-                    for c in 0..3 {
-                        let fg = color[c] as i32;
-                        let bgc = existing[c] as i32;
-                        let val = (fg * alpha + bgc * (255 - alpha)) / 255;
-                        out[c] = val as u8;
-                    }
-                    // Preserve alpha channel as opaque
-                    out[3] = 255u8;
-                    img.put_pixel(px as u32, py as u32, Rgba(out));
-                }
-            });
+    let line_metrics = font.horizontal_line_metrics(size_px).unwrap_or_else(|| {
+        fontdue::LineMetrics {
+            ascent: size_px,
+            descent: 0.0,
+            line_gap: 0.0,
+            new_line_size: size_px,
         }
+    });
+    // Baseline is at y + ascent
+    let mut cursor_x = x as f32;
+    let baseline_y = y as f32 + line_metrics.ascent;
+
+    for ch in text.chars() {
+        let (metrics, bitmap) = font.rasterize(ch, size_px);
+        if metrics.width == 0 || metrics.height == 0 {
+            cursor_x += metrics.advance_width;
+            continue;
+        }
+        // metrics.xmin/ymin are offsets from the cursor position
+        let origin_x = cursor_x + metrics.xmin as f32;
+        let origin_y = baseline_y + metrics.ymin as f32;
+
+        for row in 0..metrics.height {
+            for col in 0..metrics.width {
+                let cov = bitmap[row * metrics.width + col];
+                if cov == 0 {
+                    continue;
+                }
+                let px = origin_x.round() as i32 + col as i32;
+                let py = origin_y.round() as i32 + row as i32;
+                if px < 0 || px >= img_w || py < 0 || py >= img_h {
+                    continue;
+                }
+                let alpha = cov as i32;
+                let existing = img.get_pixel(px as u32, py as u32);
+                let mut out = [0u8; 4];
+                for c in 0..3 {
+                    let fg = color[c] as i32;
+                    let bgc = existing[c] as i32;
+                    out[c] = ((fg * alpha + bgc * (255 - alpha)) / 255) as u8;
+                }
+                out[3] = 255;
+                img.put_pixel(px as u32, py as u32, Rgba(out));
+            }
+        }
+        cursor_x += metrics.advance_width;
     }
 }
