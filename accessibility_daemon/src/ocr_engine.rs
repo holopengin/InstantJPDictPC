@@ -127,15 +127,12 @@ impl OcrEngine {
             img_data[2 * h_usize * w_usize + y_usize * w_usize + x_usize] = b;
         }
 
-        // In ort rc.12, Tensor::from_array takes (shape, data) where shape is a tuple of i64 dims
-        // and data is a boxed slice.
         let input_tensor = Tensor::from_array((
             [1i64, 3, DETECT_HEIGHT as i64, DETECT_WIDTH as i64],
             img_data.into_boxed_slice(),
         ))?;
 
         // 3. Build inputs map using the named map form of ort::inputs!
-        // Collect input names to avoid holding borrows into `self.detect_session` across a mutable run() call.
         let session_input_names: Vec<String> = self
             .detect_session
             .inputs()
@@ -149,7 +146,6 @@ impl OcrEngine {
             .or_else(|| session_input_names.first())
             .context("Detection model has no inputs")?;
 
-        // Check if the model expects orig_target_sizes as an additional input
         let has_orig_target_sizes = session_input_names.iter().any(|n| n == "orig_target_sizes");
 
         let inputs = if has_orig_target_sizes {
@@ -167,7 +163,7 @@ impl OcrEngine {
             }
         };
 
-        // Collect output names before calling run() so we don't hold borrows from the session across the mutable call.
+        // 4. Run the detection model and extract arrays
         let output_names: Vec<String> = self
             .detect_session
             .outputs()
@@ -188,7 +184,6 @@ impl OcrEngine {
             .context("No scores output found")?
             .clone();
 
-        // 4. Run the detection model and extract arrays. Keep run_outputs scoped so it drops before we borrow `self` again.
         let (boxes_arr, scores_arr) = {
             let run_outputs = self.detect_session.run(inputs)?;
 
@@ -205,8 +200,7 @@ impl OcrEngine {
             (boxes_arr, scores_arr)
         };
 
-        // boxes shape: [batch, num_boxes, 4] or [num_boxes, 4]
-        // scores shape: [batch, num_boxes] or [num_boxes]
+        // 5. Parse boxes and scores
         let num_boxes = if boxes_arr.ndim() == 3 {
             boxes_arr.shape()[1]
         } else {
