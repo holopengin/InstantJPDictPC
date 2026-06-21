@@ -106,12 +106,22 @@ fn run_ocr_viewer(
         image.height()
     );
 
-    // Run detection + recognition
-    let (annotations, _annotated_opt) =
-        engine.run_detection(&image, false, font_path.as_deref())?;
+    // Run detection + recognition (render=true to draw boxes on the image)
+    let (annotations, annotated_opt) =
+        engine.run_detection(&image, true, font_path.as_deref())?;
 
-    // Encode original image to PNG bytes for the viewer
-    let display_img = image.to_rgba8();
+    // Use annotated image if available, otherwise original
+    let display_img = if let Some(ref annotated) = annotated_opt {
+        // Save annotated image for debugging
+        if let Err(e) = annotated.save("debug_annotated.png") {
+            eprintln!("Warning: failed to save debug image: {}", e);
+        } else {
+            println!("Saved debug_annotated.png");
+        }
+        annotated.clone()
+    } else {
+        image.to_rgba8()
+    };
     let dynimg = DynamicImage::ImageRgba8(display_img.clone());
     let mut buf = Cursor::new(Vec::new());
     dynimg
