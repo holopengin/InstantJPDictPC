@@ -4,8 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# ONNX Runtime for Rust
+# ONNX Runtime for Rust (legacy, being replaced by burn)
 ort = { version = "2.0.0-rc.3", features = ["webgpu"] }
+
+# Burn deep learning framework (wgpu backend)
+burn = { path = "burn/crates/burn", features = ["wgpu", "std"] }
+burn-wgpu = { path = "burn/crates/burn-wgpu", features = ["std"] }
+burn-cubecl = { path = "burn/crates/burn-cubecl", features = ["std"] }
+burn-store = { path = "burn/crates/burn-store", features = ["std", "burnpack"] }
+burn-onnx = { path = "burn-onnx/crates/burn-onnx", features = ["mmap"] }
+bytemuck = "1.14"
 
 # Image processing
 image = "0.25"

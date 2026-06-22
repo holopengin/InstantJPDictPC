@@ -108,7 +108,7 @@ impl OcrEngine {
         let resized = image.resize_exact(
             DETECT_WIDTH,
             DETECT_HEIGHT,
-            image::imageops::FilterType::Triangle,
+            image::imageops::FilterType::Lanczos3,
         );
 
         // 2. Convert to float tensor in NCHW format, normalized to [0, 1]
@@ -486,9 +486,9 @@ impl OcrEngine {
 
         // Resize chunk and pad to target
         let resized = chunk.resize_exact(
-            effective_w as u32,
-            effective_h as u32,
-            image::imageops::FilterType::Triangle,
+            REC_WIDTH,
+            REC_HEIGHT,
+            image::imageops::FilterType::Lanczos3,
         );
         let mut padded = RgbaImage::from_pixel(target_w, target_h, Rgba([0u8, 0u8, 0u8, 255u8]));
         let resized_rgba = resized.to_rgba8();
