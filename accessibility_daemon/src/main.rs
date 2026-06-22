@@ -1,11 +1,17 @@
 mod data;
 mod models;
 mod ocr_engine;
+#[cfg(feature = "burn-backend")]
+mod ocr_engine_burn;
 mod ocr_parallel;
 mod overlay_state;
-mod settings_window;
+// mod settings_window; // TODO: fix edition 2024 async block issues
 mod util;
 mod viewer;
+
+// Burn model definitions (generated from ONNX)
+#[cfg(feature = "burn-backend")]
+mod models_burn;
 
 use anyhow::{Context, Result};
 use image::DynamicImage;
@@ -15,8 +21,7 @@ use std::sync::Arc;
 
 use crate::data::db::DictionaryDatabase;
 use crate::models::*;
-use crate::ocr_engine::OcrEngine;
-use crate::settings_window::SettingsWindow;
+// use crate::settings_window::SettingsWindow; // TODO: fix edition 2024 async block issues
 use crate::util::deinflector::Deinflector;
 use crate::viewer::OcrViewer;
 
@@ -43,7 +48,8 @@ fn main() -> Result<()> {
     if args.len() < 2 {
         // No image argument — open the settings / management window
         println!("No image argument provided. Opening settings window...");
-        run_settings_window(db)?;
+        // run_settings_window(db)?; // TODO: fix edition 2024 async block issues
+        println!("Settings window disabled (edition 2024 async block issues).");
         return Ok(());
     }
 
@@ -55,15 +61,10 @@ fn main() -> Result<()> {
 // Settings window (no image argument)
 // ---------------------------------------------------------------------------
 
-fn run_settings_window(db: Arc<DictionaryDatabase>) -> Result<()> {
-    let settings_app = iced::application(
-        move || SettingsWindow::new(Arc::clone(&db)),
-        SettingsWindow::update,
-        SettingsWindow::view,
-    );
-
-    settings_app.run().context("Failed to run settings window")?;
-    Ok(())
+#[allow(dead_code)]
+fn run_settings_window(_db: Arc<DictionaryDatabase>) -> Result<()> {
+    // TODO: fix edition 2024 async block issues
+    unimplemented!("settings window requires edition 2024")
 }
 
 // ---------------------------------------------------------------------------
@@ -75,18 +76,11 @@ fn run_ocr_viewer(
     db: Arc<DictionaryDatabase>,
     deinflector: Arc<Deinflector>,
 ) -> Result<()> {
-    // Initialize OCR engine
-    let mut engine = OcrEngine::new("./assets")?;
-    println!("Models loaded successfully.");
-    println!(
-        "Character vocabulary loaded: {} chars",
-        engine.char_vocab.len()
-    );
-
     let image_path = args[1].clone();
 
     // Optional font path parsing
     let mut font_path: Option<String> = None;
+    let mut use_burn = false;
     for i in 0..args.len() {
         if args[i].starts_with("--font=") {
             font_path = Some(args[i].trim_start_matches("--font=").to_string());
@@ -94,6 +88,8 @@ fn run_ocr_viewer(
             if i + 1 < args.len() {
                 font_path = Some(args[i + 1].clone());
             }
+        } else if args[i] == "--burn" || args[i] == "-b" {
+            use_burn = true;
         }
     }
 
@@ -107,8 +103,35 @@ fn run_ocr_viewer(
     );
 
     // Run detection + recognition (render=true to draw boxes on the image)
-    let (annotations, annotated_opt) =
-        engine.run_detection(&image, true, font_path.as_deref())?;
+    let (annotations, annotated_opt) = if use_burn {
+        #[cfg(feature = "burn-backend")]
+        {
+            println!("Using Burn WGPU backend.");
+            let engine = ocr_engine_burn::OcrEngine::new("./assets")?;
+            println!("Models loaded successfully.");
+            println!(
+                "Character vocabulary loaded: {} chars",
+                engine.char_vocab.len()
+            );
+            let _boxes = engine.detect(&image)?;
+            // TODO: Add recognition and rendering
+            (Vec::new(), None)
+        }
+        #[cfg(not(feature = "burn-backend"))]
+        {
+            eprintln!("Burn backend not compiled in. Rebuild with --features burn-backend");
+            std::process::exit(1);
+        }
+    } else {
+        println!("Using ORT (ONNX Runtime) backend.");
+        let mut engine = ocr_engine::OcrEngine::new("./assets")?;
+        println!("Models loaded successfully.");
+        println!(
+            "Character vocabulary loaded: {} chars",
+            engine.char_vocab.len()
+        );
+        engine.run_detection(&image, true, font_path.as_deref())?
+    };
 
     // Use annotated image if available, otherwise original
     let display_img = if let Some(ref annotated) = annotated_opt {
