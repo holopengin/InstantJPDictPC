@@ -1,8 +1,10 @@
 mod data;
 mod models;
+#[cfg(feature = "ort")]
 mod ocr_engine;
 #[cfg(feature = "burn-backend")]
 mod ocr_engine_burn;
+#[cfg(feature = "ort")]
 mod ocr_parallel;
 mod overlay_state;
 // mod settings_window; // TODO: fix edition 2024 async block issues
@@ -76,22 +78,35 @@ fn run_ocr_viewer(
     db: Arc<DictionaryDatabase>,
     deinflector: Arc<Deinflector>,
 ) -> Result<()> {
-    let image_path = args[1].clone();
-
-    // Optional font path parsing
+    // Parse args: find image path (first non-flag arg) and optional flags
+    let mut image_path = None;
     let mut font_path: Option<String> = None;
     let mut use_burn = false;
-    for i in 0..args.len() {
-        if args[i].starts_with("--font=") {
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--burn" || args[i] == "-b" {
+            use_burn = true;
+            i += 1;
+        } else if args[i].starts_with("--font=") {
             font_path = Some(args[i].trim_start_matches("--font=").to_string());
+            i += 1;
         } else if args[i] == "--font" || args[i] == "-f" {
             if i + 1 < args.len() {
                 font_path = Some(args[i + 1].clone());
+                i += 2;
+            } else {
+                i += 1;
             }
-        } else if args[i] == "--burn" || args[i] == "-b" {
-            use_burn = true;
+        } else if args[i].starts_with("-") {
+            // Unknown flag, skip
+            i += 1;
+        } else {
+            // First non-flag argument is the image path
+            image_path = Some(args[i].clone());
+            break;
         }
     }
+    let image_path = image_path.context("No image path provided")?;
 
     let image =
         image::open(&image_path).context(format!("Failed to open image: {}", image_path))?;
@@ -115,7 +130,7 @@ fn run_ocr_viewer(
             );
             let _boxes = engine.detect(&image)?;
             // TODO: Add recognition and rendering
-            (Vec::new(), None)
+            (Vec::new(), None::<image::RgbaImage>)
         }
         #[cfg(not(feature = "burn-backend"))]
         {
@@ -123,14 +138,22 @@ fn run_ocr_viewer(
             std::process::exit(1);
         }
     } else {
-        println!("Using ORT (ONNX Runtime) backend.");
-        let mut engine = ocr_engine::OcrEngine::new("./assets")?;
-        println!("Models loaded successfully.");
-        println!(
-            "Character vocabulary loaded: {} chars",
-            engine.char_vocab.len()
-        );
-        engine.run_detection(&image, true, font_path.as_deref())?
+        #[cfg(feature = "ort")]
+        {
+            println!("Using ORT (ONNX Runtime) backend.");
+            let mut engine = ocr_engine::OcrEngine::new("./assets")?;
+            println!("Models loaded successfully.");
+            println!(
+                "Character vocabulary loaded: {} chars",
+                engine.char_vocab.len()
+            );
+            engine.run_detection(&image, true, font_path.as_deref())?
+        }
+        #[cfg(not(feature = "ort"))]
+        {
+            eprintln!("ORT backend not compiled in. Rebuild with --features ort");
+            std::process::exit(1);
+        }
     };
 
     // Use annotated image if available, otherwise original
@@ -141,7 +164,7 @@ fn run_ocr_viewer(
         } else {
             println!("Saved debug_annotated.png");
         }
-        annotated.clone()
+        image.to_rgba8()
     } else {
         image.to_rgba8()
     };
