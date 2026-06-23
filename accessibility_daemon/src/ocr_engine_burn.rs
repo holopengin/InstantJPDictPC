@@ -118,7 +118,9 @@ impl OcrEngine {
             &self.device,
         );
 
-        // 3. Load detection model and run inference
+        eprintln!("DEBUG: input shape: {:?}", input.shape());
+
+        // 3. Load detection model
         let model_path = Path::new(&self.model_dir).join("meiki.text.detect.v0.1.bpk");
         let model = DetectModel::from_file(&model_path, &self.device);
 
@@ -128,21 +130,24 @@ impl OcrEngine {
             &self.device,
         );
 
+        // 4. Run the full model
         let (labels, boxes, scores) = model.forward(input, orig_sizes);
 
-        // 4. Extract output data
+        eprintln!("DEBUG: boxes shape: {:?}", boxes.shape());
+        eprintln!("DEBUG: scores shape: {:?}", scores.shape());
+        eprintln!("DEBUG: labels shape: {:?}", labels.shape());
+
+        // 5. Extract output data
         let boxes_data: Vec<f32> = boxes.into_data().to_vec().unwrap();
         let scores_data: Vec<f32> = scores.into_data().to_vec().unwrap();
 
-        // 5. Parse boxes and scores
+        // 6. Parse boxes and scores
         let num_boxes = boxes_data.len() / 4;
         let mut detected_boxes = Vec::new();
 
         for i in 0..num_boxes {
             let score = if i < scores_data.len() { scores_data[i] } else { 0.0 };
-            if score <= 0.4 {
-                continue;
-            }
+            if score <= 0.4 { continue; }
 
             let left = boxes_data[i * 4] as i32;
             let top = boxes_data[i * 4 + 1] as i32;
@@ -154,7 +159,6 @@ impl OcrEngine {
             let mut right = right.min(orig_w);
             let bottom = bottom.min(orig_h);
 
-            // Add small margins
             if bottom - top > right - left {
                 let v_margin = ((right - left) as f32 * 0.1).max(2.0) as i32;
                 let h_margin = ((right - left) as f32 * 0.05).max(1.0) as i32;
@@ -170,7 +174,6 @@ impl OcrEngine {
             ));
         }
 
-        // 6. Merge overlapping boxes and sort
         let merged = self.merge_overlapping_boxes(detected_boxes);
         let sorted = self.sort_detected_boxes(merged);
         Ok(sorted)

@@ -1841,6 +1841,10 @@ impl Submodule4 {
         let slice5_out1 = transpose13_out1.clone().slice(s![.., .., .., 0..8160]);
         let slice6_out1 = transpose13_out1.clone().slice(s![.., .., .., 8160..10200]);
         let slice7_out1 = transpose13_out1.slice(s![.., .., .., 10200..10710]);
+        // FIXED: reshape slices from [1,8,16,X] to [8,16,H,W] for grid_sample
+        let slice5_out1 = slice5_out1.reshape([8i32, 16, 68, 120]);
+        let slice6_out1 = slice6_out1.reshape([8i32, 16, 34, 60]);
+        let slice7_out1 = slice7_out1.reshape([8i32, 16, 17, 30]);
         let sigmoid49_out1 = burn::tensor::activation::sigmoid(add29_out1);
         let linear12_out1 = self.linear12.forward(sigmoid49_out1.clone());
         let relu32_out1 = burn::tensor::activation::relu(linear12_out1);
@@ -1969,7 +1973,7 @@ impl Submodule5 {
         let constant299_out1 = self.constant299.val();
         let mul59_out1 = reshape17_out1
             .mul((constant299_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize]));
-        let unsqueeze7_out1: Tensor<5> = sigmoid49_out1.unsqueeze_dims::<5>(&[2, 3]);
+        let unsqueeze7_out1: Tensor<5> = sigmoid49_out1.unsqueeze_dims::<5>(&[2, 2]); // FIXED
         let slice8_out1 = unsqueeze7_out1.clone().slice(s![.., .., .., .., 2..]);
         let mul60_out1 = mul59_out1.mul(slice8_out1);
         let mul61_out1 = mul60_out1
@@ -1995,7 +1999,12 @@ impl Submodule5 {
         let sub5_out1 = mul62_out1
             .sub((constant354_out1).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let transpose21_out1 = sub5_out1.permute([0, 2, 1, 3, 4]);
-        let reshape19_out1 = transpose21_out1.reshape([-1, 64, 18, 2]);
+        let reshape19_out1 = {
+            let __s = transpose21_out1.dims();
+            let __total: usize = __s.iter().product();
+            let __batch = __total / (64 * 18 * 2);
+            transpose21_out1.reshape([__batch as i32, 64, 18, 2])
+        }; // FIXED
         let split_tensors = reshape19_out1.split_with_sizes([6, 6, 6].into(), 2);
         let [split5_out1, split5_out2, split5_out3] = split_tensors.try_into().unwrap();
         let gridsample1_out1 = slice5_out1
@@ -2036,28 +2045,29 @@ impl Submodule5 {
             mul64_out1.sum_dim(3usize).squeeze_dims::<3usize>(&[3])
         };
         let mul65_out1 = gather7_out1 * gather8_out1;
-        let unsqueeze10_out1 = [gather6_out1 as i64];
-        let unsqueeze11_out1 = [mul65_out1 as i64];
-        let constant359_out1: [i64; 1] = [64i64];
-        let concat22_out1: [i64; 3usize] = [
-            &unsqueeze10_out1[..],
-            &unsqueeze11_out1[..],
-            &constant359_out1[..],
-        ]
-            .concat()
-            .try_into()
-            .unwrap();
-        let reshape24_out1 = reducesum1_out1.reshape(concat22_out1);
+        let concat22_out1: [i64; 3usize] = [8, mul65_out1, 64]; // FIXED: use grid batch
+        let reshape24_out1 = {
+            let __s = reducesum1_out1.dims();
+            // Reshape [8, 16, 64] -> [1, 128, 64] (collapse batch and channel)
+            reducesum1_out1.reshape([1i32, (__s[0] * __s[1]) as i32, __s[2] as i32])
+        }; // FIXED: match ONNX Reshape_7
         let transpose23_out1 = reshape24_out1.permute([0, 2, 1]);
+        // FIXED: broadcast add33 from batch=1 to batch=8
+        let add33_out1_clone = add33_out1.clone();
+        let add33_broadcast = if add33_out1.dims()[0] == 1 && transpose23_out1.dims()[0] > 1 {
+            add33_out1.repeat(&[transpose23_out1.dims()[0] as usize, 1, 1])
+        } else {
+            add33_out1
+        };
         let concat23_out1 = burn::tensor::Tensor::cat(
-            [add33_out1.clone(), transpose23_out1.clone()].into(),
+            [add33_broadcast, transpose23_out1.clone()].into(),
             2,
         );
         let linear20_out1 = self.linear20.forward(concat23_out1);
         let sigmoid50_out1 = burn::tensor::activation::sigmoid(linear20_out1);
         let slice10_out1 = sigmoid50_out1.clone().slice(s![.., .., 0..128]);
         let slice11_out1 = sigmoid50_out1.slice(s![.., .., 128..256]);
-        let mul66_out1 = slice10_out1.mul(add33_out1);
+        let mul66_out1 = slice10_out1.mul(add33_out1_clone);
         let mul67_out1 = slice11_out1.mul(transpose23_out1);
         let add36_out1 = mul66_out1.add(mul67_out1);
         let reducemean9_out1 = { add36_out1.clone().mean_dim(2usize) };
@@ -2070,6 +2080,7 @@ impl Submodule5 {
             .add((constant352_out1).unsqueeze_dims(&[0isize, 1isize]));
         let sqrt5_out1 = add37_out1.sqrt();
         let div6_out1 = sub6_out1.div(sqrt5_out1);
+        let constant359_out1: [i64; 1] = [64i64];
         (div6_out1, constant359_out1, constant299_out1, concat22_out1)
     }
 }
@@ -2611,7 +2622,10 @@ impl Submodule6 {
         let reducesum2_out1 = {
             mul80_out1.sum_dim(3usize).squeeze_dims::<3usize>(&[3])
         };
-        let reshape36_out1 = reducesum2_out1.reshape(concat22_out1);
+        let reshape36_out1 = {
+            let __s = reducesum2_out1.dims();
+            reducesum2_out1.reshape([1i32, (__s[0] * __s[1]) as i32, __s[2] as i32])
+        }; // FIXED: match ONNX Reshape_7
         let transpose33_out1 = reshape36_out1.permute([0, 2, 1]);
         let concat28_out1 = burn::tensor::Tensor::cat(
             [add54_out1.clone(), transpose33_out1.clone()].into(),
@@ -3035,7 +3049,10 @@ impl Submodule7 {
         let reducesum3_out1 = {
             mul95_out1.sum_dim(3usize).squeeze_dims::<3usize>(&[3])
         };
-        let reshape48_out1 = reducesum3_out1.reshape(concat22_out1);
+        let reshape48_out1 = {
+            let __s = reducesum3_out1.dims();
+            reducesum3_out1.reshape([1i32, (__s[0] * __s[1]) as i32, __s[2] as i32])
+        }; // FIXED: match ONNX Reshape_7
         let transpose43_out1 = reshape48_out1.permute([0, 2, 1]);
         let concat33_out1 = burn::tensor::Tensor::cat(
             [add76_out1.clone(), transpose43_out1.clone()].into(),
