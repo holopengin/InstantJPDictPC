@@ -174,8 +174,11 @@ impl OcrEngine {
             ));
         }
 
-        let merged = self.merge_overlapping_boxes(detected_boxes);
-        let sorted = self.sort_detected_boxes(merged);
+        // DISABLED: merge_overlapping_boxes for raw comparison
+        // let merged = self.merge_overlapping_boxes(detected_boxes);
+        // let sorted = self.sort_detected_boxes(merged);
+        // Ok(sorted)
+        let sorted = self.sort_detected_boxes(detected_boxes);
         Ok(sorted)
     }
 
