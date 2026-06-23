@@ -13,7 +13,93 @@ mod viewer;
 
 // Burn model definitions (generated from ONNX)
 #[cfg(feature = "burn-backend")]
-mod models_burn;
+pub mod models_burn;
+
+#[cfg(test)]
+mod accuracy_tests {
+    use burn::prelude::*;
+    use burn::tensor::{Tensor, TensorData, Shape, Int};
+    use burn::backend::Wgpu;
+    use std::path::Path;
+    use std::fs;
+
+    type Backend = Wgpu;
+    type Device = <Wgpu as burn::backend::Backend>::Device;
+
+    /// Parse a .npy file (simple format: header + raw f32 data)
+    fn load_npy_f32(path: &str) -> (Vec<usize>, Vec<f32>) {
+        let data = fs::read(path).expect("Failed to read .npy file");
+        let header_end = data.windows(2).position(|w| w == b"\x93").unwrap();
+        let header_len = u16::from_le_bytes([data[header_end + 8], data[header_end + 9]]) as usize;
+        let header_start = header_end + 10;
+        let header_str = String::from_utf8_lossy(&data[header_start..header_start + header_len]);
+        let shape_start = header_str.find("(").unwrap();
+        let shape_end = header_str.find(")").unwrap();
+        let shape_str = &header_str[shape_start + 1..shape_end];
+        let shape: Vec<usize> = shape_str.split(",")
+            .map(|s| s.trim().parse::<usize>().unwrap())
+            .filter(|&d| d > 0)
+            .collect();
+        let data_start = header_start + header_len;
+        let num_elements: usize = shape.iter().product();
+        let raw_data = &data[data_start..data_start + num_elements * 4];
+        let values: Vec<f32> = raw_data.chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        (shape, values)
+    }
+
+    #[test]
+    fn compare_final_boxes_against_ort() {
+        let device: Device = Default::default();
+        let model_path = Path::new("./assets/meiki_text.detect.v0.1.bpk");
+        let model = super::models_burn::Model::from_file(model_path, &device);
+
+        let (shape, values) = load_npy_f32("/tmp/ort_preprocessed_f32.bin");
+        assert_eq!(shape, vec![1, 3, 544, 960], "Input shape mismatch");
+        let input = Tensor::<4>::from_data(
+            TensorData::new(values, Shape::new(shape.try_into().unwrap())),
+            &device,
+        );
+
+        let orig_sizes = Tensor::<2, Int>::from_ints([[2400i64, 1080i64]], &device);
+        let (_labels, boxes, scores) = model.forward(input, orig_sizes);
+
+        let burn_boxes: Vec<f32> = boxes.clone().into_data().to_vec().unwrap();
+        let burn_scores: Vec<f32> = scores.clone().into_data().to_vec().unwrap();
+
+        let (ort_box_shape, ort_boxes) = load_npy_f32("/tmp/ort_boxes_final.npy");
+        let (_ort_score_shape, ort_scores_ref) = load_npy_f32("/tmp/ort_scores_final.npy");
+
+        println!("Burn boxes dims: {:?}", boxes.dims());
+        println!("ORT boxes shape: {:?}", ort_box_shape);
+
+        let mut score_mae = 0.0f32;
+        let min_len = burn_scores.len().min(ort_scores_ref.len());
+        for i in 0..min_len {
+            score_mae += (burn_scores[i] - ort_scores_ref[i]).abs();
+        }
+        score_mae /= min_len as f32;
+
+        let mut box_mae = 0.0f32;
+        let min_box_len = burn_boxes.len().min(ort_boxes.len());
+        for i in 0..min_box_len {
+            box_mae += (burn_boxes[i] - ort_boxes[i]).abs();
+        }
+        box_mae /= min_box_len as f32;
+
+        println!("Score MAE: {:.6}", score_mae);
+        println!("Box MAE: {:.6}", box_mae);
+
+        for i in 0..10.min(min_len) {
+            println!("  [{}] burn={:.6} ort={:.6} diff={:.6}", i,
+                burn_scores[i], ort_scores_ref[i], (burn_scores[i] - ort_scores_ref[i]).abs());
+        }
+
+        assert!(score_mae < 0.05, "Score MAE {} exceeds threshold 0.05", score_mae);
+        assert!(box_mae < 10.0, "Box MAE {} exceeds threshold 10.0", box_mae);
+    }
+}
 
 use anyhow::{Context, Result};
 use image::DynamicImage;
@@ -82,10 +168,14 @@ fn run_ocr_viewer(
     let mut image_path = None;
     let mut font_path: Option<String> = None;
     let mut use_burn = false;
+    let mut headless = false;
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--burn" || args[i] == "-b" {
             use_burn = true;
+            i += 1;
+        } else if args[i] == "--headless" || args[i] == "-h" {
+            headless = true;
             i += 1;
         } else if args[i].starts_with("--font=") {
             font_path = Some(args[i].trim_start_matches("--font=").to_string());
@@ -188,6 +278,12 @@ fn run_ocr_viewer(
     let bytes_arc = Arc::new(bytes_vec);
     let w = display_img.width();
     let h = display_img.height();
+
+    // If headless mode, skip GUI and exit after detection
+    if headless {
+        println!("Headless mode: detection complete, skipping GUI");
+        return Ok(());
+    }
 
     // Launch Iced application
     let boot = {

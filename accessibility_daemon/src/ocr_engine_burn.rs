@@ -104,28 +104,9 @@ impl OcrEngine {
         let orig_w = image.width() as i32;
         let orig_h = image.height() as i32;
 
-        // 1. Preprocessing: resize with Lanczos3 and convert to NCHW [0,1]
-        // Both ORT and Burn use raw [0,1] input (no ImageNet normalization).
-        // For exact comparison, we can load ORT's saved preprocessed input.
-        let img_data = {
-            let ort_input_path = Path::new("/tmp/burn_input_f32.bin");
-            if ort_input_path.exists() {
-                let bytes = std::fs::read(ort_input_path).unwrap();
-                let mut data = vec![0.0f32; bytes.len() / 4];
-                for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-                    data[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                }
-                eprintln!("Loaded ORT's Lanczos3 preprocessed input ({} floats)", data.len());
-                data
-            } else {
-                let resized = image.resize_exact(
-                    DETECT_WIDTH,
-                    DETECT_HEIGHT,
-                    image::imageops::FilterType::Lanczos3,
-                );
-                self.image_to_nchw(&resized)
-            }
-        };
+        // 1. Resize with PIL-compatible Lanczos3
+        let resized = pil_compatible_lanczos3_resize(&image, DETECT_WIDTH, DETECT_HEIGHT);
+        let img_data = self.image_to_nchw(&resized);
         let input = Tensor::<4>::from_data(
             TensorData::new(img_data, [1, 3, DETECT_HEIGHT as usize, DETECT_WIDTH as usize]),
             &self.device,
@@ -252,4 +233,64 @@ impl OcrEngine {
 
     // TODO: Implement recognize_char() using Burn recognition models
     // For now, this is a stub that returns empty results
+}
+
+/// Lanczos3 kernel function matching PIL's exact implementation
+fn lanczos3_kernel(x: f64) -> f64 {
+    let a = 3.0;
+    if x.abs() < 1e-10 {
+        1.0
+    } else if x.abs() >= a {
+        0.0
+    } else {
+        let pix = std::f64::consts::PI * x;
+        a * (pix / a).sin() * pix.sin() / (pix * pix)
+    }
+}
+
+/// PIL-compatible Lanczos3 resize
+fn pil_compatible_lanczos3_resize(img: &DynamicImage, target_w: u32, target_h: u32) -> DynamicImage {
+    let src_w = img.width();
+    let src_h = img.height();
+    let scale_x = src_w as f64 / target_w as f64;
+    let scale_y = src_h as f64 / target_h as f64;
+    let support: f64 = 3.0;
+    let mut output = image::RgbaImage::new(target_w, target_h);
+    for y in 0..target_h {
+        for x in 0..target_w {
+            let src_x = (x as f64 + 0.5) * scale_x - 0.5;
+            let src_y = (y as f64 + 0.5) * scale_y - 0.5;
+            let mut r_sum = 0.0f64;
+            let mut g_sum = 0.0f64;
+            let mut b_sum = 0.0f64;
+            let mut w_sum = 0.0f64;
+            let x0 = (src_x - support).floor().max(0.0) as i32;
+            let x1 = (src_x + support).ceil().min((src_w - 1) as f64) as i32;
+            let y0 = (src_y - support).floor().max(0.0) as i32;
+            let y1 = (src_y + support).ceil().min((src_h - 1) as f64) as i32;
+            for iy in y0..=y1 {
+                for ix in x0..=x1 {
+                    let dx = src_x - ix as f64;
+                    let dy = src_y - iy as f64;
+                    let wx = lanczos3_kernel(dx);
+                    let wy = lanczos3_kernel(dy);
+                    let w = wx * wy;
+                    let pixel = img.get_pixel(ix as u32, iy as u32);
+                    r_sum += w * pixel[0] as f64 / 255.0;
+                    g_sum += w * pixel[1] as f64 / 255.0;
+                    b_sum += w * pixel[2] as f64 / 255.0;
+                    w_sum += w;
+                }
+            }
+            let (r, g, b) = if w_sum > 0.0 {
+                ((r_sum / w_sum * 255.0).round().clamp(0.0, 255.0) as u8,
+                 (g_sum / w_sum * 255.0).round().clamp(0.0, 255.0) as u8,
+                 (b_sum / w_sum * 255.0).round().clamp(0.0, 255.0) as u8)
+            } else {
+                (0, 0, 0)
+            };
+            output.put_pixel(x, y, image::Rgba([r, g, b, 255]));
+        }
+    }
+    DynamicImage::ImageRgba8(output)
 }
