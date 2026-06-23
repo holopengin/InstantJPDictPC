@@ -104,18 +104,28 @@ impl OcrEngine {
         let orig_w = image.width() as i32;
         let orig_h = image.height() as i32;
 
-        // 1. Resize with Lanczos3 (matches ORT/PIL BILINEAR)
-        // FIX: Use Triangle filter which matches PIL's BILINEAR (2x2 linear interpolation).
-        // Lanczos3 (4x4 sinc) produces slightly different pixel values that amplify through
-        // 102 conv layers and cause ~5-9 missed detections vs ORT.
-        let resized = image.resize_exact(
-            DETECT_WIDTH,
-            DETECT_HEIGHT,
-            image::imageops::FilterType::Lanczos3,
-        );
-
-        // 2. Convert to NCHW float tensor
-        let img_data = self.image_to_nchw(&resized);
+        // 1. Preprocessing: resize with Lanczos3 and convert to NCHW [0,1]
+        // Both ORT and Burn use raw [0,1] input (no ImageNet normalization).
+        // For exact comparison, we can load ORT's saved preprocessed input.
+        let img_data = {
+            let ort_input_path = Path::new("/tmp/burn_input_f32.bin");
+            if ort_input_path.exists() {
+                let bytes = std::fs::read(ort_input_path).unwrap();
+                let mut data = vec![0.0f32; bytes.len() / 4];
+                for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+                    data[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+                eprintln!("Loaded ORT's Lanczos3 preprocessed input ({} floats)", data.len());
+                data
+            } else {
+                let resized = image.resize_exact(
+                    DETECT_WIDTH,
+                    DETECT_HEIGHT,
+                    image::imageops::FilterType::Lanczos3,
+                );
+                self.image_to_nchw(&resized)
+            }
+        };
         let input = Tensor::<4>::from_data(
             TensorData::new(img_data, [1, 3, DETECT_HEIGHT as usize, DETECT_WIDTH as usize]),
             &self.device,
@@ -143,6 +153,16 @@ impl OcrEngine {
         // 5. Extract output data
         let boxes_data: Vec<f32> = boxes.into_data().to_vec().unwrap();
         let scores_data: Vec<f32> = scores.into_data().to_vec().unwrap();
+        
+        // DEBUG: save raw scores for comparison
+        let scores_str: Vec<String> = scores_data.iter().map(|s| format!("{:.4}", s)).collect();
+        std::fs::write("/tmp/burn_raw_scores.txt", scores_str.join("\n")).ok();
+        eprintln!("DEBUG: Burn raw scores ({} boxes):", scores_data.len());
+        for (i, s) in scores_data.iter().enumerate() {
+            if *s > 0.3 {
+                eprintln!("  box {}: {:.4}", i, s);
+            }
+        }
 
         // 6. Parse boxes and scores
         let num_boxes = boxes_data.len() / 4;
