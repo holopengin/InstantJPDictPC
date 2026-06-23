@@ -128,7 +128,18 @@ fn run_ocr_viewer(
                 "Character vocabulary loaded: {} chars",
                 engine.char_vocab.len()
             );
-            let _boxes = engine.detect(&image)?;
+            let boxes = engine.detect(&image)?;
+            println!("Burn detection: {} boxes found", boxes.len());
+            // Save results to file for comparison
+            let mut burn_output = String::new();
+            for (i, b) in boxes.iter().enumerate() {
+                burn_output.push_str(&format!(
+                "box {}: left={} top={} w={} h={} score={:.4}\n",
+                i, b.x, b.y, b.w, b.h, b.confidence
+                ));
+            }
+            std::fs::write("/tmp/burn_results.txt", burn_output)?;
+            println!("Burn results saved to /tmp/burn_results.txt");
             // TODO: Add recognition and rendering
             (Vec::new(), None::<image::RgbaImage>)
         }
