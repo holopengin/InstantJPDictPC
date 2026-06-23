@@ -105,10 +105,13 @@ impl OcrEngine {
         let orig_h = image.height() as i32;
 
         // 1. Resize with Lanczos3 (matches ORT/PIL BILINEAR)
+        // FIX: Use Triangle filter which matches PIL's BILINEAR (2x2 linear interpolation).
+        // Lanczos3 (4x4 sinc) produces slightly different pixel values that amplify through
+        // 102 conv layers and cause ~5-9 missed detections vs ORT.
         let resized = image.resize_exact(
             DETECT_WIDTH,
             DETECT_HEIGHT,
-            image::imageops::FilterType::Lanczos3,
+            image::imageops::FilterType::Triangle,
         );
 
         // 2. Convert to NCHW float tensor
