@@ -14,7 +14,7 @@ orig_w, orig_h = img.size
 
 # ========== ORT inference ==========
 sess = ort.InferenceSession("/var/home/holopengin/repos/InstantJPDictDecky/accessibility_daemon/assets/meiki.text.detect.v0.1.960x544.onnx")
-img_resized = img.resize((960, 544), Image.BILINEAR)
+img_resized = img.resize((960, 544), Image.LANCZOS)
 mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 img_array = np.array(img_resized, dtype=np.float32) / 255.0

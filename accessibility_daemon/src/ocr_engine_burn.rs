@@ -111,7 +111,7 @@ impl OcrEngine {
         let resized = image.resize_exact(
             DETECT_WIDTH,
             DETECT_HEIGHT,
-            image::imageops::FilterType::Triangle,
+            image::imageops::FilterType::Lanczos3,
         );
 
         // 2. Convert to NCHW float tensor
@@ -150,7 +150,7 @@ impl OcrEngine {
 
         for i in 0..num_boxes {
             let score = if i < scores_data.len() { scores_data[i] } else { 0.0 };
-            if score <= 0.4 { continue; }
+            if score <= 0.35 { continue; }
 
             let left = boxes_data[i * 4] as i32;
             let top = boxes_data[i * 4 + 1] as i32;
