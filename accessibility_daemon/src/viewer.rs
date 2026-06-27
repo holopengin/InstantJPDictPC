@@ -510,7 +510,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 }
 
                 let (pt, sz) = transform(bbox);
-                frame.fill_rectangle(pt, sz, Color::from_rgba(0.5, 0.5, 0.5, 0.5));
+                frame.fill_rectangle(pt, sz, Color::from_rgba(0.0, 0.0, 0.0, 0.39));  // argb(100,0,0,0)
 
                 if let Some(line) = &annotation.line {
                     for (i, char_box) in line.char_boxes.iter().enumerate() {
@@ -519,9 +519,9 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         // Draw cursor highlight if this is the selected character
                         if self.cursor_pos == Some((line_idx, i)) {
                             let cursor_rect = CanvasPath::rectangle(pt_c, sz_c);
-                            frame.fill(&cursor_rect, Color::from_rgba(0.0, 0.8, 1.0, 0.3));
+                            frame.fill(&cursor_rect, Color::from_rgba(1.0, 1.0, 0.0, 0.3));
                             frame.stroke(&cursor_rect,
-                                CanvasStroke::default().with_color(Color::from_rgb(0.0, 0.8, 1.0)).with_width(2.0));
+                                CanvasStroke::default().with_color(Color::from_rgb(1.0, 1.0, 0.0)).with_width(2.0));
                         }
 
                         // Render character centered in its detection box
@@ -530,7 +530,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                 content: _ch.to_string(),
                                 position: Point::new(pt_c.x + sz_c.width / 2.0, pt_c.y + sz_c.height / 2.0),
                                 max_width: 0.0,
-                                color: Color::from_rgb(0.0, 1.0, 0.0),
+                                color: Color::from_rgb(1.0, 0.467, 0.467),  // #FF7777
                                 size: Pixels(sz_c.height * BOX_FILL_RATIO),
                                 line_height: Default::default(),
                                 font: IcedFont::default(),
@@ -969,8 +969,8 @@ impl OcrViewer {
     }
 
     fn headword_section<'a>(&'a self, group: FormattedReadingGroup) -> Container<'a, Message> {
-        let cyan = Color::from_rgb(0.4, 0.8, 1.0);
-        let gray = Color::from_rgb(0.6, 0.6, 0.6);
+        let cyan = Color::from_rgb(0.0, 1.0, 1.0);      // Android CYAN
+        let gray = Color::from_rgb(0.75, 0.75, 0.75);   // Android LTGRAY (#BEBEBE)
         let mut content = Column::new().spacing(2);
 
         if group.is_kanji_entry {
@@ -1014,8 +1014,8 @@ impl OcrViewer {
     }
 
     fn sense_group<'a>(&'a self, sg: FormattedSenseGroup) -> Container<'a, Message> {
-        let cyan = Color::from_rgb(0.4, 0.8, 1.0);
-        let gray = Color::from_rgb(0.6, 0.6, 0.6);
+        let cyan = Color::from_rgb(0.0, 1.0, 1.0); // Android CYAN
+        let gray = Color::from_rgb(0.75, 0.75, 0.75); // Android LTGRAY (#BEBEBE)
         let white = Color::WHITE;
         let mut content = Column::new().spacing(3);
 
@@ -1090,6 +1090,7 @@ impl OcrViewer {
                 let btn: Element<'a, Message> = Container::new(
                     Text::new(text)
                         .size(20)
+                        .color(if is_selected { Color::BLACK } else { Color::WHITE })
                         .align_x(alignment::Horizontal::Center)
                         .align_y(alignment::Vertical::Center),
                 )
@@ -1101,7 +1102,7 @@ impl OcrViewer {
                     if is_selected {
                         container::Style {
                             background: Some(iced::Background::Color(
-                                Color::from_rgb(0.2, 0.4, 0.8),
+                                Color::from_rgb(1.0, 1.0, 0.0), // YELLOW
                             )),
                             border: iced::Border {
                                 radius: 4.0.into(),
@@ -1112,7 +1113,7 @@ impl OcrViewer {
                     } else {
                         container::Style {
                             background: Some(iced::Background::Color(
-                                Color::from_rgb(0.27, 0.27, 0.27),
+                                Color::from_rgb(0.255, 0.255, 0.255),  // argb(255, 65, 65, 65)
                             )),
                             border: iced::Border {
                                 radius: 4.0.into(),
@@ -1178,7 +1179,7 @@ impl OcrViewer {
                     if is_selected {
                         container::Style {
                             background: Some(iced::Background::Color(
-                                Color::from_rgb(0.2, 0.4, 0.8),
+                                Color::from_rgb(1.0, 1.0, 0.0),  // YELLOW
                             )),
                             border: iced::Border {
                                 radius: 4.0.into(),
@@ -1189,7 +1190,7 @@ impl OcrViewer {
                     } else {
                         container::Style {
                             background: Some(iced::Background::Color(
-                                Color::from_rgb(0.27, 0.27, 0.27),
+                                Color::from_rgb(0.255, 0.255, 0.255),  // argb(255, 65, 65, 65)
                             )),
                             border: iced::Border {
                                 radius: 4.0.into(),
