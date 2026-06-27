@@ -96,8 +96,14 @@ pub struct OverlayProgram {
     pub current_trans_x: f32,
     /// Current translation Y.
     pub current_trans_y: f32,
-    /// When false, skip annotation drawing (used during active zoom/pan for performance).
+    /// Whether this canvas draws annotations (true) or just the image (false).
     pub draw_annotations: bool,
+    /// Whether the user is actively zooming/panning.
+    pub is_zooming: bool,
+    /// Whether this canvas instance should handle pan/zoom events.
+    /// The image canvas (behind the annotation canvas) must NOT handle them,
+    /// or pan/zoom would be applied twice.
+    pub handle_pan_zoom: bool,
 }
 
 impl OverlayProgram {
@@ -179,6 +185,12 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<iced::widget::Action<Message>> {
+        // The image canvas (behind the annotation canvas) must NOT handle pan/zoom,
+        // or it would be applied twice (both canvases receive the same events).
+        if !self.handle_pan_zoom {
+            return None;
+        }
+
         // Check if cursor is over the panel area — if so, don't handle pan/zoom
         let over_panel = self.panel_visible
             && cursor.position().map_or(false, |p| self.is_over_panel(bounds, p.x, p.y));
@@ -452,16 +464,20 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
         let total_offset_x = base_offset_x + self.current_trans_x;
         let total_offset_y = base_offset_y + self.current_trans_y;
 
-        // Draw the screenshot image with the same zoom/pan transform
-        if let Some(image) = self.image.as_ref() {
-            let img_w = self.img_w as f32;
-            let img_h = self.img_h as f32;
-            let dest_size = Size::new(img_w * total_scale, img_h * total_scale);
-            let dest_pos = Point::new(total_offset_x, total_offset_y);
-            frame.draw_image(
-                Rectangle::new(dest_pos, dest_size),
-                image,
-            );
+        // When this is the image-only canvas (draw_annotations == false),
+        // draw the screenshot as the bottom layer.
+        if !self.draw_annotations {
+            if let Some(image) = self.image.as_ref() {
+                let img_w = self.img_w as f32;
+                let img_h = self.img_h as f32;
+                let dest_size = Size::new(img_w * total_scale, img_h * total_scale);
+                let dest_pos = Point::new(total_offset_x, total_offset_y);
+                frame.draw_image(
+                    Rectangle::new(dest_pos, dest_size),
+                    image,
+                );
+            }
+            return vec![frame.into_geometry()];
         }
 
         let transform = |bbox: &BoundingBox| -> (Point, Size) {
@@ -494,8 +510,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 }
 
                 let (pt, sz) = transform(bbox);
-                frame.stroke(&CanvasPath::rectangle(pt, sz),
-                    CanvasStroke::default().with_color(Color::from_rgb(1.0, 0.0, 0.0)).with_width(2.0));
+                frame.fill_rectangle(pt, sz, Color::from_rgba(0.5, 0.5, 0.5, 0.5));
 
                 if let Some(line) = &annotation.line {
                     let fixed_size = if line.is_vertical {
@@ -524,8 +539,6 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
 
                     for (i, char_box) in line.char_boxes.iter().enumerate() {
                         let (pt_c, sz_c) = transform(char_box);
-                        frame.stroke(&CanvasPath::rectangle(pt_c, sz_c),
-                            CanvasStroke::default().with_color(Color::from_rgb(0.0, 1.0, 0.0)).with_width(1.0));
 
                         // Draw cursor highlight if this is the selected character
                         if self.cursor_pos == Some((line_idx, i)) {
@@ -557,6 +570,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 }
             }
         }
+
         vec![frame.into_geometry()]
     }
 }
@@ -786,7 +800,6 @@ impl OcrViewer {
         // transform (base + pan/zoom), so the panel opens on the opposite side
         // of the character's actual screen position.
         let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
-        let _panel_on_bottom = self.state.last_portrait_gravity == Gravity::Bottom;
         let overlay = OverlayProgram {
             annotations: Rc::clone(&self.annotations),
             img_w: self.img_w,
@@ -801,13 +814,38 @@ impl OcrViewer {
             current_trans_x: self.state.current_trans_x,
             current_trans_y: self.state.current_trans_y,
             draw_annotations: !self.is_zooming,
+            is_zooming: self.is_zooming,
+            handle_pan_zoom: true,
         };
 
-        // The canvas draws both the image and annotations with zoom/pan
-        let canvas = Canvas::new(overlay).width(Length::Fill).height(Length::Fill);
+        // The image is drawn in a SEPARATE canvas underneath, because tiny_skia
+        // always composites images after primitives. Two separate Canvas widgets
+        // in a Stack gives us correct z-ordering: image (bottom) → annotations (top).
+        let image_canvas = Canvas::new(OverlayProgram {
+            annotations: Rc::clone(&self.annotations),
+            img_w: self.img_w,
+            img_h: self.img_h,
+            image: Some(self.image_handle.clone()),
+            panel_visible: false,
+            panel_on_right: false,
+            dict_width: 300.0,
+            alternatives_visible: false,
+            cursor_pos: None,
+            current_scale: self.state.current_scale,
+            current_trans_x: self.state.current_trans_x,
+            current_trans_y: self.state.current_trans_y,
+            draw_annotations: false,
+            is_zooming: self.is_zooming,
+            handle_pan_zoom: false,
+        }).width(Length::Fill).height(Length::Fill);
+
+        let annotation_canvas = Canvas::new(overlay).width(Length::Fill).height(Length::Fill);
 
         if !has_panel {
-            return Container::new(canvas).width(Length::Fill).height(Length::Fill).into();
+            return Container::new(Stack::new().push(image_canvas).push(annotation_canvas))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
         }
 
         // Build panel components
@@ -918,10 +956,12 @@ impl OcrViewer {
             content_stack = content_stack.push(alt_positioned);
         }
 
-        // Root Stack: canvas (image + annotations) on bottom, panel content on top.
+        // Root Stack: image (bottom) → annotations (middle) → panel content (top).
+        // Two separate canvases because tiny_skia composites images after primitives.
         Container::new(
             Stack::new()
-                .push(canvas)
+                .push(image_canvas)
+                .push(annotation_canvas)
                 .push(content_stack)
         )
         .width(Length::Fill)
