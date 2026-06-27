@@ -6,19 +6,10 @@ edition = "2021"
 [features]
 default = ["ort"]
 ort = ["dep:ort"]
-burn-backend = ["dep:burn", "dep:burn-wgpu", "dep:burn-cubecl", "dep:burn-store", "dep:burn-onnx", "dep:bytemuck"]
 
 [dependencies]
 # ONNX Runtime for Rust
 ort = { version = "2.0.0-rc.3", features = ["webgpu"], optional = true }
-
-# Burn deep learning framework (wgpu backend)
-burn = { path = "burn/crates/burn", features = ["wgpu", "std"], optional = true }
-burn-wgpu = { path = "burn/crates/burn-wgpu", features = ["std"], optional = true }
-burn-cubecl = { path = "burn/crates/burn-cubecl", features = ["std"], optional = true }
-burn-store = { path = "burn/crates/burn-store", features = ["std", "burnpack"], optional = true }
-burn-onnx = { path = "burn-onnx/crates/burn-onnx", features = ["mmap"], optional = true }
-bytemuck = { version = "1.14", optional = true }
 
 # Image processing
 image = "0.25"
