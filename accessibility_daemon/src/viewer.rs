@@ -858,7 +858,21 @@ impl OcrViewer {
         }
 
         // The panel container wraps the stable row.
-        let panel = Container::new(inner_row).padding(2).style(container::rounded_box);
+        let panel = Container::new(inner_row).padding(2).style(move |_t: &Theme| {
+            container::Style {
+                background: Some(iced::Background::Color(Color::from_rgba(
+                    25.0 / 255.0,
+                    25.0 / 255.0,
+                    25.0 / 255.0,
+                    245.0 / 255.0,
+                ))), // argb(245, 25, 25, 25)
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        });
 
         // The stable panel content: neighbors + dictionary in the correct
         // order. This NEVER changes — same children, same structure.
@@ -965,7 +979,17 @@ impl OcrViewer {
                     iced::widget::scrollable::Scrollbar::hidden(),
                 )),
         )
-        .width(Length::Fill).padding(4).style(container::rounded_box)
+        .width(Length::Fill)
+        .padding(4)
+        .style(move |_t: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgba(
+                25.0 / 255.0,
+                25.0 / 255.0,
+                25.0 / 255.0,
+                245.0 / 255.0,
+            ))), // argb(245, 25, 25, 25)
+            ..Default::default()
+        })
     }
 
     fn headword_section<'a>(&'a self, group: FormattedReadingGroup) -> Container<'a, Message> {
@@ -1104,21 +1128,13 @@ impl OcrViewer {
                             background: Some(iced::Background::Color(
                                 Color::from_rgb(1.0, 1.0, 0.0), // YELLOW
                             )),
-                            border: iced::Border {
-                                radius: 4.0.into(),
-                                ..Default::default()
-                            },
                             ..Default::default()
                         }
                     } else {
                         container::Style {
                             background: Some(iced::Background::Color(
-                                Color::from_rgb(0.255, 0.255, 0.255),  // argb(255, 65, 65, 65)
+                                Color::from_rgb(0.255, 0.255, 0.255), // argb(255, 65, 65, 65)
                             )),
-                            border: iced::Border {
-                                radius: 4.0.into(),
-                                ..Default::default()
-                            },
                             ..Default::default()
                         }
                     }
@@ -1141,7 +1157,15 @@ impl OcrViewer {
         .width(Pixels(42.0))
         .height(Length::Fill)
         .padding(2)
-        .style(container::rounded_box)
+        .style(move |_t: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgba(
+                25.0 / 255.0,
+                25.0 / 255.0,
+                25.0 / 255.0,
+                245.0 / 255.0,
+            ))), // argb(245, 25, 25, 25)
+            ..Default::default()
+        })
     }
 
     fn alternatives_panel<'a>(
@@ -1168,6 +1192,7 @@ impl OcrViewer {
                 let btn: Element<'a, Message> = Container::new(
                     Text::new(ch.to_string())
                         .size(20)
+                        .color(if is_selected { Color::BLACK } else { Color::WHITE })
                         .align_x(alignment::Horizontal::Center)
                         .align_y(alignment::Vertical::Center),
                 )
@@ -1179,23 +1204,15 @@ impl OcrViewer {
                     if is_selected {
                         container::Style {
                             background: Some(iced::Background::Color(
-                                Color::from_rgb(1.0, 1.0, 0.0),  // YELLOW
+                                Color::from_rgb(1.0, 1.0, 0.0), // YELLOW
                             )),
-                            border: iced::Border {
-                                radius: 4.0.into(),
-                                ..Default::default()
-                            },
                             ..Default::default()
                         }
                     } else {
                         container::Style {
                             background: Some(iced::Background::Color(
-                                Color::from_rgb(0.255, 0.255, 0.255),  // argb(255, 65, 65, 65)
+                                Color::from_rgb(0.255, 0.255, 0.255), // argb(255, 65, 65, 65)
                             )),
-                            border: iced::Border {
-                                radius: 4.0.into(),
-                                ..Default::default()
-                            },
                             ..Default::default()
                         }
                     }
@@ -1216,7 +1233,15 @@ impl OcrViewer {
         )
         .height(Length::Fill)
         .padding(2)
-        .style(container::rounded_box)
+        .style(move |_t: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgba(
+                25.0 / 255.0,
+                25.0 / 255.0,
+                25.0 / 255.0,
+                245.0 / 255.0,
+            ))), // argb(245, 25, 25, 25)
+            ..Default::default()
+        })
     }
 }
 
