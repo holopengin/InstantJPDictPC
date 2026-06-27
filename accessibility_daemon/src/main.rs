@@ -132,13 +132,7 @@ fn run_ocr_viewer(
     };
 
     // Use annotated image if available, otherwise original
-    let display_img = if let Some(ref annotated) = annotated_opt {
-        // Save annotated image for debugging
-        if let Err(e) = annotated.save("debug_annotated.png") {
-            eprintln!("Warning: failed to save debug image: {}", e);
-        } else {
-            println!("Saved debug_annotated.png");
-        }
+    let display_img = if let Some(_annotated) = annotated_opt {
         image.to_rgba8()
     } else {
         image.to_rgba8()
