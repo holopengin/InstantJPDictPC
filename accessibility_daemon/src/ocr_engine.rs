@@ -1400,6 +1400,19 @@ impl OcrEngine {
                                     );
                                 }
 
+                                // Draw black background fill behind the character for contrast
+                                if i < 3 {
+                                    println!("DBG fill: db=({},{},{},{}) img={}x{}", db.left(), db.top(), db.w, db.h, img_rgba.width(), img_rgba.height());
+                                }
+                                draw_filled_rect(
+                                    &mut img_rgba,
+                                    db.left() - 1,
+                                    db.top() - 1,
+                                    db.w + 2,
+                                    db.h + 2,
+                                    Rgba([0u8, 0u8, 0u8, 200u8]),
+                                );
+
                                 draw_text_ttf(
                                     &mut img_rgba,
                                     font,
