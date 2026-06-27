@@ -513,30 +513,6 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 frame.fill_rectangle(pt, sz, Color::from_rgba(0.5, 0.5, 0.5, 0.5));
 
                 if let Some(line) = &annotation.line {
-                    let fixed_size = if line.is_vertical {
-                        line.char_boxes.iter().map(|b| b.w).max().unwrap_or(0)
-                    } else {
-                        line.char_boxes.iter().map(|b| b.h).max().unwrap_or(0)
-                    };
-
-                    let mut refined: Vec<BoundingBox> = Vec::new();
-                    if let Some(first) = line.char_boxes.first() { refined.push(first.clone()); }
-                    for i in 1..line.char_boxes.len() {
-                        let prev = &line.char_boxes[i - 1];
-                        let cur = &line.char_boxes[i];
-                        if line.is_vertical {
-                            refined.push(BoundingBox::new(cur.left(), prev.top().saturating_add(fixed_size).max(cur.top()), cur.w, cur.h, cur.confidence));
-                        } else {
-                            refined.push(BoundingBox::new(prev.left().saturating_add(fixed_size).max(cur.left()), cur.top(), cur.w, cur.h, cur.confidence));
-                        }
-                    }
-
-                    let display_boxes: Vec<BoundingBox> = refined.iter().map(|b| {
-                        let cx = b.left() + b.w / 2;
-                        let cy = b.top() + b.h / 2;
-                        BoundingBox::new(cx - fixed_size / 2, cy - fixed_size / 2, fixed_size, fixed_size, 1.0)
-                    }).collect();
-
                     for (i, char_box) in line.char_boxes.iter().enumerate() {
                         let (pt_c, sz_c) = transform(char_box);
 
@@ -548,23 +524,20 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                 CanvasStroke::default().with_color(Color::from_rgb(0.0, 0.8, 1.0)).with_width(2.0));
                         }
 
+                        // Render character centered in its detection box
                         if let Some(_ch) = line.text.chars().nth(i) {
-                            if i < display_boxes.len() {
-                                let db = &display_boxes[i];
-                                let (pt_db, sz_db) = transform(db);
-                                frame.fill_text(CanvasText {
-                                    content: _ch.to_string(),
-                                    position: Point::new(pt_db.x + sz_db.width / 2.0, pt_db.y + sz_db.height / 2.0),
-                                    max_width: 0.0,
-                                    color: Color::from_rgb(0.0, 1.0, 0.0),
-                                    size: Pixels(sz_db.height * BOX_FILL_RATIO),
-                                    line_height: Default::default(),
-                                    font: IcedFont::default(),
-                                    align_x: iced::widget::text::Alignment::Center,
-                                    align_y: alignment::Vertical::Center,
-                                    shaping: Default::default(),
-                                });
-                            }
+                            frame.fill_text(CanvasText {
+                                content: _ch.to_string(),
+                                position: Point::new(pt_c.x + sz_c.width / 2.0, pt_c.y + sz_c.height / 2.0),
+                                max_width: 0.0,
+                                color: Color::from_rgb(0.0, 1.0, 0.0),
+                                size: Pixels(sz_c.height * BOX_FILL_RATIO),
+                                line_height: Default::default(),
+                                font: IcedFont::default(),
+                                align_x: iced::widget::text::Alignment::Center,
+                                align_y: alignment::Vertical::Center,
+                                shaping: Default::default(),
+                            });
                         }
                     }
                 }
