@@ -75,7 +75,7 @@ process_file() {
     echo "  Running OCR..."
 
     # Run from the daemon's directory so it can find ./assets/
-    if (cd "$(dirname "${DAEMON_BIN}")" && "${DAEMON_BIN}" "${file}" "$@") 2>&1; then
+    if (cd "$(dirname "${DAEMON_BIN}")/../.." && "${DAEMON_BIN}" "${file}" "$@") 2>&1; then
         echo "  OCR complete."
     else
         echo "  OCR exited with code $?."
