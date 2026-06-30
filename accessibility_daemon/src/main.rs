@@ -5,7 +5,7 @@ mod ocr_engine;
 #[cfg(feature = "ort")]
 mod ocr_parallel;
 mod overlay_state;
-// mod settings_window; // TODO: fix edition 2024 async block issues
+mod settings_window;
 mod util;
 mod viewer;
 
@@ -14,10 +14,9 @@ use image::DynamicImage;
 use std::io::Cursor;
 use std::sync::Arc;
 
-
 use crate::data::db::DictionaryDatabase;
 use crate::models::*;
-// use crate::settings_window::SettingsWindow; // TODO: fix edition 2024 async block issues
+use crate::settings_window::SettingsWindow;
 use crate::util::deinflector::Deinflector;
 use crate::viewer::OcrViewer;
 
@@ -44,8 +43,7 @@ fn main() -> Result<()> {
     if args.len() < 2 {
         // No image argument — open the settings / management window
         println!("No image argument provided. Opening settings window...");
-        // run_settings_window(db)?; // TODO: fix edition 2024 async block issues
-        println!("Settings window disabled (edition 2024 async block issues).");
+        run_settings_window(db)?;
         return Ok(());
     }
 
@@ -57,10 +55,15 @@ fn main() -> Result<()> {
 // Settings window (no image argument)
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
-fn run_settings_window(_db: Arc<DictionaryDatabase>) -> Result<()> {
-    // TODO: fix edition 2024 async block issues
-    unimplemented!("settings window requires edition 2024")
+fn run_settings_window(db: Arc<DictionaryDatabase>) -> Result<()> {
+    let settings_app = iced::application(
+        move || SettingsWindow::new(Arc::clone(&db)),
+        SettingsWindow::update,
+        SettingsWindow::view,
+    );
+
+    settings_app.run().context("Failed to run settings window")?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +166,8 @@ fn run_ocr_viewer(
                 bytes_arc.as_ref().clone(),
                 w,
                 h,
+                1280.0, // initial window width (updated by WindowResized)
+                720.0,  // initial window height (updated by WindowResized)
                 annotations.clone(),
                 Arc::clone(&db),
                 Arc::clone(&deinflector),
@@ -254,8 +259,8 @@ fn run_ocr_viewer(
                 state.zoom_idle_frames = 0;
             }
             Message::WindowResized { width, height } => {
-                state.state.window_width.set(width);
-                state.state.window_height.set(height);
+                state.window_width = width as f32;
+                state.window_height = height as f32;
             }
             Message::ZoomTick => {
                 // Re-enable annotations if no zoom/pan activity for a few ticks
@@ -298,6 +303,10 @@ fn run_ocr_viewer(
     let view = OcrViewer::view;
 
     let app = iced::application(boot, update, view)
+        .window(iced::window::Settings {
+            maximized: true,
+            ..Default::default()
+        })
         .subscription(|_state: &OcrViewer| {
             // Merge global keyboard/mouse events with a periodic zoom-check timer
             let global_events = iced_futures::subscription::filter_map(

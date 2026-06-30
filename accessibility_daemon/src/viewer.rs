@@ -23,7 +23,10 @@ use crate::models::*;
 use crate::overlay_state::OcrOverlayState;
 use crate::util::deinflector::Deinflector;
 
-const BOX_FILL_RATIO: f32 = 0.9;
+/// Font fill ratio for OCR character glyphs drawn on the canvas annotation layer.
+const CANVAS_CHAR_RATIO: f32 = 0.9;
+/// Font fill ratio for character buttons in the neighbor/alternatives panels.
+const BUTTON_CHAR_RATIO: f32 = 0.6;
 
 // ---------------------------------------------------------------------------
 // Pan state (used by OverlayProgram::State)
@@ -285,12 +288,10 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
 
                 if was_tap {
                     if let Some(cursor_position) = cursor.position_in(bounds) {
-                        return Some(iced::widget::Action::publish(
-                            match self.hit_test(bounds, cursor_position.x, cursor_position.y) {
-                                Some((li, ci)) => Message::SelectCharacter(li, ci),
-                                None => Message::Back,
-                            },
-                        ));
+                        if let Some((li, ci)) = self.hit_test(bounds, cursor_position.x, cursor_position.y) {
+                            return Some(iced::widget::Action::publish(Message::SelectCharacter(li, ci)));
+                        }
+                        // Left-click on blank area: do nothing (don't close the app)
                     }
                 }
             }
@@ -531,7 +532,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                 position: Point::new(pt_c.x + sz_c.width / 2.0, pt_c.y + sz_c.height / 2.0),
                                 max_width: 0.0,
                                 color: Color::from_rgb(1.0, 0.467, 0.467),  // #FF7777
-                                size: Pixels(sz_c.height * BOX_FILL_RATIO),
+                                size: Pixels(sz_c.height * CANVAS_CHAR_RATIO),
                                 line_height: Default::default(),
                                 font: IcedFont::default(),
                                 align_x: iced::widget::text::Alignment::Center,
@@ -560,6 +561,9 @@ pub struct OcrViewer {
     decoded_image: RefCell<Option<image::DynamicImage>>,
     pub img_w: u32,
     pub img_h: u32,
+    /// Physical window dimensions. Used for computing font sizes in neighbor/alt panels.
+    pub window_width: f32,
+    pub window_height: f32,
     pub annotations: Rc<Vec<DetectedAnnotation>>,
     pub state: OcrOverlayState,
     pub selected_word: Option<SelectedWord>,
@@ -585,6 +589,8 @@ impl OcrViewer {
         image_bytes: Vec<u8>,
         img_w: u32,
         img_h: u32,
+        window_width: f32,
+        window_height: f32,
         annotations: Vec<DetectedAnnotation>,
         db: Arc<DictionaryDatabase>,
         deinflector: Arc<Deinflector>,
@@ -595,7 +601,26 @@ impl OcrViewer {
         state.ensure_cursor_position();
         state.img_w = img_w;
         state.img_h = img_h;
-        Self { image_handle, image_bytes, decoded_image: RefCell::new(None), img_w, img_h, annotations: Rc::new(annotations), state, selected_word: None, alternatives_visible: false, db, deinflector, scroll_neighbor_to: None, scroll_alt_to: None, is_zooming: false, zoom_idle_frames: 0, cached_preview: RefCell::new(None) }
+        Self {
+            image_handle,
+            image_bytes,
+            decoded_image: RefCell::new(None),
+            img_w,
+            img_h,
+            window_width,
+            window_height,
+            annotations: Rc::new(annotations),
+            state,
+            selected_word: None,
+            alternatives_visible: false,
+            db,
+            deinflector,
+            scroll_neighbor_to: None,
+            scroll_alt_to: None,
+            is_zooming: false,
+            zoom_idle_frames: 0,
+            cached_preview: RefCell::new(None),
+        }
     }
 
     /// Crop the screenshot to show the given character with padding.
@@ -844,17 +869,16 @@ impl OcrViewer {
         let alt_panel = self.alternatives_panel(preview_image.as_ref());
 
         let dict_width = Pixels(300.0);
-        let neigh_width = Pixels(42.0);
 
         // Stable inner row: neighbors + dictionary. This never changes
         // structure, so the Scrollables inside never reset.
         let mut inner_row = Row::new().spacing(2);
         if panel_on_right {
-            inner_row = inner_row.push(neigh_panel.width(neigh_width));
+            inner_row = inner_row.push(neigh_panel);
             inner_row = inner_row.push(dict_panel.width(dict_width));
         } else {
             inner_row = inner_row.push(dict_panel.width(dict_width));
-            inner_row = inner_row.push(neigh_panel.width(neigh_width));
+            inner_row = inner_row.push(neigh_panel);
         }
 
         // The panel container wraps the stable row.
@@ -902,15 +926,24 @@ impl OcrViewer {
         let mut content_stack = Stack::new().push(positioned_panel);
 
         if self.alternatives_visible {
-            let alt_w = Pixels(42.0);
-            let panel_content_w = dict_width + Pixels(2.0) + neigh_width;
+            // Estimate neighbor panel width for spacer (box_size = window_width/11 clamped)
+            let estimated_neigh = (self.window_width / 11.0).clamp(24.0, 40.0);
+            // Add extra margin so the alt panel doesn't overlap with the neighbor panel
+            let alt_margin = 4.0;
+            let panel_content_w = dict_width + Pixels(2.0) + Pixels(estimated_neigh) + Pixels(alt_margin);
 
             // The alt panel Container.
             let alt_container = Container::new(alt_panel)
-                .width(alt_w)
                 .height(Length::Fill)
-                .padding(2)
-                .style(container::rounded_box);
+                .style(move |_t: &Theme| container::Style {
+                    background: Some(iced::Background::Color(Color::from_rgba(
+                        25.0 / 255.0,
+                        25.0 / 255.0,
+                        25.0 / 255.0,
+                        245.0 / 255.0,
+                    ))), // argb(245, 25, 25, 25)
+                    ..Default::default()
+                });
 
             // Position the alt panel using spacers on both sides.
             // The fixed-width spacer ensures the alt sits adjacent to the
@@ -1048,7 +1081,7 @@ impl OcrViewer {
             for tag in &sg.tags {
                 let bg = Self::tag_color(tag);
                 tag_row = tag_row.push(
-                    Container::new(Text::new(tag.clone()).size(9).color(white)
+                    Container::new(Text::new(tag.clone()).size(11).color(white)
                         .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }))
                     .padding([1.0, 1.0])
                     .style(move |_t: &Theme| container::Style {
@@ -1099,27 +1132,25 @@ impl OcrViewer {
 
     fn neighbor_panel<'a>(&'a self) -> Container<'a, Message> {
         let state = self.state.get_neighbor_ui_state();
-        let mut content = Column::new().padding(2).spacing(2);
+        // Compute button size dynamically based on window width
+        let item_size = self.window_width / 11.0;
+        let box_size = item_size.clamp(24.0, 40.0);
+        let mut content = Column::new().spacing(2);
         for line in state {
             for cs in line.chars {
                 let msg = Message::SelectNeighbor(line.line_idx, cs.char_idx);
                 let is_selected = cs.is_selected;
                 let text = cs.text.clone();
 
-                // Use a styled Container + MouseArea instead of Button.
-                // Button captures drag events, preventing the parent Scrollable
-                // from scrolling when the drag starts on a button.
-                // MouseArea with on_release (no on_press) does NOT capture the
-                // press event, so the Scrollable can initiate a scroll gesture.
                 let btn: Element<'a, Message> = Container::new(
                     Text::new(text)
-                        .size(20)
+                        .size(Pixels(box_size * BUTTON_CHAR_RATIO))
                         .color(if is_selected { Color::BLACK } else { Color::WHITE })
                         .align_x(alignment::Horizontal::Center)
                         .align_y(alignment::Vertical::Center),
                 )
-                .width(Pixels(32.0))
-                .height(Pixels(32.0))
+                .width(Pixels(box_size))
+                .height(Pixels(box_size))
                 .align_x(alignment::Horizontal::Center)
                 .align_y(alignment::Vertical::Center)
                 .style(move |_t: &Theme| {
@@ -1146,7 +1177,7 @@ impl OcrViewer {
                 );
             }
         }
-        // Scrollable with hidden scrollbar — fixed width so buttons always fit
+        // Scrollable with hidden scrollbar — sizes to content so buttons stay square
         Container::new(
             Scrollable::new(content)
                 .id(Id::new("neighbor_scroll"))
@@ -1154,9 +1185,7 @@ impl OcrViewer {
                     iced::widget::scrollable::Scrollbar::hidden(),
                 )),
         )
-        .width(Pixels(42.0))
         .height(Length::Fill)
-        .padding(2)
         .style(move |_t: &Theme| container::Style {
             background: Some(iced::Background::Color(Color::from_rgba(
                 25.0 / 255.0,
@@ -1172,7 +1201,10 @@ impl OcrViewer {
         &'a self,
         preview_image: Option<&iced::widget::image::Handle>,
     ) -> Container<'a, Message> {
-        let mut content = Column::new().padding(2).spacing(2);
+        let mut content = Column::new().spacing(2);
+        // Compute button size dynamically based on window width (same as neighbor_panel)
+        let item_size = self.window_width / 11.0;
+        let box_size = item_size.clamp(24.0, 40.0);
 
         // Character preview image at the top
         if let Some(img_handle) = preview_image {
@@ -1191,13 +1223,13 @@ impl OcrViewer {
 
                 let btn: Element<'a, Message> = Container::new(
                     Text::new(ch.to_string())
-                        .size(20)
+                        .size(Pixels(box_size * BUTTON_CHAR_RATIO))
                         .color(if is_selected { Color::BLACK } else { Color::WHITE })
                         .align_x(alignment::Horizontal::Center)
                         .align_y(alignment::Vertical::Center),
                 )
-                .width(Pixels(32.0))
-                .height(Pixels(32.0))
+                .width(Pixels(box_size))
+                .height(Pixels(box_size))
                 .align_x(alignment::Horizontal::Center)
                 .align_y(alignment::Vertical::Center)
                 .style(move |_t: &Theme| {
