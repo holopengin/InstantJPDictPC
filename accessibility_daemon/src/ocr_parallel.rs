@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use image::{DynamicImage, RgbaImage};
+use ndarray as nd;
 use ort::session::Session;
 use ort::value::Tensor;
 
@@ -15,6 +16,8 @@ const VERT_REC_WIDTH: u32 = 32;
 const VERT_REC_HEIGHT: u32 = 480;
 const REC_CONFIDENCE_THRESHOLD: f32 = 0.1;
 const X_OVERLAP_THRESHOLD: f32 = 0.3;
+const NUM_QUERIES: usize = 48;
+pub const MAX_BATCH_SIZE: usize = 16;
 
 /// Run recognition on a single chunk using the provided sessions.
 pub fn recognize_single_chunk_static(
@@ -312,6 +315,346 @@ pub fn recognize_single_chunk_static(
     }
 
     Ok((filtered, effective_w, effective_h))
+}
+
+/// Run batched recognition on multiple chunks at once (max 8 per batch).
+/// Returns a vec of (char_candidates, effective_w, effective_h) for each chunk.
+pub fn recognize_batch_chunks_static(
+    session: &mut Session,
+    char_vocab: &[i64],
+    chunks: &[(DynamicImage, bool)], // (chunk, is_vertical)
+) -> Result<Vec<(Vec<CharCandidate>, i32, i32)>> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let batch_size = chunks.len().min(MAX_BATCH_SIZE);
+    let is_vertical = chunks[0].1;
+
+    let target_w = if is_vertical { VERT_REC_WIDTH } else { REC_WIDTH };
+    let target_h = if is_vertical { VERT_REC_HEIGHT } else { REC_HEIGHT };
+
+    // Prepare batch input tensor: [batch_size, 3, target_h, target_w]
+    let mut batch_data = vec![0.0f32; batch_size * 3 * target_h as usize * target_w as usize];
+
+    let mut effective_sizes = Vec::with_capacity(batch_size);
+
+    for (idx, (chunk, chunk_is_vertical)) in chunks.iter().take(batch_size).enumerate() {
+        assert_eq!(*chunk_is_vertical, is_vertical, "Batch must have consistent orientation");
+
+        let (effective_w, effective_h) = if is_vertical {
+            let scale_factor = 32.0f32 / (chunk.width() as f32);
+            (
+                32i32,
+                (chunk.height() as f32 * scale_factor).min(VERT_REC_HEIGHT as f32) as i32,
+            )
+        } else {
+            let scale_factor = 32.0f32 / (chunk.height() as f32);
+            (
+                (chunk.width() as f32 * scale_factor).min(REC_WIDTH as f32) as i32,
+                32i32,
+            )
+        };
+
+        if effective_w <= 0 || effective_h <= 0 {
+            effective_sizes.push((0, 0));
+            continue;
+        }
+
+        effective_sizes.push((effective_w, effective_h));
+
+        // Resize chunk and pad to target
+        let resized = chunk.resize_exact(
+            effective_w as u32,
+            effective_h as u32,
+            image::imageops::FilterType::Triangle,
+        );
+        let mut padded = RgbaImage::from_pixel(target_w, target_h, image::Rgba([0u8, 0u8, 0u8, 255u8]));
+        let resized_rgba = resized.to_rgba8();
+        for y in 0..(effective_h as u32) {
+            for x in 0..(effective_w as u32) {
+                let p = resized_rgba.get_pixel(x, y);
+                padded.put_pixel(x, y, *p);
+            }
+        }
+
+        // Convert to NCHW and copy into batch
+        let img_data = image_to_nchw_static(&padded, target_w, target_h);
+        let batch_offset = idx * 3 * target_h as usize * target_w as usize;
+        batch_data[batch_offset..batch_offset + img_data.len()].copy_from_slice(&img_data);
+    }
+
+    let input_tensor = Tensor::from_array((
+        [batch_size as i64, 3, target_h as i64, target_w as i64],
+        batch_data.into_boxed_slice(),
+    ))?;
+
+    // Run session
+    let (labels_arr_opt, boxes_arr_opt, scores_arr_opt, indices_arr_opt, raw_logits_opt) = {
+        let session_input_names: Vec<String> = session
+            .inputs()
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
+        let image_input_name = session_input_names
+            .iter()
+            .find(|n| n.contains("image") || n.contains("input"))
+            .or_else(|| session_input_names.first())
+            .map(|s| s.to_string())
+            .context("Recognition model has no inputs")?;
+
+        let has_orig_target_sizes = session_input_names.iter().any(|n| n == "orig_target_sizes");
+
+        let inputs = if has_orig_target_sizes {
+            let size_tensor = Tensor::from_array((
+                [batch_size as i64, 2],
+                vec![target_w as i64, target_h as i64].repeat(batch_size).into_boxed_slice(),
+            ))?;
+            ort::inputs! {
+                image_input_name.as_str() => input_tensor,
+                "orig_target_sizes" => size_tensor
+            }
+        } else {
+            ort::inputs! { image_input_name.as_str() => input_tensor }
+        };
+
+        let output_names: Vec<String> = session
+            .outputs()
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
+        let run_outputs = session.run(inputs)?;
+
+        let try_extract_f32 =
+            |val: &ort::value::Value| val.try_extract_array::<f32>().ok().map(|a| a.to_owned());
+        let try_extract_i64 =
+            |val: &ort::value::Value| val.try_extract_array::<i64>().ok().map(|a| a.to_owned());
+
+        let labels_name = output_names
+            .iter()
+            .find(|n| n.contains("labels") || n.contains("char_codes"));
+        let boxes_name = output_names.iter().find(|n| n.contains("boxes"));
+        let scores_name = output_names.iter().find(|n| n.contains("scores"));
+        let logits_name = output_names.iter().find(|n| n.contains("logits"));
+        let indices_name = output_names.iter().find(|n| n.contains("indices"));
+
+        let labels_val = labels_name
+            .and_then(|n| run_outputs.get(n.as_str()))
+            .or_else(|| run_outputs.get(output_names.get(0).map(|s| s.as_str()).unwrap_or("")));
+        let boxes_val = boxes_name
+            .and_then(|n| run_outputs.get(n.as_str()))
+            .or_else(|| run_outputs.get(output_names.get(1).map(|s| s.as_str()).unwrap_or("")));
+        let scores_val = scores_name
+            .and_then(|n| run_outputs.get(n.as_str()))
+            .or_else(|| run_outputs.get(output_names.get(2).map(|s| s.as_str()).unwrap_or("")));
+        let logits_val = logits_name.and_then(|n| run_outputs.get(n.as_str()));
+        let indices_val = indices_name.and_then(|n| run_outputs.get(n.as_str()));
+
+        let labels_arr_opt: Option<Vec<i64>> = labels_val.and_then(|v| {
+            try_extract_i64(v)
+                .map(|a| a.iter().cloned().collect())
+                .or_else(|| {
+                    v.try_extract_array::<i32>()
+                        .ok()
+                        .map(|a| a.to_owned().iter().map(|x| *x as i64).collect())
+                })
+        });
+
+        let boxes_arr_opt = boxes_val.and_then(|v| try_extract_f32(v));
+        let scores_arr_opt: Option<Vec<f32>> = scores_val.and_then(|v| {
+            try_extract_f32(v)
+                .map(|a| a.iter().cloned().collect())
+                .or_else(|| {
+                    v.try_extract_array::<f64>()
+                        .ok()
+                        .map(|a| a.to_owned().iter().map(|x| *x as f32).collect())
+                })
+        });
+
+        let indices_arr_opt: Option<Vec<i64>> = indices_val.and_then(|v| {
+            try_extract_i64(v)
+                .map(|a| a.iter().cloned().collect())
+                .or_else(|| {
+                    v.try_extract_array::<i32>()
+                        .ok()
+                        .map(|a| a.to_owned().iter().map(|x| *x as i64).collect())
+                })
+        });
+
+        let raw_logits_opt: Option<Vec<f32>> = logits_val.and_then(|v| {
+            try_extract_f32(v)
+                .map(|a| a.iter().cloned().collect())
+                .or_else(|| {
+                    v.try_extract_array::<f64>()
+                        .ok()
+                        .map(|a| a.to_owned().iter().map(|x| *x as f32).collect())
+                })
+        });
+
+        (
+            labels_arr_opt,
+            boxes_arr_opt,
+            scores_arr_opt,
+            indices_arr_opt,
+            raw_logits_opt,
+        )
+    };
+
+    if labels_arr_opt.is_none() || boxes_arr_opt.is_none() || scores_arr_opt.is_none() {
+        // Return empty for all items in batch
+        return Ok(chunks
+            .iter()
+            .take(batch_size)
+            .map(|_| (Vec::new(), 0, 0))
+            .collect());
+    }
+
+    let boxes_arr = boxes_arr_opt.unwrap().iter().cloned().collect::<Vec<f32>>();
+    let scores_arr = scores_arr_opt.unwrap().iter().cloned().collect::<Vec<f32>>();
+    let labels_arr = labels_arr_opt.unwrap().iter().cloned().collect::<Vec<i64>>();
+    let indices_arr = indices_arr_opt.map(|idx| idx.iter().cloned().collect::<Vec<i64>>());
+    // Handle logits for alternatives
+        let logits_matrix: Option<Vec<Vec<Vec<f32>>>> = raw_logits_opt.as_ref().and_then(|raw| {
+            if raw.len() % (batch_size * NUM_QUERIES) == 0 && raw.len() > 0 {
+                let num_classes = raw.len() / (batch_size * NUM_QUERIES);
+                let mut batch_mat = Vec::with_capacity(batch_size);
+                for b in 0..batch_size {
+                    let mut mat: Vec<Vec<f32>> = Vec::with_capacity(NUM_QUERIES);
+                    for q in 0..NUM_QUERIES {
+                        let mut row: Vec<f32> = Vec::with_capacity(num_classes);
+                        for c in 0..num_classes {
+                            row.push(raw[(b * NUM_QUERIES + q) * num_classes + c]);
+                        }
+                        mat.push(row);
+                    }
+                    batch_mat.push(mat);
+                }
+                Some(batch_mat)
+            } else {
+                None
+            }
+        });
+
+        // Parse outputs for each item in batch
+        let mut results = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let (effective_w, effective_h) = effective_sizes[b];
+            if effective_w <= 0 || effective_h <= 0 {
+                results.push((Vec::new(), 0, 0));
+                continue;
+            }
+
+            // Extract this batch item's outputs (flat arrays)
+            let labels_start = b * NUM_QUERIES;
+            let labels_end = labels_start + NUM_QUERIES;
+            let batch_labels = &labels_arr[labels_start..labels_end];
+
+            let boxes_start = b * NUM_QUERIES * 4;
+            let boxes_end = boxes_start + NUM_QUERIES * 4;
+            let batch_boxes_flat = &boxes_arr[boxes_start..boxes_end];
+
+            let scores_start = b * NUM_QUERIES;
+            let scores_end = scores_start + NUM_QUERIES;
+            let batch_scores = &scores_arr[scores_start..scores_end];
+
+            let batch_indices = indices_arr.as_ref().map(|idx| {
+                let idx_start = b * NUM_QUERIES;
+                let idx_end = idx_start + NUM_QUERIES;
+                &idx[idx_start..idx_end]
+            });
+
+            let mut candidates: Vec<CharCandidate> = Vec::new();
+            for i in 0..batch_scores.len() {
+                if batch_scores[i] > REC_CONFIDENCE_THRESHOLD {
+                    let mut alternatives: Vec<(char, f32)> = Vec::new();
+                    if let (Some(batch_mat), Some(indices)) = (&logits_matrix, &batch_indices) {
+                        if let Some(mat) = batch_mat.get(b) {
+                            let num_classes = if !mat.is_empty() { mat[0].len() } else { 0 };
+                            if num_classes > 0 && i < indices.len() {
+                                let query_idx = (indices[i] / (num_classes as i64)) as usize;
+                                if query_idx < mat.len() {
+                                    let qlogits = &mat[query_idx];
+                                    let mut kv: Vec<(usize, f32)> =
+                                        qlogits.iter().cloned().enumerate().collect();
+                                    kv.sort_by(|a, b| {
+                                        b.1.partial_cmp(&a.1)
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    });
+                                    for (j, &(_idx, _val)) in kv.iter().enumerate().take(15) {
+                                        let class_idx = kv[j].0;
+                                        let ch = char_vocab
+                                            .get(class_idx)
+                                            .and_then(|c| std::char::from_u32(*c as u32))
+                                            .unwrap_or(' ');
+                                        alternatives.push((ch, kv[j].1));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let label_char = batch_labels
+                        .get(i)
+                        .and_then(|v| std::char::from_u32(*v as u32))
+                        .unwrap_or(' ');
+                    let box_coords = [
+                        batch_boxes_flat[i * 4 + 0],
+                        batch_boxes_flat[i * 4 + 1],
+                        batch_boxes_flat[i * 4 + 2],
+                        batch_boxes_flat[i * 4 + 3],
+                    ];
+                    candidates.push(CharCandidate {
+                        char: label_char,
+                        score: batch_scores[i],
+                        box_coords,
+                        alternatives,
+                    });
+                }
+            }
+
+        // Sort and filter overlaps (same logic as single chunk)
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut filtered: Vec<CharCandidate> = Vec::new();
+        for cand in candidates.into_iter() {
+            let mut keep = true;
+            for f in filtered.iter() {
+                let overlap = if is_vertical {
+                    calculate_y_overlap_static(&cand.box_coords, &f.box_coords)
+                } else {
+                    calculate_x_overlap_static(&cand.box_coords, &f.box_coords)
+                };
+                if overlap > X_OVERLAP_THRESHOLD {
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
+                filtered.push(cand);
+            }
+        }
+
+        if is_vertical {
+            filtered.sort_by(|a, b| {
+                a.box_coords[1]
+                    .partial_cmp(&b.box_coords[1])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        } else {
+            filtered.sort_by(|a, b| {
+                a.box_coords[0]
+                    .partial_cmp(&b.box_coords[0])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        results.push((filtered, effective_w, effective_h));
+    }
+
+    Ok(results)
 }
 
 /// Recognize a long line by splitting into chunks (vertical or horizontal).
