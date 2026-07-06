@@ -318,9 +318,13 @@ fn run_ocr_viewer(
 
     let view = OcrViewer::view;
 
+    // Use image dimensions for window size (with fallback to 1280x720)
+    let window_width = w as f32;
+    let window_height = h as f32;
+    
     let app = iced::application(boot, update, view)
         .window(iced::window::Settings {
-            maximized: true,
+            size: iced::Size::new(window_width, window_height),
             ..Default::default()
         })
         .subscription(|_state: &OcrViewer| {
