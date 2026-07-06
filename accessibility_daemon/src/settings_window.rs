@@ -28,6 +28,7 @@ pub enum SettingsMessage {
     MoveUp(i64),
     MoveDown(i64),
     OpenDownloadPage,
+    CloseWindow,
 }
 
 pub struct SettingsWindow {
@@ -267,6 +268,9 @@ impl SettingsWindow {
                 let _ = open::that("https://github.com/yomidevs/jmdict-yomitan");
                 Task::none()
             }
+            SettingsMessage::CloseWindow => {
+                std::process::exit(0);
+            }
         }
     }
 
@@ -310,7 +314,26 @@ impl SettingsWindow {
         ))
         .size(14);
 
-        let mut content = column![title, status,]
+        // --- Close button at top-right ---
+        let close_btn = Button::new(
+            Text::new("✕")
+                .size(18)
+                .align_x(Horizontal::Center),
+        )
+        .width(Pixels(40.0))
+        .height(Pixels(40.0))
+        .style(button::danger)
+        .on_press(SettingsMessage::CloseWindow);
+
+        let header = row![
+            title,
+            Space::new().width(Length::Fill),
+            close_btn,
+        ]
+        .spacing(10)
+        .align_y(Vertical::Center);
+
+        let mut content = column![header, status,]
             .spacing(8)
             .padding(24)
             .width(Length::Fill);

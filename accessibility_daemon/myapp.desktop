@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=My Application
+Exec=./target/release/accessibility_daemon
+Icon=utilities

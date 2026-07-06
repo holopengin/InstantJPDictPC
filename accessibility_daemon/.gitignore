@@ -1,2 +1,4 @@
 target/
 ../iced_sources/
+AppDir/
+dist/
