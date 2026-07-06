@@ -20,12 +20,22 @@ use crate::settings_window::SettingsWindow;
 use crate::util::deinflector::Deinflector;
 use crate::viewer::OcrViewer;
 
+use directories;
+use iced::window::settings::PlatformSpecific;
+
 fn main() -> Result<()> {
     env_logger::init();
     println!("Accessibility Daemon Starting...");
 
-    // Initialize dictionary database
-    let db = Arc::new(DictionaryDatabase::open("dictionary.sqlite")?);
+    // Initialize dictionary database using XDG data directory
+    let data_dir = directories::ProjectDirs::from("com", "Example", "accessibility_daemon")
+        .or(directories::ProjectDirs::from("org", "Example", "accessibility_daemon"))
+        .or(directories::ProjectDirs::from("net", "Example", "accessibility_daemon"))
+        .map(|dirs| dirs.data_dir().to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::fs::create_dir_all(&data_dir)?;
+    let db_path = data_dir.join("dictionary.sqlite");
+    let db = Arc::new(DictionaryDatabase::open(&db_path)?);
     let entry_count = db.get_entry_count()?;
     println!("Dictionary database loaded: {} entries", entry_count);
 
@@ -60,7 +70,13 @@ fn run_settings_window(db: Arc<DictionaryDatabase>) -> Result<()> {
         move || SettingsWindow::new(Arc::clone(&db)),
         SettingsWindow::update,
         SettingsWindow::view,
-    );
+    ).window(iced::window::Settings {
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: String::from("accessibility_daemon"),
+             ..Default::default()
+        },
+        ..Default::default()
+    });
 
     settings_app.run().context("Failed to run settings window")?;
     Ok(())

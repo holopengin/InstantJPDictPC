@@ -9,7 +9,7 @@ ort = ["dep:ort"]
 
 [dependencies]
 # ONNX Runtime for Rust
-ort = { version = "2.0.0-rc.3", features = ["webgpu"], optional = true }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["pkg-config", "copy-dylibs", "download-binaries", "tls-rustls", "webgpu", "std"], optional = true }
 
 # Image processing
 image = "0.25"
@@ -27,7 +27,7 @@ anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 
 # GUI: Iced for displaying the annotated image
-iced = { version= "0.14.0", features = ["image", "canvas", "advanced", "tokio"] }
+iced = { version= "0.14.0", features = ["image", "canvas", "advanced", "tokio", "x11", "tiny-skia"] }
 iced_futures = "0.14.0"
 
 # Database: SQLite for dictionary storage
@@ -50,5 +50,8 @@ open = "5.0"
 
 # Async timers (works with Iced's executor)
 futures-timer = "3.0"
+
+# Platform data directories
+directories = "6.0"
 
 [profile.release]
