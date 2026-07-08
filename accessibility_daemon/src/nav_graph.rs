@@ -128,7 +128,7 @@ impl NavGraph {
             t_west.push(west);
         }
 
-        // Fill any Phase‑1 empty slots with best Phase‑2 candidate
+        // Fill any Phase‑1 empty slots with best Phase‑2 candidate (no connectivity enforcement)
         for i in 0..n {
             for d in 0..4 {
                 if edges[i][d] >= n {
@@ -143,7 +143,6 @@ impl NavGraph {
             }
         }
 
-        enforce_connectivity(&mut edges, n, &positions, &t_north, &t_south, &t_east, &t_west);
         Self { edges, initial_edges, positions, n }
     }
 
@@ -317,7 +316,7 @@ fn candidate_cost(
     }
     let (xu, yu) = positions[u];
     let (xv, yv) = positions[v];
-    torus_dx(xu, xv) + torus_dy(yu, yv)
+    (xu - xv).abs() + (yu - yv).abs()
 }
 
 fn enforce_connectivity(
