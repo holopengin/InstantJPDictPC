@@ -32,7 +32,8 @@ impl NavGraph {
         let mut south_lists: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         let mut east_lists: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         let mut west_lists: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
-        const W: f32 = 10.0; // off‑axis penalty weight
+        const W: f32 = 10.0; // off‑axis penalty weight (Phase 1 — strict local)
+        const W2: f32 = 3.0; // off‑axis penalty weight (Phase 2 — island connecting)
         const LOCAL_DIST: f32 = 0.05; // max Euclidean distance for Phase 1
         const CONE45: f32 = 1.0; // allow within 45° of cardinal (off_axis ≤ primary)
 
@@ -106,13 +107,13 @@ impl NavGraph {
                 let yd = (yi - yj).abs();
                 // Phase 2: raw screen distance, 45° cone, off‑axis penalty
                 let dy_n = yi - yj;
-                if yj < yi && xd <= CONE45 * dy_n { north.push((j, dy_n + W * xd)); }
+                if yj < yi && xd <= CONE45 * dy_n { north.push((j, dy_n + W2 * xd)); }
                 let dy_s = yj - yi;
-                if yj > yi && xd <= CONE45 * dy_s { south.push((j, dy_s + W * xd)); }
+                if yj > yi && xd <= CONE45 * dy_s { south.push((j, dy_s + W2 * xd)); }
                 let dx_e = xj - xi;
-                if xj > xi && yd <= CONE45 * dx_e { east.push((j, dx_e + W * yd)); }
+                if xj > xi && yd <= CONE45 * dx_e { east.push((j, dx_e + W2 * yd)); }
                 let dx_w = xi - xj;
-                if xj < xi && yd <= CONE45 * dx_w { west.push((j, dx_w + W * yd)); }
+                if xj < xi && yd <= CONE45 * dx_w { west.push((j, dx_w + W2 * yd)); }
             }
 
             let sort_fn = |a: &(usize, f32), b: &(usize, f32)| {
