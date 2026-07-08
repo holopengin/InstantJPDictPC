@@ -422,6 +422,10 @@ fn run_ocr_viewer(
         }
         if let Some(t) = state.scroll_neighbor_task() { tasks.push(t); state.scroll_neighbor_to = None; }
         if let Some(t) = state.scroll_alt_task() { tasks.push(t); state.scroll_alt_to = None; }
+        if let Some(delta) = state.dict_scroll_request.take() {
+            state.dict_scroll_y = (state.dict_scroll_y + delta).max(0.0);
+            tasks.push(state.scroll_dict_task(state.dict_scroll_y));
+        }
         if tasks.is_empty() { iced::Task::none() } else { iced::Task::batch(tasks) }
     };
 
@@ -485,7 +489,17 @@ fn run_ocr_viewer(
                                     || *k == iced::keyboard::Key::Character("k".into()) => Some(GamepadAction::NavigateUp),
                                 _ => None,
                             };
-                            action.map(Message::Navigate)
+                            if let Some(a) = action {
+                                return Some(Message::Navigate(a));
+                            }
+                            // Dictionary scroll: D=scroll down, F=scroll up
+                            if *key == iced::keyboard::Key::Character("d".into()) {
+                                return Some(Message::Navigate(GamepadAction::ScrollDown));
+                            }
+                            if *key == iced::keyboard::Key::Character("f".into()) {
+                                return Some(Message::Navigate(GamepadAction::ScrollUp));
+                            }
+                            None
                         }
                         iced_futures::subscription::Event::Interaction {
                             event: iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Right)),
