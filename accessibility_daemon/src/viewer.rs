@@ -556,6 +556,53 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
             }
         }
 
+        // --- Debug: draw navigation graph arrows ---
+        if !self.nav_centers.is_empty() {
+            let arrow_to_screen = |cx: f32, cy: f32| -> Point {
+                let pt = transform(&BoundingBox::new(cx as i32, cy as i32, 1, 1, 0.0));
+                Point::new(pt.0.x + pt.1.width / 2.0, pt.0.y + pt.1.height / 2.0)
+            };
+            // Helper to draw a single directed edge
+            let draw_edge = |frame: &mut Frame, from: Point, to: Point, color: Color| {
+                frame.stroke(&CanvasPath::line(from, to), CanvasStroke::default().with_color(color).with_width(1.5));
+                // Arrowhead: two short lines at 30° from the target point
+                let dx = to.x - from.x;
+                let dy = to.y - from.y;
+                let len = (dx * dx + dy * dy).sqrt().max(1.0);
+                let ux = dx / len;
+                let uy = dy / len;
+                let tip = 8.0;
+                let left = Point::new(to.x - ux * tip * 0.866 + uy * tip * 0.5, to.y - uy * tip * 0.866 - ux * tip * 0.5);
+                let right = Point::new(to.x - ux * tip * 0.866 - uy * tip * 0.5, to.y - uy * tip * 0.866 + ux * tip * 0.5);
+                frame.stroke(&CanvasPath::line(to, left), CanvasStroke::default().with_color(color).with_width(1.5));
+                frame.stroke(&CanvasPath::line(to, right), CanvasStroke::default().with_color(color).with_width(1.5));
+            };
+            if let Some(ref initial) = self.nav_edges_initial {
+                for (i, edges) in initial.iter().enumerate() {
+                    if i >= self.nav_centers.len() { break; }
+                    let from = arrow_to_screen(self.nav_centers[i].0, self.nav_centers[i].1);
+                    for &target in edges {
+                        if target < self.nav_centers.len() {
+                            let to = arrow_to_screen(self.nav_centers[target].0, self.nav_centers[target].1);
+                            draw_edge(&mut frame, from, to, Color::from_rgba(1.0, 0.0, 0.0, 0.6)); // red, initial
+                        }
+                    }
+                }
+            }
+            if let Some(ref final_edges) = self.nav_edges_final {
+                for (i, edges) in final_edges.iter().enumerate() {
+                    if i >= self.nav_centers.len() { break; }
+                    let from = arrow_to_screen(self.nav_centers[i].0, self.nav_centers[i].1);
+                    for &target in edges {
+                        if target < self.nav_centers.len() {
+                            let to = arrow_to_screen(self.nav_centers[target].0, self.nav_centers[target].1);
+                            draw_edge(&mut frame, from, to, Color::from_rgba(0.0, 1.0, 1.0, 0.6)); // cyan, final
+                        }
+                    }
+                }
+            }
+        }
+
         vec![frame.into_geometry()]
     }
 }
