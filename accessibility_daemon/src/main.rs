@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use image::DynamicImage;
 use std::io::Cursor;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -35,6 +35,8 @@ static GP_COUNT: AtomicU32 = AtomicU32::new(0);
 // Repeat state (set by Navigate handler, checked by ZoomTick)
 static GP_REPEAT_ACTION: std::sync::Mutex<Option<(GamepadAction, Instant)>> =
     std::sync::Mutex::new(None);
+/// Number of repeat ticks already fired (used by ZoomTick to avoid over-firing).
+static GP_LAST_REPEAT: AtomicU64 = AtomicU64::new(0);
 
 const B_UP: u32 = 1 << 0;
 const B_DOWN: u32 = 1 << 1;
@@ -349,9 +351,11 @@ fn run_ocr_viewer(
                 }
                 GamepadAction::ScrollUp => {
                     handle_dict_scroll(state, -1.0);
+                    *GP_REPEAT_ACTION.lock().unwrap() = Some((a, Instant::now()));
                 }
                 GamepadAction::ScrollDown => {
                     handle_dict_scroll(state, 1.0);
+                    *GP_REPEAT_ACTION.lock().unwrap() = Some((a, Instant::now()));
                 }
                 _ => {}
             },
@@ -395,21 +399,30 @@ fn run_ocr_viewer(
                     if let Some((action, started)) = *ra {
                         let elapsed = started.elapsed();
                         if elapsed >= std::time::Duration::from_millis(500) {
-                            let count = (elapsed.as_millis() - 500) / 50;
-                            let prev_count = (std::cmp::max(elapsed.as_millis(), 500) - 500) / 50;
-                            if count > prev_count {
-                                if let GamepadAction::NavigateUp | GamepadAction::NavigateDown
-                                    | GamepadAction::NavigateLeft | GamepadAction::NavigateRight = action {
-                                    state.state.navigate(action);
-                                    if let Some((li, ci)) = state.state.current_cursor() {
-                                        state.move_cursor_to(li, ci);
+                            let total = ((elapsed.as_millis() - 500) / 50) as u64;
+                            let last = GP_LAST_REPEAT.load(Ordering::Relaxed);
+                            if total > last {
+                                GP_LAST_REPEAT.store(total, Ordering::Relaxed);
+                                match action {
+                                    GamepadAction::NavigateUp | GamepadAction::NavigateDown
+                                    | GamepadAction::NavigateLeft | GamepadAction::NavigateRight => {
+                                        state.state.navigate(action);
+                                        if let Some((li, ci)) = state.state.current_cursor() {
+                                            state.move_cursor_to(li, ci);
+                                        }
                                     }
+                                    GamepadAction::ScrollUp => handle_dict_scroll(state, -1.0),
+                                    GamepadAction::ScrollDown => handle_dict_scroll(state, 1.0),
+                                    _ => {}
                                 }
                             }
+                        } else {
+                            GP_LAST_REPEAT.store(0, Ordering::Relaxed);
                         }
                     }
                 } else {
                     let _ = GP_REPEAT_ACTION.lock().unwrap().take();
+                    GP_LAST_REPEAT.store(0, Ordering::Relaxed);
                 }
             }
         }
