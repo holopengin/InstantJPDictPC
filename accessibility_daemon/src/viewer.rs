@@ -562,41 +562,71 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 let pt = transform(&BoundingBox::new(cx as i32, cy as i32, 1, 1, 0.0));
                 Point::new(pt.0.x + pt.1.width / 2.0, pt.0.y + pt.1.height / 2.0)
             };
-            // Helper to draw a single directed edge
-            let draw_edge = |frame: &mut Frame, from: Point, to: Point, color: Color| {
-                frame.stroke(&CanvasPath::line(from, to), CanvasStroke::default().with_color(color).with_width(1.5));
-                // Arrowhead: two short lines at 30° from the target point
+            let dir_color = |dir: usize| -> Color {
+                match dir {
+                    0 => Color::from_rgb(0.0, 1.0, 1.0),   // N = cyan
+                    1 => Color::from_rgb(1.0, 0.0, 0.0),   // S = red
+                    2 => Color::from_rgb(0.0, 1.0, 0.0),   // E = green
+                    _ => Color::from_rgb(1.0, 1.0, 0.0),   // W = yellow
+                }
+            };
+            let dir_control = |from: Point, to: Point, dir: usize| -> Point {
                 let dx = to.x - from.x;
                 let dy = to.y - from.y;
+                let pull = 0.35;
+                match dir {
+                    0 => Point::new(from.x + dx * pull, from.y - dy.abs() * pull * 0.6),  // N: arc upward
+                    1 => Point::new(from.x + dx * pull, from.y + dy.abs() * pull * 0.6),  // S: arc downward
+                    2 => Point::new(from.x + dx.abs() * pull * 0.6, from.y + dy * pull),  // E: arc rightward
+                    _ => Point::new(from.x - dx.abs() * pull * 0.6, from.y + dy * pull),  // W: arc leftward
+                }
+            };
+            // Draw a quadratic bezier with arrowhead at target
+            let draw_curve = |frame: &mut Frame, from: Point, to: Point, color: Color, dir: usize| {
+                let ctrl = dir_control(from, to, dir);
+                let mut pb = iced::widget::canvas::path::Builder::new();
+                pb.move_to(from);
+                pb.quadratic_curve_to(ctrl, to);
+                let path = pb.build();
+                frame.stroke(&path, CanvasStroke::default().with_color(color).with_width(1.5));
+
+                // Arrowhead: compute tangent at target (to - ctrl direction)
+                let dx = to.x - ctrl.x;
+                let dy = to.y - ctrl.y;
                 let len = (dx * dx + dy * dy).sqrt().max(1.0);
                 let ux = dx / len;
                 let uy = dy / len;
-                let tip = 8.0;
+                let tip = 6.0;
                 let left = Point::new(to.x - ux * tip * 0.866 + uy * tip * 0.5, to.y - uy * tip * 0.866 - ux * tip * 0.5);
                 let right = Point::new(to.x - ux * tip * 0.866 - uy * tip * 0.5, to.y - uy * tip * 0.866 + ux * tip * 0.5);
-                frame.stroke(&CanvasPath::line(to, left), CanvasStroke::default().with_color(color).with_width(1.5));
-                frame.stroke(&CanvasPath::line(to, right), CanvasStroke::default().with_color(color).with_width(1.5));
+                frame.stroke(&iced::widget::canvas::Path::line(to, left), CanvasStroke::default().with_color(color).with_width(1.5));
+                frame.stroke(&iced::widget::canvas::Path::line(to, right), CanvasStroke::default().with_color(color).with_width(1.5));
             };
+
+            // Draw initial edges (red, pre-connectivity)
             if let Some(ref initial) = self.nav_edges_initial {
                 for (i, edges) in initial.iter().enumerate() {
                     if i >= self.nav_centers.len() { break; }
                     let from = arrow_to_screen(self.nav_centers[i].0, self.nav_centers[i].1);
-                    for &target in edges {
+                    for (d, &target) in edges.iter().enumerate() {
                         if target < self.nav_centers.len() {
                             let to = arrow_to_screen(self.nav_centers[target].0, self.nav_centers[target].1);
-                            draw_edge(&mut frame, from, to, Color::from_rgba(1.0, 0.0, 0.0, 0.6)); // red, initial
+                            let color = dir_color(d);
+                            draw_curve(&mut frame, from, to, Color::from_rgba(color.r, color.g, color.b, 0.5), d);
                         }
                     }
                 }
             }
+            // Draw final edges (cyan, finalized) — drawn on top
             if let Some(ref final_edges) = self.nav_edges_final {
                 for (i, edges) in final_edges.iter().enumerate() {
                     if i >= self.nav_centers.len() { break; }
                     let from = arrow_to_screen(self.nav_centers[i].0, self.nav_centers[i].1);
-                    for &target in edges {
+                    for (d, &target) in edges.iter().enumerate() {
                         if target < self.nav_centers.len() {
                             let to = arrow_to_screen(self.nav_centers[target].0, self.nav_centers[target].1);
-                            draw_edge(&mut frame, from, to, Color::from_rgba(0.0, 1.0, 1.0, 0.6)); // cyan, final
+                            let color = dir_color(d);
+                            draw_curve(&mut frame, from, to, color, d);
                         }
                     }
                 }
