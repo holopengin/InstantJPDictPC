@@ -109,6 +109,9 @@ pub struct OverlayProgram {
     pub handle_pan_zoom: bool,
     /// Coordinates of characters to highlight in yellow (matched word).
     pub highlighted_coords: Vec<(usize, usize)>,
+    pub nav_edges_initial: Option<Vec<[usize; 4]>>,
+    pub nav_edges_final: Option<Vec<[usize; 4]>>,
+    pub nav_centers: Vec<(f32, f32)>,
 }
 
 impl OverlayProgram {
@@ -838,6 +841,20 @@ impl OcrViewer {
         )))
     }
 
+    pub fn build_nav_centers(&self) -> Vec<(f32, f32)> {
+        let mut centers = Vec::new();
+        for line_opt in &self.state.active_line_results {
+            if let Some(line) = line_opt {
+                for b in &line.char_boxes {
+                    let cx = b.left() as f32 + (b.w as f32) / 2.0;
+                    let cy = b.top() as f32 + (b.h as f32) / 2.0;
+                    centers.push((cx, cy));
+                }
+            }
+        }
+        centers
+    }
+
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
         let has_panel = self.selected_word.is_some();
 
@@ -875,6 +892,9 @@ impl OcrViewer {
             is_zooming: self.is_zooming,
             handle_pan_zoom: true,
             highlighted_coords: self.state.last_highlighted_coords.clone(),
+            nav_edges_initial: self.state.nav_graph.as_ref().map(|g| g.initial_edges.clone()),
+            nav_edges_final: self.state.nav_graph.as_ref().map(|g| g.edges.clone()),
+            nav_centers: self.build_nav_centers(),
         };
 
         // The image is drawn in a SEPARATE canvas underneath, because tiny_skia
@@ -897,6 +917,9 @@ impl OcrViewer {
             is_zooming: self.is_zooming,
             handle_pan_zoom: false,
             highlighted_coords: Vec::new(),
+            nav_edges_initial: None,
+            nav_edges_final: None,
+            nav_centers: Vec::new(),
         }).width(Length::Fill).height(Length::Fill);
 
         let annotation_canvas = Canvas::new(overlay).width(Length::Fill).height(Length::Fill);
