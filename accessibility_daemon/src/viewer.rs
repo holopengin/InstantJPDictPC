@@ -584,6 +584,8 @@ pub struct OcrViewer {
     pub scroll_alt_to: Option<usize>,
     /// Requested dictionary scroll delta (px). Set by L1/R1 gamepad, D/F keyboard.
     pub dict_scroll_request: Option<f32>,
+    /// Accumulated dictionary scroll Y target (px from top).
+    pub dict_scroll_y: f32,
     /// When true, the user is actively panning/zooming — annotation drawing is disabled.
     pub is_zooming: bool,
     /// Frames since last zoom/pan event — used to re-enable annotations after zoom ends.
@@ -628,6 +630,7 @@ impl OcrViewer {
             scroll_neighbor_to: None,
             scroll_alt_to: None,
             dict_scroll_request: None,
+            dict_scroll_y: 0.0,
             is_zooming: false,
             zoom_idle_frames: 0,
             cached_preview: RefCell::new(None),
@@ -784,7 +787,21 @@ impl OcrViewer {
     pub fn scroll_dict_to_top_task(&self) -> iced::Task<Message> {
         operate(scroll_to(
             Id::new("dict_scroll"),
-            AbsoluteOffset { x: Some(0.0), y: Some(0.0) },
+            AbsoluteOffset {
+                x: Some(0.0),
+                y: Some(0.0),
+            },
+        ))
+    }
+
+    /// Scroll the dictionary panel to the given Y offset.
+    pub fn scroll_dict_task(&self, y: f32) -> iced::Task<Message> {
+        operate(scroll_to(
+            Id::new("dict_scroll"),
+            AbsoluteOffset {
+                x: Some(0.0),
+                y: Some(y),
+            },
         ))
     }
 
