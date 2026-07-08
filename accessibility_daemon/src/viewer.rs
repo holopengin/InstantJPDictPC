@@ -558,6 +558,20 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
 
         // --- Debug: draw navigation graph arrows ---
         if !self.nav_centers.is_empty() {
+            // Compute cursor global index for filtering
+            let cursor_global = self.cursor_pos.and_then(|(li, ci)| {
+                let mut g = 0;
+                for (a_li, ann) in self.annotations.iter().enumerate() {
+                    if a_li < li {
+                        if let Some(l) = &ann.line {
+                            g += l.text.chars().count();
+                        }
+                    } else {
+                        return Some(g + ci);
+                    }
+                }
+                None
+            });
             let arrow_to_screen = |cx: f32, cy: f32| -> Point {
                 let pt = transform(&BoundingBox::new(cx as i32, cy as i32, 1, 1, 0.0));
                 Point::new(pt.0.x + pt.1.width / 2.0, pt.0.y + pt.1.height / 2.0)
@@ -604,31 +618,35 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 frame.stroke(&iced::widget::canvas::Path::line(to, right), CanvasStroke::default().with_color(color).with_width(1.5));
             };
 
-            // Draw initial edges (red, pre-connectivity)
+            // Draw initial edges (pre-connectivity, dimmer)
             if let Some(ref initial) = self.nav_edges_initial {
                 for (i, edges) in initial.iter().enumerate() {
                     if i >= self.nav_centers.len() { break; }
-                    let from = arrow_to_screen(self.nav_centers[i].0, self.nav_centers[i].1);
                     for (d, &target) in edges.iter().enumerate() {
-                        if target < self.nav_centers.len() {
-                            let to = arrow_to_screen(self.nav_centers[target].0, self.nav_centers[target].1);
-                            let color = dir_color(d);
-                            draw_curve(&mut frame, from, to, Color::from_rgba(color.r, color.g, color.b, 0.5), d);
-                        }
+                        if target >= self.nav_centers.len() { continue; }
+                        let related = cursor_global.map_or(false, |cg| i == cg || target == cg);
+                        if !related { continue; }
+                        let from = arrow_to_screen(self.nav_centers[i].0, self.nav_centers[i].1);
+                        let to = arrow_to_screen(self.nav_centers[target].0, self.nav_centers[target].1);
+                        let color = dir_color(d);
+                        let alpha = if cursor_global == Some(i) { 0.5 } else { 0.25 };
+                        draw_curve(&mut frame, from, to, Color::from_rgba(color.r, color.g, color.b, alpha), d);
                     }
                 }
             }
-            // Draw final edges (cyan, finalized) — drawn on top
+            // Draw final edges (finalized) — drawn on top
             if let Some(ref final_edges) = self.nav_edges_final {
                 for (i, edges) in final_edges.iter().enumerate() {
                     if i >= self.nav_centers.len() { break; }
-                    let from = arrow_to_screen(self.nav_centers[i].0, self.nav_centers[i].1);
                     for (d, &target) in edges.iter().enumerate() {
-                        if target < self.nav_centers.len() {
-                            let to = arrow_to_screen(self.nav_centers[target].0, self.nav_centers[target].1);
-                            let color = dir_color(d);
-                            draw_curve(&mut frame, from, to, color, d);
-                        }
+                        if target >= self.nav_centers.len() { continue; }
+                        let related = cursor_global.map_or(false, |cg| i == cg || target == cg);
+                        if !related { continue; }
+                        let from = arrow_to_screen(self.nav_centers[i].0, self.nav_centers[i].1);
+                        let to = arrow_to_screen(self.nav_centers[target].0, self.nav_centers[target].1);
+                        let color = dir_color(d);
+                        let alpha = if cursor_global == Some(i) { 1.0 } else { 0.4 };
+                        draw_curve(&mut frame, from, to, Color::from_rgba(color.r, color.g, color.b, alpha), d);
                     }
                 }
             }
