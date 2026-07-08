@@ -107,6 +107,8 @@ pub struct OverlayProgram {
     /// The image canvas (behind the annotation canvas) must NOT handle them,
     /// or pan/zoom would be applied twice.
     pub handle_pan_zoom: bool,
+    /// Coordinates of characters to highlight in yellow (matched word).
+    pub highlighted_coords: Vec<(usize, usize)>,
 }
 
 impl OverlayProgram {
