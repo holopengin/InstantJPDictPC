@@ -1,5 +1,16 @@
 use crate::models::BoundingBox;
 
+/// Torus-wrapped horizontal distance.
+fn torus_dx(x1: f32, x2: f32) -> f32 {
+    let raw = (x1 - x2).abs();
+    raw.min(1.0 - raw)
+}
+/// Torus-wrapped vertical distance.
+fn torus_dy(y1: f32, y2: f32) -> f32 {
+    let raw = (y1 - y2).abs();
+    raw.min(1.0 - raw)
+}
+
 /// For each node (global char index): [north, south, east, west] target indices.
 #[derive(Clone, Debug)]
 pub struct NavGraph {
@@ -136,6 +147,63 @@ impl NavGraph {
                     let list = match d {
                         0 => &t_north[i], 1 => &t_south[i],
                         2 => &t_east[i],  _ => &t_west[i],
+                    };
+                    if let Some(&(v, _)) = list.first() {
+                        edges[i][d] = v;
+                    }
+                }
+            }
+        }
+
+        // Phase 3: torus-wrapped fill for remaining empty slots
+        let mut w3_north: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
+        let mut w3_south: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
+        let mut w3_east: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
+        let mut w3_west: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let (xi, yi) = positions[i];
+            let mut north: Vec<(usize, f32)> = Vec::new();
+            let mut south: Vec<(usize, f32)> = Vec::new();
+            let mut east: Vec<(usize, f32)> = Vec::new();
+            let mut west: Vec<(usize, f32)> = Vec::new();
+
+            for j in 0..n {
+                if i == j { continue; }
+                let (xj, yj) = positions[j];
+                let tx = torus_dx(xi, xj);
+                let ty = torus_dy(yi, yj);
+                let xd = (xi - xj).abs();
+                let yd = (yi - yj).abs();
+                let dy_n = if yj < yi { yi - yj } else { (yi - yj + 1.0) % 1.0 };
+                if xd <= CONE45 * dy_n { north.push((j, dy_n + W2 * tx)); }
+                let dy_s = if yj > yi { yj - yi } else { (yj - yi + 1.0) % 1.0 };
+                if xd <= CONE45 * dy_s { south.push((j, dy_s + W2 * tx)); }
+                let dx_e = if xj > xi { xj - xi } else { (xj - xi + 1.0) % 1.0 };
+                if yd <= CONE45 * dx_e { east.push((j, dx_e + W2 * ty)); }
+                let dx_w = if xi > xj { xi - xj } else { (xi - xj + 1.0) % 1.0 };
+                if yd <= CONE45 * dx_w { west.push((j, dx_w + W2 * ty)); }
+            }
+
+            let sort_fn = |a: &(usize, f32), b: &(usize, f32)| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
+            };
+            for list in [&mut north, &mut south, &mut east, &mut west] {
+                list.sort_by(sort_fn);
+            }
+            w3_north.push(north);
+            w3_south.push(south);
+            w3_east.push(east);
+            w3_west.push(west);
+        }
+
+        // Fill remaining empty slots from Phase 3 (torus)
+        for i in 0..n {
+            for d in 0..4 {
+                if edges[i][d] >= n {
+                    let list = match d {
+                        0 => &w3_north[i], 1 => &w3_south[i],
+                        2 => &w3_east[i],  _ => &w3_west[i],
                     };
                     if let Some(&(v, _)) = list.first() {
                         edges[i][d] = v;
