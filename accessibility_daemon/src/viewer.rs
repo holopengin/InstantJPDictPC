@@ -586,6 +586,8 @@ pub struct OcrViewer {
     pub dict_scroll_request: Option<f32>,
     /// Accumulated dictionary scroll Y target (px from top).
     pub dict_scroll_y: f32,
+    /// When true, lookup is deferred until the held gamepad button is released.
+    pub defer_lookup: bool,
     /// When true, the user is actively panning/zooming — annotation drawing is disabled.
     pub is_zooming: bool,
     /// Frames since last zoom/pan event — used to re-enable annotations after zoom ends.
@@ -631,6 +633,7 @@ impl OcrViewer {
             scroll_alt_to: None,
             dict_scroll_request: None,
             dict_scroll_y: 0.0,
+            defer_lookup: false,
             is_zooming: false,
             zoom_idle_frames: 0,
             cached_preview: RefCell::new(None),

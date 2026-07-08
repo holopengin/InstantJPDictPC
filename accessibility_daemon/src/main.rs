@@ -340,11 +340,9 @@ fn run_ocr_viewer(
                         navigate_alternatives(state, dir);
                     } else {
                         state.state.navigate(dir);
+                        state.defer_lookup = true;
                         if let Some((li, ci)) = state.state.current_cursor() {
                             state.move_cursor_to(li, ci);
-                            if state.selected_word.is_some() {
-                                state.select_character(li, ci);
-                            }
                         }
                     }
                     *GP_REPEAT_ACTION.lock().unwrap() = Some((a, Instant::now()));
@@ -423,6 +421,13 @@ fn run_ocr_viewer(
                 } else {
                     let _ = GP_REPEAT_ACTION.lock().unwrap().take();
                     GP_LAST_REPEAT.store(0, Ordering::Relaxed);
+                    // If dict is open and a lookup was deferred, fire it now
+                    if state.defer_lookup && state.selected_word.is_some() {
+                        state.defer_lookup = false;
+                        if let Some((li, ci)) = state.state.current_cursor() {
+                            state.select_character(li, ci);
+                        }
+                    }
                 }
             }
         }
