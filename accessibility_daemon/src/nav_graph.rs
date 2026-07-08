@@ -62,32 +62,33 @@ impl NavGraph {
                     else if prox < 0.03 { 0.5 }
                     else { 1.0 };
                 const DIR_MIN: f32 = 0.008; // ignore directional noise (< 0.8% of image)
+                const WRAP: f32 = 0.5; // penalty for wrapping past scene edge
 
                 // North: strictly upward (decreasing y). Wrapping allowed only to a different column.
                 let dy_n = if yj < yi { yi - yj } else {
                     if dx <= DIR_MIN { continue; } // don't wrap to same column
-                    (yi - yj + 1.0) % 1.0
+                    (yi - yj + 1.0) % 1.0 + WRAP
                 };
                 if dy_n > DIR_MIN { north.push((j, (dx * 32.0 + dy_n) * bonus)); }
 
                 // South: strictly downward (increasing y). Wrapping allowed only to a different column.
                 let dy_s = if yj > yi { yj - yi } else {
                     if dx <= DIR_MIN { continue; } // don't wrap to same column
-                    (yj - yi + 1.0) % 1.0
+                    (yj - yi + 1.0) % 1.0 + WRAP
                 };
                 if dy_s > DIR_MIN { south.push((j, (dx * 32.0 + dy_s) * bonus)); }
 
                 // East: strictly right (increasing x). Wrapping allowed only to a different line.
                 let dx_e = if xj > xi { xj - xi } else {
                     if dy <= DIR_MIN { continue; } // don't wrap on same line
-                    (xj - xi + 1.0) % 1.0
+                    (xj - xi + 1.0) % 1.0 + WRAP
                 };
                 if dx_e > DIR_MIN { east.push((j, (dx_e + dy * 32.0) * bonus)); }
 
                 // West: strictly left (decreasing x). Wrapping allowed only to a different line.
                 let dx_w = if xj < xi { xi - xj } else {
                     if dy <= DIR_MIN { continue; } // don't wrap on same line
-                    (xi - xj + 1.0) % 1.0
+                    (xi - xj + 1.0) % 1.0 + WRAP
                 };
                 if dx_w > DIR_MIN { west.push((j, (dx_w + dy * 32.0) * bonus)); }
             }
