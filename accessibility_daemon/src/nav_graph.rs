@@ -43,6 +43,60 @@ impl NavGraph {
         let mut south_lists: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         let mut east_lists: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         let mut west_lists: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
+        const W: f32 = 3.0; // off‑axis penalty weight
+        const LOCAL_DIST: f32 = 0.2; // max Euclidean distance for Phase 1
+
+        for i in 0..n {
+            let (xi, yi) = positions[i];
+            let mut north: Vec<(usize, f32)> = Vec::new();
+            let mut south: Vec<(usize, f32)> = Vec::new();
+            let mut east: Vec<(usize, f32)> = Vec::new();
+            let mut west: Vec<(usize, f32)> = Vec::new();
+
+            for j in 0..n {
+                if i == j { continue; }
+                let (xj, yj) = positions[j];
+                let xd = (xi - xj).abs();
+                let yd = (yi - yj).abs();
+                let euc = (xd * xd + yd * yd).sqrt();
+                if euc > LOCAL_DIST { continue; }
+                // Phase 1 — strict local: cost = primary + w * off_axis
+                if yj < yi { north.push((j, (yi - yj) + W * xd)); }
+                if yj > yi { south.push((j, (yj - yi) + W * xd)); }
+                if xj > xi { east.push((j, (xj - xi) + W * yd)); }
+                if xj < xi { west.push((j, (xi - xj) + W * yd)); }
+            }
+
+            let sort_fn = |a: &(usize, f32), b: &(usize, f32)| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        let (xa, ya) = positions[a.0];
+                        let (xb, yb) = positions[b.0];
+                        let da = ((xi - xa).powi(2) + (yi - ya).powi(2)).sqrt();
+                        let db = ((xi - xb).powi(2) + (yi - yb).powi(2)).sqrt();
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| a.0.cmp(&b.0))
+            };
+            for list in [&mut north, &mut south, &mut east, &mut west] {
+                list.sort_by(sort_fn);
+            }
+
+            north_lists.push(north);
+            south_lists.push(south);
+            east_lists.push(east);
+            west_lists.push(west);
+        }
+
+        // Phase 1: greedy local assignment
+        let mut edges = greedy_assignment_all(n, &north_lists, &south_lists, &east_lists, &west_lists);
+        let initial_edges = edges.clone();
+
+        // Phase 2: torus‑wrapped candidates for remaining/global connectivity
+        let mut t_north: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
+        let mut t_south: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
+        let mut t_east: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
+        let mut t_west: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
 
         for i in 0..n {
             let (xi, yi) = positions[i];
@@ -56,62 +110,46 @@ impl NavGraph {
                 let (xj, yj) = positions[j];
                 let dx = torus_dx(xi, xj);
                 let dy = torus_dy(yi, yj);
-                let prox = (dx * dx + dy * dy).sqrt();
-                let bonus = if prox < 0.005 { 0.05 }
-                    else if prox < 0.015 { 0.2 }
-                    else if prox < 0.03 { 0.5 }
-                    else { 1.0 };
-                const DIR_MIN: f32 = 0.008; // ignore directional noise (< 0.8% of image)
-                const WRAP: f32 = 0.5; // penalty for wrapping past scene edge
-
-                // North: strictly upward (decreasing y). Wrapping allowed only to a different column.
-                let dy_n = if yj < yi { yi - yj } else {
-                    if dx <= DIR_MIN { continue; } // don't wrap to same column
-                    (yi - yj + 1.0) % 1.0 + WRAP
-                };
-                if dy_n > DIR_MIN { north.push((j, (dx * 32.0 + dy_n) * bonus)); }
-
-                // South: strictly downward (increasing y). Wrapping allowed only to a different column.
-                let dy_s = if yj > yi { yj - yi } else {
-                    if dx <= DIR_MIN { continue; } // don't wrap to same column
-                    (yj - yi + 1.0) % 1.0 + WRAP
-                };
-                if dy_s > DIR_MIN { south.push((j, (dx * 32.0 + dy_s) * bonus)); }
-
-                // East: strictly right (increasing x). Wrapping allowed only to a different line.
-                let dx_e = if xj > xi { xj - xi } else {
-                    if dy <= DIR_MIN { continue; } // don't wrap on same line
-                    (xj - xi + 1.0) % 1.0 + WRAP
-                };
-                if dx_e > DIR_MIN { east.push((j, (dx_e + dy * 32.0) * bonus)); }
-
-                // West: strictly left (decreasing x). Wrapping allowed only to a different line.
-                let dx_w = if xj < xi { xi - xj } else {
-                    if dy <= DIR_MIN { continue; } // don't wrap on same line
-                    (xi - xj + 1.0) % 1.0 + WRAP
-                };
-                if dx_w > DIR_MIN { west.push((j, (dx_w + dy * 32.0) * bonus)); }
+                // Torus‑wrapped Manhattan cost (no off‑axis bonus needed)
+                if yj < yi { north.push((j, dx + (yi - yj))); }
+                else { north.push((j, dx + (yi - yj + 1.0) % 1.0)); }
+                if yj > yi { south.push((j, dx + (yj - yi))); }
+                else { south.push((j, dx + (yj - yi + 1.0) % 1.0)); }
+                if xj > xi { east.push((j, (xj - xi) + dy)); }
+                else { east.push((j, (xj - xi + 1.0) % 1.0 + dy)); }
+                if xj < xi { west.push((j, (xi - xj) + dy)); }
+                else { west.push((j, (xi - xj + 1.0) % 1.0 + dy)); }
             }
 
             let sort_fn = |a: &(usize, f32), b: &(usize, f32)| {
                 a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
             };
-            north.sort_by(sort_fn);
-            south.sort_by(sort_fn);
-            east.sort_by(sort_fn);
-            west.sort_by(sort_fn);
+            for list in [&mut north, &mut south, &mut east, &mut west] {
+                list.sort_by(sort_fn);
+            }
 
-            north_lists.push(north);
-            south_lists.push(south);
-            east_lists.push(east);
-            west_lists.push(west);
+            t_north.push(north);
+            t_south.push(south);
+            t_east.push(east);
+            t_west.push(west);
         }
 
-        let mut edges = greedy_assignment_all(n, &north_lists, &south_lists, &east_lists, &west_lists);
-        let initial_edges = edges.clone();
+        // Fill any Phase‑1 empty slots with best Phase‑2 candidate
+        for i in 0..n {
+            for d in 0..4 {
+                if edges[i][d] >= n {
+                    let list = match d {
+                        0 => &t_north[i], 1 => &t_south[i],
+                        2 => &t_east[i],  _ => &t_west[i],
+                    };
+                    if let Some(&(v, _)) = list.first() {
+                        edges[i][d] = v;
+                    }
+                }
+            }
+        }
 
-        enforce_connectivity(&mut edges, n, &positions, &north_lists, &south_lists, &east_lists, &west_lists);
-
+        enforce_connectivity(&mut edges, n, &positions, &t_north, &t_south, &t_east, &t_west);
         Self { edges, initial_edges, positions, n }
     }
 
@@ -156,8 +194,8 @@ fn greedy_assignment(
     east: &[(usize, f32)],
     west: &[(usize, f32)],
 ) -> [usize; 4] {
-    // Pick top choice for each direction
-    let mut result = [0usize; 4];
+    // Pick top choice for each direction. Empty = n (sentinel).
+    let mut result = [n; 4];
     let mut dir_candidates = [
         north.first().copied(),
         south.first().copied(),
@@ -166,7 +204,7 @@ fn greedy_assignment(
     ];
 
     for d in 0..4 {
-        result[d] = dir_candidates[d].map(|(idx, _)| idx).unwrap_or(0);
+        result[d] = dir_candidates[d].map(|(idx, _)| idx).unwrap_or(n);
     }
 
     // Resolve conflicts: pick next best for the cheaper-to-change direction
@@ -176,7 +214,7 @@ fn greedy_assignment(
         let mut used = std::collections::HashSet::new();
         let mut clean = true;
         for d in 0..4 {
-            if result[d] == 0 || !used.insert(result[d]) {
+            if result[d] == n || !used.insert(result[d]) {
                 clean = false;
             }
         }
@@ -185,12 +223,12 @@ fn greedy_assignment(
         // Find the first conflict and resolve it
         used.clear();
         for d in 0..4 {
-            if result[d] == 0 || !used.insert(result[d]) {
-                // Conflict or zero — find best alternative
+            if result[d] == n || !used.insert(result[d]) {
+                // Conflict or empty — find best alternative
                 let list = match d { 0 => north, 1 => south, 2 => east, _ => west };
                 let original = result[d];
                 for &(alt, _cost) in list {
-                    if !used.contains(&alt) && alt != 0 {
+                    if !used.contains(&alt) && alt != n {
                         result[d] = alt;
                         used.insert(alt);
                         has_conflict = true;
@@ -199,7 +237,7 @@ fn greedy_assignment(
                 }
                 if result[d] == original {
                     // No alternative found — pick any unused node
-                    for j in 1..n {
+                    for j in 0..n {
                         if !used.contains(&j) {
                             result[d] = j;
                             used.insert(j);
@@ -308,7 +346,7 @@ fn enforce_connectivity(
                 if !reachable[u] { continue; }
                 for d in 0..4 {
                     let old_v = edges[u][d];
-                    if !reachable[old_v] { continue; }
+                    if old_v >= n || !reachable[old_v] { continue; }
                     for &v in &unreachable {
                         if v == u || edges[u].contains(&v) { continue; }
                         let cost = match d {
