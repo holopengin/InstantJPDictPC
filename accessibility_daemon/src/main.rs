@@ -101,11 +101,15 @@ fn start_evdev_thread() {
                     } else { None };
                     if let Some(hat_bits) = hat_handled {
                         if val == -1 {
-                            GP_BITS.fetch_or(if code == AbsoluteAxisCode::ABS_HAT0X.0 { B_LEFT } else { B_UP }, Ordering::Relaxed);
-                            GP_BITS.fetch_and(!hat_bits, Ordering::Relaxed); // also clear opp direction
+                            let set = if code == AbsoluteAxisCode::ABS_HAT0X.0 { B_LEFT } else { B_UP };
+                            let clear = if code == AbsoluteAxisCode::ABS_HAT0X.0 { B_RIGHT } else { B_DOWN };
+                            GP_BITS.fetch_or(set, Ordering::Relaxed);
+                            GP_BITS.fetch_and(!clear, Ordering::Relaxed);
                         } else if val == 1 {
-                            GP_BITS.fetch_or(if code == AbsoluteAxisCode::ABS_HAT0X.0 { B_RIGHT } else { B_DOWN }, Ordering::Relaxed);
-                            GP_BITS.fetch_and(!hat_bits, Ordering::Relaxed);
+                            let set = if code == AbsoluteAxisCode::ABS_HAT0X.0 { B_RIGHT } else { B_DOWN };
+                            let clear = if code == AbsoluteAxisCode::ABS_HAT0X.0 { B_LEFT } else { B_UP };
+                            GP_BITS.fetch_or(set, Ordering::Relaxed);
+                            GP_BITS.fetch_and(!clear, Ordering::Relaxed);
                         } else {
                             GP_BITS.fetch_and(!hat_bits, Ordering::Relaxed); // center: clear both
                         }
@@ -265,7 +269,14 @@ fn run_ocr_viewer(
             }
             Message::Navigate(a) => match a {
                 GamepadAction::Confirm => {
-                    if let Some((li, ci)) = state.state.current_cursor() {
+                    if state.alternatives_visible {
+                        // Alt open → close it
+                        state.alternatives_visible = false;
+                    } else if state.selected_word.is_some() {
+                        // Dict open, no alt → toggle alt open
+                        state.alternatives_visible = true;
+                    } else if let Some((li, ci)) = state.state.current_cursor() {
+                        // Nothing open → open dictionary
                         state.select_character(li, ci);
                     }
                 }
