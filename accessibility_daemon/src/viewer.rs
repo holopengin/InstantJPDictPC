@@ -533,7 +533,13 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                 content: _ch.to_string(),
                                 position: Point::new(pt_c.x + sz_c.width / 2.0, pt_c.y + sz_c.height / 2.0),
                                 max_width: 0.0,
-                                color: Color::from_rgb(1.0, 0.467, 0.467),  // #FF7777
+                                color: if self.highlighted_coords.contains(&(line_idx, i)) {
+                                    Color::from_rgb(1.0, 1.0, 0.0)  // yellow for matched word
+                                } else if self.cursor_pos == Some((line_idx, i)) {
+                                    Color::from_rgb(1.0, 1.0, 0.0)  // yellow for cursor
+                                } else {
+                                    Color::from_rgb(1.0, 0.467, 0.467)  // #FF7777
+                                },
                                 size: Pixels(sz_c.height * CANVAS_CHAR_RATIO),
                                 line_height: Default::default(),
                                 font: IcedFont::default(),
@@ -663,6 +669,12 @@ impl OcrViewer {
     }
 
     pub fn select_character(&mut self, line_idx: usize, char_idx: usize) {
+        // Reset zoom to fit-to-screen when first opening the dictionary (prevents jump)
+        if !self.state.is_dictionary_visible {
+            self.state.current_scale = 1.0;
+            self.state.current_trans_x = 0.0;
+            self.state.current_trans_y = 0.0;
+        }
         self.set_cursor_pos(line_idx, char_idx);
         self.state.is_dictionary_visible = true;
         self.alternatives_visible = false;
@@ -812,9 +824,22 @@ impl OcrViewer {
         // Gravity is computed in select_character/update_gravity with the full
         // transform (base + pan/zoom), so the panel opens on the opposite side
         // of the character's actual screen position.
+        // Sync annotation text from active_line_results so alt character changes
+        // are reflected in the canvas overlay.
+        let synced_annotations = {
+            let mut ann = (*self.annotations).clone();
+            for (i, line_opt) in self.state.active_line_results.iter().enumerate() {
+                if let (Some(ann_line), Some(active_line)) =
+                    (ann.get_mut(i).and_then(|a| a.line.as_mut()), line_opt.as_ref())
+                {
+                    ann_line.text.clone_from(&active_line.text);
+                }
+            }
+            Rc::new(ann)
+        };
         let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
         let overlay = OverlayProgram {
-            annotations: Rc::clone(&self.annotations),
+            annotations: synced_annotations.clone(),
             img_w: self.img_w,
             img_h: self.img_h,
             image: Some(self.image_handle.clone()),
