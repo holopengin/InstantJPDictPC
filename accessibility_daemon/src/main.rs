@@ -13,6 +13,9 @@ use anyhow::{Context, Result};
 use image::DynamicImage;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::LazyLock;
+use std::time::Instant;
 
 use crate::data::db::DictionaryDatabase;
 use crate::models::*;
@@ -22,12 +25,132 @@ use crate::viewer::OcrViewer;
 
 use directories;
 use iced::window::settings::PlatformSpecific;
+use iced_futures::futures;
+
+// ── evdev statics ──────────────────────────────────────────────────────
+static GP_BITS: AtomicU32 = AtomicU32::new(0);
+static GP_LAST: AtomicU32 = AtomicU32::new(0);
+static GP_COUNT: AtomicU32 = AtomicU32::new(0);
+
+// Repeat state (set by Navigate handler, checked by ZoomTick)
+static GP_REPEAT_ACTION: std::sync::Mutex<Option<(GamepadAction, Instant)>> =
+    std::sync::Mutex::new(None);
+
+const B_UP: u32 = 1 << 0;
+const B_DOWN: u32 = 1 << 1;
+const B_LEFT: u32 = 1 << 2;
+const B_RIGHT: u32 = 1 << 3;
+const B_A: u32 = 1 << 4;
+const B_B: u32 = 1 << 5;
+const B_L1: u32 = 1 << 6;
+const B_R1: u32 = 1 << 7;
+
+fn start_evdev_thread() {
+    std::thread::spawn(|| {
+        use evdev::{Device, EventType, AbsoluteAxisCode, KeyCode};
+        let mut devices: Vec<Device> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/dev/input") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.to_string_lossy().contains("event") { continue; }
+                if let Ok(d) = Device::open(&path) {
+                    let has_btn = d.supported_keys().map_or(false, |caps| {
+                        caps.contains(KeyCode::BTN_SOUTH) || caps.contains(KeyCode::new(0x130))
+                    });
+                    if has_btn {
+                        let name = d.name().unwrap_or("?").to_string();
+                        println!("[GP] evdev gamepad found: {name} at {p}", p = path.display());
+                        devices.push(d);
+                    }
+                }
+            }
+        }
+        GP_COUNT.store(devices.len() as u32, Ordering::Relaxed);
+        println!("[GP] Found {} gamepad devices", devices.len());
+        if devices.is_empty() { return; }
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+            for dev in &mut devices {
+                for ev in dev.fetch_events().into_iter().flatten() {
+                    let etype = ev.event_type();
+                    let code = ev.code();
+                    let val = ev.value();
+                    // Determine which button this event is for (regardless of val)
+                    let bit = if etype == EventType::ABSOLUTE {
+                        0 // handled below
+                    } else if etype == EventType::KEY {
+                        let kc = KeyCode(code);
+                             if kc == KeyCode::BTN_DPAD_UP    || kc == KeyCode::new(0x220) { B_UP }
+                        else if kc == KeyCode::BTN_DPAD_DOWN  || kc == KeyCode::new(0x221) { B_DOWN }
+                        else if kc == KeyCode::BTN_DPAD_LEFT  || kc == KeyCode::new(0x222) { B_LEFT }
+                        else if kc == KeyCode::BTN_DPAD_RIGHT || kc == KeyCode::new(0x223) { B_RIGHT }
+                        else if kc == KeyCode::BTN_SOUTH      || kc == KeyCode::new(0x130) { B_A }
+                        else if kc == KeyCode::BTN_EAST       || kc == KeyCode::new(0x131) { B_B }
+                        else if kc == KeyCode::BTN_TL         || kc == KeyCode::new(0x136) { B_L1 }
+                        else if kc == KeyCode::BTN_TR         || kc == KeyCode::new(0x137) { B_R1 }
+                        else { 0 }
+                    } else { 0 };
+                    // HAT absolute axes: modify GP_BITS directly for both directions
+                    let hat_handled = if etype == EventType::ABSOLUTE {
+                        if code == AbsoluteAxisCode::ABS_HAT0X.0 {
+                            Some(if val == -1 { B_LEFT } else if val == 1 { B_RIGHT } else { B_LEFT | B_RIGHT })
+                        } else if code == AbsoluteAxisCode::ABS_HAT0Y.0 {
+                            Some(if val == -1 { B_UP } else if val == 1 { B_DOWN } else { B_UP | B_DOWN })
+                        } else { None }
+                    } else { None };
+                    if let Some(hat_bits) = hat_handled {
+                        if val == -1 {
+                            GP_BITS.fetch_or(if code == AbsoluteAxisCode::ABS_HAT0X.0 { B_LEFT } else { B_UP }, Ordering::Relaxed);
+                            GP_BITS.fetch_and(!hat_bits, Ordering::Relaxed); // also clear opp direction
+                        } else if val == 1 {
+                            GP_BITS.fetch_or(if code == AbsoluteAxisCode::ABS_HAT0X.0 { B_RIGHT } else { B_DOWN }, Ordering::Relaxed);
+                            GP_BITS.fetch_and(!hat_bits, Ordering::Relaxed);
+                        } else {
+                            GP_BITS.fetch_and(!hat_bits, Ordering::Relaxed); // center: clear both
+                        }
+                        eprintln!("[GP] evdev HAT: code=0x{code:04x} val={} bits={hat_bits:08b}", val);
+                        continue;
+                    }
+                    if bit == 0 { continue; }
+
+                    eprintln!("[GP] evdev raw: type={} code=0x{code:04x} val={} bit={}",
+                        etype.0, val, bit);
+
+                    if val != 0 {
+                        GP_BITS.fetch_or(bit, Ordering::Relaxed);
+                    } else {
+                        GP_BITS.fetch_and(!bit, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn set_val(val: i32, neg_bit: u32, pos_bit: u32) -> u32 {
+    match val { -1 => neg_bit, 1 => pos_bit, _ => 0 }
+}
+fn press_flag(val: i32, bit: u32) -> u32 { if val != 0 { bit } else { 0 } }
+
+fn gp_bits_to_msg(bits: u32) -> Option<Message> {
+    match bits {
+        p if p & B_UP != 0 => Some(Message::Navigate(GamepadAction::NavigateUp)),
+        p if p & B_DOWN != 0 => Some(Message::Navigate(GamepadAction::NavigateDown)),
+        p if p & B_LEFT != 0 => Some(Message::Navigate(GamepadAction::NavigateLeft)),
+        p if p & B_RIGHT != 0 => Some(Message::Navigate(GamepadAction::NavigateRight)),
+        p if p & B_A != 0 => Some(Message::Navigate(GamepadAction::Confirm)),
+        p if p & B_B != 0 => Some(Message::Navigate(GamepadAction::Back)),
+        p if p & B_L1 != 0 => Some(Message::Navigate(GamepadAction::ScrollUp)),
+        p if p & B_R1 != 0 => Some(Message::Navigate(GamepadAction::ScrollDown)),
+        _ => None,
+    }
+}
 
 fn main() -> Result<()> {
     env_logger::init();
     println!("Accessibility Daemon Starting...");
 
-    // Initialize dictionary database using XDG data directory
     let data_dir = directories::ProjectDirs::from("com", "Example", "accessibility_daemon")
         .or(directories::ProjectDirs::from("org", "Example", "accessibility_daemon"))
         .or(directories::ProjectDirs::from("net", "Example", "accessibility_daemon"))
@@ -39,7 +162,6 @@ fn main() -> Result<()> {
     let entry_count = db.get_entry_count()?;
     println!("Dictionary database loaded: {} entries", entry_count);
 
-    // Initialize deinflector
     let deinflector = Arc::new(
         Deinflector::from_json_file("assets/deinflect.json").unwrap_or_else(|e| {
             println!("Warning: Could not load deinflection rules: {}", e);
@@ -49,357 +171,277 @@ fn main() -> Result<()> {
     println!("Deinflector loaded: {} rules", deinflector.rule_count());
 
     let args: Vec<String> = std::env::args().collect();
-
     if args.len() < 2 {
-        // No image argument — open the settings / management window
         println!("No image argument provided. Opening settings window...");
         run_settings_window(db)?;
         return Ok(());
     }
-
-    // Image argument provided — run the OCR viewer
     run_ocr_viewer(args, db, deinflector)
 }
 
-// ---------------------------------------------------------------------------
-// Settings window (no image argument)
-// ---------------------------------------------------------------------------
-
 fn run_settings_window(db: Arc<DictionaryDatabase>) -> Result<()> {
-    let settings_app = iced::application(
+    let app = iced::application(
         move || SettingsWindow::new(Arc::clone(&db)),
         SettingsWindow::update,
         SettingsWindow::view,
     ).window(iced::window::Settings {
-        platform_specific: iced::window::settings::PlatformSpecific {
+        platform_specific: PlatformSpecific {
             application_id: String::from("accessibility_daemon"),
-             ..Default::default()
+            ..Default::default()
         },
         ..Default::default()
     });
-
-    settings_app.run().context("Failed to run settings window")?;
+    app.run().context("Failed to run settings window")?;
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// OCR viewer (image argument provided)
-// ---------------------------------------------------------------------------
 
 fn run_ocr_viewer(
     args: Vec<String>,
     db: Arc<DictionaryDatabase>,
     deinflector: Arc<Deinflector>,
 ) -> Result<()> {
-    // Parse args: find image path (first non-flag arg) and optional flags
     let mut image_path = None;
     let mut font_path: Option<String> = None;
     let mut headless = false;
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--headless" || args[i] == "-h" {
-            headless = true;
-            i += 1;
-        } else if args[i].starts_with("--font=") {
-            font_path = Some(args[i].trim_start_matches("--font=").to_string());
-            i += 1;
-        } else if args[i] == "--font" || args[i] == "-f" {
-            if i + 1 < args.len() {
-                font_path = Some(args[i + 1].clone());
-                i += 2;
-            } else {
-                i += 1;
-            }
-        } else if args[i].starts_with("-") {
-            // Unknown flag, skip
-            i += 1;
-        } else {
-            // First non-flag argument is the image path
-            image_path = Some(args[i].clone());
-            break;
-        }
+        if args[i] == "--headless" || args[i] == "-h" { headless = true; i += 1; }
+        else if args[i].starts_with("--font=") { font_path = Some(args[i].trim_start_matches("--font=").to_string()); i += 1; }
+        else if args[i] == "--font" || args[i] == "-f" {
+            if i + 1 < args.len() { font_path = Some(args[i + 1].clone()); i += 2; } else { i += 1; }
+        } else if args[i].starts_with("-") { i += 1; }
+        else { image_path = Some(args[i].clone()); break; }
     }
     let image_path = image_path.context("No image path provided")?;
+    let image = image::open(&image_path).context(format!("Failed to open image: {image_path}"))?;
+    println!("Image loaded: {image_path} ({}x{})", image.width(), image.height());
 
-    let image =
-        image::open(&image_path).context(format!("Failed to open image: {}", image_path))?;
-    println!(
-        "Image loaded successfully: {} ({}x{})",
-        image_path,
-        image.width(),
-        image.height()
-    );
-
-    // Run detection + recognition (render=true to draw boxes on the image)
-    let (annotations, annotated_opt) = {
+    let (annotations, _annotated_opt) = {
         #[cfg(feature = "ort")]
         {
             println!("Using ORT (ONNX Runtime) backend.");
             let mut engine = ocr_engine::OcrEngine::new("./assets")?;
-            println!("Models loaded successfully.");
-            println!(
-                "Character vocabulary loaded: {} chars",
-                engine.char_vocab.len()
-            );
+            println!("Models loaded. {} chars", engine.char_vocab.len());
             engine.run_detection(&image, true, font_path.as_deref())?
         }
         #[cfg(not(feature = "ort"))]
-        {
-            eprintln!("ORT backend not compiled in. Rebuild with --features ort");
-            std::process::exit(1);
-        }
+        { eprintln!("ORT not compiled. Rebuild with --features ort"); std::process::exit(1); }
     };
 
-    // Use annotated image if available, otherwise original
-    let display_img = if let Some(_annotated) = annotated_opt {
-        image.to_rgba8()
-    } else {
-        image.to_rgba8()
-    };
+    let display_img = image.to_rgba8();
     let dynimg = DynamicImage::ImageRgba8(display_img.clone());
     let mut buf = Cursor::new(Vec::new());
-    dynimg
-        .write_to(&mut buf, image::ImageFormat::Png)
-        .context("Failed to encode annotated image to PNG")?;
-    let bytes_vec: Vec<u8> = buf.into_inner();
-    let bytes_arc = Arc::new(bytes_vec);
-    let w = display_img.width();
-    let h = display_img.height();
+    dynimg.write_to(&mut buf, image::ImageFormat::Png).context("Failed to encode PNG")?;
+    let bytes_arc = Arc::new(buf.into_inner());
+    let (w, h) = (display_img.width(), display_img.height());
+    if headless { println!("Headless: done"); return Ok(()); }
 
-    // If headless mode, skip GUI and exit after detection
-    if headless {
-        println!("Headless mode: detection complete, skipping GUI");
-        return Ok(());
-    }
+    start_evdev_thread();
 
-    // Launch Iced application
     let boot = {
         let db = Arc::clone(&db);
         let deinflector = Arc::clone(&deinflector);
-        move || {
-            OcrViewer::new(
-                iced::widget::image::Handle::from_bytes(bytes_arc.as_ref().clone()),
-                bytes_arc.as_ref().clone(),
-                w,
-                h,
-                1280.0, // initial window width (updated by WindowResized)
-                720.0,  // initial window height (updated by WindowResized)
-                annotations.clone(),
-                Arc::clone(&db),
-                Arc::clone(&deinflector),
-            )
-        }
+        move || OcrViewer::new(
+            iced::widget::image::Handle::from_bytes(bytes_arc.as_ref().clone()),
+            bytes_arc.as_ref().clone(), w, h, 1280.0, 720.0,
+            annotations.clone(), Arc::clone(&db), Arc::clone(&deinflector),
+        )
     };
 
-    let update = |state: &mut OcrViewer, message: Message| -> iced::Task<Message> {
-        match message {
-            Message::SelectCharacter(line_idx, char_idx) => {
-                state.select_character(line_idx, char_idx);
-            }
-            Message::SelectNeighbor(line_idx, char_idx) => {
-                state.select_neighbor(line_idx, char_idx);
-            }
-            Message::SelectAlternative(new_char) => {
-                if let Some(selected) = state.selected_word.as_ref() {
-                    let current_char = state.state.active_line_results
-                        .get(selected.line_idx)
-                        .and_then(|l| l.as_ref())
-                        .and_then(|line| line.text.chars().nth(selected.char_idx));
-                    if current_char == Some(new_char) {
-                        state.alternatives_visible = false;
-                    } else {
-                        state.state.update_character(selected.line_idx, selected.char_idx, new_char);
-                        let _ = state.state.lookup(selected.line_idx, selected.char_idx, &state.db, &state.deinflector);
+    let update = |state: &mut OcrViewer, msg: Message| -> iced::Task<Message> {
+        match msg {
+            Message::SelectCharacter(li, ci) => state.select_character(li, ci),
+            Message::SelectNeighbor(li, ci) => state.select_neighbor(li, ci),
+            Message::SelectAlternative(c) => {
+                if let Some(sel) = state.selected_word.as_ref() {
+                    let cur = state.state.active_line_results.get(sel.line_idx)
+                        .and_then(|l| l.as_ref()).and_then(|l| l.text.chars().nth(sel.char_idx));
+                    if cur == Some(c) { state.alternatives_visible = false; }
+                    else {
+                        state.state.update_character(sel.line_idx, sel.char_idx, c);
+                        let _ = state.state.lookup(sel.line_idx, sel.char_idx, &state.db, &state.deinflector);
                     }
                 }
             }
-            Message::Navigate(action) => {
-                state.state.navigate(action);
-                if let Some((line_idx, char_idx)) = state.state.current_cursor() {
-                    state.select_character(line_idx, char_idx);
+            Message::Navigate(a) => match a {
+                GamepadAction::Confirm => {
+                    if let Some((li, ci)) = state.state.current_cursor() {
+                        state.select_character(li, ci);
+                    }
                 }
-            }
+                GamepadAction::Back => {
+                    if state.alternatives_visible { state.alternatives_visible = false; }
+                    else if state.selected_word.is_some() { state.selected_word = None; state.state.is_dictionary_visible = false; }
+                    else { std::process::exit(0); }
+                    let _ = GP_REPEAT_ACTION.lock().unwrap().take();
+                }
+                dir @ (GamepadAction::NavigateUp | GamepadAction::NavigateDown
+                | GamepadAction::NavigateLeft | GamepadAction::NavigateRight) => {
+                    state.state.navigate(dir);
+                    if let Some((li, ci)) = state.state.current_cursor() {
+                        state.move_cursor_to(li, ci);
+                        // If dictionary is already open, update lookup on nav (like Kotlin)
+                        if state.selected_word.is_some() {
+                            state.select_character(li, ci);
+                        }
+                    }
+                    *GP_REPEAT_ACTION.lock().unwrap() = Some((a, Instant::now()));
+                }
+                _ => {}
+            },
             Message::Back => {
-                if state.alternatives_visible {
-                    state.alternatives_visible = false;
-                } else if state.selected_word.is_some() {
-                    state.selected_word = None;
-                    state.state.is_dictionary_visible = false;
-                } else {
-                    println!("[App] Back with no selection — exiting");
-                    std::process::exit(0);
-                }
+                if state.alternatives_visible { state.alternatives_visible = false; }
+                else if state.selected_word.is_some() { state.selected_word = None; state.state.is_dictionary_visible = false; }
+                else { std::process::exit(0); }
+                let _ = GP_REPEAT_ACTION.lock().unwrap().take();
             }
             Message::ZoomOnCursor { delta, cursor_x, cursor_y } => {
-                let requested_factor = if delta > 0.0 { 1.1 } else { 0.9 };
-                let old_scale = state.state.current_scale;
-                let new_scale = (old_scale * requested_factor).clamp(0.5, 5.0);
-                // Use the actual factor after clamping so pan matches the real zoom change
-                let actual_factor = if old_scale > 0.0 { new_scale / old_scale } else { 1.0 };
-                state.state.current_scale = new_scale;
-                state.state.current_trans_x = cursor_x - (cursor_x - state.state.current_trans_x) * actual_factor;
-                state.state.current_trans_y = cursor_y - (cursor_y - state.state.current_trans_y) * actual_factor;
-                state.is_zooming = true;
-                state.zoom_idle_frames = 0;
+                let factor = if delta > 0.0 { 1.1 } else { 0.9 };
+                let old = state.state.current_scale;
+                let new = (old * factor).clamp(0.5, 5.0);
+                let actual = if old > 0.0 { new / old } else { 1.0 };
+                state.state.current_scale = new;
+                state.state.current_trans_x = cursor_x - (cursor_x - state.state.current_trans_x) * actual;
+                state.state.current_trans_y = cursor_y - (cursor_y - state.state.current_trans_y) * actual;
+                state.is_zooming = true; state.zoom_idle_frames = 0;
             }
-            Message::PanDelta { dx, dy } => {
-                state.state.current_trans_x += dx;
-                state.state.current_trans_y += dy;
-                state.zoom_idle_frames = 0;
-            }
-            Message::PanStart { .. } => {
-                state.is_zooming = true;
-                state.zoom_idle_frames = 0;
-            }
-            Message::PanEnd => {
-                state.is_zooming = false;
-                state.zoom_idle_frames = 0;
-            }
-            Message::SetScale { scale } => {
-                state.state.current_scale = scale.clamp(0.5, 5.0);
-            }
+            Message::PanDelta { dx, dy } => { state.state.current_trans_x += dx; state.state.current_trans_y += dy; state.zoom_idle_frames = 0; }
+            Message::PanStart { .. } => { state.is_zooming = true; state.zoom_idle_frames = 0; }
+            Message::PanEnd => { state.is_zooming = false; state.zoom_idle_frames = 0; }
+            Message::SetScale { scale } => { state.state.current_scale = scale.clamp(0.5, 5.0); }
             Message::PinchZoom { scale_factor, focus_x, focus_y, prev_focus_x, prev_focus_y, base_offset_y } => {
-                let old_scale = state.state.current_scale;
-                let new_scale = (old_scale * scale_factor).clamp(0.5, 5.0);
-                state.state.current_scale = new_scale;
-                let actual_factor = if old_scale > 0.0 { new_scale / old_scale } else { 1.0 };
-                let eff_x = state.state.current_trans_x;
-                let eff_y = state.state.current_trans_y + base_offset_y;
-                state.state.current_trans_x = focus_x - (prev_focus_x - eff_x) * actual_factor;
-                state.state.current_trans_y = (focus_y - (prev_focus_y - eff_y) * actual_factor) - base_offset_y;
-                state.is_zooming = true;
-                state.zoom_idle_frames = 0;
+                let old = state.state.current_scale;
+                let new = (old * scale_factor).clamp(0.5, 5.0);
+                state.state.current_scale = new;
+                let actual = if old > 0.0 { new / old } else { 1.0 };
+                state.state.current_trans_x = focus_x - (prev_focus_x - state.state.current_trans_x) * actual;
+                state.state.current_trans_y = (focus_y - (prev_focus_y - state.state.current_trans_y - base_offset_y) * actual) - base_offset_y;
+                state.is_zooming = true; state.zoom_idle_frames = 0;
             }
-            Message::PinchEnd => {
-                state.is_zooming = false;
-                state.zoom_idle_frames = 0;
-            }
-            Message::WindowResized { width, height } => {
-                state.window_width = width as f32;
-                state.window_height = height as f32;
-            }
+            Message::PinchEnd => { state.is_zooming = false; state.zoom_idle_frames = 0; }
+            Message::WindowResized { width, height } => { state.window_width = width as f32; state.window_height = height as f32; }
             Message::ZoomTick => {
-                // Re-enable annotations if no zoom/pan activity for a few ticks
-                if state.zoom_idle_frames > 3 {
-                    state.is_zooming = false;
+                if state.zoom_idle_frames > 3 { state.is_zooming = false; }
+                let bits = GP_BITS.load(Ordering::Relaxed);
+                let held = bits & (B_UP|B_DOWN|B_LEFT|B_RIGHT|B_L1|B_R1);
+                if held != 0 {
+                    let mut ra = GP_REPEAT_ACTION.lock().unwrap();
+                    if let Some((action, started)) = *ra {
+                        let elapsed = started.elapsed();
+                        if elapsed >= std::time::Duration::from_millis(500) {
+                            let count = (elapsed.as_millis() - 500) / 50;
+                            let prev_count = (std::cmp::max(elapsed.as_millis(), 500) - 500) / 50;
+                            if count > prev_count {
+                                if let GamepadAction::NavigateUp | GamepadAction::NavigateDown
+                                    | GamepadAction::NavigateLeft | GamepadAction::NavigateRight = action {
+                                    state.state.navigate(action);
+                                    if let Some((li, ci)) = state.state.current_cursor() {
+                                        state.move_cursor_to(li, ci);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let _ = GP_REPEAT_ACTION.lock().unwrap().take();
                 }
             }
         }
-
-        // Increment idle counter every update; reset on zoom/pan activity
-        if matches!(message, Message::ZoomOnCursor { .. } | Message::PanDelta { .. } | Message::PanStart { .. } | Message::PinchZoom { .. }) {
+        if matches!(msg, Message::ZoomOnCursor { .. } | Message::PanDelta { .. } | Message::PanStart { .. } | Message::PinchZoom { .. }) {
             state.zoom_idle_frames = 0;
-        } else {
-            state.zoom_idle_frames = state.zoom_idle_frames.saturating_add(1);
-        }
-
-        // Return scroll tasks to auto-scroll panels when selection changes
+        } else { state.zoom_idle_frames = state.zoom_idle_frames.saturating_add(1); }
         let mut tasks = Vec::new();
-        // Always scroll dictionary to top when content changes
-        if matches!(message, Message::SelectCharacter(_, _) | Message::SelectNeighbor(_, _) | Message::SelectAlternative(_)) {
+        if matches!(msg, Message::SelectCharacter(_, _) | Message::SelectNeighbor(_, _) | Message::SelectAlternative(_)) {
             tasks.push(state.scroll_dict_to_top_task());
         }
-        // Scroll neighbor/alt panels to the selected character.
-        // Clear the targets after firing so they don't re-fire on every frame.
-        if let Some(task) = state.scroll_neighbor_task() {
-            tasks.push(task);
-            state.scroll_neighbor_to = None;
-        }
-        if let Some(task) = state.scroll_alt_task() {
-            tasks.push(task);
-            state.scroll_alt_to = None;
-        }
-        if tasks.is_empty() {
-            iced::Task::none()
-        } else {
-            iced::Task::batch(tasks)
-        }
+        if let Some(t) = state.scroll_neighbor_task() { tasks.push(t); state.scroll_neighbor_to = None; }
+        if let Some(t) = state.scroll_alt_task() { tasks.push(t); state.scroll_alt_to = None; }
+        if tasks.is_empty() { iced::Task::none() } else { iced::Task::batch(tasks) }
     };
 
-    let view = OcrViewer::view;
-
-    // Use image dimensions for window size (with fallback to 1280x720)
-    let window_width = w as f32;
-    let window_height = h as f32;
-    
-    let app = iced::application(boot, update, view)
+    let app = iced::application(boot, update, OcrViewer::view)
         .window(iced::window::Settings {
-            size: iced::Size::new(window_width, window_height),
+            size: iced::Size::new(w as f32, h as f32),
             ..Default::default()
         })
         .subscription(|_state: &OcrViewer| {
-            // Merge global keyboard/mouse events with a periodic zoom-check timer
-            let global_events = iced_futures::subscription::filter_map(
-                "global-events",
+            let gp_events = iced::time::every(iced::time::Duration::from_millis(16))
+                .map(|_| {
+                    let bits = GP_BITS.load(Ordering::Relaxed);
+                    let prev = GP_LAST.swap(bits, Ordering::Relaxed);
+                    let changed = bits ^ prev;
+                    let pressed = changed & bits;
+                    let ngp = GP_COUNT.load(Ordering::Relaxed);
+
+                    let held: Vec<&str> = {
+                        let mut v = Vec::new();
+                        if bits & B_UP != 0 { v.push("UP"); }
+                        if bits & B_DOWN != 0 { v.push("DN"); }
+                        if bits & B_LEFT != 0 { v.push("LT"); }
+                        if bits & B_RIGHT != 0 { v.push("RT"); }
+                        if bits & B_A != 0 { v.push("A"); }
+                        if bits & B_B != 0 { v.push("B"); }
+                        if bits & B_L1 != 0 { v.push("L1"); }
+                        if bits & B_R1 != 0 { v.push("R1"); }
+                        v
+                    };
+                    if pressed != 0 || bits != 0 {
+                        let held_str = if held.is_empty() { String::new() } else { format!(" held=[{}]", held.join(" ")) };
+                        eprintln!("[GP] poll: bits={bits:08b} pressed={pressed:08b}{held_str} gamepads={ngp}");
+                    }
+                    gp_bits_to_msg(pressed)
+                })
+                .filter_map(|m| m);
+
+            let keyboard_events = iced_futures::subscription::filter_map(
+                "keyboard",
                 |event: iced_futures::subscription::Event| {
                     match &event {
                         iced_futures::subscription::Event::Interaction {
                             event: iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }),
                             ..
                         } => {
-                            println!("[Subscription] KeyPressed: {:?}", key);
-                            if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) {
-                                println!("[Subscription] Escape -> Back");
+                            if *key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
+                                || *key == iced::keyboard::Key::Character("q".into()) {
                                 return Some(Message::Back);
                             }
-                            if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) {
-                                println!("[Subscription] Enter -> Confirm (SelectCharacter)");
-                                return Some(Message::SelectCharacter(0, 0));
+                            if *key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) {
+                                return Some(Message::Navigate(GamepadAction::Confirm));
                             }
-                            let action = if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight)
-                                || key == &iced::keyboard::Key::Character("l".into())
-                            {
-                                Some(GamepadAction::NavigateRight)
-                            } else if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft)
-                                || key == &iced::keyboard::Key::Character("h".into())
-                            {
-                                Some(GamepadAction::NavigateLeft)
-                            } else if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown)
-                                || key == &iced::keyboard::Key::Character("j".into())
-                            {
-                                Some(GamepadAction::NavigateDown)
-                            } else if key == &iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp)
-                                || key == &iced::keyboard::Key::Character("k".into())
-                            {
-                                Some(GamepadAction::NavigateUp)
-                            } else {
-                                None
+                            let action = match key {
+                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight)
+                                    || *k == iced::keyboard::Key::Character("l".into()) => Some(GamepadAction::NavigateRight),
+                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft)
+                                    || *k == iced::keyboard::Key::Character("h".into()) => Some(GamepadAction::NavigateLeft),
+                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown)
+                                    || *k == iced::keyboard::Key::Character("j".into()) => Some(GamepadAction::NavigateDown),
+                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp)
+                                    || *k == iced::keyboard::Key::Character("k".into()) => Some(GamepadAction::NavigateUp),
+                                _ => None,
                             };
-                            if let Some(nav_action) = action {
-                                println!("[Subscription] Navigation {:?}", nav_action);
-                                return Some(Message::Navigate(nav_action));
-                            }
-                            None
+                            action.map(Message::Navigate)
                         }
                         iced_futures::subscription::Event::Interaction {
                             event: iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Right)),
                             ..
-                        } => {
-                            println!("[Subscription] Right-click -> Back");
-                            Some(Message::Back)
-                        }
+                        } => Some(Message::Back),
                         _ => None,
                     }
                 },
             );
 
-            // Periodic timer to detect when scroll-wheel zoom has stopped
-            let zoom_timer = iced::time::every(iced::time::Duration::from_millis(30))
-                .map(|_| Message::ZoomTick);
-
-            // Window resize events to track actual window dimensions
+            let zoom_timer = iced::time::every(iced::time::Duration::from_millis(30)).map(|_| Message::ZoomTick);
             let resize_events = iced::window::resize_events()
-                .map(|(_id, size)| Message::WindowResized {
-                    width: size.width,
-                    height: size.height,
-                });
+                .map(|(_id, size)| Message::WindowResized { width: size.width, height: size.height });
 
-            iced_futures::Subscription::batch(vec![global_events, zoom_timer, resize_events])
+            iced::Subscription::batch(vec![
+                gp_events.into(),
+                keyboard_events,
+                zoom_timer,
+                resize_events,
+            ])
         });
 
-    if let Err(e) = app.run() {
-        println!("Failed to run GUI: {:?}", e);
-    }
-
+    if let Err(e) = app.run() { println!("GUI failed: {e:?}"); }
     Ok(())
 }

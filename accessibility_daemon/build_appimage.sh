@@ -19,6 +19,8 @@ cargo build --release
 wget "$SHARUN" -O ./quick-sharun
 chmod +x ./quick-sharun
 
+rm -rf AppDir
+
 # Bundle the application
 ./quick-sharun ./target/release/accessibility_daemon
 

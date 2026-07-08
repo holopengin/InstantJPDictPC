@@ -54,4 +54,7 @@ futures-timer = "3.0"
 # Platform data directories
 directories = "6.0"
 
+# Gamepad support
+evdev = "0.13"
+
 [profile.release]
