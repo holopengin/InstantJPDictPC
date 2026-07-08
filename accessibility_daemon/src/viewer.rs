@@ -570,29 +570,30 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                     _ => Color::from_rgb(1.0, 1.0, 0.0),   // W = yellow
                 }
             };
-            let dir_control = |from: Point, to: Point, dir: usize| -> Point {
+            let dir_controls = |from: Point, to: Point, dir: usize| -> (Point, Point) {
                 let dx = to.x - from.x;
                 let dy = to.y - from.y;
-                let pull = 0.35;
+                let dist = (dx * dx + dy * dy).sqrt().max(20.0);
+                let card_pull = dist * 0.3;
                 match dir {
-                    0 => Point::new(from.x + dx * pull, from.y - dy.abs() * pull * 0.6),  // N: arc upward
-                    1 => Point::new(from.x + dx * pull, from.y + dy.abs() * pull * 0.6),  // S: arc downward
-                    2 => Point::new(from.x + dx.abs() * pull * 0.6, from.y + dy * pull),  // E: arc rightward
-                    _ => Point::new(from.x - dx.abs() * pull * 0.6, from.y + dy * pull),  // W: arc leftward
+                    0 => (Point::new(from.x, from.y - card_pull), Point::new(to.x, to.y + dy * 0.2)),  // N
+                    1 => (Point::new(from.x, from.y + card_pull), Point::new(to.x, to.y - dy * 0.2)),  // S
+                    2 => (Point::new(from.x + card_pull, from.y), Point::new(to.x - dx * 0.2, to.y)),  // E
+                    _ => (Point::new(from.x - card_pull, from.y), Point::new(to.x - dx * 0.2, to.y)),  // W
                 }
             };
-            // Draw a quadratic bezier with arrowhead at target
+            // Draw a cubic bezier with arrowhead at target
             let draw_curve = |frame: &mut Frame, from: Point, to: Point, color: Color, dir: usize| {
-                let ctrl = dir_control(from, to, dir);
+                let (ctrl_a, ctrl_b) = dir_controls(from, to, dir);
                 let mut pb = iced::widget::canvas::path::Builder::new();
                 pb.move_to(from);
-                pb.quadratic_curve_to(ctrl, to);
+                pb.bezier_curve_to(ctrl_a, ctrl_b, to);
                 let path = pb.build();
                 frame.stroke(&path, CanvasStroke::default().with_color(color).with_width(1.5));
 
-                // Arrowhead: compute tangent at target (to - ctrl direction)
-                let dx = to.x - ctrl.x;
-                let dy = to.y - ctrl.y;
+                // Arrowhead: tangent at endpoint = (to - ctrl_b) direction
+                let dx = to.x - ctrl_b.x;
+                let dy = to.y - ctrl_b.y;
                 let len = (dx * dx + dy * dy).sqrt().max(1.0);
                 let ux = dx / len;
                 let uy = dy / len;
