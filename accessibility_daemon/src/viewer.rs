@@ -597,7 +597,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 let len = (dx * dx + dy * dy).sqrt().max(1.0);
                 let ux = dx / len;
                 let uy = dy / len;
-                let tip = 6.0;
+                let tip = 12.0;
                 let left = Point::new(to.x - ux * tip * 0.866 + uy * tip * 0.5, to.y - uy * tip * 0.866 - ux * tip * 0.5);
                 let right = Point::new(to.x - ux * tip * 0.866 - uy * tip * 0.5, to.y - uy * tip * 0.866 + ux * tip * 0.5);
                 frame.stroke(&iced::widget::canvas::Path::line(to, left), CanvasStroke::default().with_color(color).with_width(1.5));
