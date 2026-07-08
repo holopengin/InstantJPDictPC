@@ -151,6 +151,51 @@ fn gp_bits_to_msg(bits: u32) -> Option<Message> {
     }
 }
 
+/// Navigate the alternatives selection when the alt panel is visible.
+/// In portrait: LEFT/RIGHT cycle through alts. In landscape: UP/DOWN.
+fn navigate_alternatives(state: &mut crate::viewer::OcrViewer, dir: GamepadAction) {
+    let is_landscape = state.window_width > state.window_height;
+    let (line_idx, char_idx) = match state.state.current_cursor() {
+        Some(c) => c,
+        None => return,
+    };
+    let line = match state.state.active_line_results.get(line_idx).and_then(|l| l.as_ref()) {
+        Some(l) => l,
+        None => return,
+    };
+    let alts = match line.alternatives.get(char_idx) {
+        Some(a) => a,
+        None => return,
+    };
+    let current_char = match line.text.chars().nth(char_idx) {
+        Some(c) => c,
+        None => return,
+    };
+
+    let diff = match (dir, is_landscape) {
+        (GamepadAction::NavigateDown, true) | (GamepadAction::NavigateRight, false) => 1,
+        (GamepadAction::NavigateUp, true) | (GamepadAction::NavigateLeft, false) => -1,
+        _ => 0,
+    };
+    if diff == 0 { return; }
+
+    let candidates: Vec<char> = alts.iter().take(15).map(|(c, _)| *c).collect();
+    let current_idx = candidates.iter().position(|c| *c == current_char).unwrap_or(0);
+    let new_idx = (current_idx as isize + diff).clamp(0, candidates.len() as isize - 1) as usize;
+
+    if new_idx != current_idx {
+        let new_char = candidates[new_idx];
+        state.state.update_character(line_idx, char_idx, new_char);
+        let _ = state.state.lookup(line_idx, char_idx, &state.db, &state.deinflector);
+        state.state.update_highlight_coords(line_idx, char_idx, state.state.current_word_length);
+    }
+}
+
+/// Scroll the dictionary panel by N lines (or delta px).
+fn handle_dict_scroll(state: &mut crate::viewer::OcrViewer, direction: f32) {
+    state.dict_scroll_request = Some(direction * 120.0);
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     println!("Accessibility Daemon Starting...");
@@ -288,15 +333,25 @@ fn run_ocr_viewer(
                 }
                 dir @ (GamepadAction::NavigateUp | GamepadAction::NavigateDown
                 | GamepadAction::NavigateLeft | GamepadAction::NavigateRight) => {
-                    state.state.navigate(dir);
-                    if let Some((li, ci)) = state.state.current_cursor() {
-                        state.move_cursor_to(li, ci);
-                        // If dictionary is already open, update lookup on nav (like Kotlin)
-                        if state.selected_word.is_some() {
-                            state.select_character(li, ci);
+                    if state.alternatives_visible {
+                        // Navigate alternatives instead of OCR content
+                        navigate_alternatives(state, dir);
+                    } else {
+                        state.state.navigate(dir);
+                        if let Some((li, ci)) = state.state.current_cursor() {
+                            state.move_cursor_to(li, ci);
+                            if state.selected_word.is_some() {
+                                state.select_character(li, ci);
+                            }
                         }
                     }
                     *GP_REPEAT_ACTION.lock().unwrap() = Some((a, Instant::now()));
+                }
+                GamepadAction::ScrollUp => {
+                    handle_dict_scroll(state, -1.0);
+                }
+                GamepadAction::ScrollDown => {
+                    handle_dict_scroll(state, 1.0);
                 }
                 _ => {}
             },
