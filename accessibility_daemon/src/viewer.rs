@@ -829,6 +829,7 @@ impl OcrViewer {
             draw_annotations: !self.is_zooming,
             is_zooming: self.is_zooming,
             handle_pan_zoom: true,
+            highlighted_coords: self.state.last_highlighted_coords.clone(),
         };
 
         // The image is drawn in a SEPARATE canvas underneath, because tiny_skia
@@ -850,6 +851,7 @@ impl OcrViewer {
             draw_annotations: false,
             is_zooming: self.is_zooming,
             handle_pan_zoom: false,
+            highlighted_coords: Vec::new(),
         }).width(Length::Fill).height(Length::Fill);
 
         let annotation_canvas = Canvas::new(overlay).width(Length::Fill).height(Length::Fill);
