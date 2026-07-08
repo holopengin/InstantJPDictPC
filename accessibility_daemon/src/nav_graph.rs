@@ -60,16 +60,32 @@ impl NavGraph {
                 let dy = torus_dy(yi, yj);
 
                 let dy_n = (yi - yj + 1.0) % 1.0;
-                if dy_n > 0.0 { north.push((j, dx * 8.0 + dy_n)); }
+                if dy_n > 0.0 {
+                    let prox = (dx * dx + dy * dy).sqrt();
+                    let bonus = if prox < 0.005 { 0.05 } else if prox < 0.015 { 0.2 } else if prox < 0.03 { 0.5 } else { 1.0 };
+                    north.push((j, (dx * 8.0 + dy_n) * bonus));
+                }
 
                 let dy_s = (yj - yi + 1.0) % 1.0;
-                if dy_s > 0.0 { south.push((j, dx * 8.0 + dy_s)); }
+                if dy_s > 0.0 {
+                    let prox = (dx * dx + dy * dy).sqrt();
+                    let bonus = if prox < 0.005 { 0.05 } else if prox < 0.015 { 0.2 } else if prox < 0.03 { 0.5 } else { 1.0 };
+                    south.push((j, (dx * 8.0 + dy_s) * bonus));
+                }
 
                 let dx_e = (xj - xi + 1.0) % 1.0;
-                if dx_e > 0.0 { east.push((j, dx_e + dy * 8.0)); }
+                if dx_e > 0.0 {
+                    let prox = (dx * dx + dy * dy).sqrt();
+                    let bonus = if prox < 0.005 { 0.05 } else if prox < 0.015 { 0.2 } else if prox < 0.03 { 0.5 } else { 1.0 };
+                    east.push((j, (dx_e + dy * 8.0) * bonus));
+                }
 
                 let dx_w = (xi - xj + 1.0) % 1.0;
-                if dx_w > 0.0 { west.push((j, dx_w + dy * 8.0)); }
+                if dx_w > 0.0 {
+                    let prox = (dx * dx + dy * dy).sqrt();
+                    let bonus = if prox < 0.005 { 0.05 } else if prox < 0.015 { 0.2 } else if prox < 0.03 { 0.5 } else { 1.0 };
+                    west.push((j, (dx_w + dy * 8.0) * bonus));
+                }
             }
 
             let sort_fn = |a: &(usize, f32), b: &(usize, f32)| {
