@@ -43,8 +43,8 @@ impl NavGraph {
         let mut south_lists: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         let mut east_lists: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         let mut west_lists: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
-        const W: f32 = 3.0; // off‑axis penalty weight
-        const LOCAL_DIST: f32 = 0.2; // max Euclidean distance for Phase 1
+        const W: f32 = 10.0; // off‑axis penalty weight
+        const LOCAL_DIST: f32 = 0.05; // max Euclidean distance for Phase 1
 
         for i in 0..n {
             let (xi, yi) = positions[i];
@@ -110,15 +110,15 @@ impl NavGraph {
                 let (xj, yj) = positions[j];
                 let dx = torus_dx(xi, xj);
                 let dy = torus_dy(yi, yj);
-                // Torus‑wrapped Manhattan cost (no off‑axis bonus needed)
-                if yj < yi { north.push((j, dx + (yi - yj))); }
-                else { north.push((j, dx + (yi - yj + 1.0) % 1.0)); }
-                if yj > yi { south.push((j, dx + (yj - yi))); }
-                else { south.push((j, dx + (yj - yi + 1.0) % 1.0)); }
-                if xj > xi { east.push((j, (xj - xi) + dy)); }
-                else { east.push((j, (xj - xi + 1.0) % 1.0 + dy)); }
-                if xj < xi { west.push((j, (xi - xj) + dy)); }
-                else { west.push((j, (xi - xj + 1.0) % 1.0 + dy)); }
+                // Phase 2: torus‑wrapped with off‑axis penalty
+                if yj < yi { north.push((j, W * dx + (yi - yj))); }
+                else { north.push((j, W * dx + (yi - yj + 1.0) % 1.0)); }
+                if yj > yi { south.push((j, W * dx + (yj - yi))); }
+                else { south.push((j, W * dx + (yj - yi + 1.0) % 1.0)); }
+                if xj > xi { east.push((j, (xj - xi) + W * dy)); }
+                else { east.push((j, (xj - xi + 1.0) % 1.0 + W * dy)); }
+                if xj < xi { west.push((j, (xi - xj) + W * dy)); }
+                else { west.push((j, (xi - xj + 1.0) % 1.0 + W * dy)); }
             }
 
             let sort_fn = |a: &(usize, f32), b: &(usize, f32)| {
