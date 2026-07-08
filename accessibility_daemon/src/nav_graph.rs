@@ -229,15 +229,17 @@ fn greedy_assignment(
                     }
                 }
                 if result[d] == original {
-                    // No alternative found — pick any unused node
-                    for j in 0..n {
-                        if !used.contains(&j) {
-                            result[d] = j;
-                            used.insert(j);
-                            has_conflict = true;
-                            break;
+                    if original != n {
+                        // No alternative found — pick any unused node
+                        for j in 0..n {
+                            if !used.contains(&j) {
+                                result[d] = j;
+                                used.insert(j);
+                                has_conflict = true;
+                                break;
+                            }
                         }
-                    }
+                    } // else: genuinely empty direction, leave as n
                 }
                 break; // fix one conflict per iteration
             }
