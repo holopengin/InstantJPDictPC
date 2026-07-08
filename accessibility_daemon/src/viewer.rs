@@ -658,16 +658,11 @@ impl OcrViewer {
     }
 
     pub fn select_character(&mut self, line_idx: usize, char_idx: usize) {
-        self.state.current_tapped_line_idx = line_idx as isize;
-        self.state.current_tapped_char_idx_in_line = char_idx as isize;
-        self.state.current_tapped_idx = self.state.get_global_idx(line_idx, char_idx) as isize;
-        self.state.update_highlight_coords(line_idx, char_idx, 1);
+        self.set_cursor_pos(line_idx, char_idx);
         self.state.is_dictionary_visible = true;
         self.alternatives_visible = false;
 
         // Update gravity so panel opens on the opposite side of the character.
-        // Uses the full transform (base fit-to-screen + pan/zoom) to compute
-        // the character's actual screen position.
         let box_item = self.state.active_line_results.get(line_idx)
             .and_then(|l| l.as_ref())
             .and_then(|line| line.char_boxes.get(char_idx))
@@ -676,9 +671,21 @@ impl OcrViewer {
             self.state.update_gravity(&b, self.panel_width());
         }
         self.do_lookup(line_idx, char_idx);
-
-        // Compute scroll targets: center the selected character in each panel
         self.compute_scroll_targets(line_idx, char_idx);
+    }
+
+    /// Move the cursor without opening the dictionary (for gamepad navigation).
+    pub fn move_cursor_to(&mut self, line_idx: usize, char_idx: usize) {
+        self.set_cursor_pos(line_idx, char_idx);
+        // Highlight just the one character at the cursor position.
+        self.state.update_highlight_coords(line_idx, char_idx, 1);
+        self.compute_scroll_targets(line_idx, char_idx);
+    }
+
+    fn set_cursor_pos(&mut self, line_idx: usize, char_idx: usize) {
+        self.state.current_tapped_line_idx = line_idx as isize;
+        self.state.current_tapped_char_idx_in_line = char_idx as isize;
+        self.state.current_tapped_idx = self.state.get_global_idx(line_idx, char_idx) as isize;
     }
 
     pub fn select_neighbor(&mut self, line_idx: usize, char_idx: usize) {
@@ -718,9 +725,12 @@ impl OcrViewer {
         if let Some(result) = self.state.lookup(line_idx, char_idx, &self.db, &self.deinflector) {
             self.state.cached_entries = result.matches;
             self.state.current_word_length = result.max_len;
+            // Highlight the full matched word in yellow (like Kotlin)
+            self.state.update_highlight_coords(line_idx, char_idx, result.max_len);
         } else {
             self.state.cached_entries.clear();
             self.state.current_word_length = 1;
+            self.state.update_highlight_coords(line_idx, char_idx, 1);
         }
     }
 
