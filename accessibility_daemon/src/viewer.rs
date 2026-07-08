@@ -574,6 +574,8 @@ pub struct OcrViewer {
     pub scroll_neighbor_to: Option<usize>,
     /// The index of the character that should be scrolled into view in the alt panel.
     pub scroll_alt_to: Option<usize>,
+    /// Requested dictionary scroll delta (px). Set by L1/R1 gamepad, D/F keyboard.
+    pub dict_scroll_request: Option<f32>,
     /// When true, the user is actively panning/zooming — annotation drawing is disabled.
     pub is_zooming: bool,
     /// Frames since last zoom/pan event — used to re-enable annotations after zoom ends.
@@ -617,6 +619,7 @@ impl OcrViewer {
             deinflector,
             scroll_neighbor_to: None,
             scroll_alt_to: None,
+            dict_scroll_request: None,
             is_zooming: false,
             zoom_idle_frames: 0,
             cached_preview: RefCell::new(None),
