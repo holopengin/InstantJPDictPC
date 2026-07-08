@@ -584,21 +584,21 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                     _ => Color::from_rgb(1.0, 1.0, 0.0),   // W = yellow
                 }
             };
-            let dir_controls = |from: Point, to: Point, dir: usize| -> (Point, Point) {
+            let dir_controls = |from: Point, to: Point, dir: usize, bias_x: f32| -> (Point, Point) {
                 let dx = to.x - from.x;
                 let dy = to.y - from.y;
                 let dist = (dx * dx + dy * dy).sqrt().max(20.0);
                 let card_pull = dist * 0.3;
                 match dir {
-                    0 => (Point::new(from.x, from.y - card_pull), Point::new(to.x, to.y + dy * 0.2)),  // N
-                    1 => (Point::new(from.x, from.y + card_pull), Point::new(to.x, to.y - dy * 0.2)),  // S
-                    2 => (Point::new(from.x + card_pull, from.y), Point::new(to.x - dx * 0.2, to.y)),  // E
-                    _ => (Point::new(from.x - card_pull, from.y), Point::new(to.x - dx * 0.2, to.y)),  // W
+                    0 => (Point::new(from.x + bias_x, from.y - card_pull), Point::new(to.x + bias_x * 0.3, to.y + dy * 0.2)),  // N
+                    1 => (Point::new(from.x + bias_x, from.y + card_pull), Point::new(to.x + bias_x * 0.3, to.y - dy * 0.2)),  // S
+                    2 => (Point::new(from.x + card_pull + bias_x, from.y), Point::new(to.x - dx * 0.2 + bias_x * 0.3, to.y)),  // E
+                    _ => (Point::new(from.x - card_pull + bias_x, from.y), Point::new(to.x - dx * 0.2 + bias_x * 0.3, to.y)),  // W
                 }
             };
             // Draw a cubic bezier with arrowhead at target
-            let draw_curve = |frame: &mut Frame, from: Point, to: Point, color: Color, dir: usize| {
-                let (ctrl_a, ctrl_b) = dir_controls(from, to, dir);
+            let draw_curve = |frame: &mut Frame, from: Point, to: Point, color: Color, dir: usize, bias_x: f32| {
+                let (ctrl_a, ctrl_b) = dir_controls(from, to, dir, bias_x);
                 let mut pb = iced::widget::canvas::path::Builder::new();
                 pb.move_to(from);
                 pb.bezier_curve_to(ctrl_a, ctrl_b, to);
@@ -630,7 +630,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         let to = arrow_to_screen(self.nav_centers[target].0, self.nav_centers[target].1);
                         let color = dir_color(d);
                         let alpha = if cursor_global == Some(i) { 0.5 } else { 0.25 };
-                        draw_curve(&mut frame, from, to, Color::from_rgba(color.r, color.g, color.b, alpha), d);
+                        draw_curve(&mut frame, from, to, Color::from_rgba(color.r, color.g, color.b, alpha), d, if cursor_global == Some(i) { 10.0 } else { -10.0 });
                     }
                 }
             }
@@ -646,7 +646,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         let to = arrow_to_screen(self.nav_centers[target].0, self.nav_centers[target].1);
                         let color = dir_color(d);
                         let alpha = if cursor_global == Some(i) { 1.0 } else { 0.4 };
-                        draw_curve(&mut frame, from, to, Color::from_rgba(color.r, color.g, color.b, alpha), d);
+                        draw_curve(&mut frame, from, to, Color::from_rgba(color.r, color.g, color.b, alpha), d, if cursor_global == Some(i) { 10.0 } else { -10.0 });
                     }
                 }
             }
