@@ -1,16 +1,5 @@
 use crate::models::BoundingBox;
 
-/// Torus-wrapped horizontal distance.
-fn torus_dx(x1: f32, x2: f32) -> f32 {
-    let raw = (x1 - x2).abs();
-    raw.min(1.0 - raw)
-}
-/// Torus-wrapped vertical distance.
-fn torus_dy(y1: f32, y2: f32) -> f32 {
-    let raw = (y1 - y2).abs();
-    raw.min(1.0 - raw)
-}
-
 /// For each node (global char index): [north, south, east, west] target indices.
 #[derive(Clone, Debug)]
 pub struct NavGraph {
@@ -45,6 +34,7 @@ impl NavGraph {
         let mut west_lists: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         const W: f32 = 10.0; // off‑axis penalty weight
         const LOCAL_DIST: f32 = 0.05; // max Euclidean distance for Phase 1
+        const CONE45: f32 = 1.0; // allow within 45° of cardinal (off_axis ≤ primary)
 
         for i in 0..n {
             let (xi, yi) = positions[i];
@@ -60,11 +50,15 @@ impl NavGraph {
                 let yd = (yi - yj).abs();
                 let euc = (xd * xd + yd * yd).sqrt();
                 if euc > LOCAL_DIST { continue; }
-                // Phase 1 — strict local: cost = primary + w * off_axis
-                if yj < yi { north.push((j, (yi - yj) + W * xd)); }
-                if yj > yi { south.push((j, (yj - yi) + W * xd)); }
-                if xj > xi { east.push((j, (xj - xi) + W * yd)); }
-                if xj < xi { west.push((j, (xi - xj) + W * yd)); }
+                // Phase 1 — strict local: cost = primary + w * off_axis, 45° cone
+                let dy_n = yi - yj;
+                if yj < yi && xd <= CONE45 * dy_n { north.push((j, dy_n + W * xd)); }
+                let dy_s = yj - yi;
+                if yj > yi && xd <= CONE45 * dy_s { south.push((j, dy_s + W * xd)); }
+                let dx_e = xj - xi;
+                if xj > xi && yd <= CONE45 * dx_e { east.push((j, dx_e + W * yd)); }
+                let dx_w = xi - xj;
+                if xj < xi && yd <= CONE45 * dx_w { west.push((j, dx_w + W * yd)); }
             }
 
             let sort_fn = |a: &(usize, f32), b: &(usize, f32)| {
@@ -92,7 +86,7 @@ impl NavGraph {
         let mut edges = greedy_assignment_all(n, &north_lists, &south_lists, &east_lists, &west_lists);
         let initial_edges = edges.clone();
 
-        // Phase 2: torus‑wrapped candidates for remaining/global connectivity
+        // Phase 2: global candidates (no torus, unlimited distance, 45° cone)
         let mut t_north: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         let mut t_south: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         let mut t_east: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
@@ -108,17 +102,17 @@ impl NavGraph {
             for j in 0..n {
                 if i == j { continue; }
                 let (xj, yj) = positions[j];
-                let dx = torus_dx(xi, xj);
-                let dy = torus_dy(yi, yj);
-                // Phase 2: torus‑wrapped with off‑axis penalty
-                if yj < yi { north.push((j, W * dx + (yi - yj))); }
-                else { north.push((j, W * dx + (yi - yj + 1.0) % 1.0)); }
-                if yj > yi { south.push((j, W * dx + (yj - yi))); }
-                else { south.push((j, W * dx + (yj - yi + 1.0) % 1.0)); }
-                if xj > xi { east.push((j, (xj - xi) + W * dy)); }
-                else { east.push((j, (xj - xi + 1.0) % 1.0 + W * dy)); }
-                if xj < xi { west.push((j, (xi - xj) + W * dy)); }
-                else { west.push((j, (xi - xj + 1.0) % 1.0 + W * dy)); }
+                let xd = (xi - xj).abs();
+                let yd = (yi - yj).abs();
+                // Phase 2: raw screen distance, 45° cone, off‑axis penalty
+                let dy_n = yi - yj;
+                if yj < yi && xd <= CONE45 * dy_n { north.push((j, dy_n + W * xd)); }
+                let dy_s = yj - yi;
+                if yj > yi && xd <= CONE45 * dy_s { south.push((j, dy_s + W * xd)); }
+                let dx_e = xj - xi;
+                if xj > xi && yd <= CONE45 * dx_e { east.push((j, dx_e + W * yd)); }
+                let dx_w = xi - xj;
+                if xj < xi && yd <= CONE45 * dx_w { west.push((j, dx_w + W * yd)); }
             }
 
             let sort_fn = |a: &(usize, f32), b: &(usize, f32)| {
