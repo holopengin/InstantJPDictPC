@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::data::db::DictionaryDatabase;
+use crate::nav_graph;
 use crate::data::models::DictionaryEntry;
 use crate::models::*;
 use crate::util::deinflector::Deinflector;
@@ -45,6 +46,10 @@ pub struct OcrOverlayState {
     /// Use Cell so they can be updated from the canvas draw() which only has &self.
     pub window_width: Cell<f32>,
     pub window_height: Cell<f32>,
+    /// Navigation graph: for each node (global char index), [north, south, east, west] target indices.
+    pub nav_graph: Option<crate::nav_graph::NavGraph>,
+    /// Normalized (x, y) positions for each node in [0,1)².
+    pub nav_positions: Vec<(f32, f32)>,
 }
 
 impl OcrOverlayState {
@@ -74,6 +79,8 @@ impl OcrOverlayState {
             img_h: 0,
             window_width: Cell::new(800.0),
             window_height: Cell::new(480.0),
+            nav_graph: None,
+            nav_positions: Vec::new(),
         }
     }
 
@@ -102,6 +109,7 @@ impl OcrOverlayState {
                 .flat_map(|line| line.chunk_boxes.clone()),
         );
         self.update_global_data();
+self.build_nav_graph();
     }
 
     pub fn get_global_idx(&self, line_idx: usize, char_idx_in_line: usize) -> usize {
@@ -154,106 +162,49 @@ impl OcrOverlayState {
             *slot = new_char;
             line.text = chars.into_iter().collect();
             self.update_global_data();
+self.build_nav_graph();
         }
     }
 
-    pub fn navigate(&mut self, action: GamepadAction) -> bool {
-        let root_width = self.window_width.get();
-        let root_height = self.window_height.get();
+
+pub fn navigate(&mut self, action: GamepadAction) -> bool {
         let (line_idx, char_idx) = match self.current_cursor() {
             Some(coords) => coords,
             None => return false,
         };
-        let Some(line) = self
-            .active_line_results
-            .get(line_idx)
-            .and_then(|line| line.as_ref())
-        else {
-            return false;
-        };
-        let Some(box_item) = line.char_boxes.get(char_idx) else {
-            return false;
-        };
-        let center_x = box_item.left() as f32 + (box_item.w as f32 / 2.0);
-        let center_y = box_item.top() as f32 + (box_item.h as f32 / 2.0);
-
-        let mut best_dist = f32::MAX;
-        let mut best_idx = None;
-        let mut best_char_idx = None;
-
-        match action {
-            GamepadAction::NavigateRight | GamepadAction::NavigateLeft => {
-                let dir: i32 = if action == GamepadAction::NavigateRight { 1 } else { -1 };
-                let next_char_idx = char_idx as isize + dir as isize;
-                if next_char_idx >= 0 && (next_char_idx as usize) < line.char_boxes.len() {
-                    self.current_tapped_char_idx_in_line = next_char_idx;
-                    self.current_tapped_idx =
-                        self.get_global_idx(line_idx, next_char_idx as usize) as isize;
+        let global = self.get_global_idx(line_idx, char_idx);
+        if let Some(ref graph) = self.nav_graph {
+            let dir = match action {
+                GamepadAction::NavigateUp => 0,
+                GamepadAction::NavigateDown => 1,
+                GamepadAction::NavigateRight => 2,
+                GamepadAction::NavigateLeft => 3,
+                _ => return false,
+            };
+            if let Some(next_global) = graph.navigate(global, dir) {
+                if let Some((nl, nc)) = self.get_coords_from_global_idx(next_global) {
+                    self.current_tapped_line_idx = nl as isize;
+                    self.current_tapped_char_idx_in_line = nc as isize;
+                    self.current_tapped_idx = next_global as isize;
                     return true;
                 }
-
-                for (i, other_line_opt) in self.active_line_results.iter().enumerate() {
-                    let Some(other_line) = other_line_opt else { continue; };
-                    for (c, c_box) in other_line.char_boxes.iter().enumerate() {
-                        let mut dx = c_box.left() as f32 + (c_box.w as f32 / 2.0) - center_x;
-                        let dy = c_box.top() as f32 + (c_box.h as f32 / 2.0) - center_y;
-
-                        if dir == 1 && dx <= 5.0 {
-                            dx += root_width;
-                        } else if dir == -1 && dx >= -5.0 {
-                            dx -= root_width;
-                        }
-
-                        if (dir == 1 && dx <= 5.0) || (dir == -1 && dx >= -5.0) {
-                            continue;
-                        }
-
-                        let dist = (dx * dx) + (dy * dy * 64.0);
-                        if dist < best_dist {
-                            best_dist = dist;
-                            best_idx = Some(i);
-                            best_char_idx = Some(c);
-                        }
-                    }
-                }
             }
-            GamepadAction::NavigateDown | GamepadAction::NavigateUp => {
-                let dir: i32 = if action == GamepadAction::NavigateDown { 1 } else { -1 };
-                for (i, other_line_opt) in self.active_line_results.iter().enumerate() {
-                    let Some(other_line) = other_line_opt else { continue; };
-                    for (c, c_box) in other_line.char_boxes.iter().enumerate() {
-                        let dx = c_box.left() as f32 + (c_box.w as f32 / 2.0) - center_x;
-                        let mut dy = c_box.top() as f32 + (c_box.h as f32 / 2.0) - center_y;
-
-                        if dir == 1 && dy <= 5.0 {
-                            dy += root_height;
-                        } else if dir == -1 && dy >= -5.0 {
-                            dy -= root_height;
-                        }
-
-                        if (dir == 1 && dy <= 5.0) || (dir == -1 && dy >= -5.0) {
-                            continue;
-                        }
-
-                        let dist = (dx * dx * 64.0) + (dy * dy);
-                        if dist < best_dist {
-                            best_dist = dist;
-                            best_idx = Some(i);
-                            best_char_idx = Some(c);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        if let (Some(i), Some(c)) = (best_idx, best_char_idx) {
-            self.current_tapped_line_idx = i as isize;
-            self.current_tapped_char_idx_in_line = c as isize;
-            self.current_tapped_idx = self.get_global_idx(i, c) as isize;
-            return true;
         }
         false
+    }
+
+    pub fn build_nav_graph(&mut self) {
+        let mut boxes = Vec::new();
+        for line_opt in &self.active_line_results {
+            if let Some(line) = line_opt {
+                for b in &line.char_boxes {
+                    boxes.push(b.clone());
+                }
+            }
+        }
+        let graph = nav_graph::NavGraph::build(&boxes);
+        self.nav_positions = graph.positions.clone();
+        self.nav_graph = Some(graph);
     }
 
     pub fn current_cursor(&self) -> Option<(usize, usize)> {

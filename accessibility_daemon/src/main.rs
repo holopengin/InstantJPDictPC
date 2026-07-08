@@ -1,3 +1,4 @@
+mod nav_graph;
 mod data;
 mod models;
 #[cfg(feature = "ort")]
