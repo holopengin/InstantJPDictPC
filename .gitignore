@@ -1,1 +1,8 @@
 docs.rs/
+docs.rs/
+perf.data
+perf.data.old
+flamegraph.svg
+flamegraph.html
+collapsed_perf.txt
+*.perf
