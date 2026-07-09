@@ -9,7 +9,7 @@ ort = ["dep:ort"]
 
 [dependencies]
 # ONNX Runtime for Rust
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["pkg-config", "copy-dylibs", "download-binaries", "tls-rustls", "webgpu", "std"], optional = true }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["pkg-config", "copy-dylibs", "download-binaries", "tls-rustls", "std"], optional = true }
 
 # Image processing
 image = "0.25"
