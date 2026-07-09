@@ -17,7 +17,7 @@ const VERT_REC_HEIGHT: u32 = 480;
 const REC_CONFIDENCE_THRESHOLD: f32 = 0.1;
 const X_OVERLAP_THRESHOLD: f32 = 0.3;
 const NUM_QUERIES: usize = 48;
-pub const MAX_BATCH_SIZE: usize = 8;
+pub const MAX_BATCH_SIZE: usize = 16;
 
 /// Run recognition on a single chunk using the provided sessions.
 pub fn recognize_single_chunk_static(
