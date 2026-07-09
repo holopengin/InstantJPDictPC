@@ -44,7 +44,7 @@ impl NavGraph {
         let mut east_lists: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         let mut west_lists: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         const W: f32 = 10.0; // off‑axis penalty weight (Phase 1 — strict local)
-        const W2: f32 = 3.0; // off‑axis penalty weight (Phase 2 — island connecting)
+        const W2: f32 = 1.5; // off‑axis penalty weight (Phase 2 — island connecting)
         const LOCAL_DIST: f32 = 0.05; // max Euclidean distance for Phase 1
         const CONE45: f32 = 1.0; // allow within 45° of cardinal (off_axis ≤ primary)
 
@@ -140,22 +140,36 @@ impl NavGraph {
             t_west.push(west);
         }
 
-        // Fill any Phase‑1 empty slots with best Phase‑2 candidate (no connectivity enforcement)
+                // Phase 2: SCC-aware fill + connectivity enforcement
         for i in 0..n {
-            for d in 0..4 {
-                if edges[i][d] >= n {
-                    let list = match d {
-                        0 => &t_north[i], 1 => &t_south[i],
-                        2 => &t_east[i],  _ => &t_west[i],
-                    };
-                    if let Some(&(v, _)) = list.first() {
-                        edges[i][d] = v;
+            let mut occupied: [usize; 4] = edges[i];
+            let dirs = [(0, &t_north[i]), (1, &t_south[i]), (2, &t_east[i]), (3, &t_west[i])];
+            let mut unfilled: Vec<usize> = (0..4).filter(|&d| occupied[d] >= n).collect();
+            unfilled.sort_by(|&a, &b| {
+                let ca = dirs[a].1.iter().filter(|(v,_)| v != &i && !occupied.contains(v)).count();
+                let cb = dirs[b].1.iter().filter(|(v,_)| v != &i && !occupied.contains(v)).count();
+                ca.cmp(&cb).then_with(|| a.cmp(&b))
+            });
+            for &d in &unfilled {
+                let list = dirs[d].1;
+                let mut chosen = n;
+                for &(v, _) in list {
+                    if v != i && !occupied.contains(&v) {
+                        chosen = v;
+                        break;
                     }
+                }
+                if chosen < n {
+                    occupied[d] = chosen;
+                    edges[i][d] = chosen;
                 }
             }
         }
 
-        // Phase 3: torus-wrapped fill for remaining empty slots
+        // Enforce strong connectivity using Phase 2 candidate lists
+        enforce_connectivity(&mut edges, n, &positions, &t_north, &t_south, &t_east, &t_west);
+
+        // Phase 3: wrapping-only candidates (opposite half-plane)
         let mut w3_north: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         let mut w3_south: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         let mut w3_east: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
@@ -175,14 +189,26 @@ impl NavGraph {
                 let ty = torus_dy(yi, yj);
                 let xd = (xi - xj).abs();
                 let yd = (yi - yj).abs();
-                let dy_n = if yj < yi { yi - yj } else { (yi - yj + 1.0) % 1.0 };
-                if xd <= CONE45 * dy_n { north.push((j, dy_n + W2 * tx)); }
-                let dy_s = if yj > yi { yj - yi } else { (yj - yi + 1.0) % 1.0 };
-                if xd <= CONE45 * dy_s { south.push((j, dy_s + W2 * tx)); }
-                let dx_e = if xj > xi { xj - xi } else { (xj - xi + 1.0) % 1.0 };
-                if yd <= CONE45 * dx_e { east.push((j, dx_e + W2 * ty)); }
-                let dx_w = if xi > xj { xi - xj } else { (xi - xj + 1.0) % 1.0 };
-                if yd <= CONE45 * dx_w { west.push((j, dx_w + W2 * ty)); }
+                // N wrapped: only nodes physically below
+                if yj > yi {
+                    let dy_n = (yi - yj + 1.0) % 1.0;
+                    if xd <= CONE45 * dy_n { north.push((j, dy_n + W2 * tx)); }
+                }
+                // S wrapped: only nodes physically above
+                if yj < yi {
+                    let dy_s = (yj - yi + 1.0) % 1.0;
+                    if xd <= CONE45 * dy_s { south.push((j, dy_s + W2 * tx)); }
+                }
+                // E wrapped: only nodes physically to the left
+                if xj < xi {
+                    let dx_e = (xj - xi + 1.0) % 1.0;
+                    if yd <= CONE45 * dx_e { east.push((j, dx_e + W2 * ty)); }
+                }
+                // W wrapped: only nodes physically to the right
+                if xj > xi {
+                    let dx_w = (xi - xj + 1.0) % 1.0;
+                    if yd <= CONE45 * dx_w { west.push((j, dx_w + W2 * ty)); }
+                }
             }
 
             let sort_fn = |a: &(usize, f32), b: &(usize, f32)| {
@@ -197,17 +223,28 @@ impl NavGraph {
             w3_west.push(west);
         }
 
-        // Fill remaining empty slots from Phase 3 (torus)
+        // Phase 3: fill remaining empty slots with wrapping-only candidates
         for i in 0..n {
-            for d in 0..4 {
-                if edges[i][d] >= n {
-                    let list = match d {
-                        0 => &w3_north[i], 1 => &w3_south[i],
-                        2 => &w3_east[i],  _ => &w3_west[i],
-                    };
-                    if let Some(&(v, _)) = list.first() {
-                        edges[i][d] = v;
+            let mut occupied: [usize; 4] = edges[i];
+            let dirs = [(0, &w3_north[i]), (1, &w3_south[i]), (2, &w3_east[i]), (3, &w3_west[i])];
+            let mut unfilled: Vec<usize> = (0..4).filter(|&d| occupied[d] >= n).collect();
+            unfilled.sort_by(|&a, &b| {
+                let ca = dirs[a].1.iter().filter(|(v,_)| v != &i && !occupied.contains(v)).count();
+                let cb = dirs[b].1.iter().filter(|(v,_)| v != &i && !occupied.contains(v)).count();
+                ca.cmp(&cb).then_with(|| a.cmp(&b))
+            });
+            for &d in &unfilled {
+                let list = dirs[d].1;
+                let mut chosen = n;
+                for &(v, _) in list {
+                    if v != i && !occupied.contains(&v) {
+                        chosen = v;
+                        break;
                     }
+                }
+                if chosen < n {
+                    occupied[d] = chosen;
+                    edges[i][d] = chosen;
                 }
             }
         }
