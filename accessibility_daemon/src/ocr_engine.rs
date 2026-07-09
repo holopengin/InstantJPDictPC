@@ -1155,11 +1155,10 @@ impl OcrEngine {
 
                     let chunk_slice = &all_chunks[start..end];
                     s.spawn(move || {
-                        let chunks: Vec<_> = chunk_slice.to_vec();
                         let t_box = std::time::Instant::now();
                         let mut sess = rec_sess.lock().unwrap();
                         let results = ocr_parallel::recognize_batch_chunks_static(
-                            &mut sess, &cv, &chunks,
+                            &mut sess, &cv, chunk_slice,
                         );
                         let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
                         let mut locked = br.lock().unwrap();
@@ -1255,11 +1254,10 @@ impl OcrEngine {
 
                     let chunk_slice = &all_chunks[start..end];
                     s.spawn(move || {
-                        let chunks: Vec<_> = chunk_slice.to_vec();
                         let t_box = std::time::Instant::now();
                         let mut sess = rec_sess.lock().unwrap();
                         let results = ocr_parallel::recognize_batch_chunks_static(
-                            &mut sess, &cv, &chunks,
+                            &mut sess, &cv, chunk_slice,
                         );
                         let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
                         let mut locked = br.lock().unwrap();
