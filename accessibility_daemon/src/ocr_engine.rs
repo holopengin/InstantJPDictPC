@@ -37,7 +37,7 @@ const MEIKI_SWAPPED_PAIRS: &[(&str, &str); 8] = &[
 
 /// Number of sessions in each orientation pool.
 /// More sessions = less contention, but each session costs ~31 MB of RAM.
-const SESSION_POOL_SIZE: usize = 8;
+const SESSION_POOL_SIZE: usize = 4;
 
 pub struct OcrEngine {
     detect_session: Session,
@@ -74,6 +74,8 @@ impl RecognizeSessionPool {
             for _ in 0..SESSION_POOL_SIZE {
                 let s = Session::builder()
                     .expect("Failed to create session builder")
+                    .with_execution_providers([ort::ep::WebGPU::default().build()])
+                    .expect("Failed to configure WebGPU execution provider")
                     .commit_from_file(&self.model_path)
                     .expect("Failed to load recognition model");
                 sessions.push(std::sync::Arc::new(std::sync::Mutex::new(s)));
