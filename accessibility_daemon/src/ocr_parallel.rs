@@ -50,7 +50,7 @@ pub fn recognize_single_chunk_static(
     let resized = chunk.resize_exact(
         effective_w as u32,
         effective_h as u32,
-        image::imageops::FilterType::Triangle,
+        image::imageops::FilterType::Nearest,
     );
     let mut padded = RgbaImage::from_pixel(target_w, target_h, image::Rgba([0u8, 0u8, 0u8, 255u8]));
     let resized_rgba = resized.to_rgba8();
@@ -367,7 +367,7 @@ pub fn recognize_batch_chunks_static(
         let resized = chunk.resize_exact(
             effective_w as u32,
             effective_h as u32,
-            image::imageops::FilterType::Triangle,
+            image::imageops::FilterType::Nearest,
         );
         let mut padded = RgbaImage::from_pixel(target_w, target_h, image::Rgba([0u8, 0u8, 0u8, 255u8]));
         let resized_rgba = resized.to_rgba8();
