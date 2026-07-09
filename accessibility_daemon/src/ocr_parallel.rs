@@ -50,7 +50,7 @@ pub fn recognize_single_chunk_static(
     let resized = chunk.resize_exact(
         effective_w as u32,
         effective_h as u32,
-        image::imageops::FilterType::Nearest,
+        image::imageops::FilterType::Triangle,
     );
     let mut padded = RgbaImage::from_pixel(target_w, target_h, image::Rgba([0u8, 0u8, 0u8, 255u8]));
     let resized_rgba = resized.to_rgba8();
@@ -335,6 +335,8 @@ pub fn recognize_batch_chunks_static(
     let target_h = if is_vertical { VERT_REC_HEIGHT } else { REC_HEIGHT };
 
     // Prepare batch input tensor: [batch_size, 3, target_h, target_w]
+    let t_pre = std::time::Instant::now();
+    let mut t_infer = std::time::Duration::ZERO;
     let mut batch_data = vec![0.0f32; batch_size * 3 * target_h as usize * target_w as usize];
 
     let mut effective_sizes = Vec::with_capacity(batch_size);
@@ -367,7 +369,7 @@ pub fn recognize_batch_chunks_static(
         let resized = chunk.resize_exact(
             effective_w as u32,
             effective_h as u32,
-            image::imageops::FilterType::Nearest,
+            image::imageops::FilterType::Triangle,
         );
         let mut padded = RgbaImage::from_pixel(target_w, target_h, image::Rgba([0u8, 0u8, 0u8, 255u8]));
         let resized_rgba = resized.to_rgba8();
@@ -424,6 +426,7 @@ pub fn recognize_batch_chunks_static(
             .map(|o| o.name().to_string())
             .collect();
         let run_outputs = session.run(inputs)?;
+        let t_infer = t_pre.elapsed();
 
         let try_extract_f32 =
             |val: &ort::value::Value| val.try_extract_array::<f32>().ok().map(|a| a.to_owned());
@@ -653,6 +656,12 @@ pub fn recognize_batch_chunks_static(
 
         results.push((filtered, effective_w, effective_h));
     }
+
+    println!("[BATCH timing] {:>2} items: pre={:.1}ms  infer={:.1}ms  total={:.1}ms",
+        batch_size,
+        t_pre.elapsed().as_secs_f64() * 1000.0 - t_infer.as_secs_f64() * 1000.0,
+        t_infer.as_secs_f64() * 1000.0,
+        t_pre.elapsed().as_secs_f64() * 1000.0);
 
     Ok(results)
 }
