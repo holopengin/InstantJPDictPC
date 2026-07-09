@@ -74,8 +74,6 @@ impl RecognizeSessionPool {
             for _ in 0..SESSION_POOL_SIZE {
                 let s = Session::builder()
                     .expect("Failed to create session builder")
-                    .with_execution_providers([ort::ep::WebGPU::default().build()])
-                    .expect("Failed to configure WebGPU execution provider")
                     .commit_from_file(&self.model_path)
                     .expect("Failed to load recognition model");
                 sessions.push(std::sync::Arc::new(std::sync::Mutex::new(s)));
