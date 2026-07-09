@@ -37,7 +37,7 @@ const MEIKI_SWAPPED_PAIRS: &[(&str, &str); 8] = &[
 
 /// Number of sessions in each orientation pool.
 /// More sessions = less contention, but each session costs ~31 MB of RAM.
-const SESSION_POOL_SIZE: usize = 4;
+const SESSION_POOL_SIZE: usize = 8;
 
 pub struct OcrEngine {
     detect_session: Session,
