@@ -1150,28 +1150,19 @@ impl OcrEngine {
             let num_batches = (all_chunks.len() + batch_size - 1) / batch_size;
             let batch_results: std::sync::Mutex<Vec<Option<(Result<Vec<(Vec<CharCandidate>, i32, i32)>>, f64)>>> = std::sync::Mutex::new((0..num_batches).map(|_| None).collect());
 
-            std::thread::scope(|s| {
-                for batch_idx in 0..num_batches {
-                    let start = batch_idx * batch_size;
-                    let end = (start + batch_size).min(all_chunks.len());
-                    let pool_idx = batch_idx % pool_size;
-                    let rec_sess = rec_sessions[pool_idx].clone();
-                    let cv = char_vocab.clone();
-                    let br = &batch_results;
-
-                    let chunk_slice = &all_chunks[start..end];
-                    s.spawn(move || {
-                        let t_box = std::time::Instant::now();
-                        let mut sess = rec_sess.lock().unwrap();
-                        let results = ocr_parallel::recognize_batch_chunks_static(
-                            &mut sess, &cv, chunk_slice,
-                        );
-                        let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
-                        let mut locked = br.lock().unwrap();
-                        locked[batch_idx] = Some((results, box_ms));
-                    });
-                }
-            });
+            for batch_idx in 0..num_batches {
+                let start = batch_idx * batch_size;
+                let end = (start + batch_size).min(all_chunks.len());
+                let rec_sess = rec_sessions[batch_idx % rec_sessions.len()].clone();
+                let chunk_slice = &all_chunks[start..end];
+                let t_box = std::time::Instant::now();
+                let mut sess = rec_sess.lock().unwrap();
+                let results = ocr_parallel::recognize_batch_chunks_static(
+                    &mut sess, &char_vocab, chunk_slice,
+                );
+                let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
+                batch_results.lock().unwrap()[batch_idx] = Some((results, box_ms));
+            }
 
             // Process results in order
             for batch_idx in 0..num_batches {
@@ -1249,28 +1240,19 @@ impl OcrEngine {
             let num_batches = (all_chunks.len() + batch_size - 1) / batch_size;
             let batch_results: std::sync::Mutex<Vec<Option<(Result<Vec<(Vec<CharCandidate>, i32, i32)>>, f64)>>> = std::sync::Mutex::new((0..num_batches).map(|_| None).collect());
 
-            std::thread::scope(|s| {
-                for batch_idx in 0..num_batches {
-                    let start = batch_idx * batch_size;
-                    let end = (start + batch_size).min(all_chunks.len());
-                    let pool_idx = batch_idx % pool_size;
-                    let rec_sess = vert_sessions[pool_idx].clone();
-                    let cv = char_vocab.clone();
-                    let br = &batch_results;
-
-                    let chunk_slice = &all_chunks[start..end];
-                    s.spawn(move || {
-                        let t_box = std::time::Instant::now();
-                        let mut sess = rec_sess.lock().unwrap();
-                        let results = ocr_parallel::recognize_batch_chunks_static(
-                            &mut sess, &cv, chunk_slice,
-                        );
-                        let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
-                        let mut locked = br.lock().unwrap();
-                        locked[batch_idx] = Some((results, box_ms));
-                    });
-                }
-            });
+            for batch_idx in 0..num_batches {
+                let start = batch_idx * batch_size;
+                let end = (start + batch_size).min(all_chunks.len());
+                let rec_sess = vert_sessions[batch_idx % vert_sessions.len()].clone();
+                let chunk_slice = &all_chunks[start..end];
+                let t_box = std::time::Instant::now();
+                let mut sess = rec_sess.lock().unwrap();
+                let results = ocr_parallel::recognize_batch_chunks_static(
+                    &mut sess, &char_vocab, chunk_slice,
+                );
+                let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
+                batch_results.lock().unwrap()[batch_idx] = Some((results, box_ms));
+            }
 
             for batch_idx in 0..num_batches {
                 let start = batch_idx * batch_size;
