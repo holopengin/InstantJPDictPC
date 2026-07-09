@@ -74,6 +74,8 @@ impl RecognizeSessionPool {
             for _ in 0..SESSION_POOL_SIZE {
                 let s = Session::builder()
                     .expect("Failed to create session builder")
+                    .with_execution_providers([ort::ep::XNNPACK::default().build()])
+                    .expect("Failed to configure XNNPACK execution provider")
                     .commit_from_file(&self.model_path)
                     .expect("Failed to load recognition model");
                 sessions.push(std::sync::Arc::new(std::sync::Mutex::new(s)));
@@ -87,8 +89,12 @@ impl OcrEngine {
     pub fn new(model_dir: &str) -> Result<Self> {
         let model_path = Path::new(model_dir);
 
-        let detect_session = Session::builder()?
-            .commit_from_file(model_path.join("meiki.text.detect.v0.1.960x544.onnx"))?;
+        let detect_session = Session::builder()
+            .expect("Failed to create session builder")
+            .with_execution_providers([ort::ep::XNNPACK::default().build()])
+            .expect("Failed to configure XNNPACK for detection")
+            .commit_from_file(model_path.join("meiki.text.detect.v0.1.960x544.onnx"))
+            .expect("Failed to load detection model");
 
         println!("Detection model loaded. Recognition models will be loaded on first use.");
 
