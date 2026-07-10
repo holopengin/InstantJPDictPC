@@ -228,7 +228,41 @@ fn main() -> Result<()> {
         run_settings_window(db)?;
         return Ok(());
     }
+
+    // Check for help before any parsing
+    if args.iter().any(|a| a == "--help" || a == "-help" || a == "/?") {
+        print_usage();
+        return Ok(());
+    }
+
     run_ocr_viewer(args, db, deinflector)
+}
+
+fn print_usage() {
+    let name = std::env::args().next().unwrap_or_else(|| "accessibility_daemon".into());
+    println!("InstantJPDict accessibility overlay — OCR and dictionary daemon");
+    println!();
+    println!("USAGE:");
+    println!("  {name} [OPTIONS] <IMAGE_PATH>");
+    println!("  {name}                     Opens settings window (no arguments)");
+    println!("  {name} --help              Show this help message");
+    println!();
+    println!("OPTIONS:");
+    println!("  -h, --headless             Run in headless mode (no GUI window)");
+    println!("  -f, --font <PATH>          Path to a custom font file for overlay text");
+    println!("      --font=<PATH>          (alternative syntax)");
+    println!();
+    println!("ARGUMENTS:");
+    println!("  <IMAGE_PATH>               Path to a screenshot image for OCR analysis");
+    println!();
+    println!("EXAMPLES:");
+    println!("  {name} screenshot.png");
+    println!("  {name} --headless --font=~/myfont.ttf image.png");
+    println!("  {name}                     (opens interactive settings dialog)");
+    println!();
+    println!("KEYBOARD SHORTCUTS (when GUI is shown):");
+    println!("  D / Shift+J                Scroll dictionary down");
+    println!("  F / Shift+K                Scroll dictionary up");
 }
 
 fn run_settings_window(db: Arc<DictionaryDatabase>) -> Result<()> {
