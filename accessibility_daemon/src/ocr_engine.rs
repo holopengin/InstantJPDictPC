@@ -46,6 +46,8 @@ pub struct OcrEngine {
     recognize_sessions: RecognizeSessionPool,
     recognize_sessions_vertical: RecognizeSessionPool,
     pub char_vocab: Vec<i64>,
+    pub recognition_mode: RecognitionMode,
+    pub batch_size: usize,
     model_dir: String,
 }
 
@@ -64,6 +66,13 @@ impl RecognizeSessionPool {
         RecognizeSessionPool {
             sessions: std::sync::OnceLock::new(),
             model_path,
+        }
+    }
+
+    fn empty() -> Self {
+        RecognizeSessionPool {
+            sessions: std::sync::OnceLock::new(),
+            model_path: std::path::PathBuf::new(),
         }
     }
 
@@ -86,7 +95,7 @@ impl RecognizeSessionPool {
 }
 
 impl OcrEngine {
-    pub fn new(model_dir: &str) -> Result<Self> {
+    pub fn new(model_dir: &str, recognition_mode: RecognitionMode, batch_size: usize) -> Result<Self> {
         let model_path = Path::new(model_dir);
 
         let detect_session = Session::builder()
@@ -109,11 +118,20 @@ impl OcrEngine {
         let rec_path = model_path.join("meiki.text.rec.v0.960x32.with_logits.onnx");
         let rec_vert_path = model_path.join("meiki.text.rec.v0.vertical.32x480.with_logits.onnx");
 
+        let rec_vert_pool = match recognition_mode {
+            RecognitionMode::Horizontal => RecognizeSessionPool::empty(),
+            _ => RecognizeSessionPool::new(rec_vert_path.to_path_buf()),
+        };
+
+        println!("Recognition mode: {:?}, batch size: {}", recognition_mode, batch_size);
+
         Ok(OcrEngine {
             detect_session,
             recognize_sessions: RecognizeSessionPool::new(rec_path.to_path_buf()),
-            recognize_sessions_vertical: RecognizeSessionPool::new(rec_vert_path.to_path_buf()),
+            recognize_sessions_vertical: rec_vert_pool,
             char_vocab: vocab_json,
+            recognition_mode,
+            batch_size,
             model_dir: model_dir.to_string(),
         })
     }
@@ -1135,7 +1153,7 @@ impl OcrEngine {
             let rec_sessions = self.recognize_sessions.get().to_vec();
             let pool_size = rec_sessions.len();
             let char_vocab = self.char_vocab.clone();
-            let batch_size = ocr_parallel::MAX_BATCH_SIZE;
+            let batch_size = self.batch_size;
 
             // Build all chunk crops upfront (shared read-only)
             let all_chunks: Vec<(DynamicImage, bool)> = horizontal_boxes.iter().map(|bbox| {
@@ -1222,11 +1240,11 @@ impl OcrEngine {
         }
 
         // Process vertical boxes in parallel batches        // Process vertical boxes in parallel batches
-        if !vertical_boxes.is_empty() {
+        if !vertical_boxes.is_empty() && self.recognition_mode != RecognitionMode::Horizontal {
             let vert_sessions = self.recognize_sessions_vertical.get().to_vec();
             let pool_size = vert_sessions.len();
             let char_vocab = self.char_vocab.clone();
-            let batch_size = ocr_parallel::MAX_BATCH_SIZE;
+            let batch_size = self.batch_size;
 
             let all_chunks: Vec<(DynamicImage, bool)> = vertical_boxes.iter().map(|bbox| {
                 let crop_x = bbox.x.max(0) as u32;

@@ -251,6 +251,10 @@ fn print_usage() {
     println!("  -h, --headless             Run in headless mode (no GUI window)");
     println!("  -f, --font <PATH>          Path to a custom font file for overlay text");
     println!("      --font=<PATH>          (alternative syntax)");
+    println!("  -v, --vert                 Vertical-only recognition (skip horizontal boxes)");
+    println!("      --hybrid               Hybrid mode: both horizontal and vertical recognition");
+    println!("  -b, --batch-size <N>       Recognition batch size (default: 10)");
+    println!("      --batch-size=<N>       (alternative syntax)");
     println!();
     println!("ARGUMENTS:");
     println!("  <IMAGE_PATH>               Path to a screenshot image for OCR analysis");
@@ -289,12 +293,26 @@ fn run_ocr_viewer(
     let mut image_path = None;
     let mut font_path: Option<String> = None;
     let mut headless = false;
+    let mut recognition_mode = RecognitionMode::Horizontal;
+    let mut batch_size: usize = 10;
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--headless" || args[i] == "-h" { headless = true; i += 1; }
         else if args[i].starts_with("--font=") { font_path = Some(args[i].trim_start_matches("--font=").to_string()); i += 1; }
         else if args[i] == "--font" || args[i] == "-f" {
             if i + 1 < args.len() { font_path = Some(args[i + 1].clone()); i += 2; } else { i += 1; }
+        } else if args[i] == "--vert" || args[i] == "-v" {
+            recognition_mode = RecognitionMode::Vertical; i += 1;
+        } else if args[i] == "--hybrid" {
+            recognition_mode = RecognitionMode::Both; i += 1;
+        } else if args[i] == "-b" || args[i] == "--batch-size" {
+            if i + 1 < args.len() {
+                batch_size = args[i + 1].parse().unwrap_or(10);
+                i += 2;
+            } else { i += 1; }
+        } else if args[i].starts_with("--batch-size=") {
+            batch_size = args[i].trim_start_matches("--batch-size=").parse().unwrap_or(10);
+            i += 1;
         } else if args[i].starts_with("-") { i += 1; }
         else { image_path = Some(args[i].clone()); break; }
     }
@@ -306,7 +324,7 @@ fn run_ocr_viewer(
         #[cfg(feature = "ort")]
         {
             println!("Using ORT (ONNX Runtime) backend.");
-            let mut engine = ocr_engine::OcrEngine::new("./assets")?;
+            let mut engine = ocr_engine::OcrEngine::new("./assets", recognition_mode, batch_size)?;
             println!("Models loaded. {} chars", engine.char_vocab.len());
             engine.run_detection(&image, true, font_path.as_deref())?
         }

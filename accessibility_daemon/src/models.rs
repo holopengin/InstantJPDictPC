@@ -103,6 +103,13 @@ pub enum Gravity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecognitionMode {
+    Horizontal,
+    Vertical,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GamepadAction {
     None,
     NavigateLeft,
