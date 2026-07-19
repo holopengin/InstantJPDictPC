@@ -320,7 +320,10 @@ fn run_ocr_viewer(
     // Bootstrap channel — one-shot events (image, dict, deinflector)
     let (bootstrap_tx, bootstrap_rx) = std::sync::mpsc::channel::<BootstrapMsg>();
     // OCR channel — streamed detection boxes and recognition results
-    let (ocr_tx, ocr_rx) = std::sync::mpsc::channel::<DetectedAnnotation>();
+    // Tuple is (target_index, DetectedAnnotation). Detection boxes use
+    // sequential indices; recognition results use the same index as the
+    // detection box they correspond to.
+    let (ocr_tx, ocr_rx) = std::sync::mpsc::channel::<(usize, DetectedAnnotation)>();
 
     let ocr_tx2 = ocr_tx.clone();
     let image_path2 = image_path.clone();
@@ -394,11 +397,12 @@ fn run_ocr_viewer(
                 let detect_ms = t_detect.elapsed().as_secs_f64() * 1000.0;
                 println!("[OCR timing] Line detection:       {:>8.2} ms ({} boxes)", detect_ms, boxes.len());
 
-                // Send boxes
-                for b in &boxes {
-                    if ocr_tx2.send(
+                // Send boxes with their original indices
+                for (i, b) in boxes.iter().enumerate() {
+                    if ocr_tx2.send((
+                        i,
                         DetectedAnnotation { bbox: b.clone(), line: None }
-                    ).is_err() { return; }
+                    )).is_err() { return; }
                 }
 
                 // Recognition
@@ -462,8 +466,8 @@ fn run_ocr_viewer(
         // Drain OCR channel (detection boxes + recognition results)
         if let Ok(mut guard) = ocr_rx_update.lock() {
             if let Some(rx) = guard.as_mut() {
-                while let Ok(ann) = rx.try_recv() {
-                    let idx = state.annotations.len();
+                while let Ok((idx, ann)) = rx.try_recv() {
+                    let idx = idx;
                     state.handle_ocr_recognition_result(idx, ann);
                 }
             }
@@ -506,13 +510,18 @@ fn run_ocr_viewer(
                 dir @ (GamepadAction::NavigateUp | GamepadAction::NavigateDown
                 | GamepadAction::NavigateLeft | GamepadAction::NavigateRight) => {
                     if state.alternatives_visible {
-                        // Navigate alternatives instead of OCR content
                         navigate_alternatives(state, dir);
                     } else {
-                        state.state.navigate(dir);
+                        let cursor_before = state.state.current_cursor();
+                        let has_graph = state.state.nav_graph.is_some();
+                        let result = state.state.navigate(dir);
+                        eprintln!("[NAV] navigate({dir:?}) → {result}, cursor was {cursor_before:?}, graph={has_graph}");
                         state.defer_lookup = true;
                         if let Some((li, ci)) = state.state.current_cursor() {
                             state.move_cursor_to(li, ci);
+                            eprintln!("[NAV] moved cursor to ({li},{ci})");
+                        } else {
+                            eprintln!("[NAV] no cursor after navigate");
                         }
                     }
                     *GP_REPEAT_ACTION.lock().unwrap() = Some((a, Instant::now()));
@@ -613,8 +622,7 @@ fn run_ocr_viewer(
         if let Some(t) = state.scroll_neighbor_task() { tasks.push(t); state.scroll_neighbor_to = None; }
         if let Some(t) = state.scroll_alt_task() { tasks.push(t); state.scroll_alt_to = None; }
         if let Some(delta) = state.dict_scroll_request.take() {
-            state.dict_scroll_y = (state.dict_scroll_y + delta).max(0.0);
-            tasks.push(state.scroll_dict_task(state.dict_scroll_y));
+            tasks.push(state.scroll_dict_by_delta(delta));
         }
         if tasks.is_empty() { iced::Task::none() } else { iced::Task::batch(tasks) }
     };
