@@ -24,5 +24,9 @@ rm -rf AppDir
 # Bundle the application
 ./quick-sharun ./target/release/accessibility_daemon
 
+# Bundle the CJK font alongside the binary (resolved via current_exe())
+mkdir -p AppDir/usr/bin/fonts
+cp fonts/NotoSansJP-Regular.ttf AppDir/usr/bin/fonts/
+
 # Create the AppImage
 ./quick-sharun --make-appimage
