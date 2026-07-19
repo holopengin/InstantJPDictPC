@@ -27,9 +27,8 @@ anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 
 # GUI: Iced for displaying the annotated image
-iced = { version= "0.14.0", features = ["image", "canvas", "advanced", "tokio", "x11", "tiny-skia"] }
+iced = { version= "0.14.0", features = ["image", "canvas", "advanced", "tokio", "x11", "wgpu"] }
 iced_futures = "0.14.0"
-cosmic-text = "0.15.0"
 
 # Database: SQLite for dictionary storage
 rusqlite = { version = "0.37", features = ["bundled"] }

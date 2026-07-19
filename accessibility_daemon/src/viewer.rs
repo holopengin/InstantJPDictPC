@@ -25,67 +25,108 @@ use crate::models::*;
 use crate::overlay_state::OcrOverlayState;
 use crate::util::deinflector::Deinflector;
 
-use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
-use lazy_static::lazy_static;
-use std::sync::Mutex;
-
-lazy_static! {
-    static ref FONT_SYSTEM: Mutex<FontSystem> = Mutex::new(FontSystem::new());
-    static ref SWASH_CACHE: Mutex<SwashCache> = Mutex::new(SwashCache::new());
-}
-
-/// Measure the horizontal offset needed to center the VISIBLE GLYPH (not the em‑box)
-/// of a character. Returns a signed offset to add to the bbox center position.
-///
-/// How it works:
-/// 1. Shape the character with cosmic‑text
-/// 2. Rasterize it to get the actual ink bounding box (bearing + width)
-/// 3. Compute `advance/2 - (bearing_x + raster_width/2)` —
-///    the difference between the layout center and the visual glyph center.
-fn glyph_center_offset(ch: char, font_size: f32) -> f32 {
-    let mtcs = Metrics::new(font_size, font_size * 1.2);
-    let mut fs = FONT_SYSTEM.lock().unwrap();
-    let mut swash = SWASH_CACHE.lock().unwrap();
-
-    let mut buffer = Buffer::new(&mut fs, mtcs);
-    buffer.set_size(&mut fs, Some(font_size * 2.0), Some(font_size * 2.0));
-
-    let text: String = ch.into();
-    let attrs = Attrs::new();
-    buffer.set_text(&mut fs, &text, &attrs, Shaping::Advanced, None);
-
-    if let Some(run) = buffer.layout_runs().next() {
-        if let Some(glyph) = run.glyphs.first() {
-            let advance = run.line_w;
-            let phys = glyph.physical((0.0, 0.0), 1.0);
-            if let Some(img) = swash.get_image(&mut fs, phys.cache_key) {
-                // img.placement.left  = bearing_x (px from origin to glyph's left edge)
-                // img.placement.width = actual raster width
-                let bearing_x = img.placement.left as f32;
-                let raster_w = img.placement.width.max(1) as f32;
-                let visual_center = bearing_x + raster_w / 2.0;
-                // How far the visual center is from the layout center
-                return advance / 2.0 - visual_center;
-            }
-        }
-    }
-    0.0
-}
+use fontdue::Font;
+use iced::widget::image::Handle as ImageHandle;
+use std::collections::HashMap;
 
 /// Font fill ratio for OCR character glyphs drawn on the canvas annotation layer.
 const CANVAS_CHAR_RATIO: f32 = 0.9;
 /// Font fill ratio for character buttons in the neighbor/alternatives panels.
 const BUTTON_CHAR_RATIO: f32 = 0.6;
 
-// ---------------------------------------------------------------------------
-// Pan state (used by OverlayProgram::State)
-// ---------------------------------------------------------------------------
-
 const TAP_THRESHOLD: f32 = 5.0;
 /// Dead zone for drag start in the TapOrDrag widget.
 /// The first few pixels of movement don't count as drag, preventing
 /// accidental drags from taps.
 const DRAG_DEAD_ZONE: f32 = 3.0;
+
+// ---------------------------------------------------------------------------
+// GlyphCache — rasterizes characters with fontdue, caches as Iced image
+// handles. Completely bypasses cosmic-text to avoid font atlas corruption.
+// ---------------------------------------------------------------------------
+
+/// Standard pink color for overlay text. (#FF7777)
+const OVERLAY_FG: (u8, u8, u8) = (255, 119, 119);
+/// Yellow for highlighted/matched characters.
+const OVERLAY_HL: (u8, u8, u8) = (255, 255, 0);
+
+struct CachedGlyph {
+    w: u32,
+    h: u32,
+    xmin: i32,
+    ymin: i32,
+    handles: [ImageHandle; 2], // [pink, yellow]
+}
+
+/// Lazily rasterizes characters at requested pixel sizes, caching RGBA
+/// image handles. Thread‑safe via RefCell for interior mutability.
+pub struct GlyphCache {
+    font: Font,
+    cache: HashMap<(char, u32), CachedGlyph>,
+}
+
+impl GlyphCache {
+    pub fn new() -> Option<Rc<RefCell<Self>>> {
+        let paths = [
+            "fonts/NotoSansJP-Regular.ttf",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
+        ];
+        for p in &paths {
+            if let Ok(data) = std::fs::read(p) {
+                if let Ok(font) = Font::from_bytes(data, fontdue::FontSettings::default()) {
+                    return Some(Rc::new(RefCell::new(GlyphCache {
+                        font,
+                        cache: HashMap::new(),
+                    })));
+                }
+            }
+        }
+        eprintln!("[GlyphCache] no CJK font found, overlay text will not render");
+        None
+    }
+
+    /// Ensure both tinted handles exist for (char, px_size) and return one.
+    fn get_handle(&mut self, ch: char, px: u32, highlighted: bool) -> Option<(&ImageHandle, u32, u32)> {
+        let entry = self.cache.entry((ch, px)).or_insert_with(|| {
+            let (metrics, coverage) = self.font.rasterize(ch, px as f32);
+            let w = metrics.width.max(1) as u32;
+            let h = metrics.height.max(1) as u32;
+            let pink = Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2);
+            let yellow = Self::make_handle(w, h, &coverage, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2);
+            CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
+        });
+        let idx = if highlighted { 1 } else { 0 };
+        Some((&entry.handles[idx], entry.w, entry.h))
+    }
+
+    fn make_handle(w: u32, h: u32, cov: &[u8], r: u8, g: u8, b: u8) -> ImageHandle {
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for &a in cov {
+            rgba.push(r);
+            rgba.push(g);
+            rgba.push(b);
+            rgba.push(a);
+        }
+        ImageHandle::from_rgba(w, h, rgba)
+    }
+}
+
+/// Look up or rasterize a glyph, returning (handle, w, h) for drawing.
+/// Returns None if no glyph cache is available.
+fn draw_glyph(
+    cache: &RefCell<GlyphCache>,
+    ch: char,
+    px_size: u32,
+    highlighted: bool,
+) -> Option<(ImageHandle, u32, u32)> {
+    let glyph_metrics = {
+        let mut c = cache.borrow_mut();
+        let r = c.get_handle(ch, px_size, highlighted)?;
+        Some((r.0.clone(), r.1, r.2))
+    };
+    glyph_metrics
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PanState {
@@ -116,18 +157,20 @@ pub struct PanState {
     pub pinch_prev_focus_x: f32,
     /// Pinch zoom: previous frame's midpoint Y.
     pub pinch_prev_focus_y: f32,
-
+    /// Whether we've emitted a warmup fill_text to prime the font atlas.
+    /// Set after the first draw frame.
+    pub font_atlas_warmed: bool,
 }
 
 // ---------------------------------------------------------------------------
 // OverlayProgram
 // ---------------------------------------------------------------------------
 
-use iced::widget::image::Handle as ImageHandle;
 
 #[derive(Clone)]
 pub struct OverlayProgram {
     pub annotations: Rc<Vec<DetectedAnnotation>>,
+    pub glyph_cache: Rc<RefCell<GlyphCache>>,
     pub img_w: u32,
     pub img_h: u32,
     /// The screenshot image to draw on the canvas.
@@ -519,7 +562,12 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
         let total_offset_x = base_offset_x + self.current_trans_x;
         let total_offset_y = base_offset_y + self.current_trans_y;
 
-        // When this is the image-only canvas (draw_annotations == false),
+        // Warm up the font atlas on the very first frame by rendering an off-screen
+        // character. This populates Iced's internal cosmic-text glyph cache *before*
+        // OCR results arrive and trigger a burst of fill_text calls. Without this,
+        // the first frame of annotation rendering can corrupt the atlas (sporadic
+        // wrong-size glyphs, artifacts). Zooming in/out fixes it because it triggers
+                // When this is the image-only canvas (draw_annotations == false),
         // draw the screenshot as the bottom layer.
         if !self.draw_annotations {
             if let Some(image) = self.image.as_ref() {
@@ -585,25 +633,29 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         // for punctuation like 。 、 that would otherwise drift left).
                         if let Some(_ch) = line.text.chars().nth(i) {
                             let font_size = sz_c.height * CANVAS_CHAR_RATIO;
-                            let pos_x = pt_c.x + sz_c.width / 2.0 + glyph_center_offset(_ch, font_size);
-                            frame.fill_text(CanvasText {
-                                content: _ch.to_string(),
-                                position: Point::new(pos_x, pt_c.y + sz_c.height / 2.0),
-                                max_width: 0.0,
-                                color: if self.highlighted_coords.contains(&(line_idx, i)) {
-                                    Color::from_rgb(1.0, 1.0, 0.0)  // yellow for matched word
-                                } else if self.cursor_pos == Some((line_idx, i)) {
-                                    Color::from_rgb(1.0, 1.0, 0.0)  // yellow for cursor
-                                } else {
-                                    Color::from_rgb(1.0, 0.467, 0.467)  // #FF7777
-                                },
-                                size: Pixels(font_size),
-                                line_height: Default::default(),
-                                font: IcedFont::default(),
-                                align_x: iced::widget::text::Alignment::Center,
-                                align_y: alignment::Vertical::Center,
-                                shaping: Default::default(),
-                            });
+                            let pos_x = pt_c.x + sz_c.width / 2.0;
+                            // Render with fontdue glyph cache — bypasses cosmic-text entirely.
+                            let px_size = font_size.round() as u32;
+                            let highlighted = self.highlighted_coords.contains(&(line_idx, i))
+                                || self.cursor_pos == Some((line_idx, i));
+                            let (gw, gh, draw_x, draw_y, handle) = {
+                                let mut c = self.glyph_cache.borrow_mut();
+                                if !c.cache.contains_key(&(_ch, px_size)) {
+                                    let (metrics, coverage) = c.font.rasterize(_ch, px_size as f32);
+                                    let w = metrics.width.max(1) as u32;
+                                    let h = metrics.height.max(1) as u32;
+                                    let pink = GlyphCache::make_handle(w, h, &coverage, 255, 119, 119);
+                                    let yellow = GlyphCache::make_handle(w, h, &coverage, 255, 255, 0);
+                                    c.cache.insert((_ch, px_size), CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] });
+                                }
+                                let entry = c.cache.get(&(_ch, px_size)).unwrap();
+                                let idx = if highlighted { 1 } else { 0 };
+                                (entry.w, entry.h, pt_c.x + (sz_c.width - entry.w as f32) / 2.0, pt_c.y + (sz_c.height - entry.h as f32) / 2.0, entry.handles[idx].clone())
+                            };
+                            frame.draw_image(
+                                Rectangle::new(Point::new(draw_x, draw_y), Size::new(gw as f32, gh as f32)),
+                                &handle,
+                            );
                         }
                     }
                 }
@@ -753,6 +805,9 @@ pub struct OcrViewer {
     /// Cached character preview image for the alternatives panel.
     /// Stores (line_idx, char_idx, handle) so we only regenerate when the selection changes.
     cached_preview: RefCell<Option<(usize, usize, iced::widget::image::Handle)>>,
+    /// Fontdue-based glyph rasterization cache. Bypasses cosmic-text to avoid
+    /// font atlas corruption triggered by rendering OCR text via Iced's pipeline.
+    pub glyph_cache: Option<Rc<RefCell<GlyphCache>>>,
 }
 
 impl OcrViewer {
@@ -780,6 +835,7 @@ impl OcrViewer {
             is_zooming: false,
             zoom_idle_frames: 0,
             cached_preview: RefCell::new(None),
+            glyph_cache: GlyphCache::new(),
         }
     }
 
@@ -1103,6 +1159,7 @@ impl OcrViewer {
         let overlay = OverlayProgram {
             annotations: synced_annotations.clone(),
             img_w: self.img_w,
+            glyph_cache: self.glyph_cache.clone().unwrap_or_else(|| GlyphCache::new().unwrap_or_else(|| panic!("no glyph cache"))),
             img_h: self.img_h,
             image: None,
             panel_visible: has_panel,
@@ -1132,6 +1189,7 @@ impl OcrViewer {
         let image_canvas = Canvas::new(OverlayProgram {
             annotations: Rc::clone(&self.annotations),
             img_w: self.img_w,
+            glyph_cache: self.glyph_cache.clone().unwrap_or_else(|| GlyphCache::new().unwrap_or_else(|| panic!("no glyph cache"))),
             img_h: self.img_h,
             image: self.image_handle.as_ref().cloned(),
             panel_visible: false,
