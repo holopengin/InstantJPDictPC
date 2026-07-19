@@ -23,6 +23,7 @@ name = "accessibility_daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cosmic-text",
  "directories",
  "env_logger",
  "evdev",

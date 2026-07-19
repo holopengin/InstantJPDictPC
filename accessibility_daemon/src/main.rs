@@ -55,6 +55,8 @@ const B_A: u32 = 1 << 4;
 const B_B: u32 = 1 << 5;
 const B_L1: u32 = 1 << 6;
 const B_R1: u32 = 1 << 7;
+const B_L2: u32 = 1 << 8;
+const B_R2: u32 = 1 << 9;
 
 fn start_evdev_thread() {
     std::thread::spawn(|| {
@@ -100,6 +102,8 @@ fn start_evdev_thread() {
                         else if kc == KeyCode::BTN_EAST       || kc == KeyCode::new(0x131) { B_B }
                         else if kc == KeyCode::BTN_TL         || kc == KeyCode::new(0x136) { B_L1 }
                         else if kc == KeyCode::BTN_TR         || kc == KeyCode::new(0x137) { B_R1 }
+                        else if kc == KeyCode::BTN_TL2        || kc == KeyCode::new(0x138) { B_L2 }
+                        else if kc == KeyCode::BTN_TR2        || kc == KeyCode::new(0x139) { B_R2 }
                         else { 0 }
                     } else { 0 };
                     // HAT absolute axes: modify GP_BITS directly for both directions
@@ -158,6 +162,8 @@ fn gp_bits_to_msg(bits: u32) -> Option<Message> {
         p if p & B_B != 0 => Some(Message::Navigate(GamepadAction::Back)),
         p if p & B_L1 != 0 => Some(Message::Navigate(GamepadAction::ScrollUp)),
         p if p & B_R1 != 0 => Some(Message::Navigate(GamepadAction::ScrollDown)),
+        p if p & B_L2 != 0 => Some(Message::SetScale { scale: 0.9 }),   // zoom out
+        p if p & B_R2 != 0 => Some(Message::SetScale { scale: 1.1 }),   // zoom in
         _ => None,
     }
 }
@@ -604,7 +610,8 @@ fn run_ocr_viewer(
                     if state.defer_lookup && state.selected_word.is_some() {
                         state.defer_lookup = false;
                         if let Some((li, ci)) = state.state.current_cursor() {
-                            state.select_character(li, ci);
+                            state.do_lookup(li, ci);
+                            state.compute_scroll_targets(li, ci);
                         }
                     }
                 }
