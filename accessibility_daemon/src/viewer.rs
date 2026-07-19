@@ -674,10 +674,10 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                     let em_left = pt_c.x + (sz_c.width - px_size as f32) / 2.0;
                                     em_left + entry_xmin as f32
                                 };
-                                // Baseline positioned within em-box using font's line metrics
+                                // Baseline: em-bottom offset by half the font's descent ratio.
                                 let em_bottom = pt_c.y + sz_c.height / 2.0 + px_size as f32 / 2.0;
-                                let baseline_y = em_bottom - (baseline_ratio as f32) * px_size as f32;
-                                // ymin is in Y-UP font coords; -ymin - h for screen Y-down
+                                let baseline_y = em_bottom - (baseline_ratio as f32) * px_size as f32 / 2.0;
+                                // ymin is in Y-UP font coords; -ymin - h converts to screen Y-down.
                                 let draw_y = baseline_y - entry_ymin as f32 - entry_h as f32;
                                 (entry_w, entry_h, bbox_cx, draw_y, handle)
                             };
