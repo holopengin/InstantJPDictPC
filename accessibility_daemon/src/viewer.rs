@@ -679,9 +679,9 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
 // ---------------------------------------------------------------------------
 
 pub struct OcrViewer {
-    pub image_handle: iced::widget::image::Handle,
+    pub image_handle: Option<iced::widget::image::Handle>,
     /// Raw PNG bytes of the original screenshot, used for cropping character previews.
-    image_bytes: Vec<u8>,
+    image_bytes: Option<Vec<u8>>,
     /// Decoded image, cached to avoid re-decoding PNG on every crop_character_image call.
     decoded_image: RefCell<Option<image::DynamicImage>>,
     pub img_w: u32,
@@ -693,8 +693,8 @@ pub struct OcrViewer {
     pub state: OcrOverlayState,
     pub selected_word: Option<SelectedWord>,
     pub alternatives_visible: bool,
-    pub db: Arc<DictionaryDatabase>,
-    pub deinflector: Arc<Deinflector>,
+    pub db: Option<Arc<DictionaryDatabase>>,
+    pub deinflector: Option<Arc<Deinflector>>,
     /// The index of the character that should be scrolled into view in the neighbor panel.
     pub scroll_neighbor_to: Option<usize>,
     /// The index of the character that should be scrolled into view in the alt panel.
@@ -715,37 +715,23 @@ pub struct OcrViewer {
 }
 
 impl OcrViewer {
-    pub fn new(
-        image_handle: iced::widget::image::Handle,
-        image_bytes: Vec<u8>,
-        img_w: u32,
-        img_h: u32,
-        window_width: f32,
-        window_height: f32,
-        annotations: Vec<DetectedAnnotation>,
-        db: Arc<DictionaryDatabase>,
-        deinflector: Arc<Deinflector>,
-    ) -> Self {
-        let mut state = OcrOverlayState::new();
-        let line_results = annotations.iter().map(|a| a.line.clone()).collect::<Vec<_>>();
-        state.set_line_results(line_results);
-        state.ensure_cursor_position();
-        state.img_w = img_w;
-        state.img_h = img_h;
+    /// Create a minimal viewer with no image, no db, no annotations.
+    /// Everything is populated asynchronously via bootstrap events.
+    pub fn new_empty() -> Self {
         Self {
-            image_handle,
-            image_bytes,
+            image_handle: None,
+            image_bytes: None,
             decoded_image: RefCell::new(None),
-            img_w,
-            img_h,
-            window_width,
-            window_height,
-            annotations: Rc::new(annotations),
-            state,
+            img_w: 1,
+            img_h: 1,
+            window_width: 1280.0,
+            window_height: 720.0,
+            annotations: Rc::new(Vec::new()),
+            state: OcrOverlayState::new(),
             selected_word: None,
             alternatives_visible: false,
-            db,
-            deinflector,
+            db: None,
+            deinflector: None,
             scroll_neighbor_to: None,
             scroll_alt_to: None,
             dict_scroll_request: None,
@@ -757,6 +743,16 @@ impl OcrViewer {
         }
     }
 
+    /// Set the screenshot image after it's loaded by the bootstrap thread.
+    pub fn set_image(&mut self, handle: iced::widget::image::Handle, bytes: Vec<u8>, w: u32, h: u32) {
+        self.image_handle = Some(handle);
+        self.image_bytes = Some(bytes);
+        self.img_w = w;
+        self.img_h = h;
+        self.state.img_w = w;
+        self.state.img_h = h;
+    }
+
     /// Crop the screenshot to show the given character with padding.
     /// Returns an image Handle for the cropped region.
     pub fn crop_character_image(&self, line_idx: usize, char_idx: usize) -> Option<iced::widget::image::Handle> {
@@ -765,8 +761,10 @@ impl OcrViewer {
 
         // Lazily decode and cache the original image
         if self.decoded_image.borrow().is_none() {
-            if let Ok(img) = image::load_from_memory(&self.image_bytes) {
-                *self.decoded_image.borrow_mut() = Some(img);
+            if let Some(ref bytes) = self.image_bytes {
+                if let Ok(img) = image::load_from_memory(bytes) {
+                    *self.decoded_image.borrow_mut() = Some(img);
+                }
             }
         }
         let img = self.decoded_image.borrow();
@@ -862,15 +860,18 @@ impl OcrViewer {
         let Some(box_item) = line.char_boxes.get(char_idx) else { return; };
         let text = line.text.chars().skip(char_idx).take(3).collect::<String>();
         self.selected_word = Some(SelectedWord { line_idx, char_idx, text, box_item: box_item.clone() });
-        if let Some(result) = self.state.lookup(line_idx, char_idx, &self.db, &self.deinflector) {
-            self.state.cached_entries = result.matches;
-            self.state.current_word_length = result.max_len;
-            // Highlight the full matched word in yellow (like Kotlin)
-            self.state.update_highlight_coords(line_idx, char_idx, result.max_len);
-        } else {
-            self.state.cached_entries.clear();
-            self.state.current_word_length = 1;
-            self.state.update_highlight_coords(line_idx, char_idx, 1);
+        // Only look up if db/deinflector are loaded (bootstrap may not be done yet)
+        if let (Some(db), Some(deinf)) = (self.db.as_ref(), self.deinflector.as_ref()) {
+            if let Some(result) = self.state.lookup(line_idx, char_idx, db, deinf) {
+                self.state.cached_entries = result.matches;
+                self.state.current_word_length = result.max_len;
+                // Highlight the full matched word in yellow (like Kotlin)
+                self.state.update_highlight_coords(line_idx, char_idx, result.max_len);
+            } else {
+                self.state.cached_entries.clear();
+                self.state.current_word_length = 1;
+                self.state.update_highlight_coords(line_idx, char_idx, 1);
+            }
         }
     }
 
@@ -969,6 +970,39 @@ impl OcrViewer {
         centers
     }
 
+    /// Called when a recognition result streams in from the background OCR thread.
+    /// Replaces the detection-only annotation (bbox + line: None) at the given
+    /// index with the full annotation (bbox + line with text and char_boxes).
+    pub fn handle_ocr_recognition_result(&mut self, index: usize, annotation: DetectedAnnotation) {
+        // Extend annotations vec if this is a new box beyond current length
+        while self.annotations.len() <= index {
+            self.annotations = Rc::new(
+                self.annotations.iter().cloned().chain(
+                    std::iter::once(DetectedAnnotation {
+                        bbox: BoundingBox::new(0, 0, 0, 0, 0.0),
+                        line: None,
+                    })
+                ).collect()
+            );
+        }
+
+        // Replace the annotation at the given index
+        let mut anns: Vec<DetectedAnnotation> = (*self.annotations).clone();
+        anns[index] = annotation;
+
+        // If the annotation has a line result, update the overlay state
+        if let Some(line) = anns[index].line.clone() {
+            self.state.set_single_line_result(index, line);
+        }
+
+        self.annotations = Rc::new(anns);
+
+        // If cursor is not yet set, place it on the first recognized character
+        if self.state.current_tapped_line_idx < 0 || self.state.current_tapped_char_idx_in_line < 0 {
+            self.state.ensure_cursor_position();
+        }
+    }
+
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
         let has_panel = self.selected_word.is_some();
 
@@ -993,7 +1027,7 @@ impl OcrViewer {
             annotations: synced_annotations.clone(),
             img_w: self.img_w,
             img_h: self.img_h,
-            image: Some(self.image_handle.clone()),
+            image: self.image_handle.as_ref().cloned(),
             panel_visible: has_panel,
             panel_on_right,
             dict_width: 300.0,
@@ -1018,7 +1052,7 @@ impl OcrViewer {
             annotations: Rc::clone(&self.annotations),
             img_w: self.img_w,
             img_h: self.img_h,
-            image: Some(self.image_handle.clone()),
+            image: self.image_handle.as_ref().cloned(),
             panel_visible: false,
             panel_on_right: false,
             dict_width: 300.0,

@@ -11,8 +11,6 @@ mod util;
 mod viewer;
 
 use anyhow::{Context, Result};
-use image::DynamicImage;
-use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::LazyLock;
@@ -25,6 +23,16 @@ use crate::util::deinflector::Deinflector;
 use crate::viewer::OcrViewer;
 
 use directories;
+/// Messages from the bootstrap thread to the Iced UI update function.
+/// The bootstrap thread loads everything (image, dict, engine) so the
+/// window can appear in << 100 ms.
+enum BootstrapMsg {
+    ImageReady(iced::widget::image::Handle, Vec<u8>, u32, u32),
+    DictReady(Arc<DictionaryDatabase>),
+    DeinflectReady(Arc<Deinflector>),
+    AnnotationReady(DetectedAnnotation),
+}
+
 use iced::window::settings::PlatformSpecific;
 use iced_futures::futures;
 
@@ -189,7 +197,9 @@ fn navigate_alternatives(state: &mut crate::viewer::OcrViewer, dir: GamepadActio
     if new_idx != current_idx {
         let new_char = candidates[new_idx];
         state.state.update_character(line_idx, char_idx, new_char);
-        let _ = state.state.lookup(line_idx, char_idx, &state.db, &state.deinflector);
+        let _ = state.db.as_ref().and_then(|db| state.deinflector.as_ref().and_then(|deinf| {
+            state.state.lookup(line_idx, char_idx, db, deinf)
+        }));
         state.state.update_highlight_coords(line_idx, char_idx, state.state.current_word_length);
     }
 }
@@ -209,33 +219,23 @@ fn main() -> Result<()> {
         .map(|dirs| dirs.data_dir().to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     std::fs::create_dir_all(&data_dir)?;
-    let db_path = data_dir.join("dictionary.sqlite");
-    let db = Arc::new(DictionaryDatabase::open(&db_path)?);
-    let entry_count = db.get_entry_count()?;
-    println!("Dictionary database loaded: {} entries", entry_count);
-
-    let deinflector = Arc::new(
-        Deinflector::from_json_file("assets/deinflect.json").unwrap_or_else(|e| {
-            println!("Warning: Could not load deinflection rules: {}", e);
-            Deinflector::empty()
-        }),
-    );
-    println!("Deinflector loaded: {} rules", deinflector.rule_count());
+    let _ = data_dir; // data directory created, but dict loaded lazily in bootstrap thread
 
     let args: Vec<String> = std::env::args().collect();
+    // Check for help before any parsing
+    if args.len() >= 2 && (args[1] == "--help" || args[1] == "-help" || args[1] == "/?") {
+        print_usage();
+        return Ok(());
+    }
     if args.len() < 2 {
         println!("No image argument provided. Opening settings window...");
+        let db_path = data_dir.join("dictionary.sqlite");
+        let db = Arc::new(DictionaryDatabase::open(&db_path)?);
         run_settings_window(db)?;
         return Ok(());
     }
 
-    // Check for help before any parsing
-    if args.iter().any(|a| a == "--help" || a == "-help" || a == "/?") {
-        print_usage();
-        return Ok(());
-    }
-
-    run_ocr_viewer(args, db, deinflector)
+    run_ocr_viewer(args)
 }
 
 fn print_usage() {
@@ -287,9 +287,8 @@ fn run_settings_window(db: Arc<DictionaryDatabase>) -> Result<()> {
 
 fn run_ocr_viewer(
     args: Vec<String>,
-    db: Arc<DictionaryDatabase>,
-    deinflector: Arc<Deinflector>,
 ) -> Result<()> {
+    let t_start = std::time::Instant::now();
     let mut image_path = None;
     let mut font_path: Option<String> = None;
     let mut headless = false;
@@ -317,42 +316,158 @@ fn run_ocr_viewer(
         else { image_path = Some(args[i].clone()); break; }
     }
     let image_path = image_path.context("No image path provided")?;
-    let image = image::open(&image_path).context(format!("Failed to open image: {image_path}"))?;
-    println!("Image loaded: {image_path} ({}x{})", image.width(), image.height());
 
-    let (annotations, _annotated_opt) = {
-        #[cfg(feature = "ort")]
-        {
-            println!("Using ORT (ONNX Runtime) backend.");
-            let mut engine = ocr_engine::OcrEngine::new("./assets", recognition_mode, batch_size)?;
-            println!("Models loaded. {} chars", engine.char_vocab.len());
-            engine.run_detection(&image, true, font_path.as_deref())?
-        }
-        #[cfg(not(feature = "ort"))]
-        { eprintln!("ORT not compiled. Rebuild with --features ort"); std::process::exit(1); }
-    };
+    // Bootstrap channel — one-shot events (image, dict, deinflector)
+    let (bootstrap_tx, bootstrap_rx) = std::sync::mpsc::channel::<BootstrapMsg>();
+    // OCR channel — streamed detection boxes and recognition results
+    let (ocr_tx, ocr_rx) = std::sync::mpsc::channel::<DetectedAnnotation>();
 
-    let display_img = image.to_rgba8();
-    let dynimg = DynamicImage::ImageRgba8(display_img.clone());
-    let mut buf = Cursor::new(Vec::new());
-    dynimg.write_to(&mut buf, image::ImageFormat::Png).context("Failed to encode PNG")?;
-    let bytes_arc = Arc::new(buf.into_inner());
-    let (w, h) = (display_img.width(), display_img.height());
-    if headless { println!("Headless: done"); return Ok(()); }
+    let ocr_tx2 = ocr_tx.clone();
+    let image_path2 = image_path.clone();
+    std::thread::Builder::new()
+        .name("bootstrap".into())
+        .spawn(move || {
+            // Phase 1: load the screenshot image and send it to the viewer
+            let t_load = std::time::Instant::now();
+            let image = match image::open(&image_path2) {
+                Ok(img) => img,
+                Err(e) => { eprintln!("[Bootstrap] Failed to open image: {e}"); return; }
+            };
+            let (w, h) = (image.width(), image.height());
+            println!("[Bootstrap] Image loaded: {} ({}x{}) in {:.0} ms",
+                image_path2, w, h, t_load.elapsed().as_secs_f64() * 1000.0);
+
+            let display_img = image.to_rgba8();
+            let dynimg = image::DynamicImage::ImageRgba8(display_img);
+            let mut buf = std::io::Cursor::new(Vec::new());
+            if dynimg.write_to(&mut buf, image::ImageFormat::Png).is_err() {
+                eprintln!("[Bootstrap] PNG encode failed"); return;
+            }
+            let png_bytes = buf.into_inner();
+            let handle = iced::widget::image::Handle::from_bytes(png_bytes.clone());
+            if bootstrap_tx.send(BootstrapMsg::ImageReady(handle, png_bytes, w, h)).is_err() { return; }
+
+            // Phase 2: load dictionary
+            let db_path = directories::ProjectDirs::from("com", "Example", "accessibility_daemon")
+                .or(directories::ProjectDirs::from("org", "Example", "accessibility_daemon"))
+                .or(directories::ProjectDirs::from("net", "Example", "accessibility_daemon"))
+                .map(|dirs| dirs.data_dir().to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("dictionary.sqlite");
+            let db = match DictionaryDatabase::open(&db_path) {
+                Ok(d) => { println!("[Bootstrap] Dictionary database loaded: {} entries", d.get_entry_count().unwrap_or(0)); d }
+                Err(e) => { eprintln!("[Bootstrap] Failed to load dictionary: {e}"); return; }
+            };
+            if bootstrap_tx.send(BootstrapMsg::DictReady(Arc::new(db))).is_err() { return; }
+
+            // Phase 3: load deinflector
+            let deinf = Deinflector::from_json_file("assets/deinflect.json").unwrap_or_else(|e| {
+                eprintln!("[Bootstrap] Warning: deinflector: {e}");
+                Deinflector::empty()
+            });
+            println!("[Bootstrap] Deinflector loaded: {} rules", deinf.rule_count());
+            if bootstrap_tx.send(BootstrapMsg::DeinflectReady(Arc::new(deinf))).is_err() { return; }
+
+            // Phase 4: OCR pipeline (engine creation → detection → recognition)
+            #[cfg(feature = "ort")]
+            {
+                let t_engine = std::time::Instant::now();
+                let mut engine = match ocr_engine::OcrEngine::new("./assets", recognition_mode, batch_size) {
+                    Ok(e) => e,
+                    Err(err) => { eprintln!("[Bootstrap] OCR engine error: {err}"); return; }
+                };
+                println!("[Bootstrap] OCR engine created ({} chars) in {:.0} ms",
+                    engine.char_vocab.len(), t_engine.elapsed().as_secs_f64() * 1000.0);
+
+                // Init recognition sessions
+                engine.recognize_sessions.get();
+                if recognition_mode != RecognitionMode::Horizontal {
+                    engine.recognize_sessions_vertical.get();
+                }
+
+                // Detection
+                let t_detect = std::time::Instant::now();
+                let boxes = match engine.detect_lines(&image) {
+                    Ok(b) => b,
+                    Err(e) => { eprintln!("[OCR] Detection error: {e}"); return; }
+                };
+                let detect_ms = t_detect.elapsed().as_secs_f64() * 1000.0;
+                println!("[OCR timing] Line detection:       {:>8.2} ms ({} boxes)", detect_ms, boxes.len());
+
+                // Send boxes
+                for b in &boxes {
+                    if ocr_tx2.send(
+                        DetectedAnnotation { bbox: b.clone(), line: None }
+                    ).is_err() { return; }
+                }
+
+                // Recognition
+                let char_vocab = engine.char_vocab.clone();
+                let batch_sz = engine.batch_size;
+                let rec_mode = engine.recognition_mode;
+                let t_recognize = std::time::Instant::now();
+                let vert_sessions = if rec_mode != RecognitionMode::Horizontal {
+                    engine.recognize_sessions_vertical.get()
+                } else {
+                    &[]
+                };
+                if let Err(e) = ocr_engine::recognize_boxes_streaming(
+                    &image, &boxes,
+                    engine.recognize_sessions.get(),
+                    vert_sessions,
+                    &char_vocab, batch_sz, rec_mode,
+                    ocr_tx2,
+                ) {
+                    eprintln!("[OCR] Recognition error: {e}");
+                }
+                let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;
+                println!("[OCR timing] Character recognition: {:>8.2} ms", recognize_ms);
+            }
+            #[cfg(not(feature = "ort"))]
+            { eprintln!("ORT not compiled. Rebuild with --features ort"); }
+        })?;
+
+    // Don't go further in headless mode — bootstrap thread handles everything
+    if headless { println!("Headless: done (bootstrap running in background)"); return Ok(()); }
 
     start_evdev_thread();
 
-    let boot = {
-        let db = Arc::clone(&db);
-        let deinflector = Arc::clone(&deinflector);
-        move || OcrViewer::new(
-            iced::widget::image::Handle::from_bytes(bytes_arc.as_ref().clone()),
-            bytes_arc.as_ref().clone(), w, h, 1280.0, 720.0,
-            annotations.clone(), Arc::clone(&db), Arc::clone(&deinflector),
-        )
-    };
+    let bootstrap_rx = Arc::new(std::sync::Mutex::new(Some(bootstrap_rx)));
+    let rx_for_update = Arc::clone(&bootstrap_rx);
+    let ocr_rx = Arc::new(std::sync::Mutex::new(Some(ocr_rx)));
+    let ocr_rx_update = Arc::clone(&ocr_rx);
 
-    let update = |state: &mut OcrViewer, msg: Message| -> iced::Task<Message> {
+    let boot = move || OcrViewer::new_empty();
+
+    let update = move |state: &mut OcrViewer, msg: Message| -> iced::Task<Message> {
+        // Drain bootstrap channel (image, dict, deinflector)
+        if let Ok(mut guard) = rx_for_update.lock() {
+            if let Some(rx) = guard.as_mut() {
+                while let Ok(event) = rx.try_recv() {
+                    match event {
+                        BootstrapMsg::ImageReady(handle, bytes, w, h) => {
+                            state.set_image(handle, bytes, w, h);
+                        }
+                        BootstrapMsg::DictReady(db) => {
+                            state.db = Some(db);
+                        }
+                        BootstrapMsg::DeinflectReady(d) => {
+                            state.deinflector = Some(d);
+                        }
+                        BootstrapMsg::AnnotationReady(ann) => { /* deprecated */ }
+                    }
+                }
+            }
+        }
+        // Drain OCR channel (detection boxes + recognition results)
+        if let Ok(mut guard) = ocr_rx_update.lock() {
+            if let Some(rx) = guard.as_mut() {
+                while let Ok(ann) = rx.try_recv() {
+                    let idx = state.annotations.len();
+                    state.handle_ocr_recognition_result(idx, ann);
+                }
+            }
+        }
         match msg {
             Message::SelectCharacter(li, ci) => state.select_character(li, ci),
             Message::SelectNeighbor(li, ci) => state.select_neighbor(li, ci),
@@ -363,7 +478,9 @@ fn run_ocr_viewer(
                     if cur == Some(c) { state.alternatives_visible = false; }
                     else {
                         state.state.update_character(sel.line_idx, sel.char_idx, c);
-                        let _ = state.state.lookup(sel.line_idx, sel.char_idx, &state.db, &state.deinflector);
+                        let _ = state.db.as_ref().and_then(|db| state.deinflector.as_ref().and_then(|deinf| {
+            state.state.lookup(sel.line_idx, sel.char_idx, db, deinf)
+        }));
                     }
                 }
             }
@@ -483,6 +600,8 @@ fn run_ocr_viewer(
                     }
                 }
             }
+            // OCR streaming messages — receiver drained in update body above
+            Message::OcrDetectionComplete(_) | Message::OcrRecognitionResult(_, _) | Message::OcrAllDone => {}
         }
         if matches!(msg, Message::ZoomOnCursor { .. } | Message::PanDelta { .. } | Message::PanStart { .. } | Message::PinchZoom { .. }) {
             state.zoom_idle_frames = 0;
@@ -502,7 +621,7 @@ fn run_ocr_viewer(
 
     let app = iced::application(boot, update, OcrViewer::view)
         .window(iced::window::Settings {
-            size: iced::Size::new(w as f32, h as f32),
+            size: iced::Size::new(1280.0, 720.0),
             ..Default::default()
         })
         .subscription(|_state: &OcrViewer| {
@@ -592,6 +711,9 @@ fn run_ocr_viewer(
                 resize_events,
             ])
         });
+
+    let to_spawn_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+    println!("[DEBUG] To window spawn:         {:>8.2} ms", to_spawn_ms);
 
     if let Err(e) = app.run() { println!("GUI failed: {e:?}"); }
     Ok(())

@@ -109,7 +109,24 @@ impl OcrOverlayState {
                 .flat_map(|line| line.chunk_boxes.clone()),
         );
         self.update_global_data();
-self.build_nav_graph();
+        self.build_nav_graph();
+    }
+
+    /// Replace a single line result at the given index, expanding the vec if needed.
+    pub fn set_single_line_result(&mut self, index: usize, line: LineResult) {
+        while self.active_line_results.len() <= index {
+            self.active_line_results.push(None);
+        }
+        self.active_line_results[index] = Some(line);
+        self.active_line_boxes.clear();
+        self.active_line_boxes.extend(
+            self.active_line_results
+                .iter()
+                .flatten()
+                .flat_map(|line| line.chunk_boxes.clone()),
+        );
+        self.update_global_data();
+        self.build_nav_graph();
     }
 
     pub fn get_global_idx(&self, line_idx: usize, char_idx_in_line: usize) -> usize {
