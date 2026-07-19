@@ -10,7 +10,9 @@ use iced::widget::{
     Column, Container, Image as IcedImage, Row, Scrollable, Stack, Text,
 };
 use iced::widget::container;
-use iced::advanced::widget::operation::scrollable::{scroll_to, AbsoluteOffset};
+use iced::advanced::widget::operation::scrollable::{
+    scroll_to, scroll_by, AbsoluteOffset,
+};
 use iced::widget::Id;
 use iced::advanced::widget::operate;
 use iced::{
@@ -516,7 +518,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 }
 
                 let (pt, sz) = transform(bbox);
-                frame.fill_rectangle(pt, sz, Color::from_rgba(0.0, 0.0, 0.0, 0.39));  // argb(100,0,0,0)
+                frame.fill_rectangle(pt, sz, Color::from_rgba(0.0, 0.0, 0.0, 0.40)); // argb(51,0,0,0)
 
                 if let Some(line) = &annotation.line {
                     for (i, char_box) in line.char_boxes.iter().enumerate() {
@@ -536,13 +538,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         // for punctuation like 。 、 that would otherwise drift left).
                         if let Some(_ch) = line.text.chars().nth(i) {
                             let font_size = sz_c.height * CANVAS_CHAR_RATIO;
-                            // CJK characters are roughly square; the em-box width ≈ font_size.
-                            let glyph_width = font_size;
-                            let center_x = pt_c.x + sz_c.width / 2.0;
-                            // Left edge of centered glyph = center_x - glyph_width/2.
-                            // Clamp so it's at least pt_c.x (bbox left edge).
-                            let min_center = pt_c.x + glyph_width / 2.0;
-                            let pos_x = center_x.max(min_center);
+                            let pos_x = pt_c.x + sz_c.width / 2.0;
                             frame.fill_text(CanvasText {
                                 content: _ch.to_string(),
                                 position: Point::new(pos_x, pt_c.y + sz_c.height / 2.0),
@@ -699,10 +695,8 @@ pub struct OcrViewer {
     pub scroll_neighbor_to: Option<usize>,
     /// The index of the character that should be scrolled into view in the alt panel.
     pub scroll_alt_to: Option<usize>,
-    /// Requested dictionary scroll delta (px). Set by L1/R1 gamepad, D/F keyboard.
+    /// Requested dictionary scroll delta (px), set by L1/R1 gamepad, D/F keyboard.
     pub dict_scroll_request: Option<f32>,
-    /// Accumulated dictionary scroll Y target (px from top).
-    pub dict_scroll_y: f32,
     /// When true, lookup is deferred until the held gamepad button is released.
     pub defer_lookup: bool,
     /// When true, the user is actively panning/zooming — annotation drawing is disabled.
@@ -735,7 +729,6 @@ impl OcrViewer {
             scroll_neighbor_to: None,
             scroll_alt_to: None,
             dict_scroll_request: None,
-            dict_scroll_y: 0.0,
             defer_lookup: false,
             is_zooming: false,
             zoom_idle_frames: 0,
@@ -908,34 +901,26 @@ impl OcrViewer {
     pub fn scroll_dict_to_top_task(&self) -> iced::Task<Message> {
         operate(scroll_to(
             Id::new("dict_scroll"),
-            AbsoluteOffset {
-                x: Some(0.0),
-                y: Some(0.0),
-            },
+            AbsoluteOffset { x: Some(0.0), y: Some(0.0) },
         ))
     }
 
-    /// Scroll the dictionary panel to the given Y offset.
-    pub fn scroll_dict_task(&self, y: f32) -> iced::Task<Message> {
-        operate(scroll_to(
-            Id::new("dict_scroll"),
-            AbsoluteOffset {
-                x: Some(0.0),
-                y: Some(y),
-            },
-        ))
+    /// Scroll the dictionary panel by a delta (px) relative to the current scroll position.
+    /// This acts like mouse-wheel scrolling — clamped by Iced, no phantom accumulation.
+    pub fn scroll_dict_by_delta(&self, delta: f32) -> iced::Task<Message> {
+        operate(scroll_by(Id::new("dict_scroll"), AbsoluteOffset { x: 0.0, y: delta }))
     }
-
-    /// Create a scroll task for the neighbor panel to center the selected character.
     /// Returns None if no scroll is needed.
     #[allow(dead_code)]
     pub fn scroll_neighbor_task(&self) -> Option<iced::Task<Message>> {
         let target = self.scroll_neighbor_to?;
-        // Each button is 32px + 2px spacing = 34px per item
-        let item_height = 34.0;
+        // Compute box_size matching neighbor_panel (window_width / 11, clamped 24..40)
+        let box_size = (self.window_width / 11.0).clamp(24.0, 40.0);
+        let item_height = box_size + 2.0; // button height + spacing
         let target_y = target as f32 * item_height;
-        // Center in viewport: subtract approximate half viewport height
-        let scroll_y = (target_y - 200.0).max(0.0);
+        // Center in viewport using actual window height (neighbor panel is ~70% of window)
+        let viewport_h = self.window_height * 0.7;
+        let scroll_y = (target_y - viewport_h / 2.0).max(0.0);
         Some(operate(scroll_to(
             Id::new("neighbor_scroll"),
             AbsoluteOffset { x: Some(0.0), y: Some(scroll_y) },
@@ -947,9 +932,11 @@ impl OcrViewer {
     #[allow(dead_code)]
     pub fn scroll_alt_task(&self) -> Option<iced::Task<Message>> {
         let target = self.scroll_alt_to?;
-        let item_height = 34.0;
+        let box_size = (self.window_width / 11.0).clamp(24.0, 40.0);
+        let item_height = box_size + 2.0;
         let target_y = target as f32 * item_height;
-        let scroll_y = (target_y - 200.0).max(0.0);
+        let viewport_h = self.window_height * 0.7;
+        let scroll_y = (target_y - viewport_h / 2.0).max(0.0);
         Some(operate(scroll_to(
             Id::new("alt_scroll"),
             AbsoluteOffset { x: Some(0.0), y: Some(scroll_y) },
@@ -988,12 +975,15 @@ impl OcrViewer {
 
         // Replace the annotation at the given index
         let mut anns: Vec<DetectedAnnotation> = (*self.annotations).clone();
-        anns[index] = annotation;
+        anns[index] = annotation.clone();
 
         // If the annotation has a line result, update the overlay state
-        if let Some(line) = anns[index].line.clone() {
+        if let Some(line) = annotation.line {
             self.state.set_single_line_result(index, line);
         }
+
+        // Rebuild nav graph after any annotation change (detection box or text)
+        self.state.build_nav_graph();
 
         self.annotations = Rc::new(anns);
 
@@ -1027,7 +1017,7 @@ impl OcrViewer {
             annotations: synced_annotations.clone(),
             img_w: self.img_w,
             img_h: self.img_h,
-            image: self.image_handle.as_ref().cloned(),
+            image: None,
             panel_visible: has_panel,
             panel_on_right,
             dict_width: 300.0,
@@ -1044,6 +1034,10 @@ impl OcrViewer {
             nav_edges_final: self.state.nav_graph.as_ref().map(|g| g.edges.clone()),
             nav_centers: self.build_nav_centers(),
         };
+
+        let annotation_canvas = Canvas::new(overlay)
+            .width(Length::Fill)
+            .height(Length::Fill);
 
         // The image is drawn in a SEPARATE canvas underneath, because tiny_skia
         // always composites images after primitives. Two separate Canvas widgets
@@ -1069,8 +1063,6 @@ impl OcrViewer {
             nav_edges_final: None,
             nav_centers: Vec::new(),
         }).width(Length::Fill).height(Length::Fill);
-
-        let annotation_canvas = Canvas::new(overlay).width(Length::Fill).height(Length::Fill);
 
         if !has_panel {
             return Container::new(Stack::new().push(image_canvas).push(annotation_canvas))
@@ -1439,12 +1431,12 @@ impl OcrViewer {
         let item_size = self.window_width / 11.0;
         let box_size = item_size.clamp(24.0, 40.0);
 
-        // Character preview image at the top
+        // Character preview image at the top — sized to match buttons
         if let Some(img_handle) = preview_image {
             content = content.push(
                 IcedImage::new(img_handle.clone())
-                    .width(Pixels(32.0))
-                    .height(Pixels(32.0)),
+                    .width(Pixels(box_size))
+                    .height(Pixels(box_size)),
             );
         }
 

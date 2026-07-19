@@ -1867,13 +1867,18 @@ pub fn recognize_boxes_streaming(
     char_vocab: &[i64],
     batch_size: usize,
     recognition_mode: RecognitionMode,
-    sender: std::sync::mpsc::Sender<DetectedAnnotation>,
+    sender: std::sync::mpsc::Sender<(usize, DetectedAnnotation)>,
 ) -> Result<()> {
     use std::time::Instant;
     let t_recognize = Instant::now();
 
     let horizontal_boxes: Vec<_> = sorted.iter().filter(|b| b.w >= b.h).cloned().collect();
     let vertical_boxes: Vec<_> = sorted.iter().filter(|b| b.h > b.w).cloned().collect();
+    // Pre-compute sorted indices for each horizontal/vertical box
+    let h_indices: Vec<usize> = sorted.iter().enumerate()
+        .filter(|(_, b)| b.w >= b.h).map(|(i, _)| i).collect();
+    let v_indices: Vec<usize> = sorted.iter().enumerate()
+        .filter(|(_, b)| b.h > b.w).map(|(i, _)| i).collect();
 
     // Horizontal boxes
     if !horizontal_boxes.is_empty() {
@@ -1937,7 +1942,7 @@ pub fn recognize_boxes_streaming(
                             )],
                         }),
                     };
-                    if sender.send(annotation).is_err() { return Ok(()); }
+                    if sender.send((h_indices[start + i], annotation)).is_err() { return Ok(()); }
                 }
             }
         }
@@ -2005,7 +2010,7 @@ pub fn recognize_boxes_streaming(
                             )],
                         }),
                     };
-                    if sender.send(annotation).is_err() { return Ok(()); }
+                    if sender.send((v_indices[start + i], annotation)).is_err() { return Ok(()); }
                 }
             }
         }
