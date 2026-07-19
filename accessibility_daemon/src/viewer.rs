@@ -666,7 +666,14 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                 let handle = entry.handles[idx].clone();
                                 drop(c); // release borrow before draw_image
                                 let px_size = font_size.round() as u32;
-                                let bbox_cx = pt_c.x + (sz_c.width - entry_w as f32) / 2.0;
+                                let bbox_cx = if sz_c.height / sz_c.width > 1.2 {
+                                    // Thin/tall bbox: center ink
+                                    pt_c.x + (sz_c.width - entry_w as f32) / 2.0
+                                } else {
+                                    // Square-ish bbox: center em-box, then use xmin
+                                    let em_left = pt_c.x + (sz_c.width - px_size as f32) / 2.0;
+                                    em_left + entry_xmin as f32
+                                };
                                 // Baseline positioned within em-box using font's line metrics
                                 let em_bottom = pt_c.y + sz_c.height / 2.0 + px_size as f32 / 2.0;
                                 let baseline_y = em_bottom - (baseline_ratio as f32) * px_size as f32;
