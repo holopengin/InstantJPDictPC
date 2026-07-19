@@ -40,11 +40,11 @@ const MEIKI_SWAPPED_PAIRS: &[(&str, &str); 8] = &[
 const SESSION_POOL_SIZE: usize = 1;
 
 pub struct OcrEngine {
-    detect_session: Session,
+    pub detect_session: Session,
     /// Recognition sessions are loaded lazily on first use to speed up startup.
     /// Each pool is initialized exactly once via `std::sync::Once`.
-    recognize_sessions: RecognizeSessionPool,
-    recognize_sessions_vertical: RecognizeSessionPool,
+    pub recognize_sessions: RecognizeSessionPool,
+    pub recognize_sessions_vertical: RecognizeSessionPool,
     pub char_vocab: Vec<i64>,
     pub recognition_mode: RecognitionMode,
     pub batch_size: usize,
@@ -77,7 +77,7 @@ impl RecognizeSessionPool {
     }
 
     /// Get the session pool, initializing it on first call.
-    fn get(&self) -> &[std::sync::Arc<std::sync::Mutex<Session>>] {
+    pub fn get(&self) -> &[std::sync::Arc<std::sync::Mutex<Session>>] {
         self.sessions.get_or_init(|| {
             let mut sessions = Vec::with_capacity(SESSION_POOL_SIZE);
             for _ in 0..SESSION_POOL_SIZE {
@@ -1102,6 +1102,200 @@ impl OcrEngine {
     }
 
     // Modified: return the annotated image in-memory when `render` is true
+    /// Just line detection — returns raw bounding boxes (fast, no character recognition).
+    /// Used by the streaming OCR pipeline to show the image immediately.
+    pub fn detect_lines(&mut self, image: &DynamicImage) -> Result<Vec<BoundingBox>> {
+        let boxes = self.detect(image)?;
+        let merged = self.merge_overlapping_boxes(boxes);
+        let sorted = self.sort_detected_boxes(merged);
+        Ok(sorted)
+    }
+
+    /// Full detection + streaming recognition pipeline.
+    ///
+    /// Runs character recognition on the given bounding boxes and sends each
+    /// completed `DetectedAnnotation` over the channel as soon as it's ready.
+    /// The caller is responsible for running `detect_lines` first and sending
+    /// detection results to the UI before calling this.
+    pub fn recognize_streaming(
+        &self,
+        image: &DynamicImage,
+        sorted: &[BoundingBox],
+        sender: std::sync::mpsc::Sender<DetectedAnnotation>,
+    ) -> Result<()> {
+        use std::time::Instant;
+        let t_recognize = Instant::now();
+
+        // Group boxes by orientation
+        let horizontal_boxes: Vec<_> = sorted
+            .iter()
+            .filter(|b| b.w >= b.h)
+            .cloned()
+            .collect();
+        let vertical_boxes: Vec<_> = sorted
+            .iter()
+            .filter(|b| b.h > b.w)
+            .cloned()
+            .collect();
+
+        // Process horizontal boxes in batches
+        if !horizontal_boxes.is_empty() {
+            let rec_sessions = self.recognize_sessions.get().to_vec();
+            let char_vocab = self.char_vocab.clone();
+            let batch_size = self.batch_size;
+
+            let all_chunks: Vec<(DynamicImage, bool)> = horizontal_boxes.iter().map(|bbox| {
+                let crop_x = bbox.x.max(0) as u32;
+                let crop_y = bbox.y.max(0) as u32;
+                let crop_w = bbox.w.max(0) as u32;
+                let crop_h = bbox.h.max(0) as u32;
+                (image.crop_imm(crop_x, crop_y, crop_w, crop_h), false)
+            }).collect();
+
+            let num_batches = (all_chunks.len() + batch_size - 1) / batch_size;
+            for batch_idx in 0..num_batches {
+                let start = batch_idx * batch_size;
+                let end = (start + batch_size).min(all_chunks.len());
+                let rec_sess = rec_sessions[batch_idx % rec_sessions.len()].clone();
+                let chunk_slice = &all_chunks[start..end];
+                let mut sess = rec_sess.lock().unwrap();
+                let results = ocr_parallel::recognize_batch_chunks_static(
+                    &mut sess, &char_vocab, chunk_slice,
+                );
+                drop(sess);
+
+                if let Ok(batch_results) = results {
+                    for (i, (bbox, result)) in horizontal_boxes[start..end]
+                        .iter().zip(batch_results.into_iter()).enumerate()
+                    {
+                        let (filtered, eff_w, eff_h) = result;
+                        let text: String = filtered.iter().map(|c| c.char).collect();
+                        let alternatives: Vec<Vec<(char, f32)>> =
+                            filtered.iter().map(|c| c.alternatives.clone()).collect();
+
+                        let mut char_boxes: Vec<BoundingBox> = Vec::new();
+                        let crop_x = bbox.x.max(0) as u32;
+                        let crop_y = bbox.y.max(0) as u32;
+                        let crop_w = bbox.w.max(0) as u32;
+                        let crop_h = bbox.h.max(0) as u32;
+
+                        for c in &filtered {
+                            let x1 = (c.box_coords[0] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
+                            let y1 = (c.box_coords[1] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
+                            let x2 = (c.box_coords[2] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
+                            let y2 = (c.box_coords[3] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
+                            char_boxes.push(BoundingBox::new(
+                                x1.round() as i32, y1.round() as i32,
+                                (x2 - x1).round() as i32, (y2 - y1).round() as i32,
+                                c.score,
+                            ));
+                        }
+
+                        let annotation = DetectedAnnotation {
+                            bbox: bbox.clone(),
+                            line: Some(LineResult {
+                                text,
+                                char_boxes,
+                                alternatives,
+                                is_vertical: false,
+                                chunk_boxes: vec![BoundingBox::new(
+                                    crop_x as i32, crop_y as i32,
+                                    crop_w as i32, crop_h as i32, 1.0,
+                                )],
+                            }),
+                        };
+                        if sender.send(annotation).is_err() {
+                            // Channel closed — viewer is no longer listening.
+                            // This is not an OCR error, just early-termination.
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process vertical boxes in batches
+        if !vertical_boxes.is_empty() && self.recognition_mode != RecognitionMode::Horizontal {
+            let vert_sessions = self.recognize_sessions_vertical.get().to_vec();
+            let char_vocab = self.char_vocab.clone();
+            let batch_size = self.batch_size;
+
+            let all_chunks: Vec<(DynamicImage, bool)> = vertical_boxes.iter().map(|bbox| {
+                let crop_x = bbox.x.max(0) as u32;
+                let crop_y = bbox.y.max(0) as u32;
+                let crop_w = bbox.w.max(0) as u32;
+                let crop_h = bbox.h.max(0) as u32;
+                (image.crop_imm(crop_x, crop_y, crop_w, crop_h), true)
+            }).collect();
+
+            let num_batches = (all_chunks.len() + batch_size - 1) / batch_size;
+            for batch_idx in 0..num_batches {
+                let start = batch_idx * batch_size;
+                let end = (start + batch_size).min(all_chunks.len());
+                let rec_sess = vert_sessions[batch_idx % vert_sessions.len()].clone();
+                let chunk_slice = &all_chunks[start..end];
+                let mut sess = rec_sess.lock().unwrap();
+                let results = ocr_parallel::recognize_batch_chunks_static(
+                    &mut sess, &char_vocab, chunk_slice,
+                );
+                drop(sess);
+
+                if let Ok(batch_results) = results {
+                    for (i, (bbox, result)) in vertical_boxes[start..end]
+                        .iter().zip(batch_results.into_iter()).enumerate()
+                    {
+                        let (filtered, eff_w, eff_h) = result;
+                        let text: String = filtered.iter().map(|c| c.char).collect();
+                        let alternatives: Vec<Vec<(char, f32)>> =
+                            filtered.iter().map(|c| c.alternatives.clone()).collect();
+
+                        let mut char_boxes: Vec<BoundingBox> = Vec::new();
+                        let crop_x = bbox.x.max(0) as u32;
+                        let crop_y = bbox.y.max(0) as u32;
+                        let crop_w = bbox.w.max(0) as u32;
+                        let crop_h = bbox.h.max(0) as u32;
+
+                        for c in &filtered {
+                            let x1 = (c.box_coords[0] / (VERT_REC_WIDTH as f32)) * (crop_w as f32) + (crop_x as f32);
+                            let y1 = (c.box_coords[1] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
+                            let x2 = (c.box_coords[2] / (VERT_REC_WIDTH as f32)) * (crop_w as f32) + (crop_x as f32);
+                            let y2 = (c.box_coords[3] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
+                            char_boxes.push(BoundingBox::new(
+                                x1.round() as i32, y1.round() as i32,
+                                (x2 - x1).round() as i32, (y2 - y1).round() as i32,
+                                c.score,
+                            ));
+                        }
+
+                        let annotation = DetectedAnnotation {
+                            bbox: bbox.clone(),
+                            line: Some(LineResult {
+                                text,
+                                char_boxes,
+                                alternatives,
+                                is_vertical: true,
+                                chunk_boxes: vec![BoundingBox::new(
+                                    crop_x as i32, crop_y as i32,
+                                    crop_w as i32, crop_h as i32, 1.0,
+                                )],
+                            }),
+                        };
+                        if sender.send(annotation).is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "[OCR timing] Character recognition: {:>8.2} ms  ({} boxes, streamed)",
+            recognize_ms, sorted.len()
+        );
+        Ok(())
+    }
+
     pub fn run_detection(
         &mut self,
         image: &DynamicImage,
@@ -1656,6 +1850,173 @@ impl OcrEngine {
             return Ok((annotations, None));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming recognition (standalone, Send-friendly)
+// ---------------------------------------------------------------------------
+
+/// Run character recognition on pre-detected boxes and stream each result
+/// over the channel as soon as it's ready. Designed to be called from a
+/// background thread: all sessions are `Arc`-wrapped and `Send`.
+pub fn recognize_boxes_streaming(
+    image: &DynamicImage,
+    sorted: &[BoundingBox],
+    rec_sessions: &[std::sync::Arc<std::sync::Mutex<Session>>],
+    vert_sessions: &[std::sync::Arc<std::sync::Mutex<Session>>],
+    char_vocab: &[i64],
+    batch_size: usize,
+    recognition_mode: RecognitionMode,
+    sender: std::sync::mpsc::Sender<DetectedAnnotation>,
+) -> Result<()> {
+    use std::time::Instant;
+    let t_recognize = Instant::now();
+
+    let horizontal_boxes: Vec<_> = sorted.iter().filter(|b| b.w >= b.h).cloned().collect();
+    let vertical_boxes: Vec<_> = sorted.iter().filter(|b| b.h > b.w).cloned().collect();
+
+    // Horizontal boxes
+    if !horizontal_boxes.is_empty() {
+        let all_chunks: Vec<(DynamicImage, bool)> = horizontal_boxes.iter().map(|bbox| {
+            let crop_x = bbox.x.max(0) as u32;
+            let crop_y = bbox.y.max(0) as u32;
+            let crop_w = bbox.w.max(0) as u32;
+            let crop_h = bbox.h.max(0) as u32;
+            (image.crop_imm(crop_x, crop_y, crop_w, crop_h), false)
+        }).collect();
+
+        let num_batches = (all_chunks.len() + batch_size - 1) / batch_size;
+        for batch_idx in 0..num_batches {
+            let start = batch_idx * batch_size;
+            let end = (start + batch_size).min(all_chunks.len());
+            let rec_sess = rec_sessions[batch_idx % rec_sessions.len()].clone();
+            let chunk_slice = &all_chunks[start..end];
+            let mut sess = rec_sess.lock().unwrap();
+            let results = ocr_parallel::recognize_batch_chunks_static(
+                &mut sess, char_vocab, chunk_slice,
+            );
+            drop(sess);
+
+            if let Ok(batch_results) = results {
+                for (i, (bbox, result)) in horizontal_boxes[start..end]
+                    .iter().zip(batch_results.into_iter()).enumerate()
+                {
+                    let (filtered, eff_w, eff_h) = result;
+                    let text: String = filtered.iter().map(|c| c.char).collect();
+                    let alternatives: Vec<Vec<(char, f32)>> =
+                        filtered.iter().map(|c| c.alternatives.clone()).collect();
+
+                    let mut char_boxes: Vec<BoundingBox> = Vec::new();
+                    let crop_x = bbox.x.max(0) as u32;
+                    let crop_y = bbox.y.max(0) as u32;
+                    let crop_w = bbox.w.max(0) as u32;
+                    let crop_h = bbox.h.max(0) as u32;
+
+                    for c in &filtered {
+                        let x1 = (c.box_coords[0] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
+                        let y1 = (c.box_coords[1] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
+                        let x2 = (c.box_coords[2] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
+                        let y2 = (c.box_coords[3] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
+                        char_boxes.push(BoundingBox::new(
+                            x1.round() as i32, y1.round() as i32,
+                            (x2 - x1).round() as i32, (y2 - y1).round() as i32,
+                            c.score,
+                        ));
+                    }
+
+                    let annotation = DetectedAnnotation {
+                        bbox: bbox.clone(),
+                        line: Some(LineResult {
+                            text,
+                            char_boxes,
+                            alternatives,
+                            is_vertical: false,
+                            chunk_boxes: vec![BoundingBox::new(
+                                crop_x as i32, crop_y as i32,
+                                crop_w as i32, crop_h as i32, 1.0,
+                            )],
+                        }),
+                    };
+                    if sender.send(annotation).is_err() { return Ok(()); }
+                }
+            }
+        }
+    }
+
+    // Vertical boxes
+    if !vertical_boxes.is_empty() && recognition_mode != RecognitionMode::Horizontal {
+        let all_chunks: Vec<(DynamicImage, bool)> = vertical_boxes.iter().map(|bbox| {
+            let crop_x = bbox.x.max(0) as u32;
+            let crop_y = bbox.y.max(0) as u32;
+            let crop_w = bbox.w.max(0) as u32;
+            let crop_h = bbox.h.max(0) as u32;
+            (image.crop_imm(crop_x, crop_y, crop_w, crop_h), true)
+        }).collect();
+
+        let num_batches = (all_chunks.len() + batch_size - 1) / batch_size;
+        for batch_idx in 0..num_batches {
+            let start = batch_idx * batch_size;
+            let end = (start + batch_size).min(all_chunks.len());
+            let rec_sess = vert_sessions[batch_idx % vert_sessions.len()].clone();
+            let chunk_slice = &all_chunks[start..end];
+            let mut sess = rec_sess.lock().unwrap();
+            let results = ocr_parallel::recognize_batch_chunks_static(
+                &mut sess, char_vocab, chunk_slice,
+            );
+            drop(sess);
+
+            if let Ok(batch_results) = results {
+                for (i, (bbox, result)) in vertical_boxes[start..end]
+                    .iter().zip(batch_results.into_iter()).enumerate()
+                {
+                    let (filtered, eff_w, eff_h) = result;
+                    let text: String = filtered.iter().map(|c| c.char).collect();
+                    let alternatives: Vec<Vec<(char, f32)>> =
+                        filtered.iter().map(|c| c.alternatives.clone()).collect();
+
+                    let mut char_boxes: Vec<BoundingBox> = Vec::new();
+                    let crop_x = bbox.x.max(0) as u32;
+                    let crop_y = bbox.y.max(0) as u32;
+                    let crop_w = bbox.w.max(0) as u32;
+                    let crop_h = bbox.h.max(0) as u32;
+
+                    for c in &filtered {
+                        let x1 = (c.box_coords[0] / (VERT_REC_WIDTH as f32)) * (crop_w as f32) + (crop_x as f32);
+                        let y1 = (c.box_coords[1] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
+                        let x2 = (c.box_coords[2] / (VERT_REC_WIDTH as f32)) * (crop_w as f32) + (crop_x as f32);
+                        let y2 = (c.box_coords[3] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
+                        char_boxes.push(BoundingBox::new(
+                            x1.round() as i32, y1.round() as i32,
+                            (x2 - x1).round() as i32, (y2 - y1).round() as i32,
+                            c.score,
+                        ));
+                    }
+
+                    let annotation = DetectedAnnotation {
+                        bbox: bbox.clone(),
+                        line: Some(LineResult {
+                            text,
+                            char_boxes,
+                            alternatives,
+                            is_vertical: true,
+                            chunk_boxes: vec![BoundingBox::new(
+                                crop_x as i32, crop_y as i32,
+                                crop_w as i32, crop_h as i32, 1.0,
+                            )],
+                        }),
+                    };
+                    if sender.send(annotation).is_err() { return Ok(()); }
+                }
+            }
+        }
+    }
+
+    let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "[OCR timing] Character recognition: {:>8.2} ms  ({} boxes, thread)",
+        recognize_ms, sorted.len()
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

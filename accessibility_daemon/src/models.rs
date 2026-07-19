@@ -212,4 +212,10 @@ pub enum Message {
     ZoomTick,
     /// The window was resized.
     WindowResized { width: f32, height: f32 },
+    /// Line detection complete — show bounding boxes (no text yet).
+    OcrDetectionComplete(Vec<DetectedAnnotation>),
+    /// One line's character recognition complete.
+    OcrRecognitionResult(usize, DetectedAnnotation),
+    /// All OCR processing is done.
+    OcrAllDone,
 }
