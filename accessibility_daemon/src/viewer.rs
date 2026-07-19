@@ -530,11 +530,22 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                 CanvasStroke::default().with_color(Color::from_rgb(1.0, 1.0, 0.0)).with_width(2.0));
                         }
 
-                        // Render character centered in its detection box
+                        // Render character in its detection box.
+                        // Clamp the horizontal position so the left edge of the glyph
+                        // never goes left of the bbox left edge (fixes thin/tall bboxes
+                        // for punctuation like 。 、 that would otherwise drift left).
                         if let Some(_ch) = line.text.chars().nth(i) {
+                            let font_size = sz_c.height * CANVAS_CHAR_RATIO;
+                            // CJK characters are roughly square; the em-box width ≈ font_size.
+                            let glyph_width = font_size;
+                            let center_x = pt_c.x + sz_c.width / 2.0;
+                            // Left edge of centered glyph = center_x - glyph_width/2.
+                            // Clamp so it's at least pt_c.x (bbox left edge).
+                            let min_center = pt_c.x + glyph_width / 2.0;
+                            let pos_x = center_x.max(min_center);
                             frame.fill_text(CanvasText {
                                 content: _ch.to_string(),
-                                position: Point::new(pt_c.x + sz_c.width / 2.0, pt_c.y + sz_c.height / 2.0),
+                                position: Point::new(pos_x, pt_c.y + sz_c.height / 2.0),
                                 max_width: 0.0,
                                 color: if self.highlighted_coords.contains(&(line_idx, i)) {
                                     Color::from_rgb(1.0, 1.0, 0.0)  // yellow for matched word
@@ -543,7 +554,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                 } else {
                                     Color::from_rgb(1.0, 0.467, 0.467)  // #FF7777
                                 },
-                                size: Pixels(sz_c.height * CANVAS_CHAR_RATIO),
+                                size: Pixels(font_size),
                                 line_height: Default::default(),
                                 font: IcedFont::default(),
                                 align_x: iced::widget::text::Alignment::Center,
@@ -556,6 +567,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
             }
         }
 
+        #[cfg(debug_assertions)]
         // --- Debug: draw navigation graph arrows ---
         if !self.nav_centers.is_empty() {
             // Compute cursor global index for filtering
@@ -1222,8 +1234,8 @@ impl OcrViewer {
                 let mut row = Row::new().spacing(6).align_y(alignment::Vertical::Center);
                 row = row.push(Text::new(hw.kanji.clone()).size(36).color(cyan)
                     .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }));
-                if let Some(o) = &hw.onyomi { row = row.push(Text::new(format!("ON: {o}")).size(12).color(gray)); }
-                if let Some(k) = &hw.kunyomi { row = row.push(Text::new(format!("KUN: {k}")).size(12).color(gray)); }
+                if let Some(o) = &hw.onyomi { row = row.push(Text::new(format!("ON: {o}")).size(14).color(gray)); }
+                if let Some(k) = &hw.kunyomi { row = row.push(Text::new(format!("KUN: {k}")).size(14).color(gray)); }
                 content = content.push(row);
             }
         } else {
@@ -1234,7 +1246,7 @@ impl OcrViewer {
                         .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }));
                 } else {
                     let mut rc = Column::new().align_x(alignment::Horizontal::Center).spacing(1);
-                    rc = rc.push(Text::new(group.reading.clone()).size(10).color(gray));
+                    rc = rc.push(Text::new(group.reading.clone()).size(14).color(gray));
                     rc = rc.push(Text::new(hw.kanji.clone()).size(24).color(cyan)
                         .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }));
                     row = row.push(rc);
@@ -1268,9 +1280,9 @@ impl OcrViewer {
             for tag in &sg.tags {
                 let bg = Self::tag_color(tag);
                 tag_row = tag_row.push(
-                    Container::new(Text::new(tag.clone()).size(11).color(white)
+                    Container::new(Text::new(tag.clone()).size(13).color(white)
                         .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }))
-                    .padding([1.0, 1.0])
+                    .padding([1.0, 3.0])
                     .style(move |_t: &Theme| container::Style {
                         background: Some(iced::Background::Color(bg)),
                         border: iced::Border { radius: 3.0.into(), ..Default::default() },
@@ -1283,30 +1295,30 @@ impl OcrViewer {
 
         for sense in &sg.senses {
             let mut sense_row = Row::new().spacing(3).align_y(alignment::Vertical::Top);
-            sense_row = sense_row.push(Text::new(format!("{}. ", sense.index)).size(13).color(white));
+            sense_row = sense_row.push(Text::new(format!("{}. ", sense.index)).size(16).color(white));
             let mut nodes_col = Column::new().spacing(1).width(Length::Fill);
             for node in &sense.nodes {
                 match node {
                     DefinitionNode::Text(t) => {
                         nodes_col = nodes_col.push(
-                            Text::new(t.clone()).size(13).color(white).width(Length::Fill)
+                            Text::new(t.clone()).size(14).color(white).width(Length::Fill)
                                 .wrapping(iced::widget::text::Wrapping::Word),
                         );
                     }
                     DefinitionNode::Ruby { term, reading, .. } => {
                         if term == reading {
-                            nodes_col = nodes_col.push(Text::new(term.clone()).size(13).color(cyan)
+                            nodes_col = nodes_col.push(Text::new(term.clone()).size(16).color(cyan)
                                 .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }));
                         } else {
                             let mut rc = Column::new().align_x(alignment::Horizontal::Center).spacing(0);
-                            rc = rc.push(Text::new(reading.clone()).size(8).color(gray));
-                            rc = rc.push(Text::new(term.clone()).size(13).color(cyan)
+                            rc = rc.push(Text::new(reading.clone()).size(12).color(gray));
+                            rc = rc.push(Text::new(term.clone()).size(16).color(cyan)
                                 .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }));
                             nodes_col = nodes_col.push(rc);
                         }
                     }
                     DefinitionNode::Tag { text, .. } => {
-                        nodes_col = nodes_col.push(Text::new(format!("[{text}]")).size(11).color(gray));
+                        nodes_col = nodes_col.push(Text::new(format!("[{text}]")).size(14).color(gray));
                     }
                     _ => {}
                 }
