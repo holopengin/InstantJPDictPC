@@ -63,6 +63,8 @@ struct CachedGlyph {
 pub struct GlyphCache {
     font: Font,
     cache: HashMap<(char, u32), CachedGlyph>,
+    /// Proportion of the em-box below the baseline (0.0 = baseline at em-bottom, 1.0 = em-top).
+    baseline_below: f64,
 }
 
 impl GlyphCache {
@@ -75,9 +77,15 @@ impl GlyphCache {
         for p in &paths {
             if let Ok(data) = std::fs::read(p) {
                 if let Ok(font) = Font::from_bytes(data, fontdue::FontSettings::default()) {
+                    let lm = font.horizontal_line_metrics(16.0);
+                    let baseline_below = lm.map_or(0.2, |m| {
+                        let desc = m.descent.abs() as f64;
+                        desc / (m.ascent as f64 + desc)
+                    });
                     return Some(Rc::new(RefCell::new(GlyphCache {
                         font,
                         cache: HashMap::new(),
+                        baseline_below,
                     })));
                 }
             }
@@ -650,18 +658,21 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                 }
                                 let entry = c.cache.get(&(_ch, px_size)).unwrap();
                                 let idx = if highlighted { 1 } else { 0 };
+                                let baseline_ratio = c.baseline_below;
+                                let entry_w = entry.w;
+                                let entry_h = entry.h;
+                                let entry_xmin = entry.xmin;
+                                let entry_ymin = entry.ymin;
+                                let handle = entry.handles[idx].clone();
+                                drop(c); // release borrow before draw_image
                                 let px_size = font_size.round() as u32;
-                                let bbox_cx = pt_c.x + (sz_c.width - entry.w as f32) / 2.0;
-                                let bbox_cy = pt_c.y + (sz_c.height - entry.h as f32) / 2.0;
-                                // For short glyphs (punctuation, quotes) the font's vertical
-                                // design position is relative to the CJK centerline baseline.
-                                // Natural font positioning: em-box centered in bbox,
-                                // baseline at bottom of em-box, ymin relative to baseline.
-                                let em_cy = pt_c.y + sz_c.height / 2.0;
-                                let em_bottom = em_cy + px_size as f32 / 2.0;
-                                // Baseline + ymin (screen coords, Y down) = top of glyph bitmap
-                                let draw_y = em_bottom + entry.ymin as f32 - entry.h as f32;
-                                (entry.w, entry.h, bbox_cx, draw_y, entry.handles[idx].clone())
+                                let bbox_cx = pt_c.x + (sz_c.width - entry_w as f32) / 2.0;
+                                // Baseline positioned within em-box using font's line metrics
+                                let em_bottom = pt_c.y + sz_c.height / 2.0 + px_size as f32 / 2.0;
+                                let baseline_y = em_bottom - (baseline_ratio as f32) * px_size as f32;
+                                // ymin is in Y-UP font coords; -ymin - h for screen Y-down
+                                let draw_y = baseline_y - entry_ymin as f32 - entry_h as f32;
+                                (entry_w, entry_h, bbox_cx, draw_y, handle)
                             };
                             frame.draw_image(
                                 Rectangle::new(Point::new(draw_x, draw_y), Size::new(gw as f32, gh as f32)),
