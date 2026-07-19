@@ -650,7 +650,18 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                 }
                                 let entry = c.cache.get(&(_ch, px_size)).unwrap();
                                 let idx = if highlighted { 1 } else { 0 };
-                                (entry.w, entry.h, pt_c.x + (sz_c.width - entry.w as f32) / 2.0, pt_c.y + (sz_c.height - entry.h as f32) / 2.0, entry.handles[idx].clone())
+                                let px_size = font_size.round() as u32;
+                                let bbox_cx = pt_c.x + (sz_c.width - entry.w as f32) / 2.0;
+                                let bbox_cy = pt_c.y + (sz_c.height - entry.h as f32) / 2.0;
+                                // For short glyphs (punctuation, quotes) the font's vertical
+                                // design position is relative to the CJK centerline baseline.
+                                // Natural font positioning: em-box centered in bbox,
+                                // baseline at bottom of em-box, ymin relative to baseline.
+                                let em_cy = pt_c.y + sz_c.height / 2.0;
+                                let em_bottom = em_cy + px_size as f32 / 2.0;
+                                // Baseline + ymin (screen coords, Y down) = top of glyph bitmap
+                                let draw_y = em_bottom + entry.ymin as f32 - entry.h as f32;
+                                (entry.w, entry.h, bbox_cx, draw_y, entry.handles[idx].clone())
                             };
                             frame.draw_image(
                                 Rectangle::new(Point::new(draw_x, draw_y), Size::new(gw as f32, gh as f32)),
