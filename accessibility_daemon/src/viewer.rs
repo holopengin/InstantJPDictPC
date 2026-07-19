@@ -25,6 +25,53 @@ use crate::models::*;
 use crate::overlay_state::OcrOverlayState;
 use crate::util::deinflector::Deinflector;
 
+use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
+use lazy_static::lazy_static;
+use std::sync::Mutex;
+
+lazy_static! {
+    static ref FONT_SYSTEM: Mutex<FontSystem> = Mutex::new(FontSystem::new());
+    static ref SWASH_CACHE: Mutex<SwashCache> = Mutex::new(SwashCache::new());
+}
+
+/// Measure the horizontal offset needed to center the VISIBLE GLYPH (not the em‑box)
+/// of a character. Returns a signed offset to add to the bbox center position.
+///
+/// How it works:
+/// 1. Shape the character with cosmic‑text
+/// 2. Rasterize it to get the actual ink bounding box (bearing + width)
+/// 3. Compute `advance/2 - (bearing_x + raster_width/2)` —
+///    the difference between the layout center and the visual glyph center.
+fn glyph_center_offset(ch: char, font_size: f32) -> f32 {
+    let mtcs = Metrics::new(font_size, font_size * 1.2);
+    let mut fs = FONT_SYSTEM.lock().unwrap();
+    let mut swash = SWASH_CACHE.lock().unwrap();
+
+    let mut buffer = Buffer::new(&mut fs, mtcs);
+    buffer.set_size(&mut fs, Some(font_size * 2.0), Some(font_size * 2.0));
+
+    let text: String = ch.into();
+    let attrs = Attrs::new();
+    buffer.set_text(&mut fs, &text, &attrs, Shaping::Advanced, None);
+
+    if let Some(run) = buffer.layout_runs().next() {
+        if let Some(glyph) = run.glyphs.first() {
+            let advance = run.line_w;
+            let phys = glyph.physical((0.0, 0.0), 1.0);
+            if let Some(img) = swash.get_image(&mut fs, phys.cache_key) {
+                // img.placement.left  = bearing_x (px from origin to glyph's left edge)
+                // img.placement.width = actual raster width
+                let bearing_x = img.placement.left as f32;
+                let raster_w = img.placement.width.max(1) as f32;
+                let visual_center = bearing_x + raster_w / 2.0;
+                // How far the visual center is from the layout center
+                return advance / 2.0 - visual_center;
+            }
+        }
+    }
+    0.0
+}
+
 /// Font fill ratio for OCR character glyphs drawn on the canvas annotation layer.
 const CANVAS_CHAR_RATIO: f32 = 0.9;
 /// Font fill ratio for character buttons in the neighbor/alternatives panels.
@@ -538,7 +585,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         // for punctuation like 。 、 that would otherwise drift left).
                         if let Some(_ch) = line.text.chars().nth(i) {
                             let font_size = sz_c.height * CANVAS_CHAR_RATIO;
-                            let pos_x = pt_c.x + sz_c.width / 2.0;
+                            let pos_x = pt_c.x + sz_c.width / 2.0 + glyph_center_offset(_ch, font_size);
                             frame.fill_text(CanvasText {
                                 content: _ch.to_string(),
                                 position: Point::new(pos_x, pt_c.y + sz_c.height / 2.0),
@@ -783,15 +830,18 @@ impl OcrViewer {
     }
 
     pub fn select_character(&mut self, line_idx: usize, char_idx: usize) {
-        // Reset zoom to fit-to-screen when first opening the dictionary (prevents jump)
-        if !self.state.is_dictionary_visible {
-            self.state.current_scale = 1.0;
-            self.state.current_trans_x = 0.0;
-            self.state.current_trans_y = 0.0;
-        }
+        let was_visible = self.state.is_dictionary_visible;
+        let is_same = self.state.current_tapped_line_idx == line_idx as isize
+            && self.state.current_tapped_char_idx_in_line == char_idx as isize;
         self.set_cursor_pos(line_idx, char_idx);
         self.state.is_dictionary_visible = true;
-        self.alternatives_visible = false;
+        if is_same && was_visible {
+            // Clicking the already-selected character on an already-open
+            // dictionary toggles the alternatives panel.
+            self.alternatives_visible = !self.alternatives_visible;
+        } else {
+            self.alternatives_visible = false;
+        }
 
         // Update gravity so panel opens on the opposite side of the character.
         let box_item = self.state.active_line_results.get(line_idx)
@@ -811,6 +861,43 @@ impl OcrViewer {
         // Highlight just the one character at the cursor position.
         self.state.update_highlight_coords(line_idx, char_idx, 1);
         self.compute_scroll_targets(line_idx, char_idx);
+
+        // Keep the selected character visible on screen by panning if needed.
+        if let Some(ann) = self.state.active_line_results.get(line_idx).and_then(|l| l.as_ref()) {
+            if let Some(char_box) = ann.char_boxes.get(char_idx) {
+                let img_w_f = self.state.img_w as f32;
+                let img_h_f = self.state.img_h as f32;
+                let base_scale = f32::min(self.window_width / img_w_f, self.window_height / img_h_f);
+                let total_scale = base_scale * self.state.current_scale;
+                let base_offset_x = (self.window_width - img_w_f * base_scale) / 2.0;
+                let base_offset_y = (self.window_height - img_h_f * base_scale) / 2.0;
+
+                let sx = char_box.x as f32 * total_scale + base_offset_x + self.state.current_trans_x;
+                let sy = char_box.y as f32 * total_scale + base_offset_y + self.state.current_trans_y;
+                let sw = (char_box.w as f32).max(1.0) * total_scale;
+                let sh = (char_box.h as f32).max(1.0) * total_scale;
+
+                let margin = 30.0; // px margin from screen edge
+
+                // Pan horizontally — keep the full character visible
+                if sx + sw > self.window_width - margin {
+                    let overshoot = (sx + sw) - (self.window_width - margin);
+                    self.state.current_trans_x -= overshoot;
+                }
+                if sx < margin {
+                    self.state.current_trans_x += margin - sx;
+                }
+
+                // Pan vertically
+                if sy + sh > self.window_height - margin {
+                    let overshoot = (sy + sh) - (self.window_height - margin);
+                    self.state.current_trans_y -= overshoot;
+                }
+                if sy < margin {
+                    self.state.current_trans_y += margin - sy;
+                }
+            }
+        }
     }
 
     fn set_cursor_pos(&mut self, line_idx: usize, char_idx: usize) {
@@ -848,7 +935,7 @@ impl OcrViewer {
         self.scroll_alt_to = None;
     }
 
-    fn do_lookup(&mut self, line_idx: usize, char_idx: usize) {
+    pub(crate) fn do_lookup(&mut self, line_idx: usize, char_idx: usize) {
         let Some(line) = self.state.active_line_results.get(line_idx).and_then(|l| l.as_ref()) else { return; };
         let Some(box_item) = line.char_boxes.get(char_idx) else { return; };
         let text = line.text.chars().skip(char_idx).take(3).collect::<String>();
@@ -881,7 +968,7 @@ impl OcrViewer {
 
     /// Compute the scroll targets for the neighbor and alternatives panels
     /// so the selected character is centered (or as close as possible).
-    fn compute_scroll_targets(&mut self, line_idx: usize, char_idx: usize) {
+    pub(crate) fn compute_scroll_targets(&mut self, line_idx: usize, char_idx: usize) {
         // Compute the global character index across all lines
         let mut global_idx = 0;
         for (li, line_opt) in self.state.active_line_results.iter().enumerate() {
