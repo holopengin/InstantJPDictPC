@@ -1007,38 +1007,46 @@ impl OcrViewer {
         self.compute_scroll_targets(line_idx, char_idx);
 
         // Keep the selected character visible on screen by panning if needed.
-        if let Some(ann) = self.state.active_line_results.get(line_idx).and_then(|l| l.as_ref()) {
-            if let Some(char_box) = ann.char_boxes.get(char_idx) {
-                let img_w_f = self.state.img_w as f32;
-                let img_h_f = self.state.img_h as f32;
-                let base_scale = f32::min(self.window_width / img_w_f, self.window_height / img_h_f);
-                let total_scale = base_scale * self.state.current_scale;
-                let base_offset_x = (self.window_width - img_w_f * base_scale) / 2.0;
-                let base_offset_y = (self.window_height - img_h_f * base_scale) / 2.0;
+        // At default zoom (1.0) the full image is already visible — skip panning.
+        if self.state.current_scale > 1.01 {
+            if let Some(ann) = self.state.active_line_results.get(line_idx)
+                .and_then(|l| l.as_ref())
+            {
+                if let Some(char_box) = ann.char_boxes.get(char_idx) {
+                    let img_w_f = self.state.img_w as f32;
+                    let img_h_f = self.state.img_h as f32;
+                    let base_scale =
+                        f32::min(self.window_width / img_w_f, self.window_height / img_h_f);
+                    let total_scale = base_scale * self.state.current_scale;
+                    let base_offset_x = (self.window_width - img_w_f * base_scale) / 2.0;
+                    let base_offset_y = (self.window_height - img_h_f * base_scale) / 2.0;
 
-                let sx = char_box.x as f32 * total_scale + base_offset_x + self.state.current_trans_x;
-                let sy = char_box.y as f32 * total_scale + base_offset_y + self.state.current_trans_y;
-                let sw = (char_box.w as f32).max(1.0) * total_scale;
-                let sh = (char_box.h as f32).max(1.0) * total_scale;
+                    let sx = char_box.x as f32 * total_scale + base_offset_x
+                        + self.state.current_trans_x;
+                    let sy = char_box.y as f32 * total_scale + base_offset_y
+                        + self.state.current_trans_y;
+                    let sw = (char_box.w as f32).max(1.0) * total_scale;
+                    let sh = (char_box.h as f32).max(1.0) * total_scale;
 
-                let margin = 30.0; // px margin from screen edge
+                    let margin = 30.0; // px margin from screen edge
 
-                // Pan horizontally — keep the full character visible
-                if sx + sw > self.window_width - margin {
-                    let overshoot = (sx + sw) - (self.window_width - margin);
-                    self.state.current_trans_x -= overshoot;
-                }
-                if sx < margin {
-                    self.state.current_trans_x += margin - sx;
-                }
+                    // Pan horizontally — keep the full character visible
+                    if sx + sw > self.window_width - margin {
+                        let overshoot = (sx + sw) - (self.window_width - margin);
+                        self.state.current_trans_x -= overshoot;
+                    }
+                    if sx < margin {
+                        self.state.current_trans_x += margin - sx;
+                    }
 
-                // Pan vertically
-                if sy + sh > self.window_height - margin {
-                    let overshoot = (sy + sh) - (self.window_height - margin);
-                    self.state.current_trans_y -= overshoot;
-                }
-                if sy < margin {
-                    self.state.current_trans_y += margin - sy;
+                    // Pan vertically
+                    if sy + sh > self.window_height - margin {
+                        let overshoot = (sy + sh) - (self.window_height - margin);
+                        self.state.current_trans_y -= overshoot;
+                    }
+                    if sy < margin {
+                        self.state.current_trans_y += margin - sy;
+                    }
                 }
             }
         }

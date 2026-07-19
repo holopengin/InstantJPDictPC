@@ -66,13 +66,20 @@ fn start_evdev_thread() {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if !path.to_string_lossy().contains("event") { continue; }
-                if let Ok(d) = Device::open(&path) {
+                if let Ok(mut d) = Device::open(&path) {
                     let has_btn = d.supported_keys().map_or(false, |caps| {
                         caps.contains(KeyCode::BTN_SOUTH) || caps.contains(KeyCode::new(0x130))
                     });
                     if has_btn {
                         let name = d.name().unwrap_or("?").to_string();
                         println!("[GP] evdev gamepad found: {name} at {p}", p = path.display());
+                        // Grab the device so events are captured exclusively and
+                        // don't also reach the game running underneath.
+                        if let Err(e) = d.grab() {
+                            println!("[GP] grab {name} failed (events will pass through): {e}");
+                        } else {
+                            println!("[GP] grabbed {name} — events blocked from other apps");
+                        }
                         devices.push(d);
                     }
                 }
@@ -440,7 +447,9 @@ fn run_ocr_viewer(
     // Don't go further in headless mode — bootstrap thread handles everything
     if headless { println!("Headless: done (bootstrap running in background)"); return Ok(()); }
 
-    start_evdev_thread();
+    // Gamepad input disabled — Steam Deck game mode prevents exclusive evdev grab.
+    // Keyboard controls (arrow keys, Enter, Esc, D/F) are always available.
+    // start_evdev_thread();
 
     let bootstrap_rx = Arc::new(std::sync::Mutex::new(Some(bootstrap_rx)));
     let rx_for_update = Arc::clone(&bootstrap_rx);
@@ -636,7 +645,7 @@ fn run_ocr_viewer(
 
     let app = iced::application(boot, update, OcrViewer::view)
         .window(iced::window::Settings {
-            size: iced::Size::new(1280.0, 720.0),
+            size: iced::Size::new(1280.0, 800.0),
             ..Default::default()
         })
         .subscription(|_state: &OcrViewer| {
