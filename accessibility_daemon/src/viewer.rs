@@ -69,12 +69,24 @@ pub struct GlyphCache {
 
 impl GlyphCache {
     pub fn new() -> Option<Rc<RefCell<Self>>> {
+        // Binary-relative path for AppImage deployments
+        let exe_path = std::env::current_exe().ok();
+        let exe_dir = exe_path.as_ref().and_then(|p| p.parent());
+        let exe_font = exe_dir.map(|d| d.join("fonts").join("NotoSansJP-Regular.ttf"));
+
+        // AppImage mount point (sharun sets APPDIR; appimagetool uses /tmp/.mount_*)
+        let appdir = std::env::var("APPDIR").ok();
+        let appdir_font = appdir.as_ref()
+            .map(|d| std::path::Path::new(d).join("usr").join("bin").join("fonts").join("NotoSansJP-Regular.ttf"));
+
         let paths = [
-            "fonts/NotoSansJP-Regular.ttf",
-            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
+            exe_font.as_ref().and_then(|p| p.to_str()),
+            appdir_font.as_ref().and_then(|p| p.to_str()),
+            Some("fonts/NotoSansJP-Regular.ttf"),
+            Some("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
+            Some("/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc"),
         ];
-        for p in &paths {
+        for p in paths.iter().flatten() {
             if let Ok(data) = std::fs::read(p) {
                 if let Ok(font) = Font::from_bytes(data, fontdue::FontSettings::default()) {
                     let lm = font.horizontal_line_metrics(16.0);
@@ -168,6 +180,53 @@ pub struct PanState {
     /// Whether we've emitted a warmup fill_text to prime the font atlas.
     /// Set after the first draw frame.
     pub font_atlas_warmed: bool,
+}
+
+/// Convert a CJK character to its vertical-mode presentation form.
+/// Replaces standard CJK punctuation and fullwidth forms with Unicode
+/// vertical presentation forms (U+FE10–U+FE48) so the font renders
+/// them in the correct vertical writing position (periods/comma at top-right,
+/// brackets rotated 90°, etc.).
+fn to_vertical_glyph(ch: char) -> char {
+    match ch {
+        // ── FE10-FE19: Vertical Forms block ──
+        ','          | '\u{FF0C}' => '\u{FE10}', // ,  ， -> VERTICAL COMMA
+        '\u{3001}'                => '\u{FE11}', // 、   -> VERTICAL IDEOGRAPHIC COMMA
+        '\u{3002}'  | '\u{FF0E}' => '\u{FE12}', // 。 ． -> VERTICAL IDEOGRAPHIC FULL STOP
+        ':'         | '\u{FF1A}' => '\u{FE13}', // :  ： -> VERTICAL COLON
+        ';'         | '\u{FF1B}' => '\u{FE14}', // ;  ； -> VERTICAL SEMICOLON
+        '!'         | '\u{FF01}' => '\u{FE15}', // !  ！ -> VERTICAL EXCLAMATION MARK
+        '?'         | '\u{FF1F}' => '\u{FE16}', // ?  ？ -> VERTICAL QUESTION MARK
+        '\u{3016}'                => '\u{FE17}', // 〖   -> VERTICAL LEFT WHITE LENTICULAR BRACKET
+        '\u{3017}'                => '\u{FE18}', // 〗   -> VERTICAL RIGHT WHITE LENTICULAR BRACKET
+        '\u{2026}'                => '\u{FE19}', // …   -> VERTICAL HORIZONTAL ELLIPSIS
+
+        // ── FE30-FE48: CJK Compatibility Forms (vertical variants) ──
+        '\u{2025}'                => '\u{FE30}', // ‥   -> VERTICAL TWO DOT LEADER
+        '\u{2014}' | '\u{30FC}'  => '\u{FE31}', // — ー -> VERTICAL EM DASH
+        '\u{2013}'                => '\u{FE32}', // –   -> VERTICAL EN DASH
+        '_'                       => '\u{FE33}', // _   -> VERTICAL LOW LINE
+        '('         | '\u{FF08}' => '\u{FE35}', // (  （ -> VERTICAL LEFT PARENTHESIS
+        ')'         | '\u{FF09}' => '\u{FE36}', // )  ） -> VERTICAL RIGHT PARENTHESIS
+        '{'                       => '\u{FE37}', // {   -> VERTICAL LEFT CURLY BRACKET
+        '}'                       => '\u{FE38}', // }   -> VERTICAL RIGHT CURLY BRACKET
+        '\u{3014}'                => '\u{FE39}', // 〔   -> VERTICAL LEFT TORTOISE SHELL BRACKET
+        '\u{3015}'                => '\u{FE3A}', // 〕   -> VERTICAL RIGHT TORTOISE SHELL BRACKET
+        '\u{3010}'                => '\u{FE3B}', // 【   -> VERTICAL LEFT BLACK LENTICULAR BRACKET
+        '\u{3011}'                => '\u{FE3C}', // 】   -> VERTICAL RIGHT BLACK LENTICULAR BRACKET
+        '\u{300A}'                => '\u{FE3D}', // 《   -> VERTICAL LEFT DOUBLE ANGLE BRACKET
+        '\u{300B}'                => '\u{FE3E}', // 》   -> VERTICAL RIGHT DOUBLE ANGLE BRACKET
+        '\u{3008}'                => '\u{FE3F}', // 〈   -> VERTICAL LEFT ANGLE BRACKET
+        '\u{3009}'                => '\u{FE40}', // 〉   -> VERTICAL RIGHT ANGLE BRACKET
+        '\u{300C}'                => '\u{FE41}', // 「   -> VERTICAL LEFT CORNER BRACKET
+        '\u{300D}'                => '\u{FE42}', // 」   -> VERTICAL RIGHT CORNER BRACKET
+        '\u{300E}'                => '\u{FE43}', // 『   -> VERTICAL LEFT WHITE CORNER BRACKET
+        '\u{300F}'                => '\u{FE44}', // 』   -> VERTICAL RIGHT WHITE CORNER BRACKET
+        '['         | '\u{FF3B}' => '\u{FE47}', // [  ［ -> VERTICAL LEFT SQUARE BRACKET
+        ']'         | '\u{FF3D}' => '\u{FE48}', // ]  ］ -> VERTICAL RIGHT SQUARE BRACKET
+
+        _ => ch,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,7 +1247,9 @@ impl OcrViewer {
         let overlay = OverlayProgram {
             annotations: synced_annotations.clone(),
             img_w: self.img_w,
-            glyph_cache: self.glyph_cache.clone().unwrap_or_else(|| GlyphCache::new().unwrap_or_else(|| panic!("no glyph cache"))),
+            glyph_cache: self.glyph_cache.clone().unwrap_or_else(|| GlyphCache::new().expect(
+                "no glyph cache — verify fonts/NotoSansJP-Regular.ttf is bundled with the AppImage"
+            )),
             img_h: self.img_h,
             image: None,
             panel_visible: has_panel,
@@ -1218,7 +1279,9 @@ impl OcrViewer {
         let image_canvas = Canvas::new(OverlayProgram {
             annotations: Rc::clone(&self.annotations),
             img_w: self.img_w,
-            glyph_cache: self.glyph_cache.clone().unwrap_or_else(|| GlyphCache::new().unwrap_or_else(|| panic!("no glyph cache"))),
+            glyph_cache: self.glyph_cache.clone().unwrap_or_else(|| GlyphCache::new().expect(
+                "no glyph cache — verify fonts/NotoSansJP-Regular.ttf is bundled with the AppImage"
+            )),
             img_h: self.img_h,
             image: self.image_handle.as_ref().cloned(),
             panel_visible: false,
@@ -1539,7 +1602,7 @@ impl OcrViewer {
             for cs in line.chars {
                 let msg = Message::SelectNeighbor(line.line_idx, cs.char_idx);
                 let is_selected = cs.is_selected;
-                let text = cs.text.clone();
+                let text: String = cs.text.chars().map(to_vertical_glyph).collect();
 
                 let btn: Element<'a, Message> = Container::new(
                     Text::new(text)
@@ -1620,8 +1683,10 @@ impl OcrViewer {
                 let is_selected = c.is_selected;
                 let ch = c.char;
 
+                let vertical_ch: String = ch.to_string().chars().map(to_vertical_glyph).collect();
+
                 let btn: Element<'a, Message> = Container::new(
-                    Text::new(ch.to_string())
+                    Text::new(vertical_ch)
                         .size(Pixels(box_size * BUTTON_CHAR_RATIO))
                         .color(if is_selected { Color::BLACK } else { Color::WHITE })
                         .align_x(alignment::Horizontal::Center)
