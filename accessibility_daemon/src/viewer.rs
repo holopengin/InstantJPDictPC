@@ -877,6 +877,8 @@ pub struct OcrViewer {
     pub state: OcrOverlayState,
     pub selected_word: Option<SelectedWord>,
     pub alternatives_visible: bool,
+    /// Index of the highlighted alternative when using keyboard navigation.
+    pub alt_selected_idx: usize,
     pub db: Option<Arc<DictionaryDatabase>>,
     pub deinflector: Option<Arc<Deinflector>>,
     /// The index of the character that should be scrolled into view in the neighbor panel.
@@ -915,6 +917,7 @@ impl OcrViewer {
             state: OcrOverlayState::new(1280.0, 800.0),
             selected_word: None,
             alternatives_visible: false,
+            alt_selected_idx: 0,
             db: None,
             deinflector: None,
             scroll_neighbor_to: None,
