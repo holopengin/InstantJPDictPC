@@ -53,7 +53,7 @@ pub struct OcrOverlayState {
 }
 
 impl OcrOverlayState {
-    pub fn new() -> Self {
+    pub fn new(window_width: f32, window_height: f32) -> Self {
         Self {
             current_scale: 1.0,
             current_trans_x: 0.0,
@@ -77,15 +77,15 @@ impl OcrOverlayState {
             tapped_box_for_gravity: None,
             img_w: 0,
             img_h: 0,
-            window_width: Cell::new(800.0),
-            window_height: Cell::new(480.0),
+            window_width: Cell::new(window_width),
+            window_height: Cell::new(window_height),
             nav_graph: None,
             nav_positions: Vec::new(),
         }
     }
 
     pub fn reset(&mut self) {
-        *self = Self::new();
+        *self = Self::new(1280.0, 800.0);
     }
 
     pub fn update_global_data(&mut self) {
@@ -331,20 +331,45 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
         let char_left = tapped_box.left() as f32 * total_scale + total_offset_x;
         let char_top = tapped_box.top() as f32 * total_scale + total_offset_y;
 
+        eprintln!(
+            "[GRAVITY] img=({img_w_f},{img_h_f}) window=({root_width},{root_height}) \
+             base_scale={base_scale:.2} base_off=({base_offset_x:.0},{base_offset_y:.0}) \
+             cur_scale={sc:.2} cur_trans=({tx:.0},{ty:.0}) \
+             total_scale={ts:.2} total_off=({tox:.0},{toy:.0}) \
+             bbox=({bx},{bw}) char_center=({ccx:.0},{ccy:.0}) \
+             panel_w={pw:.0} rpl={rpl:.0} overlaps={ov} gravity={g:?}",
+            img_w_f=img_w_f, img_h_f=img_h_f,
+            root_width=root_width, root_height=root_height,
+            base_scale=base_scale,
+            base_offset_x=base_offset_x, base_offset_y=base_offset_y,
+            sc=self.current_scale,
+            tx=self.current_trans_x, ty=self.current_trans_y,
+            ts=total_scale,
+            tox=total_offset_x, toy=total_offset_y,
+            bx=tapped_box.left(), bw=tapped_box.w,
+            ccx=char_center_x, ccy=char_center_y,
+            pw=panel_width,
+            rpl=root_width - panel_width,
+            ov=char_center_x > root_width - panel_width,
+            g=self.last_landscape_gravity,
+        );
+
         // In portrait, panel takes roughly half the screen height
         let panel_height = root_height * 0.5_f32;
 
         if is_landscape {
-            // Default: panel on the left (Start)
-            // Switch to right (End) only if the character would be overlapped by the left panel.
-            // The panel occupies [0, panel_width] on the left side of the screen.
-            // Check if the character's screen-space bounding box overlaps that region.
-            let char_right = char_left + tapped_box.w as f32 * total_scale;
-            let overlaps_panel = char_right > 0.0 && char_left < panel_width;
+            // Default: panel on the right (End)
+            // Switch to left (Start) only if the character's center would be
+            // overlapped by the right panel (i.e. its center is past the
+            // panel's left edge). Using center rather than right edge avoids
+            // bouncing between similarly-positioned characters whose widths
+            // happen to tip one over the panel boundary.
+            let right_panel_left = root_width - panel_width;
+            let overlaps_panel = char_center_x > right_panel_left;
             self.last_landscape_gravity = if overlaps_panel {
-                Gravity::End
-            } else {
                 Gravity::Start
+            } else {
+                Gravity::End
             };
         } else {
             // Default: panel at top (Top)
