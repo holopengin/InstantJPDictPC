@@ -1007,9 +1007,10 @@ impl OcrViewer {
         self.state.update_highlight_coords(line_idx, char_idx, 1);
         self.compute_scroll_targets(line_idx, char_idx);
 
-        // If the dictionary panel is open, reposition it so it doesn't overlap
-        // the newly highlighted character.
-        if self.state.is_dictionary_visible {
+        // If the dictionary panel is open and we're at default zoom (no panning),
+        // flip the panel side when the character would be underneath it.
+        // When zoomed in, the view pans instead — the panel stays put.
+        if self.state.current_scale <= 1.01 {
             if let Some(box_item) = self.state.active_line_results.get(line_idx)
                 .and_then(|l| l.as_ref())
                 .and_then(|line| line.char_boxes.get(char_idx))
@@ -1042,14 +1043,29 @@ impl OcrViewer {
                     let sh = (char_box.h as f32).max(1.0) * total_scale;
 
                     let margin = 30.0; // px margin from screen edge
+                    let panel_margin = 10.0; // px margin from panel edge
 
-                    // Pan horizontally — keep the full character visible
-                    if sx + sw > self.window_width - margin {
-                        let overshoot = (sx + sw) - (self.window_width - margin);
+                    // Compute the allowed visible region accounting for the panel.
+                    // If the panel is open, keep the character from being pushed under it.
+                    let (vis_left, vis_right) = if self.state.is_dictionary_visible {
+                        let pw = self.panel_width();
+                        let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
+                        if panel_on_right {
+                            (margin, self.window_width - pw - panel_margin)
+                        } else {
+                            (pw + panel_margin, self.window_width - margin)
+                        }
+                    } else {
+                        (margin, self.window_width - margin)
+                    };
+
+                    // Pan horizontally — keep the full character within the visible region
+                    if sx + sw > vis_right {
+                        let overshoot = (sx + sw) - vis_right;
                         self.state.current_trans_x -= overshoot;
                     }
-                    if sx < margin {
-                        self.state.current_trans_x += margin - sx;
+                    if sx < vis_left {
+                        self.state.current_trans_x += vis_left - sx;
                     }
 
                     // Pan vertically

@@ -44,8 +44,15 @@ static GP_COUNT: AtomicU32 = AtomicU32::new(0);
 // Repeat state (set by Navigate handler, checked by ZoomTick)
 static GP_REPEAT_ACTION: std::sync::Mutex<Option<(GamepadAction, Instant)>> =
     std::sync::Mutex::new(None);
+/// Keyboard-held navigation action (set on KeyPressed, cleared on KeyReleased).
+static KB_ACTION_HELD: std::sync::Mutex<Option<(GamepadAction, Instant)>> =
+    std::sync::Mutex::new(None);
 /// Number of repeat ticks already fired (used by ZoomTick to avoid over-firing).
 static GP_LAST_REPEAT: AtomicU64 = AtomicU64::new(0);
+/// Repeat delay before auto-repeat kicks in (ms).
+const REPEAT_DELAY_MS: u64 = 250;
+/// Interval between repeat ticks (ms) — 20 repeats/s.
+const REPEAT_INTERVAL_MS: u64 = 40;
 
 const B_UP: u32 = 1 << 0;
 const B_DOWN: u32 = 1 << 1;
@@ -531,10 +538,16 @@ fn run_ocr_viewer(
                         let has_graph = state.state.nav_graph.is_some();
                         let result = state.state.navigate(dir);
                         eprintln!("[NAV] navigate({dir:?}) → {result}, cursor was {cursor_before:?}, graph={has_graph}");
-                        state.defer_lookup = true;
+                        // First press: do lookup immediately.
+                        // Repeats (handled in ZoomTick) will set defer_lookup = true
+                        // so lookups stop. On key-up the deferred final lookup fires.
+                        state.defer_lookup = false;
                         if let Some((li, ci)) = state.state.current_cursor() {
                             state.move_cursor_to(li, ci);
-                            eprintln!("[NAV] moved cursor to ({li},{ci})");
+                            if state.state.is_dictionary_visible {
+                                state.do_lookup(li, ci);
+                                state.compute_scroll_targets(li, ci);
+                            }
                         } else {
                             eprintln!("[NAV] no cursor after navigate");
                         }
@@ -589,17 +602,24 @@ fn run_ocr_viewer(
             }
             Message::ZoomTick => {
                 if state.zoom_idle_frames > 3 { state.is_zooming = false; }
-                let bits = GP_BITS.load(Ordering::Relaxed);
-                let held = bits & (B_UP|B_DOWN|B_LEFT|B_RIGHT|B_L1|B_R1);
-                if held != 0 {
-                    let mut ra = GP_REPEAT_ACTION.lock().unwrap();
-                    if let Some((action, started)) = *ra {
+                let gp_held = GP_BITS.load(Ordering::Relaxed) & (B_UP|B_DOWN|B_LEFT|B_RIGHT|B_L1|B_R1);
+                let kb_held = KB_ACTION_HELD.lock().unwrap().is_some();
+                if gp_held != 0 || kb_held {
+                    let ra = if kb_held {
+                        KB_ACTION_HELD.lock().unwrap().clone()
+                    } else {
+                        GP_REPEAT_ACTION.lock().unwrap().clone()
+                    };
+                    if let Some((action, started)) = ra {
                         let elapsed = started.elapsed();
-                        if elapsed >= std::time::Duration::from_millis(500) {
-                            let total = ((elapsed.as_millis() - 500) / 50) as u64;
+                        if elapsed >= std::time::Duration::from_millis(REPEAT_DELAY_MS) {
+                            let total = ((elapsed.as_millis() - REPEAT_DELAY_MS as u128) / REPEAT_INTERVAL_MS as u128) as u64;
                             let last = GP_LAST_REPEAT.load(Ordering::Relaxed);
                             if total > last {
                                 GP_LAST_REPEAT.store(total, Ordering::Relaxed);
+                                // Defer lookups during repeat — the final position
+                                // will be looked up on key release.
+                                state.defer_lookup = true;
                                 match action {
                                     GamepadAction::NavigateUp | GamepadAction::NavigateDown
                                     | GamepadAction::NavigateLeft | GamepadAction::NavigateRight => {
@@ -691,33 +711,49 @@ fn run_ocr_viewer(
                             event: iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }),
                             ..
                         } => {
-                            if *key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
-                                || *key == iced::keyboard::Key::Character("q".into()) {
-                                return Some(Message::Back);
+                            // If we already have a held keyboard action, this is an
+                            // OS-level key repeat — ignore it. Only our ZoomTick
+                            // repeat (300ms/20Hz) handles repeat navigation.
+                            if KB_ACTION_HELD.lock().unwrap().is_some() {
+                                return None;
                             }
-                            if *key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) {
-                                return Some(Message::Navigate(GamepadAction::Confirm));
-                            }
-                            let action = match key {
+                            let nav_action = match key {
+                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
+                                    || *k == iced::keyboard::Key::Character("q".into()) =>
+                                    return Some(Message::Back),
+                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) =>
+                                    GamepadAction::Confirm,
                                 k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight)
-                                    || *k == iced::keyboard::Key::Character("l".into()) => Some(GamepadAction::NavigateRight),
+                                    || *k == iced::keyboard::Key::Character("l".into()) => GamepadAction::NavigateRight,
                                 k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft)
-                                    || *k == iced::keyboard::Key::Character("h".into()) => Some(GamepadAction::NavigateLeft),
+                                    || *k == iced::keyboard::Key::Character("h".into()) => GamepadAction::NavigateLeft,
                                 k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown)
-                                    || *k == iced::keyboard::Key::Character("j".into()) => Some(GamepadAction::NavigateDown),
+                                    || *k == iced::keyboard::Key::Character("j".into()) => GamepadAction::NavigateDown,
                                 k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp)
-                                    || *k == iced::keyboard::Key::Character("k".into()) => Some(GamepadAction::NavigateUp),
-                                _ => None,
+                                    || *k == iced::keyboard::Key::Character("k".into()) => GamepadAction::NavigateUp,
+                                k if *k == iced::keyboard::Key::Character("d".into()) => GamepadAction::ScrollDown,
+                                k if *k == iced::keyboard::Key::Character("f".into()) => GamepadAction::ScrollUp,
+                                _ => return None,
                             };
-                            if let Some(a) = action {
-                                return Some(Message::Navigate(a));
-                            }
-                            // Dictionary scroll: D=scroll down, F=scroll up
-                            if *key == iced::keyboard::Key::Character("d".into()) {
-                                return Some(Message::Navigate(GamepadAction::ScrollDown));
-                            }
-                            if *key == iced::keyboard::Key::Character("f".into()) {
-                                return Some(Message::Navigate(GamepadAction::ScrollUp));
+                            // Set keyboard repeat tracking so ZoomTick can fire repeats.
+                            *KB_ACTION_HELD.lock().unwrap() = Some((nav_action, Instant::now()));
+                            return Some(Message::Navigate(nav_action));
+                        }
+                        iced_futures::subscription::Event::Interaction {
+                            event: iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { key, .. }),
+                            ..
+                        } => {
+                            // Clear keyboard repeat on any navigation-key release.
+                            let is_nav = matches!(key,
+                                iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp)
+                                | iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown)
+                                | iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft)
+                                | iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight)
+                                | iced::keyboard::Key::Character(_)
+                            );
+                            if is_nav {
+                                *KB_ACTION_HELD.lock().unwrap() = None;
+                                GP_LAST_REPEAT.store(0, Ordering::Relaxed);
                             }
                             None
                         }
