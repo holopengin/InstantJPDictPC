@@ -912,7 +912,7 @@ impl OcrViewer {
             window_width: 1280.0,
             window_height: 720.0,
             annotations: Rc::new(Vec::new()),
-            state: OcrOverlayState::new(),
+            state: OcrOverlayState::new(1280.0, 800.0),
             selected_word: None,
             alternatives_visible: false,
             db: None,
@@ -1006,6 +1006,18 @@ impl OcrViewer {
         // Highlight just the one character at the cursor position.
         self.state.update_highlight_coords(line_idx, char_idx, 1);
         self.compute_scroll_targets(line_idx, char_idx);
+
+        // If the dictionary panel is open, reposition it so it doesn't overlap
+        // the newly highlighted character.
+        if self.state.is_dictionary_visible {
+            if let Some(box_item) = self.state.active_line_results.get(line_idx)
+                .and_then(|l| l.as_ref())
+                .and_then(|line| line.char_boxes.get(char_idx))
+                .cloned()
+            {
+                self.state.update_gravity(&box_item, self.panel_width());
+            }
+        }
 
         // Keep the selected character visible on screen by panning if needed.
         // At default zoom (1.0) the full image is already visible — skip panning.

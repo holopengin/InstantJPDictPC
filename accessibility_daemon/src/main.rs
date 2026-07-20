@@ -581,7 +581,12 @@ fn run_ocr_viewer(
                 state.is_zooming = true; state.zoom_idle_frames = 0;
             }
             Message::PinchEnd => { state.is_zooming = false; state.zoom_idle_frames = 0; }
-            Message::WindowResized { width, height } => { state.window_width = width as f32; state.window_height = height as f32; }
+            Message::WindowResized { width, height } => {
+                state.window_width = width as f32;
+                state.window_height = height as f32;
+                state.state.window_width.set(width as f32);
+                state.state.window_height.set(height as f32);
+            }
             Message::ZoomTick => {
                 if state.zoom_idle_frames > 3 { state.is_zooming = false; }
                 let bits = GP_BITS.load(Ordering::Relaxed);
