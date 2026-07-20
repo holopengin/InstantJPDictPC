@@ -21,6 +21,7 @@ use iced::{
 };
 
 use crate::data::db::DictionaryDatabase;
+use crate::data::models::DictionaryEntry;
 use crate::models::*;
 use crate::overlay_state::OcrOverlayState;
 use crate::util::deinflector::Deinflector;
@@ -626,8 +627,8 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
         let mut frame = Frame::new(renderer, bounds.size());
         let (base_scale, base_offset_x, base_offset_y) = self.base_transform(bounds);
         let total_scale = base_scale * self.current_scale;
-        let total_offset_x = base_offset_x + self.current_trans_x;
-        let total_offset_y = base_offset_y + self.current_trans_y;
+        let total_offset_x = (base_offset_x + self.current_trans_x).round();
+        let total_offset_y = (base_offset_y + self.current_trans_y).round();
 
         // Warm up the font atlas on the very first frame by rendering an off-screen
         // character. This populates Iced's internal cosmic-text glyph cache *before*
@@ -1088,10 +1089,20 @@ impl OcrViewer {
     }
 
     pub(crate) fn do_lookup(&mut self, line_idx: usize, char_idx: usize) {
-        let Some(line) = self.state.active_line_results.get(line_idx).and_then(|l| l.as_ref()) else { return; };
-        let Some(box_item) = line.char_boxes.get(char_idx) else { return; };
-        let text = line.text.chars().skip(char_idx).take(3).collect::<String>();
-        self.selected_word = Some(SelectedWord { line_idx, char_idx, text, box_item: box_item.clone() });
+        let (text, full_line_text) = {
+            let Some(line) = self.state.active_line_results.get(line_idx)
+                .and_then(|l| l.as_ref()) else { return; };
+            let Some(box_item) = line.char_boxes.get(char_idx) else { return; };
+            let text = line.text.chars().skip(char_idx).take(3).collect::<String>();
+            let full_line_text = line.text.clone();
+            self.selected_word = Some(SelectedWord {
+                line_idx,
+                char_idx,
+                text,
+                box_item: box_item.clone(),
+            });
+            (self.selected_word.as_ref().unwrap().text.clone(), full_line_text)
+        };
         // Only look up if db/deinflector are loaded (bootstrap may not be done yet)
         if let (Some(db), Some(deinf)) = (self.db.as_ref(), self.deinflector.as_ref()) {
             if let Some(result) = self.state.lookup(line_idx, char_idx, db, deinf) {
@@ -1099,6 +1110,41 @@ impl OcrViewer {
                 self.state.current_word_length = result.max_len;
                 // Highlight the full matched word in yellow (like Kotlin)
                 self.state.update_highlight_coords(line_idx, char_idx, result.max_len);
+
+                // ── Second pass: look up each individual kanji in the matched term ──
+                let term_len = result.max_len;
+                let matched_term: String =
+                    full_line_text.chars().skip(char_idx).take(term_len).collect();
+                let mut append_kanji: Vec<FormattedEntry> = Vec::new();
+                for (i, ch) in matched_term.chars().enumerate() {
+                    // Only CJK Unified Ideographs (kanji)
+                    if !('\u{4E00}'..='\u{9FFF}').contains(&ch)
+                        && !('\u{3400}'..='\u{4DBF}').contains(&ch) {
+                        continue;
+                    }
+                    let kanji_str = ch.to_string();
+                    // Deduplicate: skip if this kanji already has an entry from the
+                    // first-pass term lookup or we already appended it above
+                    if self.state.cached_entries.iter().any(|e| e.term == kanji_str)
+                        || append_kanji.iter().any(|e| e.term == kanji_str) {
+                        continue;
+                    }
+                    if let Ok(kanji_results) = db.find_by_texts(&[kanji_str.clone()]) {
+                        let kanji_only: Vec<DictionaryEntry> = kanji_results
+                            .into_iter()
+                            .filter(|e| e.onyomi.is_some() || e.kunyomi.is_some())
+                            .collect();
+                        if !kanji_only.is_empty() {
+                            let formatted = self.state.format_dictionary_results(
+                                &[(kanji_str.clone(), kanji_only)],
+                            );
+                            append_kanji.extend(formatted);
+                        }
+                    }
+                }
+                if !append_kanji.is_empty() {
+                    self.state.cached_entries.extend(append_kanji);
+                }
             } else {
                 self.state.cached_entries.clear();
                 self.state.current_word_length = 1;
@@ -1505,8 +1551,8 @@ impl OcrViewer {
                 let mut row = Row::new().spacing(6).align_y(alignment::Vertical::Center);
                 row = row.push(Text::new(hw.kanji.clone()).size(36).color(cyan)
                     .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }));
-                if let Some(o) = &hw.onyomi { row = row.push(Text::new(format!("ON: {o}")).size(14).color(gray)); }
-                if let Some(k) = &hw.kunyomi { row = row.push(Text::new(format!("KUN: {k}")).size(14).color(gray)); }
+                if let Some(o) = &hw.onyomi { row = row.push(Text::new(format!("音: {o}")).size(14).color(gray)); }
+                if let Some(k) = &hw.kunyomi { row = row.push(Text::new(format!("訓: {k}")).size(14).color(gray)); }
                 content = content.push(row);
             }
         } else {

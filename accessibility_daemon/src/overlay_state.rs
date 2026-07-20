@@ -637,7 +637,7 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
     }
 
     /// Format dictionary results into displayable entries.
-    fn format_dictionary_results(
+    pub fn format_dictionary_results(
         &self,
         matches: &[(String, Vec<DictionaryEntry>)],
     ) -> Vec<FormattedEntry> {
