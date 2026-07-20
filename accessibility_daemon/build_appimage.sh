@@ -28,5 +28,9 @@ rm -rf AppDir
 mkdir -p AppDir/usr/bin/fonts
 cp fonts/NotoSansJP-Regular.ttf AppDir/usr/bin/fonts/
 
+# Bundle OCR models and asset files
+mkdir -p AppDir/usr/bin/assets
+cp -r assets/* AppDir/usr/bin/assets/
+
 # Create the AppImage
 ./quick-sharun --make-appimage
