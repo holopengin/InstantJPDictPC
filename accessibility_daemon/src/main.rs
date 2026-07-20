@@ -65,6 +65,37 @@ const B_R1: u32 = 1 << 7;
 const B_L2: u32 = 1 << 8;
 const B_R2: u32 = 1 << 9;
 
+/// Resolve a single asset file path, checking binary-relative and AppImage paths.
+fn resolve_asset_path(filename: &str) -> String {
+    let dir = resolve_asset_dir();
+    format!("{}/{}", dir, filename)
+}
+
+/// Resolve the assets directory, checking binary-relative and AppImage paths.
+fn resolve_asset_dir() -> String {
+    // Binary-relative: next to the executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let p = parent.join("assets");
+            if p.exists() {
+                return p.to_string_lossy().to_string();
+            }
+        }
+    }
+    // AppImage mount: $APPDIR/usr/bin/assets/
+    if let Ok(appdir) = std::env::var("APPDIR") {
+        let p = std::path::Path::new(&appdir)
+            .join("usr")
+            .join("bin")
+            .join("assets");
+        if p.exists() {
+            return p.to_string_lossy().to_string();
+        }
+    }
+    // Fallback: relative to CWD
+    "./assets".to_string()
+}
+
 fn start_evdev_thread() {
     std::thread::spawn(|| {
         use evdev::{Device, EventType, AbsoluteAxisCode, KeyCode};
@@ -384,8 +415,9 @@ fn run_ocr_viewer(
             if bootstrap_tx.send(BootstrapMsg::DictReady(Arc::new(db))).is_err() { return; }
 
             // Phase 3: load deinflector
-            let deinf = Deinflector::from_json_file("assets/deinflect.json").unwrap_or_else(|e| {
-                eprintln!("[Bootstrap] Warning: deinflector: {e}");
+            let deinf_path = resolve_asset_path("deinflect.json");
+            let deinf = Deinflector::from_json_file(&deinf_path).unwrap_or_else(|e| {
+                eprintln!("[Bootstrap] Warning: deinflector {deinf_path}: {e}");
                 Deinflector::empty()
             });
             println!("[Bootstrap] Deinflector loaded: {} rules", deinf.rule_count());
@@ -395,7 +427,7 @@ fn run_ocr_viewer(
             #[cfg(feature = "ort")]
             {
                 let t_engine = std::time::Instant::now();
-                let mut engine = match ocr_engine::OcrEngine::new("./assets", recognition_mode, batch_size) {
+                let mut engine = match ocr_engine::OcrEngine::new(&resolve_asset_dir(), recognition_mode, batch_size) {
                     Ok(e) => e,
                     Err(err) => { eprintln!("[Bootstrap] OCR engine error: {err}"); return; }
                 };
@@ -623,9 +655,13 @@ fn run_ocr_viewer(
                                 match action {
                                     GamepadAction::NavigateUp | GamepadAction::NavigateDown
                                     | GamepadAction::NavigateLeft | GamepadAction::NavigateRight => {
-                                        state.state.navigate(action);
-                                        if let Some((li, ci)) = state.state.current_cursor() {
-                                            state.move_cursor_to(li, ci);
+                                        if state.alternatives_visible {
+                                            navigate_alternatives(state, action);
+                                        } else {
+                                            state.state.navigate(action);
+                                            if let Some((li, ci)) = state.state.current_cursor() {
+                                                state.move_cursor_to(li, ci);
+                                            }
                                         }
                                     }
                                     GamepadAction::ScrollUp => handle_dict_scroll(state, -1.0),
@@ -722,7 +758,7 @@ fn run_ocr_viewer(
                                     || *k == iced::keyboard::Key::Character("q".into()) =>
                                     return Some(Message::Back),
                                 k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) =>
-                                    GamepadAction::Confirm,
+                                    return Some(Message::Navigate(GamepadAction::Confirm)),
                                 k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight)
                                     || *k == iced::keyboard::Key::Character("l".into()) => GamepadAction::NavigateRight,
                                 k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft)
