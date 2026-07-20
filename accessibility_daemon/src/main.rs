@@ -648,6 +648,7 @@ fn run_ocr_viewer(
             size: iced::Size::new(1280.0, 800.0),
             ..Default::default()
         })
+        .antialiasing(false)
         .subscription(|_state: &OcrViewer| {
             let gp_events = iced::time::every(iced::time::Duration::from_millis(16))
                 .map(|_| {
