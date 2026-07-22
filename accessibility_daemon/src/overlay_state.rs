@@ -85,7 +85,9 @@ impl OcrOverlayState {
     }
 
     pub fn reset(&mut self) {
-        *self = Self::new(1280.0, 800.0);
+        let w = self.window_width.get();
+        let h = self.window_height.get();
+        *self = Self::new(w, h);
     }
 
     pub fn update_global_data(&mut self) {

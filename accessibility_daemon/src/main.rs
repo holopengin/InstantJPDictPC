@@ -336,6 +336,92 @@ fn run_settings_window(db: Arc<DictionaryDatabase>) -> Result<()> {
     Ok(())
 }
 
+/// Try to detect the primary monitor's native resolution.
+/// Methods tried in order:
+///   1. Linux DRM sysfs (/sys/class/drm/*/modes) — works on any modern Linux
+///   2. xrandr (X11)
+///   3. wlr‑randr (Wayland wlroots)
+fn get_screen_size() -> Option<(f32, f32)> {
+    // ── 1. Linux DRM sysfs — no external tool needed ──
+    {
+        let drm_dir = std::path::Path::new("/sys/class/drm");
+        if let Ok(entries) = std::fs::read_dir(drm_dir) {
+            for entry in entries.flatten() {
+                let status_path = entry.path().join("status");
+                let ok = std::fs::read_to_string(&status_path).ok()
+                    .map(|s| s.trim() == "connected")
+                    .unwrap_or(false);
+                if !ok { continue; }
+                let modes_path = entry.path().join("modes");
+                if let Ok(modes) = std::fs::read_to_string(&modes_path) {
+                    for line in modes.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() { continue; }
+                        if let Some(x_idx) = trimmed.find('x') {
+                            if let Ok(w) = trimmed[..x_idx].parse::<f32>() {
+                                let after_x = &trimmed[x_idx + 1..];
+                                let h_end = after_x.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_x.len());
+                                if let Ok(h) = after_x[..h_end].parse::<f32>() {
+                                    return Some((w, h));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 2. xrandr (X11) ──
+    if let Ok(out) = std::process::Command::new("xrandr")
+        .arg("--current")
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        // e.g. "Screen 0: minimum 320 x 200, current 1920 x 1080, maximum …"
+        for line in text.lines() {
+            if let Some(rest) = line.find("current ") {
+                let after = &line[rest + 8..];
+                if let Some(x_idx) = after.find('x') {
+                    let w_str = after[..x_idx].trim();
+                    if let Ok(w) = w_str.parse::<f32>() {
+                        let after_x = after[x_idx + 1..].trim();
+                        // Find the next non-digit character (space or comma)
+                        let h_end = after_x.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_x.len());
+                        if let Ok(h) = after_x[..h_end].parse::<f32>() {
+                            return Some((w, h));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── wlr‑randr (Wayland wlroots) ──
+    if let Ok(out) = std::process::Command::new("wlr-randr")
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        // Look for "Mode: 1920x1080 @" in the first connected output
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if let Some(mode) = trimmed.strip_prefix("Mode: ") {
+                if let Some(x_idx) = mode.find('x') {
+                    if let Ok(w) = mode[..x_idx].parse::<f32>() {
+                        let after_x = &mode[x_idx + 1..];
+                        let h_end = after_x.find(|c: char| c == '@' || c == ' ').unwrap_or(after_x.len());
+                        if let Ok(h) = after_x[..h_end].parse::<f32>() {
+                            return Some((w, h));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn run_ocr_viewer(
     args: Vec<String>,
 ) -> Result<()> {
@@ -495,7 +581,19 @@ fn run_ocr_viewer(
     let ocr_rx = Arc::new(std::sync::Mutex::new(Some(ocr_rx)));
     let ocr_rx_update = Arc::clone(&ocr_rx);
 
-    let boot = move || OcrViewer::new_empty();
+    // Detect native screen resolution for UI scaling.
+    // Scale factor = screen_w / 1280 so that the logical viewport is always
+    // 1280 wide regardless of physical resolution.
+    let (screen_w, screen_h) = get_screen_size().unwrap_or((1280.0, 800.0));
+    let ui_scale = screen_w / 1280.0;
+    println!(
+        "[SCALE] detected screen {screen_w:.0}x{screen_h:.0}, ui_scale={ui_scale:.3} — \
+         logical viewport {:.0}x{:.0}",
+        1280.0,
+        screen_h / ui_scale,
+    );
+
+    let boot = move || OcrViewer::new_empty(screen_w, screen_h);
 
     let update = move |state: &mut OcrViewer, msg: Message| -> iced::Task<Message> {
         // Drain bootstrap channel (image, dict, deinflector)
@@ -631,6 +729,24 @@ fn run_ocr_viewer(
                 state.window_height = height as f32;
                 state.state.window_width.set(width as f32);
                 state.state.window_height.set(height as f32);
+                // Iced converts the winit physical-size event to logical pixels
+                // by dividing by total_scale (native_display * app_scale_factor).
+                // We reverse this to recover the physical window width:
+                //   logical = physical / (native * app_scale)
+                //   physical = logical * native * app_scale
+                //   new_app_scale = physical / 1280.0
+                // On the first resize we deduce native_scale from the known
+                // initial physical screen width.
+                let app_scale = state.debounced_ui_scale;
+                if state.native_scale == 0.0 && app_scale > 0.0 {
+                    state.native_scale = (state.screen_physical_width
+                        / (width as f32 * app_scale))
+                        .clamp(0.5, 4.0);
+                }
+                if state.native_scale > 0.0 && app_scale > 0.0 {
+                    let physical_w = width as f32 * state.native_scale * app_scale;
+                    state.debounced_ui_scale = (physical_w / 1280.0).max(0.5);
+                }
             }
             Message::ZoomTick => {
                 if state.zoom_idle_frames > 3 { state.is_zooming = false; }
@@ -706,10 +822,11 @@ fn run_ocr_viewer(
 
     let app = iced::application(boot, update, OcrViewer::view)
         .window(iced::window::Settings {
-            size: iced::Size::new(1280.0, 800.0),
+            size: iced::Size::new(screen_w, screen_h),
             ..Default::default()
         })
         .antialiasing(false)
+        .scale_factor(|state: &OcrViewer| state.debounced_ui_scale)
         .subscription(|_state: &OcrViewer| {
             let gp_events = iced::time::every(iced::time::Duration::from_millis(16))
                 .map(|_| {

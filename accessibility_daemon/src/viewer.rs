@@ -899,22 +899,34 @@ pub struct OcrViewer {
     /// Fontdue-based glyph rasterization cache. Bypasses cosmic-text to avoid
     /// font atlas corruption triggered by rendering OCR text via Iced's pipeline.
     pub glyph_cache: Option<Rc<RefCell<GlyphCache>>>,
+    /// Native screen width (physical pixels, detected at startup). Used to
+    /// deduce the window system's native scale factor from the first resize.
+    pub screen_physical_width: f32,
+    /// Window system's native scale factor (e.g. 1.0, 2.0 on HiDPI).
+    /// Deduced from the first WindowResized event: native_scale = physical / (logical * app_scale).
+    /// 0.0 means "not yet determined".
+    pub native_scale: f32,
+    /// Dynamic UI scale factor for iced's built-in scale_factor.
+    /// Recalculated from the physical window width after each resize:
+    /// debounced_ui_scale = physical_width / 1280.0
+    pub debounced_ui_scale: f32,
 }
 
 impl OcrViewer {
     /// Create a minimal viewer with no image, no db, no annotations.
     /// Everything is populated asynchronously via bootstrap events.
-    pub fn new_empty() -> Self {
+    /// `window_w` / `window_h` should be the native screen resolution (in physical pixels).
+    pub fn new_empty(window_w: f32, window_h: f32) -> Self {
         Self {
             image_handle: None,
             image_bytes: None,
             decoded_image: RefCell::new(None),
             img_w: 1,
             img_h: 1,
-            window_width: 1280.0,
-            window_height: 720.0,
+            window_width: window_w,
+            window_height: window_h,
             annotations: Rc::new(Vec::new()),
-            state: OcrOverlayState::new(1280.0, 800.0),
+            state: OcrOverlayState::new(window_w, window_h),
             selected_word: None,
             alternatives_visible: false,
             alt_selected_idx: 0,
@@ -928,6 +940,9 @@ impl OcrViewer {
             zoom_idle_frames: 0,
             cached_preview: RefCell::new(None),
             glyph_cache: GlyphCache::new(),
+            screen_physical_width: window_w,
+            native_scale: 0.0,
+            debounced_ui_scale: window_w / 1280.0,
         }
     }
 
@@ -1190,8 +1205,8 @@ impl OcrViewer {
         let dict_width: f32 = 300.0;
         let neigh_width: f32 = 42.0;
         let alt_width: f32 = 42.0;
-        let spacing: f32 = 2.0; // Row::new().spacing(2)
-        let padding: f32 = 4.0; // Container::padding(2) on each side
+        let spacing: f32 = 2.0;
+        let padding: f32 = 4.0;
         dict_width + neigh_width + alt_width + spacing + padding
     }
 
