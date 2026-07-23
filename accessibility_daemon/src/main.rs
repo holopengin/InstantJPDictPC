@@ -353,6 +353,22 @@ fn get_screen_size() -> Option<(f32, f32)> {
 
 /// Inner implementation — orientation‑agnostic resolution detection.
 fn _get_screen_size_inner() -> Option<(f32, f32)> {
+    // ── 0. Gamescope — environment variables set by the compositor ──
+    // On Steam Deck / Gamescope, GAMESCOPE_WIDTH/HEIGHT reflect the actual
+    // output resolution (external display, dock, etc.), not just the internal
+    // panel. Check this first so we ignore DRM sysfs on the internal panel.
+    {
+        let gw = std::env::var("GAMESCOPE_WIDTH").ok()
+            .and_then(|v| v.parse::<f32>().ok());
+        let gh = std::env::var("GAMESCOPE_HEIGHT").ok()
+            .and_then(|v| v.parse::<f32>().ok());
+        if let (Some(w), Some(h)) = (gw, gh) {
+            if w > 0.0 && h > 0.0 {
+                return Some((w, h));
+            }
+        }
+    }
+
     // ── 1. Linux DRM sysfs — no external tool needed ──
     {
         let drm_dir = std::path::Path::new("/sys/class/drm");
