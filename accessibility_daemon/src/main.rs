@@ -341,7 +341,18 @@ fn run_settings_window(db: Arc<DictionaryDatabase>) -> Result<()> {
 ///   1. Linux DRM sysfs (/sys/class/drm/*/modes) — works on any modern Linux
 ///   2. xrandr (X11)
 ///   3. wlr‑randr (Wayland wlroots)
+///
+/// Returns dimensions in landscape orientation: if the detected height exceeds
+/// the width (e.g. Steam Deck's 800×1280 native portrait panel), they are
+/// swapped so the caller always gets (landscape_w, landscape_h).
 fn get_screen_size() -> Option<(f32, f32)> {
+    let result = _get_screen_size_inner();
+    // Normalise to landscape: if height > width, swap.
+    result.map(|(w, h)| if h > w { (h, w) } else { (w, h) })
+}
+
+/// Inner implementation — orientation‑agnostic resolution detection.
+fn _get_screen_size_inner() -> Option<(f32, f32)> {
     // ── 1. Linux DRM sysfs — no external tool needed ──
     {
         let drm_dir = std::path::Path::new("/sys/class/drm");
