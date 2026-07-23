@@ -630,6 +630,14 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
         let total_offset_x = (base_offset_x + self.current_trans_x).round();
         let total_offset_y = (base_offset_y + self.current_trans_y).round();
 
+        // Fill the image canvas with black so any gap around the scaled image
+        // (due to aspect-ratio mismatch) is black, not the window's white background.
+        // Only do this on the actual image canvas (the one that has an image handle),
+        // not on the annotation canvas during zoom-out blanking.
+        if self.image.is_some() {
+            frame.fill_rectangle(Point::ORIGIN, bounds.size(), Color::BLACK);
+        }
+
         // Warm up the font atlas on the very first frame by rendering an off-screen
         // character. This populates Iced's internal cosmic-text glyph cache *before*
         // OCR results arrive and trigger a burst of fill_text calls. Without this,
@@ -1379,9 +1387,11 @@ impl OcrViewer {
         let image_canvas = Canvas::new(OverlayProgram {
             annotations: Rc::clone(&self.annotations),
             img_w: self.img_w,
-            glyph_cache: self.glyph_cache.clone().unwrap_or_else(|| GlyphCache::new().expect(
-                "no glyph cache — verify fonts/NotoSansJP-Regular.ttf is bundled with the AppImage"
-            )),
+            glyph_cache: self.glyph_cache.clone().unwrap_or_else(|| {
+                GlyphCache::new().expect(
+                    "no glyph cache — verify fonts/NotoSansJP-Regular.ttf is bundled with the AppImage"
+                )
+            }),
             img_h: self.img_h,
             image: self.image_handle.as_ref().cloned(),
             panel_visible: false,
@@ -1399,7 +1409,9 @@ impl OcrViewer {
             nav_edges_initial: None,
             nav_edges_final: None,
             nav_centers: Vec::new(),
-        }).width(Length::Fill).height(Length::Fill);
+        })
+        .width(Length::Fill)
+        .height(Length::Fill);
 
         if !has_panel {
             return Container::new(Stack::new().push(image_canvas).push(annotation_canvas))
