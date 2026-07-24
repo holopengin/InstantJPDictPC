@@ -128,7 +128,9 @@ impl OcrOverlayState {
                 .flat_map(|line| line.chunk_boxes.clone()),
         );
         self.update_global_data();
-        self.build_nav_graph();
+        // Nav graph is rebuilt lazily via mark_nav_dirty() + rebuild_nav_if_dirty()
+        // called on Tick and before navigate(). Do NOT call build_nav_graph() here
+        // — it's too expensive per streaming result.
     }
 
     pub fn get_global_idx(&self, line_idx: usize, char_idx_in_line: usize) -> usize {

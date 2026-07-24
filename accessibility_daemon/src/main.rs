@@ -538,18 +538,14 @@ fn run_ocr_viewer(
                 }
             }
         }
-        // Drain OCR channel (detection boxes + recognition results)
-        // Process up to 5 results per frame. This keeps the UI responsive
-        // while preventing pile-ups at low frame rates. The nav graph is
-        // deferred (mark_nav_dirty), so each handle call is cheap (~3ms).
+        // Track whether we drained anything — if so, schedule the next frame
+        // immediately so we keep draining until the channel is empty.
+        let mut had_ocr_work = false;
         if let Ok(mut guard) = ocr_rx_update.lock() {
             if let Some(rx) = guard.as_mut() {
-                for _ in 0..5 {
-                    if let Ok((idx, ann)) = rx.try_recv() {
-                        state.handle_ocr_recognition_result(idx, ann);
-                    } else {
-                        break;
-                    }
+                while let Ok((idx, ann)) = rx.try_recv() {
+                    had_ocr_work = true;
+                    state.handle_ocr_recognition_result(idx, ann);
                 }
             }
         }
@@ -735,8 +731,8 @@ fn run_ocr_viewer(
             Message::OcrDetectionComplete(_) | Message::OcrRecognitionResult(_, _)
                 | Message::OcrAllDone => {}
             Message::Tick => {
-                // Rebuild nav graph if dirty (streaming OCR results skip it).
-                state.state.rebuild_nav_if_dirty();
+                // Nav graph rebuild is deferred to navigate() — no need
+                // to rebuild here every frame during streaming.
             }
         }
         if matches!(msg, Message::ZoomOnCursor { .. } | Message::PanDelta { .. } | Message::PanStart { .. } | Message::PinchZoom { .. }) {
@@ -751,7 +747,18 @@ fn run_ocr_viewer(
         if let Some(delta) = state.dict_scroll_request.take() {
             tasks.push(state.scroll_dict_by_delta(delta));
         }
-        if tasks.is_empty() { iced::Task::none() } else { iced::Task::batch(tasks) }
+        if tasks.is_empty() {
+            if had_ocr_work {
+                iced::Task::perform(async {}, |_: ()| Message::Tick)
+            } else {
+                iced::Task::none()
+            }
+        } else {
+            if had_ocr_work {
+                tasks.push(iced::Task::perform(async {}, |_: ()| Message::Tick));
+            }
+            iced::Task::batch(tasks)
+        }
     };
 
     let app = iced::application(boot, update, OcrViewer::view)
