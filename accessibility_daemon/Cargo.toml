@@ -13,7 +13,8 @@ ort = { version = "2.0.0-rc.12", default-features = false, features = ["pkg-conf
 
 # Image processing
 image = "0.25"
-ndarray = "0.15"
+ndarray = "0.16"
+ndarray-conv = "0.6.1"
 
 # Font rendering for labels (TTF)
 fontdue = "0.9"

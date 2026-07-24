@@ -6,6 +6,7 @@ mod ocr_engine;
 #[cfg(feature = "ort")]
 mod ocr_parallel;
 mod overlay_state;
+mod ppocr;
 mod settings_window;
 mod util;
 mod viewer;
@@ -455,19 +456,15 @@ fn run_ocr_viewer(
 
                 // Recognition
                 let char_vocab = engine.char_vocab.clone();
+                let ppocr_vocab = engine.ppocr_vocab.clone();
                 let batch_sz = engine.batch_size;
                 let rec_mode = engine.recognition_mode;
                 let t_recognize = std::time::Instant::now();
-                let vert_sessions = if rec_mode != RecognitionMode::Horizontal {
-                    engine.recognize_sessions_vertical.get()
-                } else {
-                    &[]
-                };
                 if let Err(e) = ocr_engine::recognize_boxes_streaming(
                     &image, &boxes,
                     engine.recognize_sessions.get(),
-                    vert_sessions,
-                    &char_vocab, batch_sz, rec_mode,
+                    engine.ppocr_session.get(),
+                    &char_vocab, &ppocr_vocab, batch_sz, rec_mode,
                     ocr_tx2,
                 ) {
                     eprintln!("[OCR] Recognition error: {e}");
@@ -863,3 +860,4 @@ fn run_ocr_viewer(
     if let Err(e) = app.run() { println!("GUI failed: {e:?}"); }
     Ok(())
 }
+

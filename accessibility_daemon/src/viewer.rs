@@ -1300,6 +1300,14 @@ impl OcrViewer {
     /// Replaces the detection-only annotation (bbox + line: None) at the given
     /// index with the full annotation (bbox + line with text and char_boxes).
     pub fn handle_ocr_recognition_result(&mut self, index: usize, annotation: DetectedAnnotation) {
+        if annotation.line.is_some() {
+            let has_text = annotation.line.as_ref().map(|l| !l.text.is_empty()).unwrap_or(false);
+            println!("[VIEWER] recv ann idx={}: is_vertical={}, has_text={}, char_boxes={}",
+                index,
+                annotation.line.as_ref().map(|l| l.is_vertical).unwrap_or(false),
+                has_text,
+                annotation.line.as_ref().map(|l| l.char_boxes.len()).unwrap_or(0));
+        }
         // Extend annotations vec if this is a new box beyond current length
         while self.annotations.len() <= index {
             self.annotations = Rc::new(
