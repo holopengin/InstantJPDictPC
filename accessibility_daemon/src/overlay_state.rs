@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::data::db::DictionaryDatabase;
 use crate::nav_graph;
@@ -10,7 +11,7 @@ use crate::util::japanese;
 
 /// Result of a dictionary lookup.
 pub struct LookupResult {
-    pub matches: Vec<FormattedEntry>,
+    pub matches: Rc<Vec<FormattedEntry>>,
     pub max_len: usize,
     pub tapped_box: BoundingBox,
 }
@@ -33,10 +34,12 @@ pub struct OcrOverlayState {
     pub is_controller_navigation: bool,
     pub is_dictionary_visible: bool,
     pub is_alternatives_visible: bool,
-    /// Cached formatted entries from the last lookup.
-    pub cached_entries: Vec<FormattedEntry>,
+    /// Cached formatted entries from the last lookup (Rc for O(1) clone in view()).
+    pub cached_entries: Rc<Vec<FormattedEntry>>,
     /// The term that was looked up (for cache invalidation).
     pub cached_lookup_term: String,
+    /// Per-session cache of kanji readings to avoid repeated SQLite queries.
+    pub kanji_cache: HashMap<String, Vec<DictionaryEntry>>,
     /// The bounding box of the tapped character, used to compute panel gravity.
     pub tapped_box_for_gravity: Option<BoundingBox>,
     /// Screenshot dimensions, needed to compute the base transform for gravity.
@@ -72,8 +75,9 @@ impl OcrOverlayState {
             is_controller_navigation: false,
             is_dictionary_visible: false,
             is_alternatives_visible: false,
-            cached_entries: Vec::new(),
+            cached_entries: Rc::new(Vec::new()),
             cached_lookup_term: String::new(),
+            kanji_cache: HashMap::new(),
             tapped_box_for_gravity: None,
             img_w: 0,
             img_h: 0,
@@ -508,7 +512,7 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                 return None;
             }
             return Some(LookupResult {
-                matches: self.cached_entries.clone(),
+                matches: Rc::clone(&self.cached_entries),
                 max_len: self.current_word_length,
                 tapped_box,
             });
@@ -532,7 +536,7 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
 
         if matches.is_empty() {
             // No results — clear the cached entries so the UI shows "no results"
-            self.cached_entries.clear();
+            self.cached_entries = Rc::new(Vec::new());
             self.current_word_length = 0;
             self.cached_lookup_term = following_text;
             return None;
@@ -541,11 +545,11 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
         // Format results
         let formatted = self.format_dictionary_results(&matches);
         self.current_word_length = max_len;
-        self.cached_entries = formatted.clone();
+        self.cached_entries = Rc::new(formatted);
         self.cached_lookup_term = following_text;
 
         Some(LookupResult {
-            matches: formatted,
+            matches: Rc::clone(&self.cached_entries),
             max_len,
             tapped_box,
         })
