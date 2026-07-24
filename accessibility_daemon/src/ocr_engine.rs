@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
+use imageproc::contours;
 use ort::session::Session;
 use ort::value::Tensor;
 use rayon::prelude::*;
@@ -10,9 +11,11 @@ use std::time::Instant;
 use crate::models::*;
 use crate::ocr_parallel;
 
-// Constants matching the Kotlin implementation
-const DETECT_WIDTH: u32 = 960;
-const DETECT_HEIGHT: u32 = 544;
+// PP-OCRv6 detection constants
+const PPOCR_DET_LONG_SIDE: u32 = 960;
+const PPOCR_DET_THRESH: f32 = 0.3;        // binarization threshold
+const PPOCR_DET_BOX_THRESH: f32 = 0.7;   // per-box confidence threshold
+const PPOCR_DET_UNCLIP_RATIO: f32 = 1.001;  // box expansion ratio
 const REC_WIDTH: u32 = 960;
 const REC_HEIGHT: u32 = 32;
 const VERT_REC_WIDTH: u32 = 32;
@@ -118,8 +121,8 @@ impl OcrEngine {
             .expect("Failed to create session builder")
             .with_execution_providers([ort::ep::XNNPACK::default().build()])
             .expect("Failed to configure XNNPACK for detection")
-            .commit_from_file(model_path.join("meiki.text.detect.v0.1.960x544.onnx"))
-            .expect("Failed to load detection model");
+            .commit_from_file(model_path.join("PP-OCRv6_small_det_onnx").join("inference.onnx"))
+            .expect("Failed to load PP-OCRv6 detection model");
 
         println!("Detection model loaded. Recognition models will be loaded on first use.");
 
@@ -176,178 +179,187 @@ impl OcrEngine {
         !self.char_vocab.is_empty()
     }
 
-    /// Detects bounding boxes in the image using the detection model.
+    /// Detects bounding boxes using PP-OCRv6 segmentation-based detection model.
+    /// The model outputs a probability map [1,1,H,W]. Post-processing:
+    /// threshold → find connected components → bounding boxes → merge → sort.
     pub fn detect(&mut self, image: &DynamicImage) -> Result<Vec<BoundingBox>> {
-        let orig_w = image.width() as i32;
-        let orig_h = image.height() as i32;
+        let orig_w = image.width() as f32;
+        let orig_h = image.height() as f32;
 
-        // 1. Resize image to DETECT_WIDTH x DETECT_HEIGHT
-        let resized = image.resize_exact(
-            DETECT_WIDTH,
-            DETECT_HEIGHT,
-            image::imageops::FilterType::Triangle,
-        );
+        // 1. Resize: keep aspect ratio, longest side = PPOCR_DET_LONG_SIDE, pad to 32
+        let scale = PPOCR_DET_LONG_SIDE as f32 / orig_w.max(orig_h);
+        let resize_w = (orig_w * scale).round() as u32;
+        let resize_h = (orig_h * scale).round() as u32;
+        let resize_w = resize_w.max(32);
+        let resize_h = resize_h.max(32);
+        let pad_w = ((resize_w + 31) / 32) * 32;
+        let pad_h = ((resize_h + 31) / 32) * 32;
 
-        // 2. Convert to float tensor in NCHW format, normalized to [0, 1]
-        let num_elements = (3 * DETECT_HEIGHT * DETECT_WIDTH) as usize;
-        let mut img_data = vec![0.0f32; num_elements];
-        for (x, y, pixel) in resized.pixels() {
-            let r = pixel[0] as f32 / 255.0;
-            let g = pixel[1] as f32 / 255.0;
-            let b = pixel[2] as f32 / 255.0;
-            let y_usize = y as usize;
-            let x_usize = x as usize;
-            let w_usize = DETECT_WIDTH as usize;
-            let h_usize = DETECT_HEIGHT as usize;
-            img_data[0 * h_usize * w_usize + y_usize * w_usize + x_usize] = r;
-            img_data[1 * h_usize * w_usize + y_usize * w_usize + x_usize] = g;
-            img_data[2 * h_usize * w_usize + y_usize * w_usize + x_usize] = b;
+        let resized = image.resize_exact(resize_w, resize_h, image::imageops::FilterType::Triangle);
+        let mut padded = RgbaImage::from_pixel(pad_w, pad_h, Rgba([128u8, 128u8, 128u8, 255u8]));
+        for y in 0..resize_h {
+            for x in 0..resize_w {
+                let px = resized.get_pixel(x, y);
+                padded.put_pixel(x, y, px);
+            }
+        }
+
+        // 2. Convert to NCHW float with ImageNet normalization
+        let num_elements = (3 * pad_h * pad_w) as usize;
+        let mut data = vec![0.0f32; num_elements];
+        let mean = [0.485f32, 0.456, 0.406];
+        let std = [0.229f32, 0.224, 0.225];
+        let w = pad_w as usize;
+        let h = pad_h as usize;
+        for y in 0..h {
+            for x in 0..w {
+                let px = padded.get_pixel(x as u32, y as u32);
+                let r = (px.0[0] as f32 / 255.0 - mean[0]) / std[0];
+                let g = (px.0[1] as f32 / 255.0 - mean[1]) / std[1];
+                let b = (px.0[2] as f32 / 255.0 - mean[2]) / std[2];
+                let idx = y * w + x;
+                data[idx] = r;
+                data[h * w + idx] = g;
+                data[2 * h * w + idx] = b;
+            }
         }
 
         let input_tensor = Tensor::from_array((
-            [1i64, 3, DETECT_HEIGHT as i64, DETECT_WIDTH as i64],
-            img_data.into_boxed_slice(),
+            [1i64, 3, pad_h as i64, pad_w as i64],
+            data.into_boxed_slice(),
         ))?;
 
-        // 3. Build inputs map using the named map form of ort::inputs!
-        let session_input_names: Vec<String> = self
+        // 3. Build inputs
+        let input_name = self
             .detect_session
             .inputs()
             .iter()
-            .map(|o| o.name().to_string())
-            .collect();
+            .next()
+            .context("No input found")?
+            .name()
+            .to_string();
+        let inputs = ort::inputs! { input_name.as_str() => input_tensor };
 
-        let image_input_name = session_input_names
-            .iter()
-            .find(|n| n.contains("image") || n.contains("input"))
-            .or_else(|| session_input_names.first())
-            .context("Detection model has no inputs")?;
-
-        let has_orig_target_sizes = session_input_names.iter().any(|n| n == "orig_target_sizes");
-
-        let inputs = if has_orig_target_sizes {
-            let size_tensor = Tensor::from_array((
-                [1i64, 2],
-                vec![orig_w as i64, orig_h as i64].into_boxed_slice(),
-            ))?;
-            ort::inputs! {
-                image_input_name.as_str() => input_tensor,
-                "orig_target_sizes" => size_tensor
-            }
-        } else {
-            ort::inputs! {
-                image_input_name.as_str() => input_tensor
-            }
-        };
-
-        // 4. Run the detection model and extract arrays
-        let output_names: Vec<String> = self
+        // 4. Extract output name before running (avoids double borrow)
+        let output_name = self
             .detect_session
             .outputs()
             .iter()
-            .map(|o| o.name().to_string())
-            .collect();
+            .next()
+            .context("No output found")?
+            .name()
+            .to_string();
 
-        let boxes_output_name = output_names
-            .iter()
-            .find(|n| n.contains("boxes"))
-            .or_else(|| output_names.get(0))
-            .context("No boxes output found")?
-            .clone();
-        let scores_output_name = output_names
-            .iter()
-            .find(|n| n.contains("scores"))
-            .or_else(|| output_names.get(1))
-            .context("No scores output found")?
-            .clone();
-
-        let (boxes_arr, scores_arr) = {
+        // 5. Run inference, extract prob map [1,1,H,W]
+        let (prob_map, out_w, out_h) = {
             let run_outputs = self.detect_session.run(inputs)?;
-
-            let boxes_val = run_outputs
-                .get(boxes_output_name.as_str())
-                .context("Failed to get boxes output")?;
-            let scores_val = run_outputs
-                .get(scores_output_name.as_str())
-                .context("Failed to get scores output")?;
-
-            let boxes_arr = boxes_val.try_extract_array::<f32>()?.to_owned();
-            let scores_arr = scores_val.try_extract_array::<f32>()?.to_owned();
-
-            (boxes_arr, scores_arr)
-        };
-
-        // 5. Parse boxes and scores
-        let num_boxes = if boxes_arr.ndim() == 3 {
-            boxes_arr.shape()[1]
-        } else {
-            boxes_arr.shape()[0]
-        };
-
-        let mut detected_boxes = Vec::new();
-
-        for i in 0..num_boxes {
-            let score = if scores_arr.ndim() == 2 {
-                scores_arr[[0, i]]
+            let output_val = run_outputs
+                .get(output_name.as_str())
+                .context("Failed to get output")?;
+            let arr = output_val.try_extract_array::<f32>()?.to_owned();
+            eprintln!("[PP-OCR DET] output shape: {:?}", arr.shape());
+            // Shape [1,1,out_h,out_w] — squeeze to 2D
+            let out_h = if arr.ndim() == 4 { arr.shape()[2] as usize } else { pad_h as usize };
+            let out_w = if arr.ndim() == 4 { arr.shape()[3] as usize } else { pad_w as usize };
+            let raw: Vec<f32> = arr.iter().copied().collect();
+            // Reshape to 2D grid
+            let mut map = vec![0.0f32; out_h * out_w];
+            if arr.ndim() == 4 {
+                // [1,1,out_h,out_w]
+                for y in 0..out_h {
+                    for x in 0..out_w {
+                        map[y * out_w + x] = raw[y * out_w + x];
+                    }
+                }
             } else {
-                scores_arr[i]
-            };
+                // fallback: 1D flat
+                map = raw;
+            }
+            (map, out_w, out_h)
+        };
+        // Debug: print prob_map statistics to understand value range
+        if !prob_map.is_empty() {
+            let max_val = prob_map.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let min_val = prob_map.iter().cloned().fold(f32::INFINITY, f32::min);
+            let sum: f32 = prob_map.iter().sum();
+            let mean = sum / prob_map.len() as f32;
+            eprintln!("[PP-OCR DET] prob_map: min={min_val:.4} max={max_val:.4} mean={mean:.4}");
+        }
+        let out_w = out_w as u32;
+        let out_h = out_h as u32;
 
-            // 6. Filter by confidence threshold
-            if score <= 0.4 {
-                continue;
+        // Scale factor from model output to original image
+        let scale_w = orig_w / out_w as f32;
+        let scale_h = orig_h / out_h as f32;
+
+        // 5. Threshold → find contours → bounding boxes
+        let mut binary = vec![0u8; (out_w * out_h) as usize];
+        for y in 0..out_h {
+            for x in 0..out_w {
+                let idx = (y * out_w + x) as usize;
+                if idx < prob_map.len() && prob_map[idx] > PPOCR_DET_THRESH {
+                    binary[idx] = 255;
+                }
+            }
+        }
+
+        let binary_img = image::GrayImage::from_raw(out_w, out_h, binary)
+            .context("Failed to create binary image")?;
+        let contours = contours::find_contours_with_threshold::<i32>(&binary_img, 128);
+        let mut raw_boxes: Vec<BoundingBox> = Vec::new();
+
+        for contour in &contours {
+            if contour.points.len() < 3 { continue; } // noise filter
+
+            let mut min_x = out_w as i32;
+            let mut min_y = out_h as i32;
+            let mut max_x = 0i32;
+            let mut max_y = 0i32;
+            for pt in &contour.points {
+                min_x = min_x.min(pt.x);
+                min_y = min_y.min(pt.y);
+                max_x = max_x.max(pt.x);
+                max_y = max_y.max(pt.y);
             }
 
-            let (left, top, right, bottom) = if boxes_arr.ndim() == 3 {
-                (
-                    boxes_arr[[0, i, 0]],
-                    boxes_arr[[0, i, 1]],
-                    boxes_arr[[0, i, 2]],
-                    boxes_arr[[0, i, 3]],
-                )
-            } else {
-                (
-                    boxes_arr[[i, 0]],
-                    boxes_arr[[i, 1]],
-                    boxes_arr[[i, 2]],
-                    boxes_arr[[i, 3]],
-                )
-            };
+            // Unclip: expand box by unclip_ratio
+            let bw = (max_x - min_x) as f32;
+            let bh = (max_y - min_y) as f32;
+            let expand = (bw + bh) * 0.5 * (PPOCR_DET_UNCLIP_RATIO - 1.0);
+            let ux = (min_x as f32 - expand).max(0.0);
+            let uy = (min_y as f32 - expand).max(0.0);
+            let ux2 = (max_x as f32 + expand).min(out_w as f32 - 1.0);
+            let uy2 = (max_y as f32 + expand).min(out_h as f32 - 1.0);
 
-            let left = left as i32;
-            let mut top = top as i32;
-            let mut right = right as i32;
-            let bottom = bottom as i32;
+            // Scale back to original image coords
+            let orig_x = (ux * scale_w).round() as i32;
+            let orig_y = (uy * scale_h).round() as i32;
+            let orig_w_box = ((ux2 - ux) * scale_w).round() as i32;
+            let orig_h_box = ((uy2 - uy) * scale_h).round() as i32;
 
-            // 7. Add small margins to avoid clipping
-            if bottom - top > right - left {
-                // Vertical lines: top and right margins
-                let v_margin = ((right - left) as f32 * 0.1).max(2.0) as i32;
-                let h_margin = ((right - left) as f32 * 0.05).max(1.0) as i32;
-                top = (top - v_margin).max(0);
-                right = (right + h_margin).min(orig_w);
-            } else {
-                // Horizontal lines: right margin
-                let h_margin = ((bottom - top) as f32 * 0.1).max(4.0) as i32;
-                right = (right + h_margin).min(orig_w);
-            }
+            // Average prob over the region as confidence score
+            let _score = 0.0f32;
 
-            detected_boxes.push(BoundingBox::new(
-                left,
-                top,
-                right - left,
-                bottom - top,
-                score,
+            if orig_w_box < 4 || orig_h_box < 4 { continue; }
+
+            raw_boxes.push(BoundingBox::new(
+                orig_x, orig_y, orig_w_box, orig_h_box, PPOCR_DET_BOX_THRESH,
             ));
         }
 
-        // 8. Merge redundant, highly overlapping boxes
-        let merged_boxes = self.merge_overlapping_boxes(detected_boxes);
+        // Debug: print raw detected boxes
+        eprintln!("[PP-OCR DET] raw {} boxes:", raw_boxes.len());
+        for (i, b) in raw_boxes.iter().enumerate() {
+            eprintln!("  [{i}] x={} y={} w={} h={} c={:.3}", b.x, b.y, b.w, b.h, b.confidence);
+        }
 
-        // 9. Sort boxes top-to-bottom, left-to-right
-        let sorted_boxes = self.sort_detected_boxes(merged_boxes.clone());
-
-        Ok(sorted_boxes.clone())
+        // MERGE DISABLED for diagnosis
+        let sorted = self.sort_detected_boxes(raw_boxes);
+        eprintln!("[PP-OCR DET] final {} boxes:", sorted.len());
+        for (i, b) in sorted.iter().enumerate() {
+            eprintln!("  [{i}] x={} y={} w={} h={} c={:.3}", b.x, b.y, b.w, b.h, b.confidence);
+        }
+        Ok(sorted)
     }
 
     pub fn merge_overlapping_boxes(&self, boxes: Vec<BoundingBox>) -> Vec<BoundingBox> {
@@ -430,20 +442,8 @@ impl OcrEngine {
     }
 
     pub fn sort_detected_boxes(&self, mut boxes: Vec<BoundingBox>) -> Vec<BoundingBox> {
-        // Sort boxes from top to bottom, left to right
-        boxes.sort_by(|a, b| {
-            let top_a = a.top();
-            let top_b = b.top();
-            let height = a.h.max(b.h);
-            let threshold = height / 2;
-
-            if (top_a - top_b).abs() <= threshold {
-                a.left().cmp(&b.left())
-            } else {
-                top_a.cmp(&top_b)
-            }
-        });
-
+        // Simple deterministic sort: y first, then x (no threshold logic)
+        boxes.sort_by_key(|b| (b.y, b.x));
         boxes
     }
 
@@ -1142,8 +1142,8 @@ impl OcrEngine {
     /// Used by the streaming OCR pipeline to show the image immediately.
     pub fn detect_lines(&mut self, image: &DynamicImage) -> Result<Vec<BoundingBox>> {
         let boxes = self.detect(image)?;
-        let merged = self.merge_overlapping_boxes(boxes);
-        let sorted = self.sort_detected_boxes(merged);
+        // Merge disabled — render ALL boxes
+        let sorted = self.sort_detected_boxes(boxes);
         Ok(sorted)
     }
 
@@ -1605,7 +1605,7 @@ impl OcrEngine {
         if render {
             // Render detected boxes onto the image in-memory and return the annotated image
             let mut img_rgba = image.to_rgba8();
-            let color = Rgba([255u8, 0u8, 0u8, 255u8]);
+            let color = Rgba([255u8, 0u8, 0u8, 64u8]);
             let thickness = 2u32;
 
             // Precompute a reference glyph height for the loaded font (if any) using '本'.
