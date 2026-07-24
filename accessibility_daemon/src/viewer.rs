@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -130,6 +131,20 @@ impl GlyphCache {
             rgba.push(a);
         }
         ImageHandle::from_rgba(w, h, rgba)
+    }
+
+    /// Pre-warm the cache for a character at the given pixel size.
+    /// Called from the update handler so glyph rasterization happens off
+    /// the view/draw path, preventing first-frame stutter.
+    pub fn ensure_glyph(&mut self, ch: char, px_size: u32) {
+        self.cache.entry((ch, px_size)).or_insert_with(|| {
+            let (metrics, coverage) = self.font.rasterize(ch, px_size as f32);
+            let w = metrics.width.max(1) as u32;
+            let h = metrics.height.max(1) as u32;
+            let pink = Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2);
+            let yellow = Self::make_handle(w, h, &coverage, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2);
+            CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
+        });
     }
 }
 
@@ -624,6 +639,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
+        let _t_draw = std::time::Instant::now();
         let mut frame = Frame::new(renderer, bounds.size());
         let (base_scale, base_offset_x, base_offset_y) = self.base_transform(bounds);
         let total_scale = base_scale * self.current_scale;
@@ -862,6 +878,13 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
             }
         }
 
+        // Print draw timing (only when >1ms to avoid idle-frame spam)
+        let _t_draw_end = std::time::Instant::now();
+        let elapsed = _t_draw_end.duration_since(_t_draw);
+        if elapsed.as_micros() > 1000 {
+            eprintln!("[TIMING] draw: {}µs", elapsed.as_micros());
+        }
+
         vec![frame.into_geometry()]
     }
 }
@@ -875,6 +898,7 @@ pub struct OcrViewer {
     /// Raw PNG bytes of the original screenshot, used for cropping character previews.
     image_bytes: Option<Vec<u8>>,
     /// Decoded image, cached to avoid re-decoding PNG on every crop_character_image call.
+    /// Decoded image, cached to avoid re-decoding PNG on every crop_character_image call.
     decoded_image: RefCell<Option<image::DynamicImage>>,
     pub img_w: u32,
     pub img_h: u32,
@@ -882,6 +906,16 @@ pub struct OcrViewer {
     pub window_width: f32,
     pub window_height: f32,
     pub annotations: Rc<Vec<DetectedAnnotation>>,
+    /// Cached synced annotations for overlay rendering. Same data as `annotations`
+    /// but with text sync'd from active_line_results. Cheap Rc clone; only
+    /// re-synced on text edits (set annotations_sync_dirty). Avoids cloning
+    /// all 49 annotations every frame in view().
+    synced_annotations: Rc<Vec<DetectedAnnotation>>,
+    /// Set to true when a text edit requires re-syncing annotations with
+    /// active_line_results. view() re-syncs and clears this flag.
+    annotations_sync_dirty: Cell<bool>,
+    /// Cached total_scale from last view() frame, used for glyph pre-warm
+    last_total_scale: Cell<f32>,
     pub state: OcrOverlayState,
     pub selected_word: Option<SelectedWord>,
     pub alternatives_visible: bool,
@@ -934,6 +968,9 @@ impl OcrViewer {
             window_width: window_w,
             window_height: window_h,
             annotations: Rc::new(Vec::new()),
+            synced_annotations: Rc::new(Vec::new()),
+            annotations_sync_dirty: Cell::new(false),
+            last_total_scale: Cell::new(1.0),
             state: OcrOverlayState::new(window_w, window_h),
             selected_word: None,
             alternatives_visible: false,
@@ -1300,67 +1337,116 @@ impl OcrViewer {
     /// Replaces the detection-only annotation (bbox + line: None) at the given
     /// index with the full annotation (bbox + line with text and char_boxes).
     pub fn handle_ocr_recognition_result(&mut self, index: usize, annotation: DetectedAnnotation) {
-        if annotation.line.is_some() {
-            let has_text = annotation.line.as_ref().map(|l| !l.text.is_empty()).unwrap_or(false);
-            println!("[VIEWER] recv ann idx={}: is_vertical={}, has_text={}, char_boxes={}",
+        let t0 = std::time::Instant::now();
+        let line = annotation.line.clone();
+        if line.is_some() {
+            let has_text = line.as_ref().map(|l| !l.text.is_empty()).unwrap_or(false);
+            println!(
+                "[VIEWER] recv ann idx={}: is_vertical={}, has_text={}, char_boxes={}",
                 index,
-                annotation.line.as_ref().map(|l| l.is_vertical).unwrap_or(false),
+                line.as_ref().map(|l| l.is_vertical).unwrap_or(false),
                 has_text,
-                annotation.line.as_ref().map(|l| l.char_boxes.len()).unwrap_or(0));
-        }
-        // Extend annotations vec if this is a new box beyond current length
-        while self.annotations.len() <= index {
-            self.annotations = Rc::new(
-                self.annotations.iter().cloned().chain(
-                    std::iter::once(DetectedAnnotation {
-                        bbox: BoundingBox::new(0, 0, 0, 0, 0.0),
-                        line: None,
-                    })
-                ).collect()
+                line.as_ref().map(|l| l.char_boxes.len()).unwrap_or(0)
             );
         }
+        // Extend annotations vec if this is a new box beyond current length
+        let t_extend = std::time::Instant::now();
+        if self.annotations.len() <= index {
+            // Use make_mut to grow in-place without cloning the whole vec
+            let anns = std::rc::Rc::make_mut(&mut self.annotations);
+            anns.resize(index + 1, DetectedAnnotation {
+                bbox: BoundingBox::new(0, 0, 0, 0, 0.0),
+                line: None,
+            });
+        }
 
-        // Replace the annotation at the given index
-        let mut anns: Vec<DetectedAnnotation> = (*self.annotations).clone();
-        anns[index] = annotation.clone();
+        // Replace the annotation at the given index — in-place via make_mut
+        let t_assign = std::time::Instant::now();
+        let anns = std::rc::Rc::make_mut(&mut self.annotations);
+        anns[index] = annotation;
+        let t_before_set = std::time::Instant::now();
 
         // If the annotation has a line result, update the overlay state
-        if let Some(line) = annotation.line {
-            self.state.set_single_line_result(index, line);
+        if let Some(ref line) = line {
+            self.state.set_single_line_result(index, line.clone());
+        }
+        let t_after_state = std::time::Instant::now();
+
+        // Pre-warm glyph cache for this annotation's characters so view()
+        // doesn't rasterize them on the draw path (which causes visible
+        // stutter on the first frame new characters appear).
+        if let Some(ref line) = line {
+            if let Some(ref gc) = self.glyph_cache {
+                // Use cached total_scale from last view() frame — avoids
+                // computing from potentially-not-yet-loaded img_w/img_h (1 vs real).
+                let total_scale = self.last_total_scale.get();
+                let mut cache = gc.borrow_mut();
+                for (i, ch) in line.text.chars().enumerate() {
+                    let px = line.char_boxes.get(i)
+                        .map(|b| (b.h as f32 * total_scale * CANVAS_CHAR_RATIO).round() as u32)
+                        .unwrap_or(24)
+                        .max(1);
+                    cache.ensure_glyph(ch, px);
+                }
+            }
         }
 
         // Mark nav graph dirty — will be rebuilt lazily on next navigation or
         // render, instead of rebuilding on every streaming result.
         self.state.mark_nav_dirty();
 
-        self.annotations = Rc::new(anns);
-
-        // If cursor is not yet set, place it on the first recognized character
+        // Update cursor if not yet set
         if self.state.current_tapped_line_idx < 0 || self.state.current_tapped_char_idx_in_line < 0 {
             self.state.ensure_cursor_position();
         }
+
+        // Keep synced_annotations cache in sync.
+        // Uses a NEW Rc with a fresh clone so self.annotations keeps refcount=1.
+        // This way Rc::make_mut above mutates in-place without deep-copying the
+        // whole Vec (which would happen if refcount > 1).
+        self.synced_annotations = Rc::new((*self.annotations).clone());
+        let t_end = std::time::Instant::now();
+        eprintln!(
+            "[TIMING] handle_ocr_recognition_result idx={}: total={}µs  clone={}µs make_mut={}µs set_state={}µs",
+            index,
+            t_end.duration_since(t0).as_micros(),
+            t_extend.duration_since(t0).as_micros(),
+            t_before_set.duration_since(t_assign).as_micros(),
+            t_after_state.duration_since(t_before_set).as_micros(),
+        );
     }
 
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
+        let _t_view = std::time::Instant::now();
+        // Cache total_scale for glyph pre-warming in handle_ocr_recognition_result
+        let base_scale = f32::min(
+            self.window_width / self.img_w.max(1) as f32,
+            self.window_height / self.img_h.max(1) as f32,
+        );
+        self.last_total_scale.set(base_scale * self.state.current_scale);
         let has_panel = self.selected_word.is_some();
 
         // Gravity is computed in select_character/update_gravity with the full
         // transform (base + pan/zoom), so the panel opens on the opposite side
         // of the character's actual screen position.
         // Sync annotation text from active_line_results so alt character changes
-        // are reflected in the canvas overlay.
-        let synced_annotations = {
+        // are reflected in the canvas overlay. Only re-syncs when text has been
+        // edited (annotations_sync_dirty), avoiding a full Vec clone every frame.
+        let synced_annotations = if self.annotations_sync_dirty.get() {
             let mut ann = (*self.annotations).clone();
             for (i, line_opt) in self.state.active_line_results.iter().enumerate() {
-                if let (Some(ann_line), Some(active_line)) =
-                    (ann.get_mut(i).and_then(|a| a.line.as_mut()), line_opt.as_ref())
-                {
+                if let (Some(ann_line), Some(active_line)) = (
+                    ann.get_mut(i).and_then(|a| a.line.as_mut()),
+                    line_opt.as_ref(),
+                ) {
                     ann_line.text.clone_from(&active_line.text);
                 }
             }
+            self.annotations_sync_dirty.set(false);
             Rc::new(ann)
+        } else {
+            Rc::clone(&self.synced_annotations)
         };
-        let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
         let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
         let overlay = OverlayProgram {
             annotations: synced_annotations.clone(),

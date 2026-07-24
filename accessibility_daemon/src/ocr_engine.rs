@@ -40,7 +40,7 @@ const MEIKI_SWAPPED_PAIRS: &[(&str, &str); 8] = &[
 const SESSION_POOL_SIZE: usize = 1;
 /// More sessions for PP-OCRv6 = less contention for parallel vertical boxes.
 /// Each session adds ~21 MB of RAM.
-const PPOCR_SESSION_POOL_SIZE: usize = 4;
+const PPOCR_SESSION_POOL_SIZE: usize = 1;
 pub struct OcrEngine {
     pub detect_session: Session,
     /// Recognition sessions are loaded lazily on first use to speed up startup.
