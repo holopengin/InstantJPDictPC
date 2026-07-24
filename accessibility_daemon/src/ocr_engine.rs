@@ -15,7 +15,7 @@ use crate::ocr_parallel;
 const PPOCR_DET_LONG_SIDE: u32 = 960;
 const PPOCR_DET_THRESH: f32 = 0.3;        // binarization threshold
 const PPOCR_DET_BOX_THRESH: f32 = 0.7;   // per-box confidence threshold
-const PPOCR_DET_UNCLIP_RATIO: f32 = 1.001;  // box expansion ratio
+const PPOCR_DET_UNCLIP_RATIO: f32 = 1.1;  // box expansion ratio
 const REC_WIDTH: u32 = 960;
 const REC_HEIGHT: u32 = 32;
 const VERT_REC_WIDTH: u32 = 32;
@@ -288,9 +288,10 @@ impl OcrEngine {
         let out_w = out_w as u32;
         let out_h = out_h as u32;
 
-        // Scale factor from model output to original image
-        let scale_w = orig_w / out_w as f32;
-        let scale_h = orig_h / out_h as f32;
+        // Scale factor from model output (padded) to original image
+        // The image content occupies resize_w × resize_h within the padded space
+        let scale_w = orig_w / resize_w as f32;
+        let scale_h = orig_h / resize_h as f32;
 
         // 5. Threshold → find contours → bounding boxes
         let mut binary = vec![0u8; (out_w * out_h) as usize];
@@ -322,10 +323,12 @@ impl OcrEngine {
                 max_y = max_y.max(pt.y);
             }
 
-            // Unclip: expand box by unclip_ratio
+            // Unclip: expand box using proper PP-OCR formula: distance = area * ratio / perimeter
             let bw = (max_x - min_x) as f32;
             let bh = (max_y - min_y) as f32;
-            let expand = (bw + bh) * 0.5 * (PPOCR_DET_UNCLIP_RATIO - 1.0);
+            let area = bw * bh;
+            let perimeter = 2.0 * (bw + bh);
+            let expand = if perimeter > 0.0 { area * PPOCR_DET_UNCLIP_RATIO / perimeter } else { 0.0 };
             let ux = (min_x as f32 - expand).max(0.0);
             let uy = (min_y as f32 - expand).max(0.0);
             let ux2 = (max_x as f32 + expand).min(out_w as f32 - 1.0);
