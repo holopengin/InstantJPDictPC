@@ -187,7 +187,9 @@ self.build_nav_graph();
 
 
 pub fn navigate(&mut self, action: GamepadAction) -> bool {
-        let (line_idx, char_idx) = match self.current_cursor() {
+    // Ensure nav graph is fresh before navigating.
+    self.rebuild_nav_if_dirty();
+    let (line_idx, char_idx) = match self.current_cursor() {
             Some(coords) => coords,
             None => return false,
         };
@@ -224,6 +226,23 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
         let graph = nav_graph::NavGraph::build(&boxes);
         self.nav_positions = graph.positions.clone();
         self.nav_graph = Some(graph);
+    }
+
+    /// Mark the nav graph as stale — it will be rebuilt on next navigation or
+    /// render.  Called frequently (after each streaming OCR result) instead of
+    /// the expensive `build_nav_graph()`.
+    pub fn mark_nav_dirty(&mut self) {
+        self.nav_graph = None;
+    }
+
+    /// Ensure the nav graph is fresh.  Returns true if a rebuild actually happened.
+    pub fn rebuild_nav_if_dirty(&mut self) -> bool {
+        if self.nav_graph.is_none() {
+            self.build_nav_graph();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn current_cursor(&self) -> Option<(usize, usize)> {

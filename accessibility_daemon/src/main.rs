@@ -539,11 +539,17 @@ fn run_ocr_viewer(
             }
         }
         // Drain OCR channel (detection boxes + recognition results)
+        // Process up to 5 results per frame. This keeps the UI responsive
+        // while preventing pile-ups at low frame rates. The nav graph is
+        // deferred (mark_nav_dirty), so each handle call is cheap (~3ms).
         if let Ok(mut guard) = ocr_rx_update.lock() {
             if let Some(rx) = guard.as_mut() {
-                while let Ok((idx, ann)) = rx.try_recv() {
-                    let idx = idx;
-                    state.handle_ocr_recognition_result(idx, ann);
+                for _ in 0..5 {
+                    if let Ok((idx, ann)) = rx.try_recv() {
+                        state.handle_ocr_recognition_result(idx, ann);
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -726,7 +732,12 @@ fn run_ocr_viewer(
                 }
             }
             // OCR streaming messages — receiver drained in update body above
-            Message::OcrDetectionComplete(_) | Message::OcrRecognitionResult(_, _) | Message::OcrAllDone => {}
+            Message::OcrDetectionComplete(_) | Message::OcrRecognitionResult(_, _)
+                | Message::OcrAllDone => {}
+            Message::Tick => {
+                // Rebuild nav graph if dirty (streaming OCR results skip it).
+                state.state.rebuild_nav_if_dirty();
+            }
         }
         if matches!(msg, Message::ZoomOnCursor { .. } | Message::PanDelta { .. } | Message::PanStart { .. } | Message::PinchZoom { .. }) {
             state.zoom_idle_frames = 0;
@@ -777,7 +788,7 @@ fn run_ocr_viewer(
                     }
                     gp_bits_to_msg(pressed)
                 })
-                .filter_map(|m| m);
+                .filter_map(|m| m.or(Some(Message::Tick)));
 
             let keyboard_events = iced_futures::subscription::filter_map(
                 "keyboard",
