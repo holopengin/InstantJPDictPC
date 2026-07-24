@@ -14,7 +14,7 @@ use crate::ocr_parallel;
 // PP-OCRv6 detection constants
 const PPOCR_DET_LONG_SIDE: u32 = 960;
 const PPOCR_DET_THRESH: f32 = 0.3;        // binarization threshold
-const PPOCR_DET_BOX_THRESH: f32 = 0.7;   // per-box confidence threshold
+const PPOCR_DET_BOX_THRESH: f32 = 0.8;   // per-box confidence threshold
 const PPOCR_DET_UNCLIP_RATIO: f32 = 1.1;  // box expansion ratio
 const REC_WIDTH: u32 = 960;
 const REC_HEIGHT: u32 = 32;
@@ -358,11 +358,54 @@ impl OcrEngine {
 
         // MERGE DISABLED for diagnosis
         let sorted = self.sort_detected_boxes(raw_boxes);
-        eprintln!("[PP-OCR DET] final {} boxes:", sorted.len());
-        for (i, b) in sorted.iter().enumerate() {
+        // Post-processing
+        let mut pp_boxes = sorted;
+        // Filter out degenerate tiny boxes (noise specks)
+        pp_boxes.retain(|b| b.w >= 6 || b.h >= 6);
+        // 1. Shrink vertical box widths by 10% (centered)
+        for b in pp_boxes.iter_mut().filter(|b| b.h > b.w) {
+            let shrink = (b.w as f32 * 0.05).round() as i32;
+            b.x += shrink;
+        }
+        // 2. For stacked overlapping horizontal boxes, split at overlap midpoint
+        let h_indices: Vec<usize> = pp_boxes
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.w >= b.h)
+                .map(|(i, _)| i)
+                .collect();
+            for i in 0..h_indices.len() {
+                for j in (i + 1)..h_indices.len() {
+                    let ai = h_indices[i];
+                    let bi = h_indices[j];
+                    // Only split if boxes are in the same column (horizontal overlap too)
+                    let a_right = pp_boxes[ai].x + pp_boxes[ai].w;
+                    let b_right = pp_boxes[bi].x + pp_boxes[bi].w;
+                    let h_overlap = a_right.min(b_right) - pp_boxes[ai].x.max(pp_boxes[bi].x);
+                    if h_overlap <= 0 {
+                        continue;
+                    }
+                    let (upper, lower) = if pp_boxes[ai].y <= pp_boxes[bi].y {
+                        (ai, bi)
+                    } else {
+                        (bi, ai)
+                    };
+                    let upper_bottom = pp_boxes[upper].y + pp_boxes[upper].h;
+                    let lower_bottom = pp_boxes[lower].y + pp_boxes[lower].h;
+                    // Check vertical overlap: upper box bottom > lower box top
+                    if upper_bottom > pp_boxes[lower].y {
+                        let overlap_mid = (pp_boxes[lower].y + upper_bottom.min(lower_bottom)) / 2;
+                        pp_boxes[upper].h = (overlap_mid - pp_boxes[upper].y).max(1);
+                        pp_boxes[lower].y = pp_boxes[upper].y + pp_boxes[upper].h;
+                        pp_boxes[lower].h = (lower_bottom - pp_boxes[lower].y).max(1);
+                    }
+                }
+            }
+        eprintln!("[PP-OCR DET] final {} boxes:", pp_boxes.len());
+        for (i, b) in pp_boxes.iter().enumerate() {
             eprintln!("  [{i}] x={} y={} w={} h={} c={:.3}", b.x, b.y, b.w, b.h, b.confidence);
         }
-        Ok(sorted)
+        Ok(pp_boxes)
     }
 
     pub fn merge_overlapping_boxes(&self, boxes: Vec<BoundingBox>) -> Vec<BoundingBox> {
