@@ -882,7 +882,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
         let _t_draw_end = std::time::Instant::now();
         let elapsed = _t_draw_end.duration_since(_t_draw);
         if elapsed.as_micros() > 1000 {
-            eprintln!("[TIMING] draw: {}µs", elapsed.as_micros());
+            // eprintln!("[TIMING] draw: {}us", elapsed.as_micros());
         }
 
         vec![frame.into_geometry()]
@@ -1202,7 +1202,7 @@ impl OcrViewer {
                 // Highlight the full matched word in yellow (like Kotlin)
                 self.state.update_highlight_coords(line_idx, char_idx, result.max_len);
 
-                // ── Second pass: look up each individual kanji in the matched term ──
+                // ── Second pass: look up each individual kanji with per-session cache ──
                 let term_len = result.max_len;
                 let matched_term: String =
                     full_line_text.chars().skip(char_idx).take(term_len).collect();
@@ -1220,24 +1220,34 @@ impl OcrViewer {
                         || append_kanji.iter().any(|e| e.term == kanji_str) {
                         continue;
                     }
-                    if let Ok(kanji_results) = db.find_by_texts(&[kanji_str.clone()]) {
-                        let kanji_only: Vec<DictionaryEntry> = kanji_results
-                            .into_iter()
-                            .filter(|e| e.onyomi.is_some() || e.kunyomi.is_some())
-                            .collect();
-                        if !kanji_only.is_empty() {
-                            let formatted = self.state.format_dictionary_results(
-                                &[(kanji_str.clone(), kanji_only)],
-                            );
-                            append_kanji.extend(formatted);
-                        }
+                    // Check per-session kanji cache before querying DB
+                    let kanji_only: Vec<DictionaryEntry> =
+                        if let Some(cached) = self.state.kanji_cache.get(&kanji_str) {
+                            cached.clone()
+                        } else if let Ok(kanji_results) = db.find_by_texts(&[kanji_str.clone()]) {
+                            let filtered: Vec<DictionaryEntry> = kanji_results
+                                .into_iter()
+                                .filter(|e| e.onyomi.is_some() || e.kunyomi.is_some())
+                                .collect();
+                            self.state.kanji_cache.insert(kanji_str.clone(), filtered.clone());
+                            filtered
+                        } else {
+                            Vec::new()
+                        };
+                    if !kanji_only.is_empty() {
+                        let formatted = self.state.format_dictionary_results(
+                            &[(kanji_str.clone(), kanji_only)],
+                        );
+                        append_kanji.extend(formatted);
                     }
                 }
                 if !append_kanji.is_empty() {
-                    self.state.cached_entries.extend(append_kanji);
+                    let mut entries = (*self.state.cached_entries).clone();
+                    entries.extend(append_kanji);
+                    self.state.cached_entries = Rc::new(entries);
                 }
             } else {
-                self.state.cached_entries.clear();
+                self.state.cached_entries = Rc::new(Vec::new());
                 self.state.current_word_length = 1;
                 self.state.update_highlight_coords(line_idx, char_idx, 1);
             }
@@ -1406,14 +1416,14 @@ impl OcrViewer {
         // whole Vec (which would happen if refcount > 1).
         self.synced_annotations = Rc::new((*self.annotations).clone());
         let t_end = std::time::Instant::now();
-        eprintln!(
-            "[TIMING] handle_ocr_recognition_result idx={}: total={}µs  clone={}µs make_mut={}µs set_state={}µs",
-            index,
-            t_end.duration_since(t0).as_micros(),
-            t_extend.duration_since(t0).as_micros(),
-            t_before_set.duration_since(t_assign).as_micros(),
-            t_after_state.duration_since(t_before_set).as_micros(),
-        );
+        // eprintln!(
+        //     "[TIMING] handle_ocr_recognition_result idx={}: total={}us  clone={}us make_mut={}us set_state={}us",
+        //     index,
+        //     t_end.duration_since(t0).as_micros(),
+        //     t_extend.duration_since(t0).as_micros(),
+        //     t_before_set.duration_since(t_assign).as_micros(),
+        //     t_after_state.duration_since(t_before_set).as_micros(),
+        // );
     }
 
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
@@ -1518,9 +1528,9 @@ impl OcrViewer {
 
         // Build panel components
         let dict_panel = self.dictionary_panel(if !self.state.cached_entries.is_empty() {
-            self.state.cached_entries.clone()
+            Rc::clone(&self.state.cached_entries)
         } else {
-            Vec::new()
+            Rc::new(Vec::new())
         });
         let neigh_panel = self.neighbor_panel();
 
@@ -1659,17 +1669,17 @@ impl OcrViewer {
         .into()
     }
 
-    fn dictionary_panel<'a>(&'a self, entries: Vec<FormattedEntry>) -> Container<'a, Message> {
+    fn dictionary_panel<'a>(&'a self, entries: Rc<Vec<FormattedEntry>>) -> Container<'a, Message> {
         let mut content = Column::new().padding(4).spacing(4).width(Length::Fill);
         if entries.is_empty() {
             content = content.push(Text::new("No dictionary entries found.").size(14));
         }
-        for entry in entries {
+        for entry in entries.iter() {
             let mut entry_col = Column::new().spacing(4).width(Length::Fill);
-            for group in entry.reading_groups {
+            for group in &entry.reading_groups {
                 entry_col = entry_col.push(self.headword_section(group.clone()));
-                for sg in group.sense_groups {
-                    entry_col = entry_col.push(self.sense_group(sg));
+                for sg in &group.sense_groups {
+                    entry_col = entry_col.push(self.sense_group(sg.clone()));
                 }
                 entry_col = entry_col.push(iced::widget::Space::new().height(Pixels(4.0)));
             }
