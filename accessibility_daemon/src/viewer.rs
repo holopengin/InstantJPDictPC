@@ -1427,7 +1427,6 @@ impl OcrViewer {
     }
 
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
-        let _t_view = std::time::Instant::now();
         // Cache total_scale for glyph pre-warming in handle_ocr_recognition_result
         let base_scale = f32::min(
             self.window_width / self.img_w.max(1) as f32,
@@ -1662,7 +1661,7 @@ impl OcrViewer {
             Stack::new()
                 .push(image_canvas)
                 .push(annotation_canvas)
-                .push(content_stack)
+                .push(content_stack),
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -1677,9 +1676,9 @@ impl OcrViewer {
         for entry in entries.iter() {
             let mut entry_col = Column::new().spacing(4).width(Length::Fill);
             for group in &entry.reading_groups {
-                entry_col = entry_col.push(self.headword_section(group.clone()));
+                entry_col = entry_col.push(Self::headword_section(group.clone()));
                 for sg in &group.sense_groups {
-                    entry_col = entry_col.push(self.sense_group(sg.clone()));
+                    entry_col = entry_col.push(Self::sense_group(sg.clone()));
                 }
                 entry_col = entry_col.push(iced::widget::Space::new().height(Pixels(4.0)));
             }
@@ -1700,12 +1699,12 @@ impl OcrViewer {
                 25.0 / 255.0,
                 25.0 / 255.0,
                 245.0 / 255.0,
-            ))), // argb(245, 25, 25, 25)
+            ))),
             ..Default::default()
         })
     }
 
-    fn headword_section<'a>(&'a self, group: FormattedReadingGroup) -> Container<'a, Message> {
+    fn headword_section(group: FormattedReadingGroup) -> Container<'static, Message> {
         let cyan = Color::from_rgb(0.0, 1.0, 1.0);      // Android CYAN
         let gray = Color::from_rgb(0.75, 0.75, 0.75);   // Android LTGRAY (#BEBEBE)
         let mut content = Column::new().spacing(2);
@@ -1750,7 +1749,7 @@ impl OcrViewer {
         }
     }
 
-    fn sense_group<'a>(&'a self, sg: FormattedSenseGroup) -> Container<'a, Message> {
+    fn sense_group(sg: FormattedSenseGroup) -> Column<'static, Message> {
         let cyan = Color::from_rgb(0.0, 1.0, 1.0); // Android CYAN
         let gray = Color::from_rgb(0.75, 0.75, 0.75); // Android LTGRAY (#BEBEBE)
         let white = Color::WHITE;
@@ -1807,7 +1806,7 @@ impl OcrViewer {
             sense_row = sense_row.push(nodes_col);
             content = content.push(sense_row);
         }
-        Container::new(content)
+        content
     }
 
     fn neighbor_panel<'a>(&'a self) -> Container<'a, Message> {

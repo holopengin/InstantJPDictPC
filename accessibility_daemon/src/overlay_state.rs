@@ -36,6 +36,8 @@ pub struct OcrOverlayState {
     pub is_alternatives_visible: bool,
     /// Cached formatted entries from the last lookup (Rc for O(1) clone in view()).
     pub cached_entries: Rc<Vec<FormattedEntry>>,
+    /// Cache of parsed definition JSON strings -> DefinitionNode vecs
+    pub def_cache: HashMap<String, Vec<DefinitionNode>>,
     /// The term that was looked up (for cache invalidation).
     pub cached_lookup_term: String,
     /// Per-session cache of kanji readings to avoid repeated SQLite queries.
@@ -76,6 +78,7 @@ impl OcrOverlayState {
             is_dictionary_visible: false,
             is_alternatives_visible: false,
             cached_entries: Rc::new(Vec::new()),
+            def_cache: HashMap::new(),
             cached_lookup_term: String::new(),
             kanji_cache: HashMap::new(),
             tapped_box_for_gravity: None,
@@ -690,7 +693,7 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
 
     /// Format dictionary results into displayable entries.
     pub fn format_dictionary_results(
-        &self,
+        &mut self,
         matches: &[(String, Vec<DictionaryEntry>)],
     ) -> Vec<FormattedEntry> {
         matches
@@ -790,7 +793,13 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                                 .collect()
                         };
 
-                        let nodes = Self::parse_definition(&definitions_list);
+                        let nodes: Vec<_> = {
+                            let cache_key = &e.definitions;
+                            self.def_cache
+                                .entry(cache_key.clone())
+                                .or_insert_with(|| Self::parse_definition(&definitions_list))
+                                .clone()
+                        };
 
                         if current_group_tags.is_none() || Some(&tags) == current_group_tags.as_ref() {
                             current_group_tags = Some(tags.clone());
