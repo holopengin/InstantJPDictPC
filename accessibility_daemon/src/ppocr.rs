@@ -160,7 +160,7 @@ pub fn recognize_ppocr_vertical_batch(
                 .map(|(i, &v)| (i, v))
                 .collect();
             top5.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let top5_chars: Vec<(char, f32)> = top5[..top5.len().min(5)]
+            let top5_chars: Vec<(char, f32)> = top5[..top5.len().min(15)]
                 .iter()
                 .map(|(idx, score)| {
                     let ch = if *idx == 18709 {
@@ -174,7 +174,6 @@ pub fn recognize_ppocr_vertical_batch(
                     (ch, *score)
                 })
                 .collect();
-            alts.push(top5_chars);
 
             // CTC: skip blank (0). Collapse repeats (don't output if same as
             // previous non-blank class). Space (18709) can repeat.
@@ -187,6 +186,7 @@ pub fn recognize_ppocr_vertical_batch(
                 prev_class = 18709;
                 // Track timestep position even for space
                 char_cols.push(t as f32);
+                alts.push(top5_chars);
                 continue;
             }
             if class_idx == prev_class {
@@ -201,6 +201,7 @@ pub fn recognize_ppocr_vertical_batch(
             };
             text.push(ch);
             char_cols.push(t as f32);
+            alts.push(top5_chars);
             prev_class = class_idx;
         }
 

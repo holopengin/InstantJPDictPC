@@ -140,14 +140,14 @@ impl OcrEngine {
         };
 
         // PP-OCRv6 vertical recognition model
-        let ppocr_model_path = model_path.join("PP-OCRv6").join("inference.onnx");
+        let ppocr_model_path = model_path.join("PP-OCRv6_small_rec").join("inference.onnx");
         let ppocr_pool = if ppocr_model_path.exists() {
             RecognizeSessionPool::with_size(ppocr_model_path, PPOCR_SESSION_POOL_SIZE)
         } else {
             eprintln!("[PP-OCR] Model not found at {ppocr_model_path:?}, vertical recognition disabled");
             RecognizeSessionPool::empty()
         };
-        let ppocr_vocab_path = model_path.join("PP-OCRv6").join("vocab.json");
+        let ppocr_vocab_path = model_path.join("PP-OCRv6_small_rec").join("vocab.json");
         let ppocr_vocab: Vec<String> = match std::fs::read_to_string(&ppocr_vocab_path) {
             Ok(content) => serde_json::from_str(&content)
                 .with_context(|| format!("Failed to parse PP-OCR vocab"))?,
