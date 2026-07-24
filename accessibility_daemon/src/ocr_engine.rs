@@ -38,7 +38,9 @@ const MEIKI_SWAPPED_PAIRS: &[(&str, &str); 8] = &[
 /// Number of sessions in each orientation pool.
 /// More sessions = less contention, but each session costs ~31 MB of RAM.
 const SESSION_POOL_SIZE: usize = 1;
-
+/// More sessions for PP-OCRv6 = less contention for parallel vertical boxes.
+/// Each session adds ~21 MB of RAM.
+const PPOCR_SESSION_POOL_SIZE: usize = 4;
 pub struct OcrEngine {
     pub detect_session: Session,
     /// Recognition sessions are loaded lazily on first use to speed up startup.
@@ -61,6 +63,7 @@ pub struct OcrEngine {
 pub struct RecognizeSessionPool {
     sessions: std::sync::OnceLock<Vec<std::sync::Arc<std::sync::Mutex<Session>>>>,
     model_path: std::path::PathBuf,
+    pool_size: usize,
 }
 
 impl RecognizeSessionPool {
@@ -68,6 +71,7 @@ impl RecognizeSessionPool {
         RecognizeSessionPool {
             sessions: std::sync::OnceLock::new(),
             model_path,
+            pool_size: SESSION_POOL_SIZE,
         }
     }
 
@@ -75,14 +79,24 @@ impl RecognizeSessionPool {
         RecognizeSessionPool {
             sessions: std::sync::OnceLock::new(),
             model_path: std::path::PathBuf::new(),
+            pool_size: 0,
+        }
+    }
+
+    fn with_size(model_path: std::path::PathBuf, pool_size: usize) -> Self {
+        RecognizeSessionPool {
+            sessions: std::sync::OnceLock::new(),
+            model_path,
+            pool_size,
         }
     }
 
     /// Get the session pool, initializing it on first call.
     pub fn get(&self) -> &[std::sync::Arc<std::sync::Mutex<Session>>] {
+        let n = self.pool_size;
         self.sessions.get_or_init(|| {
-            let mut sessions = Vec::with_capacity(SESSION_POOL_SIZE);
-            for _ in 0..SESSION_POOL_SIZE {
+            let mut sessions = Vec::with_capacity(n);
+            for _ in 0..n {
                 let s = Session::builder()
                     .expect("Failed to create session builder")
                     .with_execution_providers([ort::ep::XNNPACK::default().build()])
@@ -128,7 +142,7 @@ impl OcrEngine {
         // PP-OCRv6 vertical recognition model
         let ppocr_model_path = model_path.join("PP-OCRv6").join("inference.onnx");
         let ppocr_pool = if ppocr_model_path.exists() {
-            RecognizeSessionPool::new(ppocr_model_path)
+            RecognizeSessionPool::with_size(ppocr_model_path, PPOCR_SESSION_POOL_SIZE)
         } else {
             eprintln!("[PP-OCR] Model not found at {ppocr_model_path:?}, vertical recognition disabled");
             RecognizeSessionPool::empty()
@@ -1974,6 +1988,15 @@ pub fn recognize_boxes_streaming(
     // Vertical boxes → use PP-OCRv6 recognition model directly on crops
     if !vertical_boxes.is_empty() && !ppocr_vocab.is_empty() && !rec_sessions_ppocr.is_empty() {
         println!("[PP-OCR] Processing {} vertical boxes", vertical_boxes.len());
+
+        // Build job list: each job is a crop + metadata.
+        struct JobInfo {
+            idx: usize,
+            bbox: BoundingBox,
+            crop: DynamicImage,
+            crop_x: u32, crop_y: u32, crop_w: u32, crop_h: u32,
+        }
+        let mut jobs: Vec<JobInfo> = Vec::with_capacity(vertical_boxes.len());
         for (i, bbox) in vertical_boxes.iter().enumerate() {
             let crop_x = bbox.x.max(0) as u32;
             let crop_y = bbox.y.max(0) as u32;
@@ -1981,129 +2004,135 @@ pub fn recognize_boxes_streaming(
             let crop_h = bbox.h.max(0) as u32;
             let crop = image.crop_imm(crop_x, crop_y, crop_w, crop_h);
             if crop.width() < 4 || crop.height() < 4 { continue; }
+            jobs.push(JobInfo { idx: i, bbox: bbox.clone(), crop, crop_x, crop_y, crop_w, crop_h });
+        }
 
-            let ppocr_sess = rec_sessions_ppocr[0].clone();
-            let mut sess = ppocr_sess.lock().unwrap();
-            let (text, alternatives, char_cols, _max_t) = match crate::ppocr::recognize_ppocr_vertical(
-                &mut sess, &crop, ppocr_vocab,
-            ) {
-                Ok(r) => r,
-                Err(e) => { eprintln!("[PP-OCR] box {i}: {e}"); continue; }
-            };
-            drop(sess);
+        // Spawn persistent workers (not scoped) that outlive this function.
+        // Each worker pops jobs from a shared queue, processes them with its
+        // dedicated session, and sends results to the viewer channel.
+        // Workers yield CPU briefly after each send so the iced main thread
+        // gets scheduling time to drain the channel.
+        let num_workers = rec_sessions_ppocr.len().min(jobs.len());
+        use std::collections::VecDeque;
+        let job_queue = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::from(jobs)));
+        let v_indices_clone: Vec<usize> = v_indices.to_vec();
 
-            if text.is_empty() { continue; }
+        for worker_id in 0..num_workers {
+            let queue = job_queue.clone();
+            let sess = rec_sessions_ppocr[worker_id].clone();
+            let voc = ppocr_vocab.to_vec();
+            let sender = sender.clone();
+            let v_indices = v_indices_clone.clone();
+            std::thread::Builder::new()
+                .name(format!("ppocr-{worker_id}"))
+                .spawn(move || loop {
+                    let job = {
+                        let mut q = queue.lock().unwrap();
+                        q.pop_front()
+                    };
+                    let job = match job {
+                        Some(j) => j,
+                        None => return,
+                    };
 
-            // Debug: dump first 3 crop images for offline comparison with Python
-            if i < 3 {
-                let _ = crop.save(&format!("/tmp/ppocr_crop_{i}.png"));
-                println!("[PP-OCR] box {i}: crop saved ({}x{})", crop.width(), crop.height());
-            }
+                    let t_box = std::time::Instant::now();
+                    let i = job.idx;
+                    let crop_x = job.crop_x;
+                    let crop_y = job.crop_y;
+                    let crop_w = job.crop_w;
+                    let crop_h = job.crop_h;
 
-            // Compute character y positions from timesteps.
-            // Map t=0 → box top, end_t → box bottom.
-            // Shift up by avg_gap/2 so the first non-blank char (typically
-            // at t≈4) doesn't render too low.
-            let mut char_boxes: Vec<BoundingBox> = Vec::with_capacity(char_cols.len());
-            if char_cols.is_empty() {
-                return Ok(());
-            }
+                    let mut session = sess.lock().unwrap();
+                    let (text, alternatives, char_cols, _max_t) =
+                        match crate::ppocr::recognize_ppocr_vertical(&mut session, &job.crop, &voc) {
+                            Ok(r) => r,
+                            Err(e) => { eprintln!("[PP-OCR] box {i}: {e}"); continue; }
+                        };
+                    drop(session);
+                    if text.is_empty() { continue; }
+                    let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
 
-            let max_ch = char_cols.iter().cloned().fold(f32::MIN, f32::max);
-            let min_ch = char_cols.iter().cloned().fold(f32::MAX, f32::min);
-            let n = char_cols.len();
-            let avg_gap = if n > 1 {
-                (max_ch - min_ch) / (n - 1) as f32
-            } else {
-                (max_ch + 1.0) // single char
-            };
-            let end_t = max_ch + avg_gap; // effective end timestep
-            let first_offset = avg_gap * 0.5; // shift origin up
-            let adj_end = (end_t - first_offset).max(1.0);
+                    if i < 3 {
+                        let _ = job.crop.save(&format!("/tmp/ppocr_crop_{i}.png"));
+                    }
 
-            // Compute y_top for each char from timesteps.
-            let mut y_tops: Vec<f32> = Vec::with_capacity(n);
-            for ci in 0..n {
-                let raw = char_cols[ci] - first_offset;
-                let t_frac = raw.max(0.0) / adj_end;
-                y_tops.push(crop_y as f32 + t_frac * crop_h as f32);
-            }
+                    let mut char_boxes: Vec<BoundingBox> = Vec::with_capacity(char_cols.len());
+                    if char_cols.is_empty() { continue; }
 
-            // Each char extends downward until it either meets the next
-            // char's start or becomes square (height = crop_w).
-            // If it meets the next char (gap < crop_w), redistribute the
-            // ci..ci+2 span so both chars get equal height.
-            let max_h = crop_w as f32; // square = box width
-            let box_bottom = (crop_y + crop_h) as f32;
-            // Use a mutable copy of y_tops since we may shift positions
-            let mut y2 = y_tops.clone();
-            // Mark which chars have already been balanced in a pair
-            let mut done = vec![false; n];
-            for ci in 0..n {
-                if done[ci] { continue; }
-                let y_top = y2[ci];
-                let next_start = if ci + 1 < n { y2[ci + 1] } else { box_bottom };
-                let gap = next_start - y_top;
-                if gap >= max_h {
-                    // Gap is large enough for a square box
-                    let y_bot = y_top + max_h;
-                    let char_h = y_bot - y_top;
-                    char_boxes.push(BoundingBox::new(
-                        crop_x as i32, y_top as i32, crop_w as i32, char_h as i32, 1.0,
-                    ));
-                } else if ci + 1 < n && (ci + 2 < n || gap < max_h) {
-                    // Small gap — pair ci with ci+1 and share the total
-                    // span, each getting at most max_h.
-                    // When ci+2 doesn't exist, use box_bottom as the end.
-                    let endpoint = if ci + 2 < n { y2[ci + 2] } else { box_bottom };
-                    let total_span = (endpoint - y_top).min(2.0 * max_h);
-                    let half = total_span / 2.0;
-                    let boundary = y_top + half;
-                    // Char ci: y_top → boundary
-                    char_boxes.push(BoundingBox::new(
-                        crop_x as i32,
-                        y_top as i32,
-                        crop_w as i32,
-                        half as i32,
-                        1.0,
-                    ));
-                    // Char ci+1: boundary → endpoint, also capped at max_h
-                    let c1_h = ((endpoint - boundary).min(max_h)).max(3.0);
-                    char_boxes.push(BoundingBox::new(
-                        crop_x as i32,
-                        boundary as i32,
-                        crop_w as i32,
-                        c1_h as i32,
-                        1.0,
-                    ));
-                    done[ci + 1] = true;
-                } else if ci == n - 1 {
-                    // Truly the last character — extend to box bottom
-                    let char_h = (box_bottom - y_top).min(max_h).max(3.0);
-                    char_boxes.push(BoundingBox::new(
-                        crop_x as i32, y_top as i32, crop_w as i32, char_h as i32, 1.0,
-                    ));
-                } else {
-                    // Remaining case: square box (gap < max_h but no ci+2)
-                    char_boxes.push(BoundingBox::new(
-                        crop_x as i32, y_top as i32, crop_w as i32, max_h as i32, 1.0,
-                    ));
-                }
-            }
+                    let max_ch = char_cols.iter().cloned().fold(f32::MIN, f32::max);
+                    let min_ch = char_cols.iter().cloned().fold(f32::MAX, f32::min);
+                    let n = char_cols.len();
+                    let avg_gap = if n > 1 {
+                        (max_ch - min_ch) / (n - 1) as f32
+                    } else {
+                        max_ch + 1.0
+                    };
+                    let end_t = max_ch + avg_gap;
+                    let first_offset = avg_gap * 0.5;
+                    let adj_end = (end_t - first_offset).max(1.0);
 
-            println!("[PP-OCR] box {i}: sending text: \"{text}\"");
-            if sender.send((v_indices[i], DetectedAnnotation {
-                bbox: bbox.clone(),
-                line: Some(LineResult {
-                    text, char_boxes,
-                    alternatives,
-                    is_vertical: true,
-                    chunk_boxes: vec![BoundingBox::new(
-                        crop_x as i32, crop_y as i32,
-                        crop_w as i32, crop_h as i32, 1.0,
-                    )],
-                }),
-            })).is_err() { return Ok(()); }
+                    let mut y_tops: Vec<f32> = Vec::with_capacity(n);
+                    for ci in 0..n {
+                        let raw = char_cols[ci] - first_offset;
+                        let t_frac = raw.max(0.0) / adj_end;
+                        y_tops.push(crop_y as f32 + t_frac * crop_h as f32);
+                    }
+
+                    let max_h = crop_w as f32;
+                    let box_bottom = (crop_y + crop_h) as f32;
+                    let y2 = y_tops.clone();
+
+                    let mut done = vec![false; n];
+                    for ci in 0..n {
+                        if done[ci] { continue; }
+                        let y_top = y2[ci];
+                        let next_start = if ci + 1 < n { y2[ci + 1] } else { box_bottom };
+                        let gap = next_start - y_top;
+                        if gap >= max_h {
+                            let y_bot = y_top + max_h;
+                            char_boxes.push(BoundingBox::new(
+                                crop_x as i32, y_top as i32, crop_w as i32, (y_bot - y_top) as i32, 1.0,
+                            ));
+                        } else if ci + 1 < n && (ci + 2 < n || gap < max_h) {
+                            let endpoint = if ci + 2 < n { y2[ci + 2] } else { box_bottom };
+                            let total_span = (endpoint - y_top).min(2.0 * max_h);
+                            let half = total_span / 2.0;
+                            let boundary = y_top + half;
+                            char_boxes.push(BoundingBox::new(
+                                crop_x as i32, y_top as i32, crop_w as i32, half as i32, 1.0,
+                            ));
+                            let c1_h = ((endpoint - boundary).min(max_h)).max(3.0);
+                            char_boxes.push(BoundingBox::new(
+                                crop_x as i32, boundary as i32, crop_w as i32, c1_h as i32, 1.0,
+                            ));
+                            done[ci + 1] = true;
+                        } else if ci == n - 1 {
+                            let char_h = (box_bottom - y_top).min(max_h).max(3.0);
+                            char_boxes.push(BoundingBox::new(
+                                crop_x as i32, y_top as i32, crop_w as i32, char_h as i32, 1.0,
+                            ));
+                        } else {
+                            char_boxes.push(BoundingBox::new(
+                                crop_x as i32, y_top as i32, crop_w as i32, max_h as i32, 1.0,
+                            ));
+                        }
+                    }
+
+                    println!("[PP-OCR] box {i} (worker {worker_id}, {crop_w}x{crop_h}): {box_ms:.0} ms  text=\"{text}\"");
+
+                    let annotation = DetectedAnnotation {
+                        bbox: job.bbox.clone(),
+                        line: Some(LineResult {
+                            text, char_boxes, alternatives, is_vertical: true,
+                            chunk_boxes: vec![BoundingBox::new(
+                                crop_x as i32, crop_y as i32, crop_w as i32, crop_h as i32, 1.0,
+                            )],
+                        }),
+                    };
+                    if sender.send((v_indices[i], annotation)).is_err() { return; }
+                    // Yield so the UI thread can drain the channel.
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                }).expect("failed to spawn PP-OCR worker");
         }
     }
     let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;

@@ -218,4 +218,6 @@ pub enum Message {
     OcrRecognitionResult(usize, DetectedAnnotation),
     /// All OCR processing is done.
     OcrAllDone,
+    /// Frame tick — drains bootstrap/OCR channels so results stream smoothly.
+    Tick,
 }

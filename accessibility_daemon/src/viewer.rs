@@ -1329,8 +1329,9 @@ impl OcrViewer {
             self.state.set_single_line_result(index, line);
         }
 
-        // Rebuild nav graph after any annotation change (detection box or text)
-        self.state.build_nav_graph();
+        // Mark nav graph dirty — will be rebuilt lazily on next navigation or
+        // render, instead of rebuilding on every streaming result.
+        self.state.mark_nav_dirty();
 
         self.annotations = Rc::new(anns);
 
@@ -1359,6 +1360,7 @@ impl OcrViewer {
             }
             Rc::new(ann)
         };
+        let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
         let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
         let overlay = OverlayProgram {
             annotations: synced_annotations.clone(),
