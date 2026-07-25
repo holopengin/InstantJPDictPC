@@ -17,7 +17,7 @@ use ort::value::Tensor;
 ///
 /// Decoding: CTC greedy — argmax → collapse repeats → strip blank (0).
 /// vocab layout: 0=blank, 1..18708=chars, 18709=space.
-pub fn recognize_ppocr_vertical_batch(
+pub fn recognize_ppocr_batch(
     sess: &mut Session,
     crops: &[&DynamicImage],
     vocab: &[String],
@@ -217,6 +217,6 @@ pub fn recognize_ppocr_vertical(
     crop: &DynamicImage,
     vocab: &[String],
 ) -> Result<(String, Vec<Vec<(char, f32)>>, Vec<f32>, usize)> {
-    let mut batch = recognize_ppocr_vertical_batch(sess, &[crop], vocab)?;
+    let mut batch = recognize_ppocr_batch(sess, &[crop], vocab)?;
     Ok(batch.remove(0))
 }
