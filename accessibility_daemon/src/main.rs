@@ -430,12 +430,9 @@ fn run_ocr_viewer(
                     Err(err) => { eprintln!("[Bootstrap] OCR engine error: {err}"); return; }
                 };
                 println!("[Bootstrap] OCR engine created ({} chars) in {:.0} ms",
-                    engine.char_vocab.len(), t_engine.elapsed().as_secs_f64() * 1000.0);
+                    engine.ppocr_vocab.len(), t_engine.elapsed().as_secs_f64() * 1000.0);
 
-                engine.recognize_sessions.get();
-                if recognition_mode != RecognitionMode::Horizontal {
-                    engine.recognize_sessions_vertical.get();
-                }
+                // Warm up PP-OCR sessions
 
                 // Detection
                 let t_detect = std::time::Instant::now();
@@ -455,16 +452,14 @@ fn run_ocr_viewer(
                 }
 
                 // Recognition
-                let char_vocab = engine.char_vocab.clone();
                 let ppocr_vocab = engine.ppocr_vocab.clone();
                 let batch_sz = engine.batch_size;
                 let rec_mode = engine.recognition_mode;
                 let t_recognize = std::time::Instant::now();
                 if let Err(e) = ocr_engine::recognize_boxes_streaming(
                     &image, &boxes,
-                    engine.recognize_sessions.get(),
                     engine.ppocr_session.get(),
-                    &char_vocab, &ppocr_vocab, batch_sz, rec_mode,
+                    &ppocr_vocab, batch_sz, rec_mode,
                     ocr_tx2,
                 ) {
                     eprintln!("[OCR] Recognition error: {e}");
