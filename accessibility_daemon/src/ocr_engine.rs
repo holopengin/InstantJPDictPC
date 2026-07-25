@@ -2089,7 +2089,7 @@ pub fn recognize_boxes_streaming(
                     let crop_h = job.crop_h;
 
                     let mut session = sess.lock().unwrap();
-                    let (text, alternatives, char_cols, _max_t) =
+                    let (text, alternatives, char_cols, seq_len_total) =
                         match crate::ppocr::recognize_ppocr_vertical(&mut session, &job.crop, &voc) {
                             Ok(r) => r,
                             Err(e) => { eprintln!("[PP-OCR] box {i}: {e}"); continue; }
@@ -2102,66 +2102,57 @@ pub fn recognize_boxes_streaming(
                         let _ = job.crop.save(&format!("/tmp/ppocr_crop_{i}.png"));
                     }
 
-                    let mut char_boxes: Vec<BoundingBox> = Vec::with_capacity(char_cols.len());
-                    if char_cols.is_empty() { continue; }
-
-                    let max_ch = char_cols.iter().cloned().fold(f32::MIN, f32::max);
-                    let min_ch = char_cols.iter().cloned().fold(f32::MAX, f32::min);
+                    // ---- Character boxes via RapidOcrNet-style mapping ----
+                    // avgColWidth = pixels per CTC timestep along the crop height.
+                    // Center of char t: (t + 0.5) * avgColWidth (the +0.5 offsets from edges).
                     let n = char_cols.len();
-                    let avg_gap = if n > 1 {
-                        (max_ch - min_ch) / (n - 1) as f32
-                    } else {
-                        max_ch + 1.0
-                    };
-                    let end_t = max_ch + avg_gap;
-                    let first_offset = avg_gap * 0.5;
-                    let adj_end = (end_t - first_offset).max(1.0);
+                    if n == 0 { continue; }
+                    if seq_len_total == 0 { continue; }
+                    let avg_col_width = crop_h as f32 / seq_len_total as f32;
 
-                    let mut y_tops: Vec<f32> = Vec::with_capacity(n);
-                    for ci in 0..n {
-                        let raw = char_cols[ci] - first_offset;
-                        let t_frac = raw.max(0.0) / adj_end;
-                        y_tops.push(crop_y as f32 + t_frac * crop_h as f32);
+                    // Compute avg char height from consecutive column spacing
+                    let avg_char_height = if n > 1 {
+                        let col_span = char_cols[n - 1] - char_cols[0];
+                        let avg_step_cols = col_span / (n - 1) as f32;
+                        (avg_step_cols * avg_col_width).max(3.0)
+                    } else {
+                        avg_col_width.max(3.0)
+                    };
+
+                    // Build character cells along the crop height
+                    struct CharCell { y_top: f32, y_bot: f32 }
+                    let mut cells: Vec<CharCell> = char_cols.iter().map(|&t| {
+                        let center = (t as f32 + 0.5) * avg_col_width;
+                        let half = avg_char_height / 2.0;
+                        CharCell {
+                            y_top: (center - half).max(0.0),
+                            y_bot: (center + half).min(crop_h as f32),
+                        }
+                    }).collect();
+
+                    // Sort by position
+                    cells.sort_by(|a, b| a.y_top.partial_cmp(&b.y_top).unwrap());
+
+                    // Overlap adjustment: split overlap evenly between adjacent cells
+                    for ci in 0..n.saturating_sub(1) {
+                        if cells[ci].y_bot > cells[ci + 1].y_top {
+                            let overlap = cells[ci].y_bot - cells[ci + 1].y_top;
+                            let half = overlap / 2.0;
+                            cells[ci].y_bot -= half;
+                            cells[ci + 1].y_top += half;
+                        }
                     }
 
-                    let max_h = crop_w as f32;
-                    let box_bottom = (crop_y + crop_h) as f32;
-                    let y2 = y_tops.clone();
-
-                    let mut done = vec![false; n];
-                    for ci in 0..n {
-                        if done[ci] { continue; }
-                        let y_top = y2[ci];
-                        let next_start = if ci + 1 < n { y2[ci + 1] } else { box_bottom };
-                        let gap = next_start - y_top;
-                        if gap >= max_h {
-                            let y_bot = y_top + max_h;
-                            char_boxes.push(BoundingBox::new(
-                                crop_x as i32, y_top as i32, crop_w as i32, (y_bot - y_top) as i32, 1.0,
-                            ));
-                        } else if ci + 1 < n && (ci + 2 < n || gap < max_h) {
-                            let endpoint = if ci + 2 < n { y2[ci + 2] } else { box_bottom };
-                            let total_span = (endpoint - y_top).min(2.0 * max_h);
-                            let half = total_span / 2.0;
-                            let boundary = y_top + half;
-                            char_boxes.push(BoundingBox::new(
-                                crop_x as i32, y_top as i32, crop_w as i32, half as i32, 1.0,
-                            ));
-                            let c1_h = ((endpoint - boundary).min(max_h)).max(3.0);
-                            char_boxes.push(BoundingBox::new(
-                                crop_x as i32, boundary as i32, crop_w as i32, c1_h as i32, 1.0,
-                            ));
-                            done[ci + 1] = true;
-                        } else if ci == n - 1 {
-                            let char_h = (box_bottom - y_top).min(max_h).max(3.0);
-                            char_boxes.push(BoundingBox::new(
-                                crop_x as i32, y_top as i32, crop_w as i32, char_h as i32, 1.0,
-                            ));
-                        } else {
-                            char_boxes.push(BoundingBox::new(
-                                crop_x as i32, y_top as i32, crop_w as i32, max_h as i32, 1.0,
-                            ));
-                        }
+                    let mut char_boxes: Vec<BoundingBox> = Vec::with_capacity(n);
+                    for cell in &cells {
+                        let ch = (cell.y_bot - cell.y_top).max(1.0);
+                        char_boxes.push(BoundingBox::new(
+                            crop_x as i32,
+                            (crop_y as f32 + cell.y_top) as i32,
+                            crop_w as i32,
+                            ch as i32,
+                            1.0,
+                        ));
                     }
 
                     println!("[PP-OCR] box {i} (worker {worker_id}, {crop_w}x{crop_h}): {box_ms:.0} ms  text=\"{text}\"");
