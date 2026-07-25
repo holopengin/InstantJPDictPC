@@ -704,11 +704,15 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                 let handle = entry.handles[idx].clone();
                                 drop(c); // release borrow before draw_image
                                 let px_size = font_size.round() as u32;
-                                let bbox_cx = if sz_c.height / sz_c.width > 1.2 {
-                                    // Thin/tall bbox: center ink
+                                let bbox_cx = if _ch.is_ascii() {
+                                    // Half-width chars (ASCII letters/digits): the
+                                    // recognition bbox is typically wider than the ink,
+                                    // so center by ink width to avoid left-alignment.
                                     pt_c.x + (sz_c.width - entry_w as f32) / 2.0
                                 } else {
-                                    // Square-ish bbox: center em-box, then use xmin
+                                    // CJK chars and punctuation: center the em-box,
+                                    // then offset by xmin to preserve traditional
+                                    // glyph positioning (punctuation sits at edge).
                                     let em_left = pt_c.x + (sz_c.width - px_size as f32) / 2.0;
                                     em_left + entry_xmin as f32
                                 };
