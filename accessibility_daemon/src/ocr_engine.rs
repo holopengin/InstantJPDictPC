@@ -9,50 +9,25 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::models::*;
-use crate::ocr_parallel;
 use crate::util::japanese::to_vertical_glyph;
 
 // PP-OCRv6 detection constants
 const PPOCR_DET_LONG_SIDE: u32 = 960;
-const PPOCR_DET_THRESH: f32 = 0.3;        // binarization threshold
-const PPOCR_DET_BOX_THRESH: f32 = 0.8;   // per-box confidence threshold
-const PPOCR_DET_UNCLIP_RATIO: f32 = 1.1;  // box expansion ratio
-const REC_WIDTH: u32 = 960;
-const REC_HEIGHT: u32 = 32;
-const VERT_REC_WIDTH: u32 = 32;
-const VERT_REC_HEIGHT: u32 = 480;
-const REC_CONFIDENCE_THRESHOLD: f32 = 0.1;
+const PPOCR_DET_THRESH: f32 = 0.3;
+const PPOCR_DET_BOX_THRESH: f32 = 0.8;
+const PPOCR_DET_UNCLIP_RATIO: f32 = 1.1;
 const X_OVERLAP_THRESHOLD: f32 = 0.3;
 
 // Box fill ratio when rendering glyphs inside detected boxes. 1.0 means match box height, <1.0 leave padding.
 const BOX_FILL_RATIO: f32 = 0.9;
 
-// Simulated swapped pairs for text correction
-const MEIKI_SWAPPED_PAIRS: &[(&str, &str); 8] = &[
-    ("儡傀", "傀儡"),
-    ("談冗", "冗談"),
-    ("汰淘", "淘汰"),
-    ("沱滂", "滂沱"),
-    ("攣痙", "痙攣"),
-    ("酊酩", "酩酊"),
-    ("麭麺", "麺麭"),
-    ("哭慟", "慟哭"),
-];
-
-/// Number of sessions in each orientation pool.
-/// More sessions = less contention, but each session costs ~31 MB of RAM.
-const SESSION_POOL_SIZE: usize = 1;
-/// More sessions for PP-OCRv6 = less contention for parallel vertical boxes.
+/// Number of sessions in the PP-OCRv6 pool.
 /// Each session adds ~21 MB of RAM.
 const PPOCR_SESSION_POOL_SIZE: usize = 4;
 pub struct OcrEngine {
     pub detect_session: Session,
-    /// Recognition sessions are loaded lazily on first use to speed up startup.
-    /// Each pool is initialized exactly once via `std::sync::Once`.
-    pub recognize_sessions: RecognizeSessionPool,
-    pub recognize_sessions_vertical: RecognizeSessionPool,
+    /// PP-OCRv6 recognition sessions — used for both horizontal and vertical text.
     pub ppocr_session: RecognizeSessionPool,
-    pub char_vocab: Vec<i64>,
     pub ppocr_vocab: Vec<String>,
     pub recognition_mode: RecognitionMode,
     pub batch_size: usize,
@@ -61,9 +36,7 @@ pub struct OcrEngine {
 
 /// Lazily-initialized pool of recognition sessions.
 ///
-/// On first access, all `SESSION_POOL_SIZE` sessions are loaded in parallel.
-/// This defers ~93 MB of model loading from startup to first recognition call,
-/// cutting cold-start time by ~1.5 seconds.
+/// On first access, all sessions are loaded in parallel.
 pub struct RecognizeSessionPool {
     sessions: std::sync::OnceLock<Vec<std::sync::Arc<std::sync::Mutex<Session>>>>,
     model_path: std::path::PathBuf,
@@ -75,7 +48,7 @@ impl RecognizeSessionPool {
         RecognizeSessionPool {
             sessions: std::sync::OnceLock::new(),
             model_path,
-            pool_size: SESSION_POOL_SIZE,
+            pool_size: PPOCR_SESSION_POOL_SIZE,
         }
     }
 
@@ -127,28 +100,12 @@ impl OcrEngine {
 
         println!("Detection model loaded. Recognition models will be loaded on first use.");
 
-        // Load character vocabulary
-        let vocab_path = model_path.join("char_vocab.json");
-        let vocab_json: Vec<i64> = match std::fs::read_to_string(&vocab_path) {
-            Ok(content) => serde_json::from_str(&content)
-                .with_context(|| format!("Failed to parse char_vocab.json"))?,
-            Err(_) => Vec::new(),
-        };
-
-        let rec_path = model_path.join("meiki.text.rec.v0.960x32.with_logits.onnx");
-        let rec_vert_path = model_path.join("meiki.text.rec.v0.vertical.32x480.with_logits.onnx");
-
-        let rec_vert_pool = match recognition_mode {
-            RecognitionMode::Horizontal => RecognizeSessionPool::empty(),
-            _ => RecognizeSessionPool::new(rec_vert_path.to_path_buf()),
-        };
-
-        // PP-OCRv6 vertical recognition model
+        // PP-OCRv6 recognition model
         let ppocr_model_path = model_path.join("PP-OCRv6_small_rec").join("inference.onnx");
         let ppocr_pool = if ppocr_model_path.exists() {
             RecognizeSessionPool::with_size(ppocr_model_path, PPOCR_SESSION_POOL_SIZE)
         } else {
-            eprintln!("[PP-OCR] Model not found at {ppocr_model_path:?}, vertical recognition disabled");
+            eprintln!("[PP-OCR] Model not found at {ppocr_model_path:?}, recognition disabled");
             RecognizeSessionPool::empty()
         };
         let ppocr_vocab_path = model_path.join("PP-OCRv6_small_rec").join("vocab.json");
@@ -165,10 +122,7 @@ impl OcrEngine {
 
         Ok(OcrEngine {
             detect_session,
-            recognize_sessions: RecognizeSessionPool::new(rec_path.to_path_buf()),
-            recognize_sessions_vertical: rec_vert_pool,
             ppocr_session: ppocr_pool,
-            char_vocab: vocab_json,
             ppocr_vocab,
             recognition_mode,
             batch_size,
@@ -177,7 +131,7 @@ impl OcrEngine {
     }
 
     pub fn is_ready(&self) -> bool {
-        !self.char_vocab.is_empty()
+        !self.ppocr_vocab.is_empty()
     }
 
     /// Detects bounding boxes using PP-OCRv6 segmentation-based detection model.
@@ -494,637 +448,6 @@ impl OcrEngine {
         boxes
     }
 
-    pub fn recognize_single_line(
-        &mut self,
-        image: &DynamicImage,
-        bbox: &BoundingBox,
-    ) -> Result<Option<LineResult>> {
-        // Similar to Kotlin: decide between short chunk, horizontal long line, vertical long line
-        let is_vertical = bbox.h > bbox.w;
-        let crop_x = bbox.x.max(0) as u32;
-        let crop_y = bbox.y.max(0) as u32;
-        let crop_w = bbox.w.max(0) as u32;
-        let crop_h = bbox.h.max(0) as u32;
-        if crop_w == 0 || crop_h == 0 {
-            return Ok(None);
-        }
-        let crop = image.crop_imm(crop_x, crop_y, crop_w, crop_h);
-
-        let result: Option<LineResult>;
-        if is_vertical && ((crop_h as f32) * (32.0f32 / crop_w as f32) > 350.0f32) {
-            result =
-                Some(self.recognize_vertical_long_line(&crop, crop_x as i32, crop_y as i32)?);
-        } else if !is_vertical && ((crop_w as f32) * (32.0f32 / crop_h as f32) > REC_WIDTH as f32) {
-            result =
-                Some(self.recognize_horizontal_long_line(&crop, crop_x as i32, crop_y as i32)?);
-        } else {
-            let (filtered, eff_w, eff_h) = self.recognize_single_chunk(&crop, is_vertical)?;
-            let text: String = filtered.iter().map(|c| c.char).collect();
-            let alternatives: Vec<Vec<(char, f32)>> =
-                filtered.iter().map(|c| c.alternatives.clone()).collect();
-            let mut char_boxes: Vec<BoundingBox> = Vec::new();
-            for c in filtered.iter() {
-                // convert to global rect
-                if is_vertical {
-                    let x1 = (c.box_coords[0] / (VERT_REC_WIDTH as f32)) * (crop_w as f32)
-                        + (crop_x as f32);
-                    let y1 = (c.box_coords[1] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
-                    let x2 = (c.box_coords[2] / (VERT_REC_WIDTH as f32)) * (crop_w as f32)
-                        + (crop_x as f32);
-                    let y2 = (c.box_coords[3] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
-                    char_boxes.push(BoundingBox::new(
-                        x1.round() as i32,
-                        y1.round() as i32,
-                        (x2 - x1).round() as i32,
-                        (y2 - y1).round() as i32,
-                        c.score,
-                    ));
-                } else {
-                    let x1 = (c.box_coords[0] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
-                    let y1 =
-                        (c.box_coords[1] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
-                    let x2 = (c.box_coords[2] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
-                    let y2 =
-                        (c.box_coords[3] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
-                    char_boxes.push(BoundingBox::new(
-                        x1.round() as i32,
-                        y1.round() as i32,
-                        (x2 - x1).round() as i32,
-                        (y2 - y1).round() as i32,
-                        c.score,
-                    ));
-                }
-            }
-            result = Some(LineResult {
-                text,
-                char_boxes,
-                alternatives,
-                is_vertical,
-                chunk_boxes: vec![BoundingBox::new(
-                    crop_x as i32,
-                    crop_y as i32,
-                    crop_w as i32,
-                    crop_h as i32,
-                    1.0,
-                )],
-            });
-        }
-
-        Ok(result)
-    }
-
-    pub fn recognize_single_chunk(
-        &mut self,
-        chunk: &DynamicImage,
-        is_vertical: bool,
-    ) -> Result<(Vec<CharCandidate>, i32, i32)> {
-        let target_w = if is_vertical {
-            VERT_REC_WIDTH as u32
-        } else {
-            REC_WIDTH as u32
-        };
-        let target_h = if is_vertical {
-            VERT_REC_HEIGHT as u32
-        } else {
-            REC_HEIGHT as u32
-        };
-
-        // Compute effective sizes matching Kotlin logic
-        let (effective_w, effective_h) = if is_vertical {
-            let scale_factor = 32.0f32 / (chunk.width() as f32);
-            (
-                32i32,
-                (chunk.height() as f32 * scale_factor).min(VERT_REC_HEIGHT as f32) as i32,
-            )
-        } else {
-            let scale_factor = 32.0f32 / (chunk.height() as f32);
-            (
-                (chunk.width() as f32 * scale_factor).min(REC_WIDTH as f32) as i32,
-                32i32,
-            )
-        };
-
-        if effective_w <= 0 || effective_h <= 0 {
-            return Ok((Vec::new(), effective_w as i32, effective_h as i32));
-        }
-
-        // Resize chunk and pad to target
-        let resized = chunk.resize_exact(
-            REC_WIDTH,
-            REC_HEIGHT,
-            image::imageops::FilterType::Triangle,
-        );
-        let mut padded = RgbaImage::from_pixel(target_w, target_h, Rgba([0u8, 0u8, 0u8, 255u8]));
-        let resized_rgba = resized.to_rgba8();
-        for y in 0..(effective_h as u32) {
-            for x in 0..(effective_w as u32) {
-                let p = resized_rgba.get_pixel(x, y);
-                padded.put_pixel(x, y, *p);
-            }
-        }
-
-        // Convert to NCHW float tensor
-        let img_data = self.image_to_nchw(&padded, target_w, target_h);
-        let input_tensor = Tensor::from_array((
-            [1i64, 3, target_h as i64, target_w as i64],
-            img_data.into_boxed_slice(),
-        ))?;
-
-        // Run the session and extract outputs inside a limited scope to avoid holding a mutable borrow on self
-        let (labels_arr_opt, boxes_arr_opt, scores_arr_opt, indices_arr_opt, raw_logits_opt) = {
-            // Build inputs
-            let mut active_session = if is_vertical {
-                self.recognize_sessions_vertical.get()[0].lock().unwrap()
-            } else {
-                self.recognize_sessions.get()[0].lock().unwrap()
-            };
-            let session_input_names: Vec<String> = active_session
-                .inputs()
-                .iter()
-                .map(|o| o.name().to_string())
-                .collect();
-            let image_input_name = session_input_names
-                .iter()
-                .find(|n| n.contains("image") || n.contains("input"))
-                .or_else(|| session_input_names.first())
-                .map(|s| s.to_string())
-                .context("Recognition model has no inputs")?;
-
-            let has_orig_target_sizes =
-                session_input_names.iter().any(|n| n == "orig_target_sizes");
-
-            let inputs = if has_orig_target_sizes {
-                let size_tensor = Tensor::from_array((
-                    [1i64, 2],
-                    vec![target_w as i64, target_h as i64].into_boxed_slice(),
-                ))?;
-                ort::inputs! {
-                    image_input_name.as_str() => input_tensor,
-                    "orig_target_sizes" => size_tensor
-                }
-            } else {
-                ort::inputs! { image_input_name.as_str() => input_tensor }
-            };
-
-            // Run session and collect outputs
-            let output_names: Vec<String> = active_session
-                .outputs()
-                .iter()
-                .map(|o| o.name().to_string())
-                .collect();
-            let run_outputs = active_session.run(inputs)?;
-
-            // Helper closures to extract arrays
-            let try_extract_f32 =
-                |val: &ort::value::Value| val.try_extract_array::<f32>().ok().map(|a| a.to_owned());
-            let try_extract_i64 =
-                |val: &ort::value::Value| val.try_extract_array::<i64>().ok().map(|a| a.to_owned());
-
-            let labels_name = output_names
-                .iter()
-                .find(|n| n.contains("labels") || n.contains("char_codes"));
-            let boxes_name = output_names.iter().find(|n| n.contains("boxes"));
-            let scores_name = output_names.iter().find(|n| n.contains("scores"));
-            let logits_name = output_names.iter().find(|n| n.contains("logits"));
-            let indices_name = output_names.iter().find(|n| n.contains("indices"));
-
-            let labels_val = labels_name
-                .and_then(|n| run_outputs.get(n.as_str()))
-                .or_else(|| run_outputs.get(output_names.get(0).map(|s| s.as_str()).unwrap_or("")));
-            let boxes_val = boxes_name
-                .and_then(|n| run_outputs.get(n.as_str()))
-                .or_else(|| run_outputs.get(output_names.get(1).map(|s| s.as_str()).unwrap_or("")));
-            let scores_val = scores_name
-                .and_then(|n| run_outputs.get(n.as_str()))
-                .or_else(|| run_outputs.get(output_names.get(2).map(|s| s.as_str()).unwrap_or("")));
-            let logits_val = logits_name.and_then(|n| run_outputs.get(n.as_str()));
-            let indices_val = indices_name.and_then(|n| run_outputs.get(n.as_str()));
-
-            // Extract arrays
-            let labels_arr_opt: Option<Vec<i64>> = labels_val.and_then(|v| {
-                try_extract_i64(v)
-                    .map(|a| a.iter().cloned().collect())
-                    .or_else(|| {
-                        // try i32
-                        v.try_extract_array::<i32>()
-                            .ok()
-                            .map(|a| a.to_owned().iter().map(|x| *x as i64).collect())
-                    })
-            });
-
-            let boxes_arr_opt = boxes_val.and_then(|v| try_extract_f32(v));
-            let scores_arr_opt: Option<Vec<f32>> = scores_val.and_then(|v| {
-                try_extract_f32(v)
-                    .map(|a| a.iter().cloned().collect())
-                    .or_else(|| {
-                        v.try_extract_array::<f64>()
-                            .ok()
-                            .map(|a| a.to_owned().iter().map(|x| *x as f32).collect())
-                    })
-            });
-
-            let indices_arr_opt: Option<Vec<i64>> = indices_val.and_then(|v| {
-                try_extract_i64(v)
-                    .map(|a| a.iter().cloned().collect())
-                    .or_else(|| {
-                        v.try_extract_array::<i32>()
-                            .ok()
-                            .map(|a| a.to_owned().iter().map(|x| *x as i64).collect())
-                    })
-            });
-
-            let raw_logits_opt: Option<Vec<f32>> = logits_val.and_then(|v| {
-                try_extract_f32(v)
-                    .map(|a| a.iter().cloned().collect())
-                    .or_else(|| {
-                        v.try_extract_array::<f64>()
-                            .ok()
-                            .map(|a| a.to_owned().iter().map(|x| *x as f32).collect())
-                    })
-            });
-
-            (
-                labels_arr_opt,
-                boxes_arr_opt,
-                scores_arr_opt,
-                indices_arr_opt,
-                raw_logits_opt,
-            )
-        };
-
-        // Basic validation
-        if labels_arr_opt.is_none() || boxes_arr_opt.is_none() || scores_arr_opt.is_none() {
-            // Clean up and return empty
-            return Ok((Vec::new(), effective_w as i32, effective_h as i32));
-        }
-
-        let labels_arr = labels_arr_opt.unwrap();
-        let boxes_arr = boxes_arr_opt.unwrap();
-        let scores_arr = scores_arr_opt.unwrap();
-        let indices_arr = indices_arr_opt;
-        let raw_logits = raw_logits_opt;
-
-        // Normalize shapes and build logits matrix if present
-        let num_queries = 48usize;
-        let logits_matrix: Option<Vec<Vec<f32>>> = raw_logits.as_ref().and_then(|raw| {
-            if raw.len() % num_queries == 0 && raw.len() > 0 {
-                let num_classes = raw.len() / num_queries;
-                let mut mat: Vec<Vec<f32>> = Vec::with_capacity(num_queries);
-                for q in 0..num_queries {
-                    let mut row: Vec<f32> = Vec::with_capacity(num_classes);
-                    for c in 0..num_classes {
-                        row.push(raw[q * num_classes + c]);
-                    }
-                    mat.push(row);
-                }
-                Some(mat)
-            } else {
-                None
-            }
-        });
-
-        // Parse boxes and scores
-        let mut parsed_boxes: Vec<[f32; 4]> = Vec::new();
-        if boxes_arr.ndim() == 3 {
-            let num = boxes_arr.shape()[1];
-            for i in 0..num {
-                parsed_boxes.push([
-                    boxes_arr[[0, i, 0]],
-                    boxes_arr[[0, i, 1]],
-                    boxes_arr[[0, i, 2]],
-                    boxes_arr[[0, i, 3]],
-                ]);
-            }
-        } else if boxes_arr.ndim() == 2 {
-            let num = boxes_arr.shape()[0];
-            for i in 0..num {
-                parsed_boxes.push([
-                    boxes_arr[[i, 0]],
-                    boxes_arr[[i, 1]],
-                    boxes_arr[[i, 2]],
-                    boxes_arr[[i, 3]],
-                ]);
-            }
-        }
-
-        let mut parsed_scores: Vec<f32> = Vec::new();
-        if scores_arr.len() > 0 {
-            parsed_scores = scores_arr.clone();
-        }
-
-        // Build candidates
-        let mut candidates: Vec<CharCandidate> = Vec::new();
-        for i in 0..parsed_scores.len() {
-            if parsed_scores[i] > REC_CONFIDENCE_THRESHOLD {
-                let mut alternatives: Vec<(char, f32)> = Vec::new();
-                if let (Some(mat), Some(indices)) = (&logits_matrix, &indices_arr) {
-                    let num_classes = if !mat.is_empty() { mat[0].len() } else { 0 };
-                    if num_classes > 0 && i < indices.len() {
-                        let query_idx = (indices[i] / (num_classes as i64)) as usize;
-                        if query_idx < mat.len() {
-                            let qlogits = &mat[query_idx];
-                            // take top 15
-                            let mut kv: Vec<(usize, f32)> =
-                                qlogits.iter().cloned().enumerate().collect();
-                            kv.sort_by(|a, b| {
-                                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            for (j, &(_idx, _val)) in kv.iter().enumerate().take(15) {
-                                let class_idx = kv[j].0;
-                                let ch = self
-                                    .char_vocab
-                                    .get(class_idx)
-                                    .and_then(|c| std::char::from_u32(*c as u32))
-                                    .unwrap_or(' ');
-                                alternatives.push((ch, kv[j].1));
-                            }
-                        }
-                    }
-                }
-
-                let label_char = labels_arr
-                    .get(i)
-                    .and_then(|v| std::char::from_u32(*v as u32))
-                    .unwrap_or(' ');
-                let box_coords = parsed_boxes.get(i).cloned().unwrap_or([0.0, 0.0, 0.0, 0.0]);
-                candidates.push(CharCandidate {
-                    char: label_char,
-                    score: parsed_scores[i],
-                    box_coords,
-                    alternatives,
-                });
-            }
-        }
-
-        // Sort and filter overlaps
-        candidates.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut filtered: Vec<CharCandidate> = Vec::new();
-        for cand in candidates.into_iter() {
-            let mut keep = true;
-            for f in filtered.iter() {
-                let overlap = if is_vertical {
-                    self.calculate_y_overlap(&cand.box_coords, &f.box_coords)
-                } else {
-                    self.calculate_x_overlap(&cand.box_coords, &f.box_coords)
-                };
-                if overlap > X_OVERLAP_THRESHOLD {
-                    keep = false;
-                    break;
-                }
-            }
-            if keep {
-                filtered.push(cand);
-            }
-        }
-
-        // Sort final
-        if is_vertical {
-            filtered.sort_by(|a, b| {
-                a.box_coords[1]
-                    .partial_cmp(&b.box_coords[1])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        } else {
-            filtered.sort_by(|a, b| {
-                a.box_coords[0]
-                    .partial_cmp(&b.box_coords[0])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-
-        Ok((filtered, effective_w as i32, effective_h as i32))
-    }
-
-    pub fn recognize_vertical_long_line(
-        &mut self,
-        crop: &DynamicImage,
-        crop_x: i32,
-        crop_y: i32,
-    ) -> Result<LineResult> {
-        let scale_factor = 32f32 / (crop.width() as f32);
-        let max_chunk_height = (350f32 / scale_factor) as i32;
-        let mut chunk_results: Vec<(Vec<CharCandidate>, i32, i32, i32, i32, i32, i32)> = Vec::new();
-        let mut current_y = 0i32;
-        while current_y < crop.height() as i32 {
-            let remaining_h = crop.height() as i32 - current_y;
-            if remaining_h < 10 {
-                break;
-            }
-            let h = std::cmp::min(max_chunk_height, remaining_h);
-            let chunk_bitmap = crop.crop_imm(0, current_y as u32, crop.width() as u32, h as u32);
-            let (candidates, eff_w, eff_h) = self.recognize_single_chunk(&chunk_bitmap, true)?;
-            if eff_h <= 0 {
-                current_y += ((h as f32) * 0.8f32) as i32;
-                continue;
-            }
-            chunk_results.push((
-                candidates.clone(),
-                0,
-                current_y,
-                crop.width() as i32,
-                h,
-                eff_w,
-                eff_h,
-            ));
-            if current_y + h >= crop.height() as i32 {
-                break;
-            }
-
-            if !candidates.is_empty() {
-                let mut sorted_candidates = candidates.clone();
-                sorted_candidates.sort_by(|a, b| {
-                    a.box_coords[1]
-                        .partial_cmp(&b.box_coords[1])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let overlap_start_threshold = (h as f32) * 0.6f32;
-                let anchor_options: Vec<_> = sorted_candidates
-                    .iter()
-                    .filter(|it| {
-                        let local_y_top = (it.box_coords[1] / eff_h as f32) * (h as f32);
-                        local_y_top > overlap_start_threshold
-                    })
-                    .collect();
-                let anchor_candidate = if anchor_options.len() >= 2 {
-                    anchor_options[anchor_options.len() - 2].clone()
-                } else if !anchor_options.is_empty() {
-                    anchor_options[0].clone()
-                } else {
-                    sorted_candidates.last().unwrap().clone()
-                };
-                let local_y_top = (anchor_candidate.box_coords[1] / eff_h as f32) * (h as f32);
-                let chunk_margin = (crop.width() as f32 * 0.1f32).max(2.0) as i32;
-                let next_y = (current_y + local_y_top as i32 - chunk_margin).max(0);
-                if next_y <= current_y || next_y >= current_y + h - 10 {
-                    current_y += ((h as f32) * 0.8f32) as i32;
-                } else {
-                    current_y = next_y;
-                }
-            } else {
-                current_y += ((h as f32) * 0.8f32) as i32;
-            }
-        }
-
-        // For simplicity, stitch naively by concatenation of recognized chars in order
-        let mut final_text = String::new();
-        let mut final_char_boxes: Vec<BoundingBox> = Vec::new();
-        for (cands, offset_x, offset_y, chunk_w, chunk_h, _eff_w, eff_h) in chunk_results.iter() {
-            for cand in cands.iter() {
-                let global = {
-                    // Convert cand.box_coords -> global rect
-                    let rx1 = cand.box_coords[0];
-                    let ry1 = cand.box_coords[1];
-                    let rx2 = cand.box_coords[2];
-                    let ry2 = cand.box_coords[3];
-                    let x1 = (rx1 / (VERT_REC_WIDTH as f32)) * (*chunk_w as f32)
-                        + (*offset_x as f32)
-                        + (crop_x as f32);
-                    let y1 = (ry1 / (*eff_h as f32)) * (*chunk_h as f32)
-                        + (*offset_y as f32)
-                        + (crop_y as f32);
-                    let x2 = (rx2 / (VERT_REC_WIDTH as f32)) * (*chunk_w as f32)
-                        + (*offset_x as f32)
-                        + (crop_x as f32);
-                    let y2 = (ry2 / (*eff_h as f32)) * (*chunk_h as f32)
-                        + (*offset_y as f32)
-                        + (crop_y as f32);
-                    BoundingBox::new(
-                        x1.round() as i32,
-                        y1.round() as i32,
-                        (x2 - x1).round() as i32,
-                        (y2 - y1).round() as i32,
-                        cand.score,
-                    )
-                };
-                final_text.push(cand.char);
-                final_char_boxes.push(global);
-            }
-        }
-
-        Ok(LineResult {
-            text: final_text,
-            char_boxes: final_char_boxes,
-            alternatives: Vec::new(),
-            is_vertical: true,
-            chunk_boxes: Vec::new(),
-        })
-    }
-
-    pub fn recognize_horizontal_long_line(
-        &mut self,
-        crop: &DynamicImage,
-        crop_x: i32,
-        crop_y: i32,
-    ) -> Result<LineResult> {
-        let scale_factor = 32f32 / (crop.height() as f32);
-        let max_chunk_width = (960f32 / scale_factor) as i32;
-        let mut chunk_results: Vec<(Vec<CharCandidate>, i32, i32, i32, i32, i32, i32)> = Vec::new();
-        let mut current_x = 0i32;
-        while current_x < crop.width() as i32 {
-            let remaining_w = crop.width() as i32 - current_x;
-            if remaining_w < 10 {
-                break;
-            }
-            let w = std::cmp::min(max_chunk_width, remaining_w);
-            let chunk_bitmap = crop.crop_imm(current_x as u32, 0, w as u32, crop.height() as u32);
-            let (candidates, eff_w, eff_h) = self.recognize_single_chunk(&chunk_bitmap, false)?;
-            if eff_w <= 0 {
-                current_x += ((w as f32) * 0.8f32) as i32;
-                continue;
-            }
-            chunk_results.push((
-                candidates.clone(),
-                current_x,
-                0,
-                w,
-                crop.height() as i32,
-                eff_w,
-                eff_h,
-            ));
-            if current_x + w >= crop.width() as i32 {
-                break;
-            }
-
-            if !candidates.is_empty() {
-                let mut sorted_candidates = candidates.clone();
-                sorted_candidates.sort_by(|a, b| {
-                    a.box_coords[0]
-                        .partial_cmp(&b.box_coords[0])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let overlap_start_threshold = (w as f32) * 0.6f32;
-                let anchor_options: Vec<_> = sorted_candidates
-                    .iter()
-                    .filter(|it| {
-                        let local_x_left = (it.box_coords[0] / eff_w as f32) * (w as f32);
-                        local_x_left > overlap_start_threshold
-                    })
-                    .collect();
-                let anchor_candidate = if anchor_options.len() >= 2 {
-                    anchor_options[anchor_options.len() - 2].clone()
-                } else if !anchor_options.is_empty() {
-                    anchor_options[0].clone()
-                } else {
-                    sorted_candidates.last().unwrap().clone()
-                };
-                let local_x_left = (anchor_candidate.box_coords[0] / eff_w as f32) * (w as f32);
-                let chunk_margin = (crop.height() as f32 * 0.1f32).max(2.0) as i32;
-                let next_x = (current_x + local_x_left as i32 - chunk_margin).max(0);
-                if next_x <= current_x || next_x >= current_x + w - 10 {
-                    current_x += ((w as f32) * 0.8f32) as i32;
-                } else {
-                    current_x = next_x;
-                }
-            } else {
-                current_x += ((w as f32) * 0.8f32) as i32;
-            }
-        }
-
-        // Naive stitching: concatenate in order
-        let mut final_text = String::new();
-        let mut final_char_boxes: Vec<BoundingBox> = Vec::new();
-        for (cands, offset_x, offset_y, chunk_w, chunk_h, eff_w, _eff_h) in chunk_results.iter() {
-            for cand in cands.iter() {
-                let rx1 = cand.box_coords[0];
-                let ry1 = cand.box_coords[1];
-                let rx2 = cand.box_coords[2];
-                let ry2 = cand.box_coords[3];
-                let x1 = (rx1 / (*eff_w as f32)) * (*chunk_w as f32)
-                    + (*offset_x as f32)
-                    + (crop_x as f32);
-                let y1 = (ry1 / (REC_HEIGHT as f32)) * (*chunk_h as f32)
-                    + (*offset_y as f32)
-                    + (crop_y as f32);
-                let x2 = (rx2 / (*eff_w as f32)) * (*chunk_w as f32)
-                    + (*offset_x as f32)
-                    + (crop_x as f32);
-                let y2 = (ry2 / (REC_HEIGHT as f32)) * (*chunk_h as f32)
-                    + (*offset_y as f32)
-                    + (crop_y as f32);
-                final_text.push(cand.char);
-                final_char_boxes.push(BoundingBox::new(
-                    x1.round() as i32,
-                    y1.round() as i32,
-                    (x2 - x1).round() as i32,
-                    (y2 - y1).round() as i32,
-                    cand.score,
-                ));
-            }
-        }
-
-        Ok(LineResult {
-            text: final_text,
-            char_boxes: final_char_boxes,
-            alternatives: Vec::new(),
-            is_vertical: false,
-            chunk_boxes: Vec::new(),
-        })
-    }
-
     pub fn image_to_nchw(&self, img: &RgbaImage, width: u32, height: u32) -> Vec<f32> {
         let mut img_data = vec![0.0f32; 3 * width as usize * height as usize];
         let w_usize = width as usize;
@@ -1173,17 +496,6 @@ impl OcrEngine {
         intersection / h1.min(h2)
     }
 
-    /// Static version of recognize_single_line that creates its own ONNX sessions.
-    /// Used for parallel recognition where each thread needs its own session.
-    fn recognize_single_line_static(
-        model_dir: &str,
-        char_vocab: &[i64],
-        image: &DynamicImage,
-        bbox: &BoundingBox,
-    ) -> Result<Option<LineResult>> {
-        ocr_parallel::recognize_single_line_static(model_dir, char_vocab, image, bbox)
-    }
-
     // Modified: return the annotated image in-memory when `render` is true
     /// Just line detection — returns raw bounding boxes (fast, no character recognition).
     /// Used by the streaming OCR pipeline to show the image immediately.
@@ -1221,65 +533,84 @@ impl OcrEngine {
             .cloned()
             .collect();
 
-        // Process horizontal boxes in batches
-        if !horizontal_boxes.is_empty() {
-            let rec_sessions = self.recognize_sessions.get().to_vec();
-            let char_vocab = self.char_vocab.clone();
+        // Process horizontal boxes with PP-OCRv6 in batches
+        if !horizontal_boxes.is_empty() && !self.ppocr_vocab.is_empty() {
+            let ppocr_sessions = self.ppocr_session.get().to_vec();
+            let ppocr_vocab = self.ppocr_vocab.clone();
             let batch_size = self.batch_size;
 
-            let all_chunks: Vec<(DynamicImage, bool)> = horizontal_boxes.iter().map(|bbox| {
+            let all_chunks: Vec<DynamicImage> = horizontal_boxes.iter().map(|bbox| {
                 let crop_x = bbox.x.max(0) as u32;
                 let crop_y = bbox.y.max(0) as u32;
                 let crop_w = bbox.w.max(0) as u32;
                 let crop_h = bbox.h.max(0) as u32;
-                (image.crop_imm(crop_x, crop_y, crop_w, crop_h), false)
+                image.crop_imm(crop_x, crop_y, crop_w, crop_h)
             }).collect();
 
             let num_batches = (all_chunks.len() + batch_size - 1) / batch_size;
             for batch_idx in 0..num_batches {
                 let start = batch_idx * batch_size;
                 let end = (start + batch_size).min(all_chunks.len());
-                let rec_sess = rec_sessions[batch_idx % rec_sessions.len()].clone();
+                let sess = ppocr_sessions[batch_idx % ppocr_sessions.len()].clone();
                 let chunk_slice = &all_chunks[start..end];
-                let mut sess = rec_sess.lock().unwrap();
-                let results = ocr_parallel::recognize_batch_chunks_static(
-                    &mut sess, &char_vocab, chunk_slice,
+                let crops_refs: Vec<&DynamicImage> = chunk_slice.iter().collect();
+                let mut session = sess.lock().unwrap();
+                let batch_results = crate::ppocr::recognize_ppocr_vertical_batch(
+                    &mut session, &crops_refs, &ppocr_vocab,
                 );
-                drop(sess);
+                drop(session);
 
-                if let Ok(batch_results) = results {
-                    for (i, (bbox, result)) in horizontal_boxes[start..end]
-                        .iter().zip(batch_results.into_iter()).enumerate()
+                if let Ok(results) = batch_results {
+                    for (i, (bbox, (text, alternatives, char_cols, seq_len_total))) in
+                        horizontal_boxes[start..end].iter().zip(results.into_iter()).enumerate()
                     {
-                        let (filtered, eff_w, eff_h) = result;
-                        let text: String = filtered.iter().map(|c| c.char).collect();
-                        let alternatives: Vec<Vec<(char, f32)>> =
-                            filtered.iter().map(|c| c.alternatives.clone()).collect();
-
-                        let mut char_boxes: Vec<BoundingBox> = Vec::new();
                         let crop_x = bbox.x.max(0) as u32;
                         let crop_y = bbox.y.max(0) as u32;
                         let crop_w = bbox.w.max(0) as u32;
                         let crop_h = bbox.h.max(0) as u32;
 
-                        for c in &filtered {
-                            let x1 = (c.box_coords[0] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
-                            let y1 = (c.box_coords[1] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
-                            let x2 = (c.box_coords[2] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
-                            let y2 = (c.box_coords[3] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
-                            char_boxes.push(BoundingBox::new(
-                                x1.round() as i32, y1.round() as i32,
-                                (x2 - x1).round() as i32, (y2 - y1).round() as i32,
-                                c.score,
-                            ));
+                        if text.is_empty() { continue; }
+
+                        // Build character boxes for horizontal text from PP-OCR CTC timesteps
+                        let n = char_cols.len();
+                        let mut char_boxes = Vec::with_capacity(n);
+                        if n > 0 && seq_len_total > 0 {
+                            let avg_col_width = crop_w as f32 / seq_len_total as f32;
+                            let avg_char_width = if n > 1 {
+                                let col_span = char_cols[n - 1] - char_cols[0];
+                                let avg_step_cols = col_span / (n - 1) as f32;
+                                (avg_step_cols * avg_col_width).max(3.0)
+                            } else {
+                                avg_col_width.max(3.0)
+                            };
+                            for &t in &char_cols {
+                                let center_x = (t as f32 + 0.5) * avg_col_width;
+                                let half = avg_char_width / 2.0;
+                                let cx = (center_x - half).max(0.0);
+                                let cw = ((center_x + half).min(crop_w as f32) - cx).max(1.0);
+                                char_boxes.push(BoundingBox::new(
+                                    (crop_x as f32 + cx).round() as i32,
+                                    crop_y as i32,
+                                    cw.round() as i32,
+                                    crop_h as i32,
+                                    1.0,
+                                ));
+                            }
                         }
+
+                        // Convert horizontal characters to vertical presentation forms
+                        let text_v = text.chars().map(to_vertical_glyph).collect::<String>();
+                        let alternatives_v: Vec<Vec<(char, f32)>> = alternatives
+                            .into_iter()
+                            .map(|alts| alts.into_iter().map(|(c, s)| (to_vertical_glyph(c), s)).collect())
+                            .collect();
 
                         let annotation = DetectedAnnotation {
                             bbox: bbox.clone(),
                             line: Some(LineResult {
-                                text,
+                                text: text_v,
                                 char_boxes,
-                                alternatives,
+                                alternatives: alternatives_v,
                                 is_vertical: false,
                                 chunk_boxes: vec![BoundingBox::new(
                                     crop_x as i32, crop_y as i32,
@@ -1289,7 +620,6 @@ impl OcrEngine {
                         };
                         if sender.send(annotation).is_err() {
                             // Channel closed — viewer is no longer listening.
-                            // This is not an OCR error, just early-termination.
                             return Ok(());
                         }
                     }
@@ -1297,77 +627,196 @@ impl OcrEngine {
             }
         }
 
-        // Process vertical boxes in batches
-        if !vertical_boxes.is_empty() && self.recognition_mode != RecognitionMode::Horizontal {
-            let vert_sessions = self.recognize_sessions_vertical.get().to_vec();
-            let char_vocab = self.char_vocab.clone();
+        // Process vertical boxes with PP-OCRv6 worker threads
+        if !vertical_boxes.is_empty() && !self.ppocr_vocab.is_empty() && self.recognition_mode != RecognitionMode::Horizontal {
+            let ppocr_sessions = self.ppocr_session.get().to_vec();
+            let ppocr_vocab = self.ppocr_vocab.clone();
             let batch_size = self.batch_size;
 
-            let all_chunks: Vec<(DynamicImage, bool)> = vertical_boxes.iter().map(|bbox| {
+            // Build job list
+            struct JobInfo {
+                idx: usize,
+                bbox: BoundingBox,
+                crop: DynamicImage,
+                crop_x: u32, crop_y: u32, crop_w: u32, crop_h: u32,
+            }
+            let mut jobs: Vec<JobInfo> = Vec::with_capacity(vertical_boxes.len());
+            for (i, bbox) in vertical_boxes.iter().enumerate() {
                 let crop_x = bbox.x.max(0) as u32;
                 let crop_y = bbox.y.max(0) as u32;
                 let crop_w = bbox.w.max(0) as u32;
                 let crop_h = bbox.h.max(0) as u32;
-                (image.crop_imm(crop_x, crop_y, crop_w, crop_h), true)
-            }).collect();
+                let crop = image.crop_imm(crop_x, crop_y, crop_w, crop_h);
+                if crop.width() < 4 || crop.height() < 4 { continue; }
+                jobs.push(JobInfo { idx: i, bbox: bbox.clone(), crop, crop_x, crop_y, crop_w, crop_h });
+            }
 
-            let num_batches = (all_chunks.len() + batch_size - 1) / batch_size;
-            for batch_idx in 0..num_batches {
-                let start = batch_idx * batch_size;
-                let end = (start + batch_size).min(all_chunks.len());
-                let rec_sess = vert_sessions[batch_idx % vert_sessions.len()].clone();
-                let chunk_slice = &all_chunks[start..end];
-                let mut sess = rec_sess.lock().unwrap();
-                let results = ocr_parallel::recognize_batch_chunks_static(
-                    &mut sess, &char_vocab, chunk_slice,
-                );
-                drop(sess);
+            let num_workers = ppocr_sessions.len().min(jobs.len());
+            use std::collections::VecDeque;
+            let job_queue = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::from(jobs)));
 
-                if let Ok(batch_results) = results {
-                    for (i, (bbox, result)) in vertical_boxes[start..end]
-                        .iter().zip(batch_results.into_iter()).enumerate()
-                    {
-                        let (filtered, eff_w, eff_h) = result;
-                        let text: String = filtered.iter().map(|c| c.char).collect();
-                        let alternatives: Vec<Vec<(char, f32)>> =
-                            filtered.iter().map(|c| c.alternatives.clone()).collect();
+            for worker_id in 0..num_workers {
+                let queue = job_queue.clone();
+                let sess = ppocr_sessions[worker_id].clone();
+                let voc = ppocr_vocab.clone();
+                let sender = sender.clone();
+                std::thread::Builder::new()
+                    .name(format!("ppocr-stream-{worker_id}"))
+                    .spawn(move || loop {
+                        let job = {
+                            let mut q = queue.lock().unwrap();
+                            q.pop_front()
+                        };
+                        let job = match job {
+                            Some(j) => j,
+                            None => return,
+                        };
 
-                        let mut char_boxes: Vec<BoundingBox> = Vec::new();
-                        let crop_x = bbox.x.max(0) as u32;
-                        let crop_y = bbox.y.max(0) as u32;
-                        let crop_w = bbox.w.max(0) as u32;
-                        let crop_h = bbox.h.max(0) as u32;
+                        let t_box = std::time::Instant::now();
+                        let i = job.idx;
+                        let crop_x = job.crop_x;
+                        let crop_y = job.crop_y;
+                        let crop_w = job.crop_w;
+                        let crop_h = job.crop_h;
 
-                        for c in &filtered {
-                            let x1 = (c.box_coords[0] / (VERT_REC_WIDTH as f32)) * (crop_w as f32) + (crop_x as f32);
-                            let y1 = (c.box_coords[1] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
-                            let x2 = (c.box_coords[2] / (VERT_REC_WIDTH as f32)) * (crop_w as f32) + (crop_x as f32);
-                            let y2 = (c.box_coords[3] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
+                        let mut session = sess.lock().unwrap();
+                        let (text, alternatives, char_cols, seq_len_total) =
+                            match crate::ppocr::recognize_ppocr_vertical(&mut session, &job.crop, &voc) {
+                                Ok(r) => r,
+                                Err(e) => { eprintln!("[PP-OCR] vertical box {i}: {e}"); continue; }
+                            };
+                        drop(session);
+                        if text.is_empty() { continue; }
+                        let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
+
+                        // Character boxes via RapidOcrNet-style mapping (vertical)
+                        let n = char_cols.len();
+                        if n == 0 || seq_len_total == 0 { continue; }
+                        let avg_col_width = crop_h as f32 / seq_len_total as f32;
+
+                        let avg_char_height = if n > 1 {
+                            let col_span = char_cols[n - 1] - char_cols[0];
+                            let avg_step_cols = col_span / (n - 1) as f32;
+                            (avg_step_cols * avg_col_width).max(3.0)
+                        } else {
+                            avg_col_width.max(3.0)
+                        };
+
+                        struct CharCell { y_top: f32, y_bot: f32 }
+                        let mut cells: Vec<CharCell> = char_cols.iter().map(|&t| {
+                            let center = (t as f32 + 0.5) * avg_col_width;
+                            let half = avg_char_height / 2.0;
+                            CharCell {
+                                y_top: (center - half).max(0.0),
+                                y_bot: (center + half).min(crop_h as f32),
+                            }
+                        }).collect();
+
+                        cells.sort_by(|a, b| a.y_top.partial_cmp(&b.y_top).unwrap());
+
+                        // Punctuation handling same as standalone streaming
+                        let is_close_punct: Vec<bool> = text.chars().map(|ch| {
+                            matches!(ch,
+                                '\u{3002}' | '\u{002E}' | '\u{FF0E}' |
+                                '\u{3001}' | '\u{002C}' | '\u{FF0C}' |
+                                ')' | '\u{FF09}' |
+                                '\u{3017}' | '\u{300D}' | '\u{300F}' |
+                                '\u{3015}' | '\u{3011}' | '\u{3009}' |
+                                ']' | '\u{FF3D}'
+                            )
+                        }).collect();
+                        let is_open_punct: Vec<bool> = text.chars().map(|ch| {
+                            matches!(ch,
+                                '(' | '\u{FF08}' |
+                                '\u{300C}' | '\u{300E}' |
+                                '\u{3014}' | '\u{3010}' |
+                                '\u{300A}' | '\u{3008}' |
+                                '\u{3016}' |
+                                '[' | '\u{FF3B}'
+                            )
+                        }).collect();
+
+                        for ci in 0..n.saturating_sub(1) {
+                            if cells[ci].y_bot <= cells[ci + 1].y_top { continue; }
+                            if is_close_punct[ci] {
+                                cells[ci].y_bot = cells[ci + 1].y_top;
+                            } else if is_open_punct[ci + 1] {
+                                cells[ci + 1].y_top = cells[ci].y_bot;
+                            } else if is_close_punct[ci + 1] {
+                                cells[ci + 1].y_top = cells[ci].y_bot;
+                            } else if is_open_punct[ci] {
+                                cells[ci].y_bot = cells[ci + 1].y_top;
+                            } else {
+                                let overlap = cells[ci].y_bot - cells[ci + 1].y_top;
+                                let half = overlap / 2.0;
+                                cells[ci].y_bot -= half;
+                                cells[ci + 1].y_top += half;
+                            }
+                        }
+
+                        let avg_non_punct_h: f32 = {
+                            let heights: Vec<f32> = cells.iter().enumerate()
+                                .filter(|(ci, _)| !is_close_punct[*ci] && !is_open_punct[*ci])
+                                .map(|(_, c)| c.y_bot - c.y_top)
+                                .collect();
+                            if heights.is_empty() { crop_w as f32 } else {
+                                heights.iter().sum::<f32>() / heights.len() as f32
+                            }
+                        };
+                        for ci in 0..n {
+                            if is_close_punct[ci] {
+                                let extent_y = cells[ci].y_top + avg_non_punct_h;
+                                let next_start = ((ci + 1)..n)
+                                    .filter(|&j| !is_close_punct[j] && !is_open_punct[j])
+                                    .next()
+                                    .map(|j| cells[j].y_top)
+                                    .unwrap_or(f32::INFINITY);
+                                cells[ci].y_bot = extent_y.min(next_start).max(cells[ci].y_bot);
+                            } else if is_open_punct[ci] {
+                                let extent_y = cells[ci].y_bot - avg_non_punct_h;
+                                let prev_bot: Option<usize> = (0..ci).rev()
+                                    .filter(|&j| !is_close_punct[j] && !is_open_punct[j])
+                                    .next();
+                                let prev_limit = prev_bot
+                                    .map(|j| cells[j].y_bot)
+                                    .unwrap_or(f32::NEG_INFINITY);
+                                cells[ci].y_top = extent_y.max(prev_limit).min(cells[ci].y_top);
+                            }
+                        }
+
+                        let mut char_boxes: Vec<BoundingBox> = Vec::with_capacity(n);
+                        for cell in &cells {
+                            let ch = (cell.y_bot - cell.y_top).max(1.0);
                             char_boxes.push(BoundingBox::new(
-                                x1.round() as i32, y1.round() as i32,
-                                (x2 - x1).round() as i32, (y2 - y1).round() as i32,
-                                c.score,
+                                crop_x as i32,
+                                (crop_y as f32 + cell.y_top) as i32,
+                                crop_w as i32,
+                                ch as i32,
+                                1.0,
                             ));
                         }
 
+                        println!("[PP-OCR] vertical box {i} (worker {worker_id}, {crop_w}x{crop_h}): {box_ms:.0} ms  text=\"{text}\"");
+
+                        // Convert horizontal characters to vertical presentation forms
+                        let text_v = text.chars().map(to_vertical_glyph).collect::<String>();
+                        let alternatives_v: Vec<Vec<(char, f32)>> = alternatives
+                            .into_iter()
+                            .map(|alts| alts.into_iter().map(|(c, s)| (to_vertical_glyph(c), s)).collect())
+                            .collect();
+
                         let annotation = DetectedAnnotation {
-                            bbox: bbox.clone(),
+                            bbox: job.bbox.clone(),
                             line: Some(LineResult {
-                                text,
-                                char_boxes,
-                                alternatives,
-                                is_vertical: true,
+                                text: text_v, char_boxes, alternatives: alternatives_v, is_vertical: true,
                                 chunk_boxes: vec![BoundingBox::new(
-                                    crop_x as i32, crop_y as i32,
-                                    crop_w as i32, crop_h as i32, 1.0,
+                                    crop_x as i32, crop_y as i32, crop_w as i32, crop_h as i32, 1.0,
                                 )],
                             }),
                         };
-                        if sender.send(annotation).is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
+                        if sender.send(annotation).is_err() { return; }
+                        std::thread::sleep(std::time::Duration::from_micros(500));
+                    }).expect("failed to spawn PP-OCR streaming worker");
             }
         }
 
@@ -1425,35 +874,35 @@ impl OcrEngine {
 
         let mut annotations = Vec::with_capacity(sorted.len());
 
-        // Process horizontal boxes in parallel batches
-        if !horizontal_boxes.is_empty() {
-            let rec_sessions = self.recognize_sessions.get().to_vec();
-            let pool_size = rec_sessions.len();
-            let char_vocab = self.char_vocab.clone();
+        // Process horizontal boxes with PP-OCRv6 in batches
+        if !horizontal_boxes.is_empty() && !self.ppocr_vocab.is_empty() {
+            let ppocr_sessions = self.ppocr_session.get().to_vec();
+            let pool_size = ppocr_sessions.len();
+            let ppocr_vocab = self.ppocr_vocab.clone();
             let batch_size = self.batch_size;
 
             // Build all chunk crops upfront (shared read-only)
-            let all_chunks: Vec<(DynamicImage, bool)> = horizontal_boxes.iter().map(|bbox| {
+            let all_chunks: Vec<DynamicImage> = horizontal_boxes.iter().map(|bbox| {
                 let crop_x = bbox.x.max(0) as u32;
                 let crop_y = bbox.y.max(0) as u32;
                 let crop_w = bbox.w.max(0) as u32;
                 let crop_h = bbox.h.max(0) as u32;
-                let crop = image.crop_imm(crop_x, crop_y, crop_w, crop_h);
-                (crop, false)
+                image.crop_imm(crop_x, crop_y, crop_w, crop_h)
             }).collect();
 
             let num_batches = (all_chunks.len() + batch_size - 1) / batch_size;
-            let batch_results: std::sync::Mutex<Vec<Option<(Result<Vec<(Vec<CharCandidate>, i32, i32)>>, f64)>>> = std::sync::Mutex::new((0..num_batches).map(|_| None).collect());
+            let batch_results: std::sync::Mutex<Vec<Option<(Result<Vec<(String, Vec<Vec<(char, f32)>>, Vec<f32>, usize)>>, f64)>>> = std::sync::Mutex::new((0..num_batches).map(|_| None).collect());
 
             for batch_idx in 0..num_batches {
                 let start = batch_idx * batch_size;
                 let end = (start + batch_size).min(all_chunks.len());
-                let rec_sess = rec_sessions[batch_idx % rec_sessions.len()].clone();
+                let sess = ppocr_sessions[batch_idx % ppocr_sessions.len()].clone();
                 let chunk_slice = &all_chunks[start..end];
                 let t_box = std::time::Instant::now();
-                let mut sess = rec_sess.lock().unwrap();
-                let results = ocr_parallel::recognize_batch_chunks_static(
-                    &mut sess, &char_vocab, chunk_slice,
+                let crops_refs: Vec<&DynamicImage> = chunk_slice.iter().collect();
+                let mut session = sess.lock().unwrap();
+                let results = crate::ppocr::recognize_ppocr_vertical_batch(
+                    &mut session, &crops_refs, &ppocr_vocab,
                 );
                 let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
                 batch_results.lock().unwrap()[batch_idx] = Some((results, box_ms));
@@ -1467,31 +916,48 @@ impl OcrEngine {
                     batch_results.lock().unwrap()[batch_idx].take()
                         .map(|(r, ms)| (r.map(|v| v), ms))
                 {
-                    for (i, (bbox, result)) in horizontal_boxes[start..end]
+                    for (i, (bbox, (text, alternatives, char_cols, seq_len_total))) in horizontal_boxes[start..end]
                         .iter().zip(batch_results_inner.into_iter()).enumerate()
                     {
-                        let (filtered, eff_w, eff_h) = result;
-                        let text: String = filtered.iter().map(|c| c.char).collect();
-                        let alternatives: Vec<Vec<(char, f32)>> =
-                            filtered.iter().map(|c| c.alternatives.clone()).collect();
-
-                        let mut char_boxes: Vec<BoundingBox> = Vec::new();
                         let crop_x = bbox.x.max(0) as u32;
                         let crop_y = bbox.y.max(0) as u32;
                         let crop_w = bbox.w.max(0) as u32;
                         let crop_h = bbox.h.max(0) as u32;
 
-                        for c in filtered.iter() {
-                            let x1 = (c.box_coords[0] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
-                            let y1 = (c.box_coords[1] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
-                            let x2 = (c.box_coords[2] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
-                            let y2 = (c.box_coords[3] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
-                            char_boxes.push(BoundingBox::new(
-                                x1.round() as i32, y1.round() as i32,
-                                (x2 - x1).round() as i32, (y2 - y1).round() as i32,
-                                c.score,
-                            ));
+                        if text.is_empty() { continue; }
+
+                        // Build character boxes for horizontal text from PP-OCR CTC timesteps
+                        let n = char_cols.len();
+                        let mut char_boxes = Vec::with_capacity(n);
+                        if n > 0 && seq_len_total > 0 {
+                            let avg_col_width = crop_w as f32 / seq_len_total as f32;
+                            let avg_char_width = if n > 1 {
+                                let col_span = char_cols[n - 1] - char_cols[0];
+                                let avg_step_cols = col_span / (n - 1) as f32;
+                                (avg_step_cols * avg_col_width).max(3.0)
+                            } else {
+                                avg_col_width.max(3.0)
+                            };
+                            for &t in &char_cols {
+                                let center_x = (t as f32 + 0.5) * avg_col_width;
+                                let half = avg_char_width / 2.0;
+                                let cx = (center_x - half).max(0.0);
+                                let cw = ((center_x + half).min(crop_w as f32) - cx).max(1.0);
+                                char_boxes.push(BoundingBox::new(
+                                    (crop_x as f32 + cx).round() as i32,
+                                    crop_y as i32,
+                                    cw.round() as i32,
+                                    crop_h as i32,
+                                    1.0,
+                                ));
+                            }
                         }
+
+                        let text_v = text.chars().map(to_vertical_glyph).collect::<String>();
+                        let alternatives_v: Vec<Vec<(char, f32)>> = alternatives
+                            .into_iter()
+                            .map(|alts| alts.into_iter().map(|(c, s)| (to_vertical_glyph(c), s)).collect())
+                            .collect();
 
                         println!(
                             "[OCR timing]   Box {:>3} ({}x{} @ {},{}): {:>8.2} ms",
@@ -1501,9 +967,9 @@ impl OcrEngine {
                         annotations.push(DetectedAnnotation {
                             bbox: bbox.clone(),
                             line: Some(LineResult {
-                                text,
+                                text: text_v,
                                 char_boxes,
-                                alternatives,
+                                alternatives: alternatives_v,
                                 is_vertical: false,
                                 chunk_boxes: vec![BoundingBox::new(
                                     crop_x as i32, crop_y as i32,
@@ -1516,34 +982,34 @@ impl OcrEngine {
             }
         }
 
-        // Process vertical boxes in parallel batches        // Process vertical boxes in parallel batches
-        if !vertical_boxes.is_empty() && self.recognition_mode != RecognitionMode::Horizontal {
-            let vert_sessions = self.recognize_sessions_vertical.get().to_vec();
-            let pool_size = vert_sessions.len();
-            let char_vocab = self.char_vocab.clone();
+        // Process vertical boxes with PP-OCRv6 in batches
+        if !vertical_boxes.is_empty() && !self.ppocr_vocab.is_empty() && self.recognition_mode != RecognitionMode::Horizontal {
+            let ppocr_sessions = self.ppocr_session.get().to_vec();
+            let pool_size = ppocr_sessions.len();
+            let ppocr_vocab = self.ppocr_vocab.clone();
             let batch_size = self.batch_size;
 
-            let all_chunks: Vec<(DynamicImage, bool)> = vertical_boxes.iter().map(|bbox| {
+            let all_chunks: Vec<DynamicImage> = vertical_boxes.iter().map(|bbox| {
                 let crop_x = bbox.x.max(0) as u32;
                 let crop_y = bbox.y.max(0) as u32;
                 let crop_w = bbox.w.max(0) as u32;
                 let crop_h = bbox.h.max(0) as u32;
-                let crop = image.crop_imm(crop_x, crop_y, crop_w, crop_h);
-                (crop, true)
+                image.crop_imm(crop_x, crop_y, crop_w, crop_h)
             }).collect();
 
             let num_batches = (all_chunks.len() + batch_size - 1) / batch_size;
-            let batch_results: std::sync::Mutex<Vec<Option<(Result<Vec<(Vec<CharCandidate>, i32, i32)>>, f64)>>> = std::sync::Mutex::new((0..num_batches).map(|_| None).collect());
+            let batch_results: std::sync::Mutex<Vec<Option<(Result<Vec<(String, Vec<Vec<(char, f32)>>, Vec<f32>, usize)>>, f64)>>> = std::sync::Mutex::new((0..num_batches).map(|_| None).collect());
 
             for batch_idx in 0..num_batches {
                 let start = batch_idx * batch_size;
                 let end = (start + batch_size).min(all_chunks.len());
-                let rec_sess = vert_sessions[batch_idx % vert_sessions.len()].clone();
+                let sess = ppocr_sessions[batch_idx % ppocr_sessions.len()].clone();
                 let chunk_slice = &all_chunks[start..end];
                 let t_box = std::time::Instant::now();
-                let mut sess = rec_sess.lock().unwrap();
-                let results = ocr_parallel::recognize_batch_chunks_static(
-                    &mut sess, &char_vocab, chunk_slice,
+                let crops_refs: Vec<&DynamicImage> = chunk_slice.iter().collect();
+                let mut session = sess.lock().unwrap();
+                let results = crate::ppocr::recognize_ppocr_vertical_batch(
+                    &mut session, &crops_refs, &ppocr_vocab,
                 );
                 let box_ms = t_box.elapsed().as_secs_f64() * 1000.0;
                 batch_results.lock().unwrap()[batch_idx] = Some((results, box_ms));
@@ -1556,31 +1022,48 @@ impl OcrEngine {
                     batch_results.lock().unwrap()[batch_idx].take()
                         .map(|(r, ms)| (r.map(|v| v), ms))
                 {
-                    for (i, (bbox, result)) in vertical_boxes[start..end]
+                    for (i, (bbox, (text, alternatives, char_cols, seq_len_total))) in vertical_boxes[start..end]
                         .iter().zip(batch_results_inner.into_iter()).enumerate()
                     {
-                        let (filtered, eff_w, eff_h) = result;
-                        let text: String = filtered.iter().map(|c| c.char).collect();
-                        let alternatives: Vec<Vec<(char, f32)>> =
-                            filtered.iter().map(|c| c.alternatives.clone()).collect();
-
-                        let mut char_boxes: Vec<BoundingBox> = Vec::new();
                         let crop_x = bbox.x.max(0) as u32;
                         let crop_y = bbox.y.max(0) as u32;
                         let crop_w = bbox.w.max(0) as u32;
                         let crop_h = bbox.h.max(0) as u32;
 
-                        for c in filtered.iter() {
-                            let x1 = (c.box_coords[0] / (VERT_REC_WIDTH as f32)) * (crop_w as f32) + (crop_x as f32);
-                            let y1 = (c.box_coords[1] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
-                            let x2 = (c.box_coords[2] / (VERT_REC_WIDTH as f32)) * (crop_w as f32) + (crop_x as f32);
-                            let y2 = (c.box_coords[3] / (eff_h as f32)) * (crop_h as f32) + (crop_y as f32);
-                            char_boxes.push(BoundingBox::new(
-                                x1.round() as i32, y1.round() as i32,
-                                (x2 - x1).round() as i32, (y2 - y1).round() as i32,
-                                c.score,
-                            ));
+                        if text.is_empty() { continue; }
+
+                        // Build character boxes for vertical text from PP-OCR CTC timesteps
+                        let n = char_cols.len();
+                        let mut char_boxes = Vec::with_capacity(n);
+                        if n > 0 && seq_len_total > 0 {
+                            let avg_col_width = crop_h as f32 / seq_len_total as f32;
+                            let avg_char_height = if n > 1 {
+                                let col_span = char_cols[n - 1] - char_cols[0];
+                                let avg_step_cols = col_span / (n - 1) as f32;
+                                (avg_step_cols * avg_col_width).max(3.0)
+                            } else {
+                                avg_col_width.max(3.0)
+                            };
+                            for &t in &char_cols {
+                                let center_y = (t as f32 + 0.5) * avg_col_width;
+                                let half = avg_char_height / 2.0;
+                                let cy = (center_y - half).max(0.0);
+                                let ch = ((center_y + half).min(crop_h as f32) - cy).max(1.0);
+                                char_boxes.push(BoundingBox::new(
+                                    crop_x as i32,
+                                    (crop_y as f32 + cy).round() as i32,
+                                    crop_w as i32,
+                                    ch.round() as i32,
+                                    1.0,
+                                ));
+                            }
                         }
+
+                        let text_v = text.chars().map(to_vertical_glyph).collect::<String>();
+                        let alternatives_v: Vec<Vec<(char, f32)>> = alternatives
+                            .into_iter()
+                            .map(|alts| alts.into_iter().map(|(c, s)| (to_vertical_glyph(c), s)).collect())
+                            .collect();
 
                         println!(
                             "[OCR timing]   Box {:>3} ({}x{} @ {},{}): {:>8.2} ms",
@@ -1590,9 +1073,9 @@ impl OcrEngine {
                         annotations.push(DetectedAnnotation {
                             bbox: bbox.clone(),
                             line: Some(LineResult {
-                                text,
+                                text: text_v,
                                 char_boxes,
-                                alternatives,
+                                alternatives: alternatives_v,
                                 is_vertical: true,
                                 chunk_boxes: vec![BoundingBox::new(
                                     crop_x as i32, crop_y as i32,
@@ -1603,7 +1086,8 @@ impl OcrEngine {
                     }
                 }
             }
-        }        let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;
+        }
+        let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;
         println!(
             "[OCR timing] Character recognition: {:>8.2} ms  ({} boxes, batched)",
             recognize_ms, sorted.len()
@@ -1846,16 +1330,9 @@ impl OcrEngine {
 
                                 if dbg_printed < 8 {
                                     dbg_printed += 1;
-                                    /*println!(
-                                        "DBG glyph='{}' box_h={} target_h={:.1} scale_px={:.2} final_h={:.1} adv_w={:.1}",
-                                        ch, db.h, target_for_line, scale_px, final_h, text_width
-                                    );*/
                                 }
 
                                 // Draw black background fill behind the character for contrast
-                                if i < 3 {
-                                    /*println!("DBG fill: db=({},{},{},{}) img={}x{}", db.left(), db.top(), db.w, db.h, img_rgba.width(), img_rgba.height());*/
-                                }
                                 draw_filled_rect(
                                     &mut img_rgba,
                                     db.left() - 1,
@@ -1945,9 +1422,7 @@ impl OcrEngine {
 pub fn recognize_boxes_streaming(
     image: &DynamicImage,
     sorted: &[BoundingBox],
-    rec_sessions: &[std::sync::Arc<std::sync::Mutex<Session>>],
     rec_sessions_ppocr: &[std::sync::Arc<std::sync::Mutex<Session>>],
-    char_vocab: &[i64],
     ppocr_vocab: &[String],
     batch_size: usize,
     recognition_mode: RecognitionMode,
@@ -1964,61 +1439,80 @@ pub fn recognize_boxes_streaming(
     let v_indices: Vec<usize> = sorted.iter().enumerate()
         .filter(|(_, b)| b.h > b.w).map(|(i, _)| i).collect();
 
-    // Horizontal boxes
-    if !horizontal_boxes.is_empty() {
-        let all_chunks: Vec<(DynamicImage, bool)> = horizontal_boxes.iter().map(|bbox| {
+    // Horizontal boxes — use PP-OCRv6 recognition
+    if !horizontal_boxes.is_empty() && !ppocr_vocab.is_empty() && !rec_sessions_ppocr.is_empty() {
+        let all_chunks: Vec<DynamicImage> = horizontal_boxes.iter().map(|bbox| {
             let crop_x = bbox.x.max(0) as u32;
             let crop_y = bbox.y.max(0) as u32;
             let crop_w = bbox.w.max(0) as u32;
             let crop_h = bbox.h.max(0) as u32;
-            (image.crop_imm(crop_x, crop_y, crop_w, crop_h), false)
+            image.crop_imm(crop_x, crop_y, crop_w, crop_h)
         }).collect();
 
         let num_batches = (all_chunks.len() + batch_size - 1) / batch_size;
         for batch_idx in 0..num_batches {
             let start = batch_idx * batch_size;
             let end = (start + batch_size).min(all_chunks.len());
-            let rec_sess = rec_sessions[batch_idx % rec_sessions.len()].clone();
+            let sess = rec_sessions_ppocr[batch_idx % rec_sessions_ppocr.len()].clone();
             let chunk_slice = &all_chunks[start..end];
-            let mut sess = rec_sess.lock().unwrap();
-            let results = ocr_parallel::recognize_batch_chunks_static(
-                &mut sess, char_vocab, chunk_slice,
+            let crops_refs: Vec<&DynamicImage> = chunk_slice.iter().collect();
+            let mut session = sess.lock().unwrap();
+            let batch_results = crate::ppocr::recognize_ppocr_vertical_batch(
+                &mut session, &crops_refs, ppocr_vocab,
             );
-            drop(sess);
+            drop(session);
 
-            if let Ok(batch_results) = results {
-                for (i, (bbox, result)) in horizontal_boxes[start..end]
-                    .iter().zip(batch_results.into_iter()).enumerate()
+            if let Ok(results) = batch_results {
+                for (i, (bbox, (text, alternatives, char_cols, seq_len_total))) in
+                    horizontal_boxes[start..end].iter().zip(results.into_iter()).enumerate()
                 {
-                    let (filtered, eff_w, eff_h) = result;
-                    let text: String = filtered.iter().map(|c| c.char).collect();
-                    let alternatives: Vec<Vec<(char, f32)>> =
-                        filtered.iter().map(|c| c.alternatives.clone()).collect();
-
-                    let mut char_boxes: Vec<BoundingBox> = Vec::new();
                     let crop_x = bbox.x.max(0) as u32;
                     let crop_y = bbox.y.max(0) as u32;
                     let crop_w = bbox.w.max(0) as u32;
                     let crop_h = bbox.h.max(0) as u32;
 
-                    for c in &filtered {
-                        let x1 = (c.box_coords[0] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
-                        let y1 = (c.box_coords[1] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
-                        let x2 = (c.box_coords[2] / (eff_w as f32)) * (crop_w as f32) + (crop_x as f32);
-                        let y2 = (c.box_coords[3] / (REC_HEIGHT as f32)) * (crop_h as f32) + (crop_y as f32);
-                        char_boxes.push(BoundingBox::new(
-                            x1.round() as i32, y1.round() as i32,
-                            (x2 - x1).round() as i32, (y2 - y1).round() as i32,
-                            c.score,
-                        ));
+                    if text.is_empty() { continue; }
+
+                    // Build character boxes for horizontal text from PP-OCR CTC timesteps
+                    let n = char_cols.len();
+                    let mut char_boxes = Vec::with_capacity(n);
+                    if n > 0 && seq_len_total > 0 {
+                        let avg_col_width = crop_w as f32 / seq_len_total as f32;
+                        let avg_char_width = if n > 1 {
+                            let col_span = char_cols[n - 1] - char_cols[0];
+                            let avg_step_cols = col_span / (n - 1) as f32;
+                            (avg_step_cols * avg_col_width).max(3.0)
+                        } else {
+                            avg_col_width.max(3.0)
+                        };
+                        for &t in &char_cols {
+                            let center_x = (t as f32 + 0.5) * avg_col_width;
+                            let half = avg_char_width / 2.0;
+                            let cx = (center_x - half).max(0.0);
+                            let cw = ((center_x + half).min(crop_w as f32) - cx).max(1.0);
+                            char_boxes.push(BoundingBox::new(
+                                (crop_x as f32 + cx).round() as i32,
+                                crop_y as i32,
+                                cw.round() as i32,
+                                crop_h as i32,
+                                1.0,
+                            ));
+                        }
                     }
+
+                    // Convert horizontal characters to vertical presentation forms
+                    let text_v = text.chars().map(to_vertical_glyph).collect::<String>();
+                    let alternatives_v: Vec<Vec<(char, f32)>> = alternatives
+                        .into_iter()
+                        .map(|alts| alts.into_iter().map(|(c, s)| (to_vertical_glyph(c), s)).collect())
+                        .collect();
 
                     let annotation = DetectedAnnotation {
                         bbox: bbox.clone(),
                         line: Some(LineResult {
-                            text,
+                            text: text_v,
                             char_boxes,
-                            alternatives,
+                            alternatives: alternatives_v,
                             is_vertical: false,
                             chunk_boxes: vec![BoundingBox::new(
                                 crop_x as i32, crop_y as i32,
@@ -2032,7 +1526,7 @@ pub fn recognize_boxes_streaming(
         }
     }
 
-    // Vertical boxes → use PP-OCRv6 recognition model directly on crops
+    // Vertical boxes → use PP-OCRv6 worker threads
     if !vertical_boxes.is_empty() && !ppocr_vocab.is_empty() && !rec_sessions_ppocr.is_empty() {
         println!("[PP-OCR] Processing {} vertical boxes", vertical_boxes.len());
 
