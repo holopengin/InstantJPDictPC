@@ -153,7 +153,10 @@ impl OcrOverlayState {
     pub fn get_coords_from_global_idx(&self, global_idx: usize) -> Option<(usize, usize)> {
         let mut count = 0;
         for (line_idx, line_opt) in self.active_line_results.iter().enumerate() {
-            let line = line_opt.as_ref()?;
+            let line = match line_opt.as_ref() {
+                Some(l) => l,
+                None => continue,
+            };
             let line_len = line.text.chars().count();
             if global_idx < count + line_len {
                 return Some((line_idx, global_idx - count));
