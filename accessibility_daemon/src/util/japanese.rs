@@ -189,3 +189,50 @@ lazy_static::lazy_static! {
         pairs.iter().copied().collect()
     };
 }
+
+/// Convert a CJK character to its vertical-mode presentation form.
+/// Replaces standard CJK punctuation and fullwidth forms with Unicode
+/// vertical presentation forms (U+FE10–U+FE48) so the font renders
+/// them in the correct vertical writing position (periods/comma at top-right,
+/// brackets rotated 90°, etc.).
+pub fn to_vertical_glyph(ch: char) -> char {
+    match ch {
+        // ── FE10-FE19: Vertical Forms block ──
+        ','          | '\u{FF0C}' => '\u{FE10}', // ,  ， -> VERTICAL COMMA
+        '\u{3001}'                => '\u{FE11}', // 、   -> VERTICAL IDEOGRAPHIC COMMA
+        '\u{3002}'  | '\u{FF0E}' => '\u{FE12}', // 。 ． -> VERTICAL IDEOGRAPHIC FULL STOP
+        ':'         | '\u{FF1A}' => '\u{FE13}', // :  ： -> VERTICAL COLON
+        ';'         | '\u{FF1B}' => '\u{FE14}', // ;  ； -> VERTICAL SEMICOLON
+        '!'         | '\u{FF01}' => '\u{FE15}', // !  ！ -> VERTICAL EXCLAMATION MARK
+        '?'         | '\u{FF1F}' => '\u{FE16}', // ?  ？ -> VERTICAL QUESTION MARK
+        '\u{3016}'                => '\u{FE17}', // 〖   -> VERTICAL LEFT WHITE LENTICULAR BRACKET
+        '\u{3017}'                => '\u{FE18}', // 〗   -> VERTICAL RIGHT WHITE LENTICULAR BRACKET
+        '\u{2026}'                => '\u{FE19}', // …   -> VERTICAL HORIZONTAL ELLIPSIS
+
+        // ── FE30-FE48: CJK Compatibility Forms (vertical variants) ──
+        '\u{2025}'                => '\u{FE30}', // ‥   -> VERTICAL TWO DOT LEADER
+        '\u{2014}' | '\u{30FC}'  => '\u{FE31}', // — ー -> VERTICAL EM DASH
+        '\u{2013}'                => '\u{FE32}', // –   -> VERTICAL EN DASH
+        '_'                       => '\u{FE33}', // _   -> VERTICAL LOW LINE
+        '('         | '\u{FF08}' => '\u{FE35}', // (  （ -> VERTICAL LEFT PARENTHESIS
+        ')'         | '\u{FF09}' => '\u{FE36}', // )  ） -> VERTICAL RIGHT PARENTHESIS
+        '{'                       => '\u{FE37}', // {   -> VERTICAL LEFT CURLY BRACKET
+        '}'                       => '\u{FE38}', // }   -> VERTICAL RIGHT CURLY BRACKET
+        '\u{3014}'                => '\u{FE39}', // 〔   -> VERTICAL LEFT TORTOISE SHELL BRACKET
+        '\u{3015}'                => '\u{FE3A}', // 〕   -> VERTICAL RIGHT TORTOISE SHELL BRACKET
+        '\u{3010}'                => '\u{FE3B}', // 【   -> VERTICAL LEFT BLACK LENTICULAR BRACKET
+        '\u{3011}'                => '\u{FE3C}', // 】   -> VERTICAL RIGHT BLACK LENTICULAR BRACKET
+        '\u{300A}'                => '\u{FE3D}', // 《   -> VERTICAL LEFT DOUBLE ANGLE BRACKET
+        '\u{300B}'                => '\u{FE3E}', // 》   -> VERTICAL RIGHT DOUBLE ANGLE BRACKET
+        '\u{3008}'                => '\u{FE3F}', // 〈   -> VERTICAL LEFT ANGLE BRACKET
+        '\u{3009}'                => '\u{FE40}', // 〉   -> VERTICAL RIGHT ANGLE BRACKET
+        '\u{300C}'                => '\u{FE41}', // 「   -> VERTICAL LEFT CORNER BRACKET
+        '\u{300D}'                => '\u{FE42}', // 」   -> VERTICAL RIGHT CORNER BRACKET
+        '\u{300E}'                => '\u{FE43}', // 『   -> VERTICAL LEFT WHITE CORNER BRACKET
+        '\u{300F}'                => '\u{FE44}', // 』   -> VERTICAL RIGHT WHITE CORNER BRACKET
+        '['         | '\u{FF3B}' => '\u{FE47}', // [  ［ -> VERTICAL LEFT SQUARE BRACKET
+        ']'         | '\u{FF3D}' => '\u{FE48}', // ]  ］ -> VERTICAL RIGHT SQUARE BRACKET
+
+        _ => ch,
+    }
+}

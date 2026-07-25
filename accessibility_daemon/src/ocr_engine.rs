@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use crate::models::*;
 use crate::ocr_parallel;
+use crate::util::japanese::to_vertical_glyph;
 
 // PP-OCRv6 detection constants
 const PPOCR_DET_LONG_SIDE: u32 = 960;
@@ -2156,6 +2157,13 @@ pub fn recognize_boxes_streaming(
                     }
 
                     println!("[PP-OCR] box {i} (worker {worker_id}, {crop_w}x{crop_h}): {box_ms:.0} ms  text=\"{text}\"");
+
+                    // Convert horizontal characters to vertical presentation forms
+                    let text = text.chars().map(to_vertical_glyph).collect::<String>();
+                    let alternatives: Vec<Vec<(char, f32)>> = alternatives
+                        .into_iter()
+                        .map(|alts| alts.into_iter().map(|(c, s)| (to_vertical_glyph(c), s)).collect())
+                        .collect();
 
                     let annotation = DetectedAnnotation {
                         bbox: job.bbox.clone(),
