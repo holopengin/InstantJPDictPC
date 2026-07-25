@@ -362,7 +362,7 @@ impl OcrEngine {
         // Post-processing
         let mut pp_boxes = sorted;
         // Filter out degenerate tiny boxes (noise specks)
-        pp_boxes.retain(|b| b.w >= 6 || b.h >= 6);
+        pp_boxes.retain(|b| b.w >= 10 && b.h >= 10);
         // 1. Shrink vertical box widths by 10% (centered)
         for b in pp_boxes.iter_mut().filter(|b| b.h > b.w) {
             let shrink = (b.w as f32 * 0.05).round() as i32;
@@ -2134,13 +2134,95 @@ pub fn recognize_boxes_streaming(
                     // Sort by position
                     cells.sort_by(|a, b| a.y_top.partial_cmp(&b.y_top).unwrap());
 
-                    // Overlap adjustment: split overlap evenly between adjacent cells
+                    // Identify which characters are Japanese punctuation that needs
+                    // special spacing handling.
+                    // Closing punctuation (periods, commas, brackets) is recognized
+                    // early (small timestep) and positioned too HIGH in the crop.
+                    // Opening punctuation (quotes, brackets) is recognized late
+                    // (large timestep) and positioned too LOW.
+                    let is_close_punct: Vec<bool> = text.chars().map(|ch| {
+                        matches!(ch,
+                            '\u{3002}' | '\u{002E}' | '\u{FF0E}' | // period
+                            '\u{3001}' | '\u{002C}' | '\u{FF0C}' | // comma
+                            ')' | '\u{FF09}' |                      // closing paren
+                            '\u{3017}' | '\u{300D}' | '\u{300F}' |  // closing brackets
+                            '\u{3015}' | '\u{3011}' | '\u{3009}' |
+                            ']' | '\u{FF3D}'
+                        )
+                    }).collect();
+                    let is_open_punct: Vec<bool> = text.chars().map(|ch| {
+                        matches!(ch,
+                            '(' | '\u{FF08}' |                      // opening paren
+                            '\u{300C}' | '\u{300E}' |               // corner brackets 「『
+                            '\u{3014}' | '\u{3010}' |               // tortoise/black lenticular
+                            '\u{300A}' | '\u{3008}' |               // double/single angle
+                            '\u{3016}' |                            // white lenticular 〖
+                            '[' | '\u{FF3B}'
+                        )
+                    }).collect();
+
+                    // Overlap adjustment with punctuation awareness:
+                    // If a punctuation cell overlaps with a non-punct neighbor,
+                    // the punctuation absorbs the entire overlap (prevents shrinking
+                    // the normal character).
+                    //   - Close punct (upper cell, ci): absorb overlap downward
+                    //   - Open punct  (lower cell, ci+1): absorb overlap upward
                     for ci in 0..n.saturating_sub(1) {
-                        if cells[ci].y_bot > cells[ci + 1].y_top {
+                        if cells[ci].y_bot <= cells[ci + 1].y_top { continue; }
+                        if is_close_punct[ci] {
+                            // Close punct is the upper cell: push its bottom down
+                            cells[ci].y_bot = cells[ci + 1].y_top;
+                        } else if is_open_punct[ci + 1] {
+                            // Open punct is the lower cell: pull its top up
+                            cells[ci + 1].y_top = cells[ci].y_bot;
+                        } else if is_close_punct[ci + 1] {
+                            // Close punct is the lower cell (also handle this)
+                            cells[ci + 1].y_top = cells[ci].y_bot;
+                        } else if is_open_punct[ci] {
+                            // Open punct is the upper cell
+                            cells[ci].y_bot = cells[ci + 1].y_top;
+                        } else {
                             let overlap = cells[ci].y_bot - cells[ci + 1].y_top;
                             let half = overlap / 2.0;
                             cells[ci].y_bot -= half;
                             cells[ci + 1].y_top += half;
+                        }
+                    }
+
+                    // For each punctuation cell, extend toward the center of the
+                    // text column to fill space up to the average non-punct char height.
+                    //   - Close punct: extend y_bot DOWNWARD
+                    //   - Open punct:  extend y_top UPWARD
+                    // Allow extension beyond the detection box for end-of-line cases.
+                    let avg_non_punct_h: f32 = {
+                        let heights: Vec<f32> = cells.iter().enumerate()
+                            .filter(|(ci, _)| !is_close_punct[*ci] && !is_open_punct[*ci])
+                            .map(|(_, c)| c.y_bot - c.y_top)
+                            .collect();
+                        if heights.is_empty() { crop_w as f32 } else {
+                            heights.iter().sum::<f32>() / heights.len() as f32
+                        }
+                    };
+                    for ci in 0..n {
+                        if is_close_punct[ci] {
+                            // Extend downward from current y_top to avg height
+                            let extent_y = cells[ci].y_top + avg_non_punct_h;
+                            let next_start = ((ci + 1)..n)
+                                .filter(|&j| !is_close_punct[j] && !is_open_punct[j])
+                                .next()
+                                .map(|j| cells[j].y_top)
+                                .unwrap_or(f32::INFINITY);
+                            cells[ci].y_bot = extent_y.min(next_start).max(cells[ci].y_bot);
+                        } else if is_open_punct[ci] {
+                            // Extend upward from current y_bot to avg height
+                            let extent_y = cells[ci].y_bot - avg_non_punct_h;
+                            let prev_bot: Option<usize> = (0..ci).rev()
+                                .filter(|&j| !is_close_punct[j] && !is_open_punct[j])
+                                .next();
+                            let prev_limit = prev_bot
+                                .map(|j| cells[j].y_bot)
+                                .unwrap_or(f32::NEG_INFINITY);
+                            cells[ci].y_top = extent_y.max(prev_limit).min(cells[ci].y_top);
                         }
                     }
 
