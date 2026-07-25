@@ -553,7 +553,23 @@ fn run_ocr_viewer(
                         .and_then(|l| l.as_ref()).and_then(|l| l.text.chars().nth(sel.char_idx));
                     if cur == Some(c) { state.alternatives_visible = false; }
                     else {
+                        if let Some(cur_char) = cur {
+                            eprintln!(
+                                "[ALTERNATIVE] line {} char {}: U+{:04X} '{}' → U+{:04X} '{}'",
+                                sel.line_idx, sel.char_idx,
+                                cur_char as u32, cur_char,
+                                c as u32, c,
+                            );
+                        } else {
+                            eprintln!(
+                                "[ALTERNATIVE] line {} char {}: (none) → U+{:04X} '{}'",
+                                sel.line_idx, sel.char_idx,
+                                c as u32, c,
+                            );
+                        }
                         state.state.update_character(sel.line_idx, sel.char_idx, c);
+                        state.annotations_sync_dirty.set(true);
+                        state.edited_lines.insert(sel.line_idx);
                         let _ = state.db.as_ref().and_then(|db| state.deinflector.as_ref().and_then(|deinf| {
             state.state.lookup(sel.line_idx, sel.char_idx, db, deinf)
         }));

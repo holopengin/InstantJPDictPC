@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -30,7 +31,6 @@ use crate::util::japanese::to_vertical_glyph;
 
 use fontdue::Font;
 use iced::widget::image::Handle as ImageHandle;
-use std::collections::HashMap;
 
 /// Font fill ratio for OCR character glyphs drawn on the canvas annotation layer.
 const CANVAS_CHAR_RATIO: f32 = 0.9;
@@ -864,10 +864,14 @@ pub struct OcrViewer {
     /// but with text sync'd from active_line_results. Cheap Rc clone; only
     /// re-synced on text edits (set annotations_sync_dirty). Avoids cloning
     /// all 49 annotations every frame in view().
-    synced_annotations: Rc<Vec<DetectedAnnotation>>,
+    synced_annotations: RefCell<Rc<Vec<DetectedAnnotation>>>,
     /// Set to true when a text edit requires re-syncing annotations with
     /// active_line_results. view() re-syncs and clears this flag.
-    annotations_sync_dirty: Cell<bool>,
+    pub annotations_sync_dirty: Cell<bool>,
+    /// Lines whose text has been user-edited (via alternative selection).
+    /// `handle_ocr_recognition_result` skips `set_single_line_result` for
+    /// these lines, preserving the user's edit against incoming OCR results.
+    pub edited_lines: HashSet<usize>,
     /// Cached total_scale from last view() frame, used for glyph pre-warm
     last_total_scale: Cell<f32>,
     pub state: OcrOverlayState,
@@ -922,8 +926,9 @@ impl OcrViewer {
             window_width: window_w,
             window_height: window_h,
             annotations: Rc::new(Vec::new()),
-            synced_annotations: Rc::new(Vec::new()),
+            synced_annotations: RefCell::new(Rc::new(Vec::new())),
             annotations_sync_dirty: Cell::new(false),
+            edited_lines: HashSet::new(),
             last_total_scale: Cell::new(1.0),
             state: OcrOverlayState::new(window_w, window_h),
             selected_word: None,
@@ -1331,8 +1336,12 @@ impl OcrViewer {
         let t_before_set = std::time::Instant::now();
 
         // If the annotation has a line result, update the overlay state
+        // UNLESS the user has edited this line's text — skip overwrite in
+        // that case to preserve the user's edit.
         if let Some(ref line) = line {
-            self.state.set_single_line_result(index, line.clone());
+            if !self.edited_lines.contains(&index) {
+                self.state.set_single_line_result(index, line.clone());
+            }
         }
         let t_after_state = std::time::Instant::now();
 
@@ -1368,7 +1377,7 @@ impl OcrViewer {
         // Uses a NEW Rc with a fresh clone so self.annotations keeps refcount=1.
         // This way Rc::make_mut above mutates in-place without deep-copying the
         // whole Vec (which would happen if refcount > 1).
-        self.synced_annotations = Rc::new((*self.annotations).clone());
+        *self.synced_annotations.borrow_mut() = Rc::new((*self.annotations).clone());
         let t_end = std::time::Instant::now();
         // eprintln!(
         //     "[TIMING] handle_ocr_recognition_result idx={}: total={}us  clone={}us make_mut={}us set_state={}us",
@@ -1406,9 +1415,14 @@ impl OcrViewer {
                 }
             }
             self.annotations_sync_dirty.set(false);
-            Rc::new(ann)
+            let result = Rc::new(ann);
+            // Cache the synced result so subsequent frames use it until
+            // the next edit triggers another sync. view() takes &self so
+            // we use RefCell for interior mutability.
+            *self.synced_annotations.borrow_mut() = result.clone();
+            result
         } else {
-            Rc::clone(&self.synced_annotations)
+            self.synced_annotations.borrow().clone()
         };
         let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
         let overlay = OverlayProgram {

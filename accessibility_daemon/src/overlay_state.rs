@@ -501,8 +501,18 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
         let line = self.active_line_results.get(line_idx)?.as_ref()?;
         let tapped_box = line.char_boxes.get(char_idx)?.clone();
 
+        // Tapping on a full-width space (void/blank placeholder) → no results
+        if line.text.chars().nth(char_idx) == Some('\u{3000}') {
+            self.cached_entries = Rc::new(Vec::new());
+            self.current_word_length = 0;
+            self.cached_lookup_term = String::new();
+            return None;
+        }
+
         let end_idx = (global_idx + 20).min(self.active_all_chars.len());
         let following_text: String = self.active_all_chars[global_idx..end_idx].join("");
+        // Strip full-width spaces (null/void character placeholder) before lookup
+        let following_text: String = following_text.chars().filter(|&c| c != '\u{3000}').collect();
 
         if following_text.is_empty() {
             return None;
@@ -536,6 +546,24 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
         // Process results
         let (matches, max_len) =
             self.process_results(&db_results, &candidates_by_length, &all_terms_vec, &following_text);
+
+        // Expand max_len to count U+3000 chars in the original text that were
+        // filtered out, so the highlight spans the correct visual range.
+        let max_len = {
+            let original = &self.active_all_chars[global_idx..];
+            let mut seen_non_space = 0usize;
+            let mut expanded = 0usize;
+            for ch in original.iter() {
+                if seen_non_space >= max_len {
+                    break;
+                }
+                expanded += 1;
+                if ch != "\u{3000}" {
+                    seen_non_space += 1;
+                }
+            }
+            expanded
+        };
 
         if matches.is_empty() {
             // No results — clear the cached entries so the UI shows "no results"
