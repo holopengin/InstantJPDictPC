@@ -443,8 +443,27 @@ impl OcrEngine {
     }
 
     pub fn sort_detected_boxes(&self, mut boxes: Vec<BoundingBox>) -> Vec<BoundingBox> {
-        // Simple deterministic sort: y first, then x (no threshold logic)
-        boxes.sort_by_key(|b| (b.y, b.x));
+        // Separate by orientation
+        let mut horizontal: Vec<BoundingBox> = Vec::new();
+        let mut vertical: Vec<BoundingBox> = Vec::new();
+        for b in boxes.drain(..) {
+            if b.w >= b.h {
+                horizontal.push(b);
+            } else {
+                vertical.push(b);
+            }
+        }
+
+        // Horizontal: top-to-bottom, left-to-right
+        horizontal.sort_by(|a, b| a.y.cmp(&b.y).then(a.x.cmp(&b.x)));
+
+        // Vertical: right-to-left, top-to-bottom
+        // Japanese vertical text is read right-to-left across columns.
+        vertical.sort_by(|a, b| b.x.cmp(&a.x).then(a.y.cmp(&b.y)));
+
+        // Concatenate: horizontal lines first, then vertical
+        boxes = horizontal;
+        boxes.extend(vertical);
         boxes
     }
 
