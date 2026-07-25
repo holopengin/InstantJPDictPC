@@ -571,7 +571,9 @@ impl OcrEngine {
 
                         if text.is_empty() { continue; }
 
-                        // Build character boxes for horizontal text from PP-OCR CTC timesteps
+                        // Build character boxes for horizontal text from PP-OCR CTC timesteps.
+                        // Uses RapidOcrNet-style mapping with overlap and punctuation handling
+                        // (same logic as vertical path, adapted for x-axis).
                         let n = char_cols.len();
                         let mut char_boxes = Vec::with_capacity(n);
                         if n > 0 && seq_len_total > 0 {
@@ -579,17 +581,100 @@ impl OcrEngine {
                             let avg_char_width = if n > 1 {
                                 let col_span = char_cols[n - 1] - char_cols[0];
                                 let avg_step_cols = col_span / (n - 1) as f32;
-                                (avg_step_cols * avg_col_width).max(3.0)
+                                (crop_h as f32).max(3.0)
                             } else {
                                 avg_col_width.max(3.0)
                             };
-                            for &t in &char_cols {
-                                let center_x = (t as f32 + 0.5) * avg_col_width;
+
+                            // Build cells along the x-axis
+                            struct HCell { x_left: f32, x_right: f32 }
+                            let mut cells: Vec<HCell> = char_cols.iter().map(|&t| {
+                                let center = (t as f32 + 0.5) * avg_col_width;
                                 let half = avg_char_width / 2.0;
-                                let cx = (center_x - half).max(0.0);
-                                let cw = ((center_x + half).min(crop_w as f32) - cx).max(1.0);
+                                HCell {
+                                    x_left: (center - half).max(0.0),
+                                    x_right: (center + half).min(crop_w as f32),
+                                }
+                            }).collect();
+
+                            cells.sort_by(|a, b| a.x_left.partial_cmp(&b.x_left).unwrap());
+
+                            // Identify punctuation (same chars as vertical path)
+                            let is_close_punct: Vec<bool> = text.chars().map(|ch| {
+                                matches!(ch,
+                                    '\u{3002}' | '\u{002E}' | '\u{FF0E}' |
+                                    '\u{3001}' | '\u{002C}' | '\u{FF0C}' |
+                                    ')' | '\u{FF09}' |
+                                    '\u{3017}' | '\u{300D}' | '\u{300F}' |
+                                    '\u{3015}' | '\u{3011}' | '\u{3009}' |
+                                    ']' | '\u{FF3D}'
+                                )
+                            }).collect();
+                            let is_open_punct: Vec<bool> = text.chars().map(|ch| {
+                                matches!(ch,
+                                    '(' | '\u{FF08}' |
+                                    '\u{300C}' | '\u{300E}' |
+                                    '\u{3014}' | '\u{3010}' |
+                                    '\u{300A}' | '\u{3008}' |
+                                    '\u{3016}' |
+                                    '[' | '\u{FF3B}'
+                                )
+                            }).collect();
+
+                            // Overlap adjustment (x-axis version)
+                            for ci in 0..n.saturating_sub(1) {
+                                if cells[ci].x_right <= cells[ci + 1].x_left { continue; }
+                                if is_close_punct[ci] {
+                                    cells[ci].x_right = cells[ci + 1].x_left;
+                                } else if is_open_punct[ci + 1] {
+                                    cells[ci + 1].x_left = cells[ci].x_right;
+                                } else if is_close_punct[ci + 1] {
+                                    cells[ci + 1].x_left = cells[ci].x_right;
+                                } else if is_open_punct[ci] {
+                                    cells[ci].x_right = cells[ci + 1].x_left;
+                                } else {
+                                    let overlap = cells[ci].x_right - cells[ci + 1].x_left;
+                                    let half = overlap / 2.0;
+                                    cells[ci].x_right -= half;
+                                    cells[ci + 1].x_left += half;
+                                }
+                            }
+
+                            // Punctuation extension (x-axis version)
+                            let avg_non_punct_w: f32 = {
+                                let widths: Vec<f32> = cells.iter().enumerate()
+                                    .filter(|(ci, _)| !is_close_punct[*ci] && !is_open_punct[*ci])
+                                    .map(|(_, c)| c.x_right - c.x_left)
+                                    .collect();
+                                if widths.is_empty() { crop_h as f32 } else {
+                                    widths.iter().sum::<f32>() / widths.len() as f32
+                                }
+                            };
+                            for ci in 0..n {
+                                if is_close_punct[ci] {
+                                    let extent_x = cells[ci].x_left + avg_non_punct_w;
+                                    let next_start = ((ci + 1)..n)
+                                        .filter(|&j| !is_close_punct[j] && !is_open_punct[j])
+                                        .next()
+                                        .map(|j| cells[j].x_left)
+                                        .unwrap_or(f32::INFINITY);
+                                    cells[ci].x_right = extent_x.min(next_start).max(cells[ci].x_right);
+                                } else if is_open_punct[ci] {
+                                    let extent_x = cells[ci].x_right - avg_non_punct_w;
+                                    let prev_right: Option<usize> = (0..ci).rev()
+                                        .filter(|&j| !is_close_punct[j] && !is_open_punct[j])
+                                        .next();
+                                    let prev_limit = prev_right
+                                        .map(|j| cells[j].x_right)
+                                        .unwrap_or(f32::NEG_INFINITY);
+                                    cells[ci].x_left = extent_x.max(prev_limit).min(cells[ci].x_left);
+                                }
+                            }
+
+                            for cell in &cells {
+                                let cw = (cell.x_right - cell.x_left).max(1.0);
                                 char_boxes.push(BoundingBox::new(
-                                    (crop_x as f32 + cx).round() as i32,
+                                    (crop_x as f32 + cell.x_left).round() as i32,
                                     crop_y as i32,
                                     cw.round() as i32,
                                     crop_h as i32,
@@ -598,19 +683,12 @@ impl OcrEngine {
                             }
                         }
 
-                        // Convert horizontal characters to vertical presentation forms
-                        let text_v = text.chars().map(to_vertical_glyph).collect::<String>();
-                        let alternatives_v: Vec<Vec<(char, f32)>> = alternatives
-                            .into_iter()
-                            .map(|alts| alts.into_iter().map(|(c, s)| (to_vertical_glyph(c), s)).collect())
-                            .collect();
-
                         let annotation = DetectedAnnotation {
                             bbox: bbox.clone(),
                             line: Some(LineResult {
-                                text: text_v,
+                                text,
                                 char_boxes,
-                                alternatives: alternatives_v,
+                                alternatives,
                                 is_vertical: false,
                                 chunk_boxes: vec![BoundingBox::new(
                                     crop_x as i32, crop_y as i32,
@@ -926,50 +1004,28 @@ impl OcrEngine {
 
                         if text.is_empty() { continue; }
 
-                        // Build character boxes for horizontal text from PP-OCR CTC timesteps
-                        let n = char_cols.len();
-                        let mut char_boxes = Vec::with_capacity(n);
-                        if n > 0 && seq_len_total > 0 {
-                            let avg_col_width = crop_w as f32 / seq_len_total as f32;
-                            let avg_char_width = if n > 1 {
-                                let col_span = char_cols[n - 1] - char_cols[0];
-                                let avg_step_cols = col_span / (n - 1) as f32;
-                                (avg_step_cols * avg_col_width).max(3.0)
-                            } else {
-                                avg_col_width.max(3.0)
-                            };
-                            for &t in &char_cols {
-                                let center_x = (t as f32 + 0.5) * avg_col_width;
-                                let half = avg_char_width / 2.0;
-                                let cx = (center_x - half).max(0.0);
-                                let cw = ((center_x + half).min(crop_w as f32) - cx).max(1.0);
-                                char_boxes.push(BoundingBox::new(
-                                    (crop_x as f32 + cx).round() as i32,
-                                    crop_y as i32,
-                                    cw.round() as i32,
-                                    crop_h as i32,
-                                    1.0,
-                                ));
+                        // HORIZONTAL char box from CTC timesteps (recognize_lines)
+                        let h_n = char_cols.len();
+                        let mut char_boxes = Vec::with_capacity(h_n);
+                        if h_n > 0 && seq_len_total > 0 {
+                            let avg_col_w = crop_w as f32 / seq_len_total as f32;
+                            let avg_ch_w = (if h_n > 1 { let span = char_cols[h_n - 1] - char_cols[0]; (span / (h_n - 1) as f32 * avg_col_w).max(3.0) } else { avg_col_w.max(3.0) });
+                            let mut cells: Vec<(f32, f32)> = char_cols.iter().map(|&t| { let c = (t + 0.5) * avg_col_w; let h = avg_ch_w / 2.0; ((c - h).max(0.0), (c + h).min(crop_w as f32)) }).collect();
+                            cells.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                            for ci in 0..h_n.saturating_sub(1) {
+                                if cells[ci].1 <= cells[ci + 1].0 { continue; }
+                                let half = (cells[ci].1 - cells[ci + 1].0) / 2.0;
+                                cells[ci].1 -= half; cells[ci + 1].0 += half;
                             }
+                            for &(xl, xr) in &cells { char_boxes.push(BoundingBox::new((crop_x as f32 + xl).round() as i32, crop_y as i32, (xr - xl).max(1.0).round() as i32, crop_h as i32, 1.0)); }
                         }
-
-                        let text_v = text.chars().map(to_vertical_glyph).collect::<String>();
-                        let alternatives_v: Vec<Vec<(char, f32)>> = alternatives
-                            .into_iter()
-                            .map(|alts| alts.into_iter().map(|(c, s)| (to_vertical_glyph(c), s)).collect())
-                            .collect();
-
-                        println!(
-                            "[OCR timing]   Box {:>3} ({}x{} @ {},{}): {:>8.2} ms",
-                            annotations.len(), bbox.w, bbox.h, bbox.x, bbox.y, box_ms
-                        );
 
                         annotations.push(DetectedAnnotation {
                             bbox: bbox.clone(),
                             line: Some(LineResult {
-                                text: text_v,
+                                text,
                                 char_boxes,
-                                alternatives: alternatives_v,
+                                alternatives,
                                 is_vertical: false,
                                 chunk_boxes: vec![BoundingBox::new(
                                     crop_x as i32, crop_y as i32,
@@ -1032,51 +1088,67 @@ impl OcrEngine {
 
                         if text.is_empty() { continue; }
 
-                        // Build character boxes for vertical text from PP-OCR CTC timesteps
-                        let n = char_cols.len();
-                        let mut char_boxes = Vec::with_capacity(n);
-                        if n > 0 && seq_len_total > 0 {
-                            let avg_col_width = crop_h as f32 / seq_len_total as f32;
-                            let avg_char_height = if n > 1 {
-                                let col_span = char_cols[n - 1] - char_cols[0];
-                                let avg_step_cols = col_span / (n - 1) as f32;
-                                (avg_step_cols * avg_col_width).max(3.0)
+                        // Build character boxes for horizontal text from PP-OCR CTC timesteps.
+                        // Uses RapidOcrNet-style mapping with overlap and punctuation handling (x-axis).
+                        let h_n = char_cols.len();
+                        let mut char_boxes = Vec::with_capacity(h_n);
+                        if h_n > 0 && seq_len_total > 0 {
+                            let avg_col_width = crop_w as f32 / seq_len_total as f32;
+                            let avg_char_width = (if h_n > 1 {
+                                let col_span = char_cols[h_n - 1] - char_cols[0];
+                                let avg_step_cols = col_span / (h_n - 1) as f32;
+                                (crop_h as f32).max(3.0)
                             } else {
                                 avg_col_width.max(3.0)
+                            });
+                            struct HCell { x_left: f32, x_right: f32 }
+                            let mut hcells: Vec<HCell> = char_cols.iter().map(|&t| {
+                                let center = (t as f32 + 0.5) * avg_col_width;
+                                let half = avg_char_width / 2.0;
+                                HCell { x_left: (center - half).max(0.0), x_right: (center + half).min(crop_w as f32) }
+                            }).collect();
+                            hcells.sort_by(|a, b| a.x_left.partial_cmp(&b.x_left).unwrap());
+                            let is_close_punct: Vec<bool> = text.chars().map(|ch| matches!(ch, '\u{3002}' | '\u{002E}' | '\u{FF0E}' | '\u{3001}' | '\u{002C}' | '\u{FF0C}' | ')' | '\u{FF09}' | '\u{3017}' | '\u{300D}' | '\u{300F}' | '\u{3015}' | '\u{3011}' | '\u{3009}' | ']' | '\u{FF3D}')).collect();
+                            let is_open_punct: Vec<bool> = text.chars().map(|ch| matches!(ch, '(' | '\u{FF08}' | '\u{300C}' | '\u{300E}' | '\u{3014}' | '\u{3010}' | '\u{300A}' | '\u{3008}' | '\u{3016}' | '[' | '\u{FF3B}')).collect();
+                            for ci in 0..h_n.saturating_sub(1) {
+                                if hcells[ci].x_right <= hcells[ci + 1].x_left { continue; }
+                                if is_close_punct[ci] { hcells[ci].x_right = hcells[ci + 1].x_left; }
+                                else if is_open_punct[ci + 1] { hcells[ci + 1].x_left = hcells[ci].x_right; }
+                                else if is_close_punct[ci + 1] { hcells[ci + 1].x_left = hcells[ci].x_right; }
+                                else if is_open_punct[ci] { hcells[ci].x_right = hcells[ci + 1].x_left; }
+                                else { let half = (hcells[ci].x_right - hcells[ci + 1].x_left) / 2.0; hcells[ci].x_right -= half; hcells[ci + 1].x_left += half; }
+                            }
+                            let avg_non_punct_w: f32 = {
+                                let widths: Vec<f32> = hcells.iter().enumerate().filter(|(ci, _)| !is_close_punct[*ci] && !is_open_punct[*ci]).map(|(_, c)| c.x_right - c.x_left).collect();
+                                if widths.is_empty() { crop_h as f32 } else { widths.iter().sum::<f32>() / widths.len() as f32 }
                             };
-                            for &t in &char_cols {
-                                let center_y = (t as f32 + 0.5) * avg_col_width;
-                                let half = avg_char_height / 2.0;
-                                let cy = (center_y - half).max(0.0);
-                                let ch = ((center_y + half).min(crop_h as f32) - cy).max(1.0);
+                            for ci in 0..h_n {
+                                if is_close_punct[ci] {
+                                    let next_start = ((ci + 1)..h_n).filter(|&j| !is_close_punct[j] && !is_open_punct[j]).next().map(|j| hcells[j].x_left).unwrap_or(f32::INFINITY);
+                                    hcells[ci].x_right = (hcells[ci].x_left + avg_non_punct_w).min(next_start).max(hcells[ci].x_right);
+                                } else if is_open_punct[ci] {
+                                    let prev_right: Option<usize> = (0..ci).rev().filter(|&j| !is_close_punct[j] && !is_open_punct[j]).next();
+                                    let prev_limit = prev_right.map(|j| hcells[j].x_right).unwrap_or(f32::NEG_INFINITY);
+                                    hcells[ci].x_left = (hcells[ci].x_right - avg_non_punct_w).max(prev_limit).min(hcells[ci].x_left);
+                                }
+                            }
+                            for cell in &hcells {
                                 char_boxes.push(BoundingBox::new(
-                                    crop_x as i32,
-                                    (crop_y as f32 + cy).round() as i32,
-                                    crop_w as i32,
-                                    ch.round() as i32,
-                                    1.0,
+                                    (crop_x as f32 + cell.x_left).round() as i32, crop_y as i32,
+                                    (cell.x_right - cell.x_left).max(1.0).round() as i32, crop_h as i32, 1.0,
                                 ));
                             }
                         }
 
-                        let text_v = text.chars().map(to_vertical_glyph).collect::<String>();
-                        let alternatives_v: Vec<Vec<(char, f32)>> = alternatives
-                            .into_iter()
-                            .map(|alts| alts.into_iter().map(|(c, s)| (to_vertical_glyph(c), s)).collect())
-                            .collect();
-
-                        println!(
-                            "[OCR timing]   Box {:>3} ({}x{} @ {},{}): {:>8.2} ms",
-                            annotations.len(), bbox.w, bbox.h, bbox.x, bbox.y, box_ms
-                        );
+                        // No vertical glyph conversion for horizontal text
 
                         annotations.push(DetectedAnnotation {
                             bbox: bbox.clone(),
                             line: Some(LineResult {
-                                text: text_v,
+                                text,
                                 char_boxes,
-                                alternatives: alternatives_v,
-                                is_vertical: true,
+                                alternatives,
+                                is_vertical: false,
                                 chunk_boxes: vec![BoundingBox::new(
                                     crop_x as i32, crop_y as i32,
                                     crop_w as i32, crop_h as i32, 1.0,
@@ -1439,91 +1511,114 @@ pub fn recognize_boxes_streaming(
     let v_indices: Vec<usize> = sorted.iter().enumerate()
         .filter(|(_, b)| b.h > b.w).map(|(i, _)| i).collect();
 
-    // Horizontal boxes — use PP-OCRv6 recognition
+    // Horizontal boxes — use PP-OCRv6 recognition via persistent worker threads
+    // (same pattern as vertical workers below — concurrent, streaming).
     if !horizontal_boxes.is_empty() && !ppocr_vocab.is_empty() && !rec_sessions_ppocr.is_empty() {
-        let all_chunks: Vec<DynamicImage> = horizontal_boxes.iter().map(|bbox| {
+        println!("[PP-OCR] Processing {} horizontal boxes", horizontal_boxes.len());
+
+        struct HJobInfo {
+            idx: usize,
+            bbox: BoundingBox,
+            crop: DynamicImage,
+            crop_x: u32, crop_y: u32, crop_w: u32, crop_h: u32,
+        }
+        let mut h_jobs: Vec<HJobInfo> = Vec::with_capacity(horizontal_boxes.len());
+        for (i, bbox) in horizontal_boxes.iter().enumerate() {
             let crop_x = bbox.x.max(0) as u32;
             let crop_y = bbox.y.max(0) as u32;
             let crop_w = bbox.w.max(0) as u32;
             let crop_h = bbox.h.max(0) as u32;
-            image.crop_imm(crop_x, crop_y, crop_w, crop_h)
-        }).collect();
+            let crop = image.crop_imm(crop_x, crop_y, crop_w, crop_h);
+            if crop.width() < 4 || crop.height() < 4 { continue; }
+            h_jobs.push(HJobInfo { idx: i, bbox: bbox.clone(), crop, crop_x, crop_y, crop_w, crop_h });
+        }
 
-        let num_batches = (all_chunks.len() + batch_size - 1) / batch_size;
-        for batch_idx in 0..num_batches {
-            let start = batch_idx * batch_size;
-            let end = (start + batch_size).min(all_chunks.len());
-            let sess = rec_sessions_ppocr[batch_idx % rec_sessions_ppocr.len()].clone();
-            let chunk_slice = &all_chunks[start..end];
-            let crops_refs: Vec<&DynamicImage> = chunk_slice.iter().collect();
-            let mut session = sess.lock().unwrap();
-            let batch_results = crate::ppocr::recognize_ppocr_vertical_batch(
-                &mut session, &crops_refs, ppocr_vocab,
-            );
-            drop(session);
+        let num_workers = rec_sessions_ppocr.len().min(h_jobs.len()).max(1);
+        use std::collections::VecDeque;
+        let h_job_queue = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::from(h_jobs)));
 
-            if let Ok(results) = batch_results {
-                for (i, (bbox, (text, alternatives, char_cols, seq_len_total))) in
-                    horizontal_boxes[start..end].iter().zip(results.into_iter()).enumerate()
-                {
-                    let crop_x = bbox.x.max(0) as u32;
-                    let crop_y = bbox.y.max(0) as u32;
-                    let crop_w = bbox.w.max(0) as u32;
-                    let crop_h = bbox.h.max(0) as u32;
+        let ppocr_vocab_clone = ppocr_vocab.to_vec();
+        let h_indices_clone: Vec<usize> = h_indices.to_vec();
+        let sender_clone = sender.clone();
+        let mut handles = Vec::with_capacity(num_workers);
 
-                    if text.is_empty() { continue; }
+        for worker_id in 0..num_workers {
+            let q = std::sync::Arc::clone(&h_job_queue);
+            let sess = rec_sessions_ppocr[worker_id % rec_sessions_ppocr.len()].clone();
+            let vocab = ppocr_vocab_clone.clone();
+            let snd = sender_clone.clone();
+            let v_idx = h_indices_clone.clone();
 
-                    // Build character boxes for horizontal text from PP-OCR CTC timesteps
-                    let n = char_cols.len();
-                    let mut char_boxes = Vec::with_capacity(n);
-                    if n > 0 && seq_len_total > 0 {
-                        let avg_col_width = crop_w as f32 / seq_len_total as f32;
-                        let avg_char_width = if n > 1 {
-                            let col_span = char_cols[n - 1] - char_cols[0];
-                            let avg_step_cols = col_span / (n - 1) as f32;
-                            (avg_step_cols * avg_col_width).max(3.0)
-                        } else {
-                            avg_col_width.max(3.0)
-                        };
-                        for &t in &char_cols {
-                            let center_x = (t as f32 + 0.5) * avg_col_width;
-                            let half = avg_char_width / 2.0;
-                            let cx = (center_x - half).max(0.0);
-                            let cw = ((center_x + half).min(crop_w as f32) - cx).max(1.0);
-                            char_boxes.push(BoundingBox::new(
-                                (crop_x as f32 + cx).round() as i32,
-                                crop_y as i32,
-                                cw.round() as i32,
-                                crop_h as i32,
-                                1.0,
-                            ));
+            handles.push(std::thread::spawn(move || {
+                loop {
+                    let job = {
+                        let mut ql = q.lock().unwrap();
+                        ql.pop_front()
+                    };
+                    let job = match job {
+                        Some(j) => j,
+                        None => break,
+                    };
+
+                    let crops_refs: [&DynamicImage; 1] = [&job.crop];
+                    let mut session = sess.lock().unwrap();
+                    let result = crate::ppocr::recognize_ppocr_vertical_batch(
+                        &mut session, &crops_refs, &vocab,
+                    );
+                    drop(session);
+
+                    if let Ok(results) = result {
+                        if let Some((text, alternatives, char_cols, seq_len_total)) = results.into_iter().next() {
+                            if text.is_empty() { continue; }
+
+                            let n = char_cols.len();
+                            let mut char_boxes = Vec::with_capacity(n);
+                            if n > 0 && seq_len_total > 0 {
+                                let avg_col_width = job.crop_w as f32 / seq_len_total as f32;
+                                let char_w = (job.crop_h as f32).max(3.0);
+                                struct HCell { x_left: f32, x_right: f32 }
+                                let mut cells: Vec<HCell> = char_cols.iter().map(|&t| {
+                                    let center = (t as f32 + 0.5) * avg_col_width;
+                                    let half = char_w / 2.0;
+                                    HCell { x_left: (center - half).max(0.0), x_right: (center + half).min(job.crop_w as f32) }
+                                }).collect();
+                                cells.sort_by(|a, b| a.x_left.partial_cmp(&b.x_left).unwrap());
+                                for ci in 0..n.saturating_sub(1) {
+                                    if cells[ci].x_right <= cells[ci + 1].x_left { continue; }
+                                    let half = (cells[ci].x_right - cells[ci + 1].x_left) / 2.0;
+                                    cells[ci].x_right -= half; cells[ci + 1].x_left += half;
+                                }
+                                for cell in &cells {
+                                    char_boxes.push(BoundingBox::new(
+                                        (job.crop_x as f32 + cell.x_left).round() as i32, job.crop_y as i32,
+                                        (cell.x_right - cell.x_left).max(1.0).round() as i32, job.crop_h as i32, 1.0,
+                                    ));
+                                }
+                            }
+
+                            let annotation = DetectedAnnotation {
+                                bbox: job.bbox.clone(),
+                                line: Some(LineResult {
+                                    text,
+                                    char_boxes,
+                                    alternatives,
+                                    is_vertical: false,
+                                    chunk_boxes: vec![BoundingBox::new(
+                                        job.crop_x as i32, job.crop_y as i32,
+                                        job.crop_w as i32, job.crop_h as i32, 1.0,
+                                    )],
+                                }),
+                            };
+                            if snd.send((v_idx[job.idx], annotation)).is_err() {
+                                return; // viewer disconnected
+                            }
+                            std::thread::yield_now();
                         }
                     }
-
-                    // Convert horizontal characters to vertical presentation forms
-                    let text_v = text.chars().map(to_vertical_glyph).collect::<String>();
-                    let alternatives_v: Vec<Vec<(char, f32)>> = alternatives
-                        .into_iter()
-                        .map(|alts| alts.into_iter().map(|(c, s)| (to_vertical_glyph(c), s)).collect())
-                        .collect();
-
-                    let annotation = DetectedAnnotation {
-                        bbox: bbox.clone(),
-                        line: Some(LineResult {
-                            text: text_v,
-                            char_boxes,
-                            alternatives: alternatives_v,
-                            is_vertical: false,
-                            chunk_boxes: vec![BoundingBox::new(
-                                crop_x as i32, crop_y as i32,
-                                crop_w as i32, crop_h as i32, 1.0,
-                            )],
-                        }),
-                    };
-                    if sender.send((h_indices[start + i], annotation)).is_err() { return Ok(()); }
                 }
-            }
+            }));
         }
+        for h in handles { h.join().unwrap(); }
     }
 
     // Vertical boxes → use PP-OCRv6 worker threads
