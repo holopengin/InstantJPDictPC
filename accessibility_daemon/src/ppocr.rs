@@ -169,7 +169,7 @@ pub fn recognize_ppocr_batch(
                         std::char::from_u32(vocab[*idx - 1].chars().next().unwrap() as u32)
                             .unwrap_or('\u{FFFD}')
                     } else {
-                        '\0'
+                        '\u{3000}'  // full-width space for blank/void characters
                     };
                     (ch, *score)
                 })
