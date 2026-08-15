@@ -31,6 +31,9 @@ pub struct OcrEngine {
     pub ppocr_vocab: Vec<String>,
     pub recognition_mode: RecognitionMode,
     pub batch_size: usize,
+    /// BOOOCR sidecar (feature-vector recognizer). When present, recognition
+    /// goes through it instead of the PP-OCR rec sessions.
+    pub booocr: Option<std::sync::Arc<std::sync::Mutex<crate::booocr::BooOcrClient>>>,
     model_dir: String,
 }
 
@@ -120,12 +123,27 @@ impl OcrEngine {
 
         println!("Recognition mode: {:?}, batch size: {}", recognition_mode, batch_size);
 
+        // BOOOCR sidecar: primary recognizer when available. Spawning it
+        // blocks ~3s on the font-database load; on any failure we fall back
+        // to the PP-OCR recognition sessions.
+        let booocr = match crate::booocr::BooOcrClient::new(&crate::booocr::booocr_dir()) {
+            Ok(c) => {
+                println!("[BOOOCR] sidecar ready — line recognition via BOOOCR");
+                Some(std::sync::Arc::new(std::sync::Mutex::new(c)))
+            }
+            Err(e) => {
+                eprintln!("[BOOOCR] unavailable ({e}) — falling back to PP-OCR recognition");
+                None
+            }
+        };
+
         Ok(OcrEngine {
             detect_session,
             ppocr_session: ppocr_pool,
             ppocr_vocab,
             recognition_mode,
             batch_size,
+            booocr,
             model_dir: model_dir.to_string(),
         })
     }
@@ -564,6 +582,7 @@ pub fn recognize_boxes_streaming(
     ppocr_vocab: &[String],
     batch_size: usize,
     recognition_mode: RecognitionMode,
+    booocr: Option<std::sync::Arc<std::sync::Mutex<crate::booocr::BooOcrClient>>>,
     sender: std::sync::mpsc::Sender<(usize, DetectedAnnotation)>,
     out_dir: &std::path::Path,
 ) -> Result<()> {
@@ -605,13 +624,121 @@ pub fn recognize_boxes_streaming(
         });
     }
 
-    if !jobs.is_empty() && !ppocr_vocab.is_empty() && !rec_sessions_ppocr.is_empty() {
-        println!("[PP-OCR] Processing {} boxes ({} workers)", jobs.len(), rec_sessions_ppocr.len().min(jobs.len()));
+    if !jobs.is_empty() {
         use std::collections::VecDeque;
+        let n_jobs = jobs.len();
         let job_queue = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::from(jobs)));
         let mut handles = Vec::new();
 
-        for worker_id in 0..rec_sessions_ppocr.len().min(job_queue.lock().unwrap().len()).max(1) {
+        if let Some(client) = booocr {
+            // BOOOCR backend: one worker, serialized through the shared
+            // sidecar connection. Per-char boxes come straight from BOOOCR.
+            let q = std::sync::Arc::clone(&job_queue);
+            let client = client.clone();
+            let snd = sender.clone();
+            let od = out_dir.clone();
+            handles.push(std::thread::spawn(move || loop {
+                let job = {
+                    let mut ql = q.lock().unwrap();
+                    ql.pop_front()
+                };
+                let job = match job {
+                    Some(j) => j,
+                    None => return,
+                };
+
+                let png_path = match crate::booocr::save_crop_png(&job.crop, job.idx) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[BOOOCR] crop save failed: {e}");
+                        continue;
+                    }
+                };
+                let line = {
+                    let mut c = client.lock().unwrap();
+                    c.recognize_crop(&png_path)
+                };
+                let _ = std::fs::remove_file(&png_path);
+
+                let Ok(line) = line else {
+                    eprintln!("[BOOOCR] recognition failed for line {}", job.idx);
+                    continue;
+                };
+                if line.chars.is_empty() {
+                    continue;
+                }
+
+                let text: String = line.chars.iter().map(|c| c.c).collect();
+                let char_boxes: Vec<BoundingBox> = line
+                    .chars
+                    .iter()
+                    .map(|c| {
+                        BoundingBox::new(
+                            job.crop_x as i32 + c.x,
+                            job.crop_y as i32 + c.y,
+                            c.w.max(1),
+                            c.h.max(1),
+                            c.alts.first().map(|(_, s)| *s).unwrap_or(1.0),
+                        )
+                    })
+                    .collect();
+                let alternatives: Vec<Vec<(char, f32)>> =
+                    line.chars.iter().map(|c| c.alts.clone()).collect();
+
+                // Dataset collection: save the line crop + detected text
+                save_line_sample(&job.crop, &text, &od);
+
+                // Apply glyph conversion only for vertical text
+                let (final_text, final_alts) = if job.is_vertical {
+                    (
+                        text.chars()
+                            .map(|c| crate::util::japanese::to_vertical_glyph(c))
+                            .collect::<String>(),
+                        alternatives
+                            .into_iter()
+                            .map(|alts| {
+                                alts.into_iter()
+                                    .map(|(c, s)| (crate::util::japanese::to_vertical_glyph(c), s))
+                                    .collect()
+                            })
+                            .collect(),
+                    )
+                } else {
+                    (text, alternatives)
+                };
+
+                let annotation = DetectedAnnotation {
+                    bbox: job.bbox.clone(),
+                    line: Some(LineResult {
+                        text: final_text,
+                        char_boxes,
+                        alternatives: final_alts,
+                        is_vertical: job.is_vertical,
+                        chunk_boxes: vec![BoundingBox::new(
+                            job.crop_x as i32,
+                            job.crop_y as i32,
+                            job.crop_w as i32,
+                            job.crop_h as i32,
+                            1.0,
+                        )],
+                    }),
+                };
+                if snd.send((job.idx, annotation)).is_err() {
+                    return;
+                }
+                std::thread::yield_now();
+            }));
+        } else if !ppocr_vocab.is_empty() && !rec_sessions_ppocr.is_empty() {
+            println!(
+                "[PP-OCR] Processing {} boxes ({} workers)",
+                n_jobs,
+                rec_sessions_ppocr.len().min(n_jobs)
+            );
+            for worker_id in 0..rec_sessions_ppocr
+                .len()
+                .min(job_queue.lock().unwrap().len())
+                .max(1)
+            {
             let q = std::sync::Arc::clone(&job_queue);
             let sess = rec_sessions_ppocr[worker_id % rec_sessions_ppocr.len()].clone();
             let voc = ppocr_vocab.to_vec();
@@ -730,6 +857,7 @@ pub fn recognize_boxes_streaming(
                     }
                 }
             }));
+        }
         }
         for h in handles { h.join().unwrap(); }
     }
