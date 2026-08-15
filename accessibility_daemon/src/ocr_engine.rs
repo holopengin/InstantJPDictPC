@@ -90,6 +90,90 @@ impl RecognizeSessionPool {
     }
 }
 
+/// Minimum-area rotated rectangle around a contour (cv2.minAreaRect
+/// equivalent): convex hull + exhaustive hull-edge orientations. Returns
+/// (cx, cy, w, h, angle_rad) with w = LONGER side and angle = angle of that
+/// side from +x (radians, y-down image coords).
+fn min_area_rect(points: &[imageproc::point::Point<i32>]) -> Option<(f32, f32, f32, f32, f32)> {
+    let hull = imageproc::geometry::convex_hull(points.to_vec());
+    if hull.len() < 3 {
+        return None;
+    }
+    let n = hull.len();
+    let mut best: Option<(f32, f32, f32, f32)> = None; // (cx, cy, area, angle)
+    let mut best_w = 0.0f32;
+    let mut best_h = 0.0f32;
+    for i in 0..n {
+        let p1 = hull[i];
+        let p2 = hull[(i + 1) % n];
+        let dx = (p2.x - p1.x) as f32;
+        let dy = (p2.y - p1.y) as f32;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-6 {
+            continue;
+        }
+        let (ux, uy) = (dx / len, dy / len);
+        let (vx, vy) = (-uy, ux);
+        let mut min_u = f32::MAX;
+        let mut max_u = f32::MIN;
+        let mut min_v = f32::MAX;
+        let mut max_v = f32::MIN;
+        for p in &hull {
+            let u = p.x as f32 * ux + p.y as f32 * uy;
+            let v = p.x as f32 * vx + p.y as f32 * vy;
+            min_u = min_u.min(u);
+            max_u = max_u.max(u);
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+        }
+        let w = max_u - min_u;
+        let h = max_v - min_v;
+        let area = w * h;
+        if best.map_or(true, |b| area < b.2) {
+            let uc = (min_u + max_u) / 2.0;
+            let vc = (min_v + max_v) / 2.0;
+            best = Some((
+                uc * ux + vc * vx,
+                uc * uy + vc * vy,
+                area,
+                uy.atan2(ux),
+            ));
+            best_w = w;
+            best_h = h;
+        }
+    }
+    let (cx, cy, _area, angle) = best?;
+    // Normalize: w = longer side, angle follows the long axis.
+    if best_w >= best_h {
+        Some((cx, cy, best_w, best_h, angle))
+    } else {
+        Some((cx, cy, best_h, best_w, angle + std::f32::consts::FRAC_PI_2))
+    }
+}
+
+/// Rotate an image about its center by `angle` radians. Positive angle
+/// rotates the content toward +y (clockwise visually in y-down coords).
+/// Output keeps the input dimensions; out-of-bounds pixels are white.
+/// Nearest-neighbor sampling — fine for OCR crops, avoids interpolation blur.
+fn rotate_crop(img: &DynamicImage, angle: f32) -> DynamicImage {
+    let (w, h) = img.dimensions();
+    let (wc, hc) = (w as f32 / 2.0, h as f32 / 2.0);
+    let (s, c) = angle.sin_cos();
+    let mut out = RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]));
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 - wc;
+            let dy = y as f32 - hc;
+            let sx = c * dx + s * dy + wc; // R(-angle) = [c, s; -s, c]
+            let sy = -s * dx + c * dy + hc;
+            if sx >= 0.0 && sy >= 0.0 && sx < w as f32 && sy < h as f32 {
+                out.put_pixel(x, y, img.get_pixel(sx as u32, sy as u32));
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(out)
+}
+
 impl OcrEngine {
     pub fn new(model_dir: &str, recognition_mode: RecognitionMode, batch_size: usize) -> Result<Self> {
         let model_path = Path::new(model_dir);
@@ -154,8 +238,10 @@ impl OcrEngine {
 
     /// Detects bounding boxes using PP-OCRv6 segmentation-based detection model.
     /// The model outputs a probability map [1,1,H,W]. Post-processing:
-    /// threshold → find connected components → bounding boxes → merge → sort.
-    pub fn detect(&mut self, image: &DynamicImage) -> Result<Vec<BoundingBox>> {
+    /// threshold → connected components → min-area rotated rects (PP-OCR's
+    /// minAreaRect) → sort. Returns axis-aligned boxes for display plus the
+    /// rotated rects for crop un-rotation.
+    pub fn detect(&mut self, image: &DynamicImage) -> Result<DetectionResult> {
         let orig_w = image.width() as f32;
         let orig_h = image.height() as f32;
 
@@ -280,105 +366,111 @@ impl OcrEngine {
         let binary_img = image::GrayImage::from_raw(out_w, out_h, binary)
             .context("Failed to create binary image")?;
         let contours = contours::find_contours_with_threshold::<i32>(&binary_img, 128);
-        let mut raw_boxes: Vec<BoundingBox> = Vec::new();
+        let mut raw_pairs: Vec<(BoundingBox, RotatedBox)> = Vec::new();
 
         for contour in &contours {
             if contour.points.len() < 3 { continue; } // noise filter
 
-            let mut min_x = out_w as i32;
-            let mut min_y = out_h as i32;
-            let mut max_x = 0i32;
-            let mut max_y = 0i32;
-            for pt in &contour.points {
-                min_x = min_x.min(pt.x);
-                min_y = min_y.min(pt.y);
-                max_x = max_x.max(pt.x);
-                max_y = max_y.max(pt.y);
-            }
+            // Minimum-area ROTATED rectangle around the contour (PP-OCR's
+            // cv2.minAreaRect equivalent). Angled text lines get a tight
+            // quad instead of one big orthogonal box covering the span.
+            let Some((cx, cy, rw, rh, angle)) = min_area_rect(&contour.points) else {
+                continue;
+            };
 
-            // Unclip: expand box using proper PP-OCR formula: distance = area * ratio / perimeter
-            let bw = (max_x - min_x) as f32;
-            let bh = (max_y - min_y) as f32;
-            let area = bw * bh;
-            let perimeter = 2.0 * (bw + bh);
+            // Unclip: expand box using proper PP-OCR formula:
+            // distance = area * ratio / perimeter (applied in rect space)
+            let area = rw * rh;
+            let perimeter = 2.0 * (rw + rh);
             let expand = if perimeter > 0.0 { area * PPOCR_DET_UNCLIP_RATIO / perimeter } else { 0.0 };
-            let ux = (min_x as f32 - expand).max(0.0);
-            let uy = (min_y as f32 - expand).max(0.0);
-            let ux2 = (max_x as f32 + expand).min(out_w as f32 - 1.0);
-            let uy2 = (max_y as f32 + expand).min(out_h as f32 - 1.0);
+            let rw = (rw + 2.0 * expand).max(1.0);
+            let rh = (rh + 2.0 * expand).max(1.0);
 
-            // Scale back to original image coords
-            let orig_x = (ux * scale_w).round() as i32;
-            let orig_y = (uy * scale_h).round() as i32;
-            let orig_w_box = ((ux2 - ux) * scale_w).round() as i32;
-            let orig_h_box = ((uy2 - uy) * scale_h).round() as i32;
+            // Scale back to original image coords (uniform scale)
+            let cx = cx * scale_w;
+            let cy = cy * scale_h;
+            let rw = rw * scale_w;
+            let rh = rh * scale_h;
 
-            // Average prob over the region as confidence score
-            let _score = 0.0f32;
+            if rw < 4.0 || rh < 4.0 { continue; }
 
-            if orig_w_box < 4 || orig_h_box < 4 { continue; }
-
-            raw_boxes.push(BoundingBox::new(
-                orig_x, orig_y, orig_w_box, orig_h_box, PPOCR_DET_BOX_THRESH,
-            ));
+            let rot = RotatedBox::new(cx, cy, rw, rh, angle, PPOCR_DET_BOX_THRESH);
+            let (bx, by, bw, bh) = rot.aabb();
+            let bbox = BoundingBox::new(
+                bx.round() as i32,
+                by.round() as i32,
+                bw.round() as i32,
+                bh.round() as i32,
+                PPOCR_DET_BOX_THRESH,
+            );
+            raw_pairs.push((bbox, rot));
         }
 
         // Debug: print raw detected boxes
-        eprintln!("[PP-OCR DET] raw {} boxes:", raw_boxes.len());
-        for (i, b) in raw_boxes.iter().enumerate() {
-            eprintln!("  [{i}] x={} y={} w={} h={} c={:.3}", b.x, b.y, b.w, b.h, b.confidence);
+        eprintln!("[PP-OCR DET] raw {} boxes:", raw_pairs.len());
+        for (i, (b, r)) in raw_pairs.iter().enumerate() {
+            eprintln!(
+                "  [{i}] x={} y={} w={} h={} angle={:.1}° c={:.3}",
+                b.x, b.y, b.w, b.h, r.angle.to_degrees(), b.confidence
+            );
         }
 
         // MERGE DISABLED for diagnosis
-        let sorted = self.sort_detected_boxes(raw_boxes);
+        let sorted = self.sort_detected_boxes(raw_pairs);
         // Post-processing
-        let mut pp_boxes = sorted;
+        let mut pp_pairs = sorted;
         // Filter out degenerate tiny boxes (noise specks)
-        pp_boxes.retain(|b| b.w >= 10 && b.h >= 10);
+        pp_pairs.retain(|(b, _)| b.w >= 10 && b.h >= 10);
         // 1. Shrink vertical box widths by 10% (centered)
-        for b in pp_boxes.iter_mut().filter(|b| b.h > b.w) {
+        for (b, _) in pp_pairs.iter_mut().filter(|(b, _)| b.h > b.w) {
             let shrink = (b.w as f32 * 0.05).round() as i32;
             b.x += shrink;
         }
         // 2. For stacked overlapping horizontal boxes, split at overlap midpoint
-        let h_indices: Vec<usize> = pp_boxes
-                .iter()
-                .enumerate()
-                .filter(|(_, b)| b.w >= b.h)
-                .map(|(i, _)| i)
-                .collect();
-            for i in 0..h_indices.len() {
-                for j in (i + 1)..h_indices.len() {
-                    let ai = h_indices[i];
-                    let bi = h_indices[j];
-                    // Only split if boxes are in the same column (horizontal overlap too)
-                    let a_right = pp_boxes[ai].x + pp_boxes[ai].w;
-                    let b_right = pp_boxes[bi].x + pp_boxes[bi].w;
-                    let h_overlap = a_right.min(b_right) - pp_boxes[ai].x.max(pp_boxes[bi].x);
-                    if h_overlap <= 0 {
-                        continue;
-                    }
-                    let (upper, lower) = if pp_boxes[ai].y <= pp_boxes[bi].y {
-                        (ai, bi)
-                    } else {
-                        (bi, ai)
-                    };
-                    let upper_bottom = pp_boxes[upper].y + pp_boxes[upper].h;
-                    let lower_bottom = pp_boxes[lower].y + pp_boxes[lower].h;
-                    // Check vertical overlap: upper box bottom > lower box top
-                    if upper_bottom > pp_boxes[lower].y {
-                        let overlap_mid = (pp_boxes[lower].y + upper_bottom.min(lower_bottom)) / 2;
-                        pp_boxes[upper].h = (overlap_mid - pp_boxes[upper].y).max(1);
-                        pp_boxes[lower].y = pp_boxes[upper].y + pp_boxes[upper].h;
-                        pp_boxes[lower].h = (lower_bottom - pp_boxes[lower].y).max(1);
-                    }
+        let h_indices: Vec<usize> = pp_pairs
+            .iter()
+            .enumerate()
+            .filter(|(_, (b, _))| b.w >= b.h)
+            .map(|(i, _)| i)
+            .collect();
+        for i in 0..h_indices.len() {
+            for j in (i + 1)..h_indices.len() {
+                let ai = h_indices[i];
+                let bi = h_indices[j];
+                // Only split if boxes are in the same column (horizontal overlap too)
+                let a_right = pp_pairs[ai].0.x + pp_pairs[ai].0.w;
+                let b_right = pp_pairs[bi].0.x + pp_pairs[bi].0.w;
+                let h_overlap = a_right.min(b_right) - pp_pairs[ai].0.x.max(pp_pairs[bi].0.x);
+                if h_overlap <= 0 {
+                    continue;
+                }
+                let (upper, lower) = if pp_pairs[ai].0.y <= pp_pairs[bi].0.y {
+                    (ai, bi)
+                } else {
+                    (bi, ai)
+                };
+                let upper_bottom = pp_pairs[upper].0.y + pp_pairs[upper].0.h;
+                let lower_bottom = pp_pairs[lower].0.y + pp_pairs[lower].0.h;
+                // Check vertical overlap: upper box bottom > lower box top
+                if upper_bottom > pp_pairs[lower].0.y {
+                    let overlap_mid = (pp_pairs[lower].0.y + upper_bottom.min(lower_bottom)) / 2;
+                    pp_pairs[upper].0.h = (overlap_mid - pp_pairs[upper].0.y).max(1);
+                    pp_pairs[lower].0.y = pp_pairs[upper].0.y + pp_pairs[upper].0.h;
+                    pp_pairs[lower].0.h = (lower_bottom - pp_pairs[lower].0.y).max(1);
                 }
             }
-        eprintln!("[PP-OCR DET] final {} boxes:", pp_boxes.len());
-        for (i, b) in pp_boxes.iter().enumerate() {
-            eprintln!("  [{i}] x={} y={} w={} h={} c={:.3}", b.x, b.y, b.w, b.h, b.confidence);
         }
-        Ok(pp_boxes)
+        eprintln!("[PP-OCR DET] final {} boxes:", pp_pairs.len());
+        for (i, (b, r)) in pp_pairs.iter().enumerate() {
+            eprintln!(
+                "  [{i}] x={} y={} w={} h={} angle={:.1}° c={:.3}",
+                b.x, b.y, b.w, b.h, r.angle.to_degrees(), b.confidence
+            );
+        }
+
+        let boxes = pp_pairs.iter().map(|(b, _)| b.clone()).collect();
+        let rotated = pp_pairs.into_iter().map(|(_, r)| r).collect();
+        Ok(DetectionResult { boxes, rotated })
     }
 
     pub fn merge_overlapping_boxes(&self, boxes: Vec<BoundingBox>) -> Vec<BoundingBox> {
@@ -460,24 +552,24 @@ impl OcrEngine {
         true
     }
 
-    pub fn sort_detected_boxes(&self, mut boxes: Vec<BoundingBox>) -> Vec<BoundingBox> {
+    pub fn sort_detected_boxes(&self, mut boxes: Vec<(BoundingBox, RotatedBox)>) -> Vec<(BoundingBox, RotatedBox)> {
         // Separate by orientation
-        let mut horizontal: Vec<BoundingBox> = Vec::new();
-        let mut vertical: Vec<BoundingBox> = Vec::new();
-        for b in boxes.drain(..) {
-            if b.w >= b.h {
-                horizontal.push(b);
+        let mut horizontal: Vec<(BoundingBox, RotatedBox)> = Vec::new();
+        let mut vertical: Vec<(BoundingBox, RotatedBox)> = Vec::new();
+        for pair in boxes.drain(..) {
+            if pair.0.w >= pair.0.h {
+                horizontal.push(pair);
             } else {
-                vertical.push(b);
+                vertical.push(pair);
             }
         }
 
         // Horizontal: top-to-bottom, left-to-right
-        horizontal.sort_by(|a, b| a.y.cmp(&b.y).then(a.x.cmp(&b.x)));
+        horizontal.sort_by(|a, b| a.0.y.cmp(&b.0.y).then(a.0.x.cmp(&b.0.x)));
 
         // Vertical: right-to-left, top-to-bottom
         // Japanese vertical text is read right-to-left across columns.
-        vertical.sort_by(|a, b| b.x.cmp(&a.x).then(a.y.cmp(&b.y)));
+        vertical.sort_by(|a, b| b.0.x.cmp(&a.0.x).then(a.0.y.cmp(&b.0.y)));
 
         // Concatenate: horizontal lines first, then vertical
         boxes = horizontal;
@@ -536,11 +628,13 @@ impl OcrEngine {
     // Modified: return the annotated image in-memory when `render` is true
     /// Just line detection — returns raw bounding boxes (fast, no character recognition).
     /// Used by the streaming OCR pipeline to show the image immediately.
-    pub fn detect_lines(&mut self, image: &DynamicImage) -> Result<Vec<BoundingBox>> {
-        let boxes = self.detect(image)?;
+    pub fn detect_lines(&mut self, image: &DynamicImage) -> Result<DetectionResult> {
+        let det = self.detect(image)?;
+        let pairs: Vec<(BoundingBox, RotatedBox)> = det.boxes.into_iter().zip(det.rotated).collect();
         // Merge disabled — render ALL boxes
-        let sorted = self.sort_detected_boxes(boxes);
-        Ok(sorted)
+        let sorted = self.sort_detected_boxes(pairs);
+        let (boxes, rotated): (Vec<_>, Vec<_>) = sorted.into_iter().unzip();
+        Ok(DetectionResult { boxes, rotated })
     }
 }
 
@@ -578,6 +672,7 @@ fn save_line_sample(crop: &image::DynamicImage, text: &str, out_dir: &std::path:
 pub fn recognize_boxes_streaming(
     image: &DynamicImage,
     sorted: &[BoundingBox],
+    rotated: &[RotatedBox],
     rec_sessions_ppocr: &[std::sync::Arc<std::sync::Mutex<Session>>],
     ppocr_vocab: &[String],
     batch_size: usize,
@@ -606,21 +701,73 @@ pub fn recognize_boxes_streaming(
         idx: usize,
         bbox: BoundingBox,
         crop: DynamicImage,
-        crop_x: u32, crop_y: u32, crop_w: u32, crop_h: u32,
+        crop_x: u32,
+        crop_y: u32,
+        crop_w: u32,
+        crop_h: u32,
         is_vertical: bool,
+        /// Rotated rect for this line; `Some` only when the text axis is
+        /// meaningfully off horizontal/vertical (crop was un-rotated).
+        rot: Option<RotatedBox>,
     }
     let mut jobs: Vec<Job> = Vec::with_capacity(sorted.len());
     for (i, bbox) in sorted.iter().enumerate() {
-        let crop = image.crop_imm(
-            bbox.x.max(0) as u32, bbox.y.max(0) as u32,
-            bbox.w.max(0) as u32, bbox.h.max(0) as u32,
-        );
-        if crop.width() < 4 || crop.height() < 4 { continue; }
+        let rot = rotated.get(i).copied();
+        let (crop, crop_x, crop_y, crop_w, crop_h, is_vertical, job_rot) = match rot {
+            Some(r) if r.is_rotated() => {
+                // Angled line: crop the quad's axis-aligned bounds, then
+                // un-rotate so the text axis is axis-aligned (BOOOCR sees a
+                // clean horizontal or vertical line instead of one huge
+                // orthogonal crop covering the whole span).
+                let (rx, ry, rw, rh) = r.aabb();
+                let crop = image.crop_imm(
+                    rx.max(0.0) as u32,
+                    ry.max(0.0) as u32,
+                    rw.max(1.0) as u32,
+                    rh.max(1.0) as u32,
+                );
+                let crop = rotate_crop(&crop, r.unrotate_angle());
+                (
+                    crop,
+                    rx.max(0.0) as u32,
+                    ry.max(0.0) as u32,
+                    rw.max(1.0) as u32,
+                    rh.max(1.0) as u32,
+                    r.is_vertical(),
+                    Some(r),
+                )
+            }
+            _ => {
+                let crop = image.crop_imm(
+                    bbox.x.max(0) as u32,
+                    bbox.y.max(0) as u32,
+                    bbox.w.max(0) as u32,
+                    bbox.h.max(0) as u32,
+                );
+                (
+                    crop,
+                    bbox.x.max(0) as u32,
+                    bbox.y.max(0) as u32,
+                    bbox.w.max(0) as u32,
+                    bbox.h.max(0) as u32,
+                    bbox.h > bbox.w,
+                    None,
+                )
+            }
+        };
+        if crop.width() < 4 || crop.height() < 4 {
+            continue;
+        }
         jobs.push(Job {
-            idx: i, bbox: bbox.clone(), crop,
-            crop_x: bbox.x.max(0) as u32, crop_y: bbox.y.max(0) as u32,
-            crop_w: bbox.w.max(0) as u32, crop_h: bbox.h.max(0) as u32,
-            is_vertical: bbox.h > bbox.w,
+            idx: i,
+            bbox: bbox.clone(),
+            crop,
+            crop_x,
+            crop_y,
+            crop_w,
+            crop_h,
+            is_vertical,
+            rot: job_rot,
         });
     }
 
@@ -673,13 +820,22 @@ pub fn recognize_boxes_streaming(
                     .chars
                     .iter()
                     .map(|c| {
-                        BoundingBox::new(
-                            job.crop_x as i32 + c.x,
-                            job.crop_y as i32 + c.y,
-                            c.w.max(1),
-                            c.h.max(1),
-                            c.alts.first().map(|(_, s)| *s).unwrap_or(1.0),
-                        )
+                        if let Some(rot) = job.rot {
+                            // Crop was un-rotated: map BOOOCR's char box back
+                            // to image coords via the inverse rotation.
+                            rot.map_char_box(
+                                job.crop_w, job.crop_h, job.crop_x, job.crop_y,
+                                c.x, c.y, c.w, c.h,
+                            )
+                        } else {
+                            BoundingBox::new(
+                                job.crop_x as i32 + c.x,
+                                job.crop_y as i32 + c.y,
+                                c.w.max(1),
+                                c.h.max(1),
+                                c.alts.first().map(|(_, s)| *s).unwrap_or(1.0),
+                            )
+                        }
                     })
                     .collect();
                 let alternatives: Vec<Vec<(char, f32)>> =
@@ -709,6 +865,7 @@ pub fn recognize_boxes_streaming(
 
                 let annotation = DetectedAnnotation {
                     bbox: job.bbox.clone(),
+                    quad: job.rot,
                     line: Some(LineResult {
                         text: final_text,
                         char_boxes,
@@ -841,6 +998,7 @@ pub fn recognize_boxes_streaming(
 
                         let annotation = DetectedAnnotation {
                             bbox: job.bbox.clone(),
+                            quad: job.rot,
                             line: Some(LineResult {
                                 text: final_text,
                                 char_boxes,

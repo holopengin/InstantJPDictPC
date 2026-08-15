@@ -473,18 +473,21 @@ fn run_ocr_viewer(
 
                 // Detection
                 let t_detect = std::time::Instant::now();
-                let boxes = match engine.detect_lines(&image) {
-                    Ok(b) => b,
+                let det = match engine.detect_lines(&image) {
+                    Ok(d) => d,
                     Err(e) => { eprintln!("[OCR] Detection error: {e}"); return; }
                 };
+                let boxes = det.boxes;
+                let rotated = det.rotated;
                 let detect_ms = t_detect.elapsed().as_secs_f64() * 1000.0;
                 println!("[OCR timing] Line detection:       {:>8.2} ms ({} boxes)", detect_ms, boxes.len());
 
                 // Send boxes with their original indices
                 for (i, b) in boxes.iter().enumerate() {
+                    let quad = rotated.get(i).copied().filter(|r| r.is_rotated());
                     if ocr_tx2.send((
                         i,
-                        DetectedAnnotation { bbox: b.clone(), line: None }
+                        DetectedAnnotation { bbox: b.clone(), quad, line: None }
                     )).is_err() { return; }
                 }
 
@@ -494,7 +497,7 @@ fn run_ocr_viewer(
                 let rec_mode = engine.recognition_mode;
                 let t_recognize = std::time::Instant::now();
                 if let Err(e) = ocr_engine::recognize_boxes_streaming(
-                    &image, &boxes,
+                    &image, &boxes, &rotated,
                     engine.ppocr_session.get(),
                     &ppocr_vocab, batch_sz, rec_mode,
                     engine.booocr.clone(),
@@ -997,17 +1000,19 @@ fn run_headless_batch(
             Err(e) => { eprintln!("[Batch] Failed to open {}: {e}", file.display()); continue; }
         };
         let t_img = std::time::Instant::now();
-        let boxes = match engine.detect_lines(&image) {
-            Ok(b) => b,
+        let det = match engine.detect_lines(&image) {
+            Ok(d) => d,
             Err(e) => { eprintln!("[Batch] Detection failed for {}: {e}", file.display()); continue; }
         };
+        let boxes = det.boxes;
+        let rotated = det.rotated;
         // Save crops next to the source image.
         let out_dir = file.parent().filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("/tmp"));
         // Keep the receiver alive so worker sends succeed for every line.
         let (tx, rx) = std::sync::mpsc::channel::<(usize, DetectedAnnotation)>();
         if let Err(e) = ocr_engine::recognize_boxes_streaming(
-            &image, &boxes,
+            &image, &boxes, &rotated,
             engine.ppocr_session.get(),
             &ppocr_vocab, batch_size, recognition_mode,
             engine.booocr.clone(),

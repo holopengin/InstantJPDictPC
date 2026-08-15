@@ -683,8 +683,33 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                     continue;
                 }
 
-                let (pt, sz) = transform(bbox);
-                frame.fill_rectangle(pt, sz, Color::from_rgba(0.0, 0.0, 0.0, 0.40)); // argb(51,0,0,0)
+                let fill_color = Color::from_rgba(0.0, 0.0, 0.0, 0.40); // argb(51,0,0,0)
+                if let Some(q) = annotation.quad {
+                    // Angled line: draw the rotated quad (min-area rect)
+                    // instead of its axis-aligned AABB.
+                    let (ux, uy) = (q.angle.cos(), q.angle.sin());
+                    let (vx, vy) = (-uy, ux);
+                    let hw = q.w / 2.0;
+                    let hh = q.h / 2.0;
+                    let corners = [
+                        (q.cx + ux * hw + vx * hh, q.cy + uy * hw + vy * hh),
+                        (q.cx - ux * hw + vx * hh, q.cy - uy * hw + vy * hh),
+                        (q.cx - ux * hw - vx * hh, q.cy - uy * hw - vy * hh),
+                        (q.cx + ux * hw - vx * hh, q.cy + uy * hw - vy * hh),
+                    ];
+                    let mut pb = iced::widget::canvas::path::Builder::new();
+                    for &(cx, cy) in &corners {
+                        pb.line_to(Point::new(
+                            cx * total_scale + total_offset_x,
+                            cy * total_scale + total_offset_y,
+                        ));
+                    }
+                    pb.close();
+                    frame.fill(&pb.build(), fill_color);
+                } else {
+                    let (pt, sz) = transform(bbox);
+                    frame.fill_rectangle(pt, sz, fill_color);
+                }
 
                 if let Some(line) = &annotation.line {
                     for (i, char_box) in line.char_boxes.iter().enumerate() {
@@ -714,8 +739,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                             let highlighted = self.highlighted_coords.contains(&(line_idx, i))
                                 || self.cursor_pos == Some((line_idx, i));
                             let ref_px = sz_c.height.round().max(4.0) as u32;
-                            if let Some((gw_ref, gh_ref)) =
-                                glyph_ink(&self.glyph_cache, ch, ref_px)
+                            if let Some((gw_ref, gh_ref)) = glyph_ink(&self.glyph_cache, ch, ref_px)
                             {
                                 let px = ((sz_c.width * ref_px as f32 / gw_ref.max(1) as f32)
                                     .min(sz_c.height * ref_px as f32 / gh_ref.max(1) as f32))
@@ -728,13 +752,41 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                     let gh_f = (gh.max(1)) as f32;
                                     let draw_x = pt_c.x + (sz_c.width - gw_f) / 2.0;
                                     let draw_y = pt_c.y + (sz_c.height - gh_f) / 2.0;
-                                    frame.draw_image(
-                                        Rectangle::new(
-                                            Point::new(draw_x, draw_y),
-                                            Size::new(gw_f, gh_f),
-                                        ),
-                                        &handle,
-                                    );
+                                    if let Some(angle) = annotation.quad.map(|q| q.angle) {
+                                        // Rotated line: draw the glyph at the
+                                        // line's angle around the char box
+                                        // center so it matches the source
+                                        // orientation. The glyph ink sits
+                                        // inside the rotated char quad, which
+                                        // is contained in the AABB, so no
+                                        // overflow.
+                                        frame.with_save(|frame| {
+                                            frame.translate(iced::Vector::new(
+                                                pt_c.x + sz_c.width / 2.0,
+                                                pt_c.y + sz_c.height / 2.0,
+                                            ));
+                                            frame.rotate(angle);
+                                            frame.translate(iced::Vector::new(
+                                                -gw_f / 2.0,
+                                                -gh_f / 2.0,
+                                            ));
+                                            frame.draw_image(
+                                                Rectangle::new(
+                                                    Point::new(0.0, 0.0),
+                                                    Size::new(gw_f, gh_f),
+                                                ),
+                                                &handle,
+                                            );
+                                        });
+                                    } else {
+                                        frame.draw_image(
+                                            Rectangle::new(
+                                                Point::new(draw_x, draw_y),
+                                                Size::new(gw_f, gh_f),
+                                            ),
+                                            &handle,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1339,6 +1391,7 @@ impl OcrViewer {
             let anns = std::rc::Rc::make_mut(&mut self.annotations);
             anns.resize(index + 1, DetectedAnnotation {
                 bbox: BoundingBox::new(0, 0, 0, 0, 0.0),
+                quad: None,
                 line: None,
             });
         }
