@@ -1,5 +1,6 @@
 mod nav_graph;
 mod data;
+mod frontend;
 mod models;
 #[cfg(feature = "ort")]
 mod ocr_engine;
@@ -10,6 +11,7 @@ mod ppocr;
 mod settings_window;
 mod util;
 mod viewer;
+mod watcher;
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -18,8 +20,8 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::data::db::DictionaryDatabase;
+use crate::frontend::FrontendWindow;
 use crate::models::*;
-use crate::settings_window::SettingsWindow;
 use crate::util::deinflector::Deinflector;
 use crate::viewer::OcrViewer;
 
@@ -279,11 +281,16 @@ fn main() -> Result<()> {
         print_usage();
         return Ok(());
     }
+    // File watcher mode: `--watcher [daemon args...]` — blocks until stopped.
+    if args.len() >= 2 && args[1] == "--watcher" {
+        watcher::run(&data_dir, &args[2..]);
+        return Ok(());
+    }
     if args.len() < 2 {
-        println!("No image argument provided. Opening settings window...");
+        println!("No image argument provided. Opening frontend window...");
         let db_path = data_dir.join("dictionary.sqlite");
         let db = Arc::new(DictionaryDatabase::open(&db_path)?);
-        run_settings_window(db)?;
+        run_frontend(db, data_dir)?;
         return Ok(());
     }
 
@@ -296,7 +303,9 @@ fn print_usage() {
     println!();
     println!("USAGE:");
     println!("  {name} [OPTIONS] <IMAGE_PATH>");
-    println!("  {name}                     Opens settings window (no arguments)");
+    println!("  {name} [OPTIONS] --headless <IMAGE_PATH|DIRECTORY> [MORE_IMAGES...]");
+    println!("  {name}                     Opens the frontend window (no arguments)");
+    println!("  {name} --watcher [ARGS]    Run the file watcher (blocks until stopped)");
     println!("  {name} --help              Show this help message");
     println!();
     println!("OPTIONS:");
@@ -308,32 +317,48 @@ fn print_usage() {
     println!("  -b, --batch-size <N>       Recognition batch size (default: 10)");
     println!("      --batch-size=<N>       (alternative syntax)");
     println!();
+    println!("FRONTEND WINDOW:");
+    println!("  Launching with no arguments opens a window with two options:");
+    println!("    - Launch Settings Window  (dictionary import & configuration)");
+    println!("    - Launch File Watcher     (monitors ~/Pictures/Screenshots and new");
+    println!("                              images in /tmp; replaced with");
+    println!("                              \"Stop File Watcher\" while it is running)");
+    println!();
     println!("ARGUMENTS:");
     println!("  <IMAGE_PATH>               Path to a screenshot image for OCR analysis");
+    println!("                             (headless: a directory, or multiple paths,");
+    println!("                             are also accepted; line crops + sidecar .txt");
+    println!("                             files are written next to each source image)");
     println!();
     println!("EXAMPLES:");
     println!("  {name} screenshot.png");
     println!("  {name} --headless --font=~/myfont.ttf image.png");
-    println!("  {name}                     (opens interactive settings dialog)");
+    println!("  {name} --headless screenshots_dir/");
+    println!("  {name} --headless shot1.png shot2.png shot3.png");
+    println!("  {name} --watcher --vert");
+    println!("  {name}                     (opens the frontend window)");
     println!();
     println!("KEYBOARD SHORTCUTS (when GUI is shown):");
     println!("  D / Shift+J                Scroll dictionary down");
     println!("  F / Shift+K                Scroll dictionary up");
 }
 
-fn run_settings_window(db: Arc<DictionaryDatabase>) -> Result<()> {
+fn run_frontend(db: Arc<DictionaryDatabase>, data_dir: std::path::PathBuf) -> Result<()> {
     let app = iced::application(
-        move || SettingsWindow::new(Arc::clone(&db)),
-        SettingsWindow::update,
-        SettingsWindow::view,
-    ).window(iced::window::Settings {
+        move || FrontendWindow::new(Arc::clone(&db), data_dir.clone()),
+        FrontendWindow::update,
+        FrontendWindow::view,
+    )
+    .subscription(FrontendWindow::subscription)
+    .window(iced::window::Settings {
+        size: iced::Size::new(560.0, 420.0),
         platform_specific: PlatformSpecific {
             application_id: String::from("accessibility_daemon"),
             ..Default::default()
         },
         ..Default::default()
     });
-    app.run().context("Failed to run settings window")?;
+    app.run().context("Failed to run frontend window")?;
     Ok(())
 }
 
@@ -341,7 +366,7 @@ fn run_ocr_viewer(
     args: Vec<String>,
 ) -> Result<()> {
     let t_start = std::time::Instant::now();
-    let mut image_path = None;
+    let mut image_paths: Vec<String> = Vec::new();
     let mut font_path: Option<String> = None;
     let mut headless = false;
     let mut recognition_mode = RecognitionMode::Horizontal;
@@ -365,9 +390,20 @@ fn run_ocr_viewer(
             batch_size = args[i].trim_start_matches("--batch-size=").parse().unwrap_or(10);
             i += 1;
         } else if args[i].starts_with("-") { i += 1; }
-        else { image_path = Some(args[i].clone()); break; }
+        else { image_paths.push(args[i].clone()); i += 1; }
     }
-    let image_path = image_path.context("No image path provided")?;
+    let _ = font_path;
+
+    // Headless batch mode: OCR a directory or a list of images, saving line
+    // crops + sidecar text files next to each source image.
+    if headless {
+        #[cfg(feature = "ort")]
+        { return run_headless_batch(image_paths, recognition_mode, batch_size); }
+        #[cfg(not(feature = "ort"))]
+        { eprintln!("ORT not compiled. Rebuild with --features ort"); return Ok(()); }
+    }
+
+    let image_path = image_paths.first().cloned().context("No image path provided")?;
 
     // Bootstrap channel — one-shot events (image, dict, deinflector)
     let (bootstrap_tx, bootstrap_rx) = std::sync::mpsc::channel::<BootstrapMsg>();
@@ -461,6 +497,7 @@ fn run_ocr_viewer(
                     engine.ppocr_session.get(),
                     &ppocr_vocab, batch_sz, rec_mode,
                     ocr_tx2,
+                    std::path::Path::new("/tmp"),
                 ) {
                     eprintln!("[OCR] Recognition error: {e}");
                 }
@@ -774,7 +811,13 @@ fn run_ocr_viewer(
 
     let app = iced::application(boot, update, OcrViewer::view)
         .window(iced::window::Settings {
-            size: iced::Size::new(screen_w, screen_h),
+            // iced treats this as LOGICAL pixels and multiplies by the app
+            // scale factor (ui_scale = screen_w / 1280) when creating the
+            // window. Passing the image size directly shrinks small images
+            // quadratically (155x129 -> a 19x16 window). The logical
+            // viewport is always 1280 wide, so physical size comes out
+            // exactly screen_w x screen_h = the image at 1:1.
+            size: iced::Size::new(1280.0, screen_h / ui_scale),
             ..Default::default()
         })
         .antialiasing(false)
@@ -887,6 +930,94 @@ fn run_ocr_viewer(
     println!("[DEBUG] To window spawn:         {:>8.2} ms", to_spawn_ms);
 
     if let Err(e) = app.run() { println!("GUI failed: {e:?}"); }
+    Ok(())
+}
+
+/// Headless batch OCR: process a directory or a list of images, saving each
+/// detected line crop + sidecar text file into the same folder as the source
+/// image. The OCR engine is loaded once and reused across all images.
+#[cfg(feature = "ort")]
+fn run_headless_batch(
+    image_paths: Vec<String>,
+    recognition_mode: RecognitionMode,
+    batch_size: usize,
+) -> Result<()> {
+    use std::path::{Path, PathBuf};
+
+    fn is_image_file(p: &Path) -> bool {
+        matches!(
+            p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+            Some("png") | Some("jpg") | Some("jpeg") | Some("bmp") | Some("webp")
+        )
+    }
+    // Skip previously-saved dataset crops when expanding a directory, so
+    // re-running the batch doesn't re-OCR its own output.
+    fn is_ocr_line_sample(p: &Path) -> bool {
+        p.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with("ocr_line_"))
+    }
+
+    // Expand directories (sorted) into a flat list of image files.
+    let mut files: Vec<PathBuf> = Vec::new();
+    for p in &image_paths {
+        let path = Path::new(p);
+        if path.is_dir() {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(path)?
+                .flatten()
+                .map(|e| e.path())
+                .filter(|f| is_image_file(f) && !is_ocr_line_sample(f))
+                .collect();
+            entries.sort();
+            println!("[Batch] Directory {}: {} image(s)", p, entries.len());
+            files.extend(entries);
+        } else if path.is_file() {
+            files.push(path.to_path_buf());
+        } else {
+            eprintln!("[Batch] Skipping (not a file or directory): {p}");
+        }
+    }
+    if files.is_empty() {
+        anyhow::bail!("No images found to process");
+    }
+    println!(
+        "[Batch] Processing {} image(s) with {:?} recognition",
+        files.len(), recognition_mode
+    );
+
+    let t_engine = std::time::Instant::now();
+    let mut engine = ocr_engine::OcrEngine::new(&resolve_asset_dir(), recognition_mode, batch_size)?;
+    println!("[Batch] OCR engine created in {:.0} ms", t_engine.elapsed().as_secs_f64() * 1000.0);
+
+    let ppocr_vocab = engine.ppocr_vocab.clone();
+
+    for file in &files {
+        let image = match image::open(file) {
+            Ok(img) => img,
+            Err(e) => { eprintln!("[Batch] Failed to open {}: {e}", file.display()); continue; }
+        };
+        let t_img = std::time::Instant::now();
+        let boxes = match engine.detect_lines(&image) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("[Batch] Detection failed for {}: {e}", file.display()); continue; }
+        };
+        // Save crops next to the source image.
+        let out_dir = file.parent().filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("/tmp"));
+        // Keep the receiver alive so worker sends succeed for every line.
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, DetectedAnnotation)>();
+        if let Err(e) = ocr_engine::recognize_boxes_streaming(
+            &image, &boxes,
+            engine.ppocr_session.get(),
+            &ppocr_vocab, batch_size, recognition_mode,
+            tx, out_dir,
+        ) {
+            eprintln!("[Batch] Recognition error for {}: {e}", file.display());
+        }
+        drop(rx);
+        println!(
+            "[Batch] {}: {} line(s) in {:.0} ms",
+            file.display(), boxes.len(), t_img.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     Ok(())
 }
 

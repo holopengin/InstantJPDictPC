@@ -531,9 +531,32 @@ impl OcrEngine {
 // Streaming recognition (standalone, Send-friendly)
 // ---------------------------------------------------------------------------
 
+/// Sequential ID for dataset line samples — unique across worker threads and runs.
+static NEXT_LINE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Save a recognized line crop as `ocr_line_<ts>_<id>.png` in `out_dir`,
+/// with a sidecar `<same-stem>.txt` containing the detected text. Used to
+/// build a dataset of real OCR content for the next OCR project.
+fn save_line_sample(crop: &image::DynamicImage, text: &str, out_dir: &std::path::Path) {
+    let id = NEXT_LINE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let stem = out_dir.join(format!("ocr_line_{ts}_{id}"));
+    if let Err(e) = crop.save(stem.with_extension("png")) {
+        eprintln!("[dataset] failed to save line crop: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::write(stem.with_extension("txt"), text) {
+        eprintln!("[dataset] failed to save line text: {e}");
+    }
+}
+
 /// Run character recognition on pre-detected boxes and stream each result
 /// over the channel as soon as it's ready. Designed to be called from a
 /// background thread: all sessions are `Arc`-wrapped and `Send`.
+/// Line crops + detected text are saved into `out_dir` for dataset collection.
 pub fn recognize_boxes_streaming(
     image: &DynamicImage,
     sorted: &[BoundingBox],
@@ -542,9 +565,12 @@ pub fn recognize_boxes_streaming(
     batch_size: usize,
     recognition_mode: RecognitionMode,
     sender: std::sync::mpsc::Sender<(usize, DetectedAnnotation)>,
+    out_dir: &std::path::Path,
 ) -> Result<()> {
     use std::time::Instant;
     let t_recognize = Instant::now();
+    // Owned copy so worker threads (which require 'static captures) can use it.
+    let out_dir = out_dir.to_path_buf();
 
     let horizontal_boxes: Vec<_> = sorted.iter().filter(|b| b.w >= b.h).cloned().collect();
     let vertical_boxes: Vec<_> = sorted.iter().filter(|b| b.h > b.w).cloned().collect();
@@ -590,6 +616,7 @@ pub fn recognize_boxes_streaming(
             let sess = rec_sessions_ppocr[worker_id % rec_sessions_ppocr.len()].clone();
             let voc = ppocr_vocab.to_vec();
             let snd = sender.clone();
+            let od = out_dir.clone();
 
             handles.push(std::thread::spawn(move || loop {
                 let job = { let mut ql = q.lock().unwrap(); ql.pop_front() };
@@ -604,6 +631,9 @@ pub fn recognize_boxes_streaming(
                 if let Ok(mut results) = result {
                     if let Some((text, alternatives, char_cols, seq_len_total)) = results.pop() {
                         if text.is_empty() { continue; }
+
+                        // Dataset collection: save the line crop + detected text
+                        save_line_sample(&job.crop, &text, &od);
 
                         let n = char_cols.len();
                         let mut char_boxes = Vec::with_capacity(n);
