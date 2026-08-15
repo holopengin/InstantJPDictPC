@@ -147,6 +147,14 @@ impl GlyphCache {
             CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
         });
     }
+
+    /// Rasterize at `px` WITHOUT caching, returning only the ink dimensions.
+    /// Used to measure a glyph's ink-to-em ratio so the caller can compute
+    /// the em size whose ink exactly matches a tight crop box.
+    pub fn measure_ink(&self, ch: char, px: u32) -> (u32, u32) {
+        let (metrics, _) = self.font.rasterize(ch, px as f32);
+        (metrics.width.max(1) as u32, metrics.height.max(1) as u32)
+    }
 }
 
 /// Look up or rasterize a glyph, returning (handle, w, h) for drawing.
@@ -163,6 +171,13 @@ fn draw_glyph(
         Some((r.0.clone(), r.1, r.2))
     };
     glyph_metrics
+}
+
+/// Measure a glyph's ink dimensions at `px_size` without caching.
+/// Returns None if no glyph cache is available.
+fn glyph_ink(cache: &RefCell<GlyphCache>, ch: char, px_size: u32) -> Option<(u32, u32)> {
+    let c = cache.borrow();
+    Some(c.measure_ink(ch, px_size))
 }
 
 /// Return the xmin (ink offset) for a cached glyph.
@@ -672,37 +687,6 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 frame.fill_rectangle(pt, sz, Color::from_rgba(0.0, 0.0, 0.0, 0.40)); // argb(51,0,0,0)
 
                 if let Some(line) = &annotation.line {
-                    // Compute font size from median center-to-center spacing.
-                    // This decouples glyph size from detection box dimensions,
-                    // so oversized detection boxes don't produce oversized glyphs.
-                    let spacing = if line.char_boxes.len() >= 2 {
-                        let mut dists: Vec<f32> = line.char_boxes.windows(2).map(|w| {
-                            let a = &w[0];
-                            let b = &w[1];
-                            if line.is_vertical {
-                                // vertical: y-axis centers
-                                let ca = a.y as f32 + a.h as f32 / 2.0;
-                                let cb = b.y as f32 + b.h as f32 / 2.0;
-                                (cb - ca).abs()
-                            } else {
-                                // horizontal: x-axis centers
-                                let ca = a.x as f32 + a.w as f32 / 2.0;
-                                let cb = b.x as f32 + b.w as f32 / 2.0;
-                                (cb - ca).abs()
-                            }
-                        }).collect();
-                        dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        dists[dists.len() / 2]
-                    } else if line.char_boxes.len() == 1 {
-                        // Single char — fall back to box height/width
-                        if line.is_vertical {
-                            line.char_boxes[0].w.max(1) as f32
-                        } else {
-                            line.char_boxes[0].h.max(1) as f32
-                        }
-                    } else {
-                        CANVAS_CHAR_RATIO.max(1.0)
-                    };
                     for (i, char_box) in line.char_boxes.iter().enumerate() {
                         let (pt_c, sz_c) = transform(char_box);
 
@@ -714,48 +698,44 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                 CanvasStroke::default().with_color(Color::from_rgb(1.0, 1.0, 0.0)).with_width(2.0));
                         }
 
-                        // Render character in its detection box.
-                        // Clamp the horizontal position so the left edge of the glyph
-                        // never goes left of the bbox left edge (fixes thin/tall bboxes
-                        // for punctuation like 。 、 that would otherwise drift left).
+                        // Render character to exactly fill its tight ink crop.
+                        // The per-char boxes are tight component boxes from
+                        // BOOOCR, not em-boxes — and the gap between em-box
+                        // and ink can be large (punctuation, small kana), so
+                        // rasterizing at the box height and upscaling would
+                        // blur. Instead, first measure the glyph's ink-to-em
+                        // ratio at a reference size, then rasterize at the em
+                        // size whose ink equals the crop size exactly:
+                        //   ink_w(px) / px = gw_ref / ref_px
+                        //   => px = crop_w * ref_px / gw_ref  (same for h)
+                        // using the smaller ratio so the ink fits the crop
+                        // (contain), then draw at natural resolution.
                         if let Some(ch) = line.text.chars().nth(i) {
-                            // Font size = median center-to-center spacing,
-                            // capped by the character box height so each glyph
-                            // fills its box proportionally.  Oversized detection
-                            // boxes are bounded by the smaller spacing-based
-                            // limit, preventing inflated glyphs.
-                            let spacing_screen = spacing * total_scale;
-                            let pos_x = pt_c.x + sz_c.width / 2.0;
-                            let px_size = spacing_screen.min(sz_c.height).round().max(4.0) as u32;
                             let highlighted = self.highlighted_coords.contains(&(line_idx, i))
                                 || self.cursor_pos == Some((line_idx, i));
-                            if let Some((handle, gw, gh)) = draw_glyph(
-                                &self.glyph_cache, ch, px_size, highlighted,
-                            ) {
-                                let bbox_cx = if ch.is_ascii() {
-                                    // Half-width chars (ASCII letters/digits): the
-                                    // recognition bbox is typically wider than the ink,
-                                    // so center by ink width to avoid left-alignment.
-                                    pt_c.x + (sz_c.width - gw as f32) / 2.0
-                                } else {
-                                    // CJK chars and punctuation: center the em-box,
-                                    // then offset by xmin to preserve traditional
-                                    // glyph positioning (punctuation sits at edge).
-                                    let em_left = pt_c.x + (sz_c.width - px_size as f32) / 2.0;
-                                    em_left + draw_glyph_xmin(&self.glyph_cache, ch, px_size) as f32
-                                };
-                                let draw_y = {
-                                    let c = self.glyph_cache.borrow();
-                                    let baseline_ratio = c.baseline_below;
-                                    let em_bottom = pt_c.y + sz_c.height / 2.0 + px_size as f32 / 2.0;
-                                    em_bottom - baseline_ratio as f32 * px_size as f32 / 2.0
-                                        - draw_glyph_ymin(&self.glyph_cache, ch, px_size) as f32
-                                        - gh as f32
-                                };
-                                frame.draw_image(
-                                    Rectangle::new(Point::new(bbox_cx, draw_y), Size::new(gw as f32, gh as f32)),
-                                    &handle,
-                                );
+                            let ref_px = sz_c.height.round().max(4.0) as u32;
+                            if let Some((gw_ref, gh_ref)) =
+                                glyph_ink(&self.glyph_cache, ch, ref_px)
+                            {
+                                let px = ((sz_c.width * ref_px as f32 / gw_ref.max(1) as f32)
+                                    .min(sz_c.height * ref_px as f32 / gh_ref.max(1) as f32))
+                                    .round()
+                                    .clamp(4.0, 1024.0) as u32;
+                                if let Some((handle, gw, gh)) =
+                                    draw_glyph(&self.glyph_cache, ch, px, highlighted)
+                                {
+                                    let gw_f = (gw.max(1)) as f32;
+                                    let gh_f = (gh.max(1)) as f32;
+                                    let draw_x = pt_c.x + (sz_c.width - gw_f) / 2.0;
+                                    let draw_y = pt_c.y + (sz_c.height - gh_f) / 2.0;
+                                    frame.draw_image(
+                                        Rectangle::new(
+                                            Point::new(draw_x, draw_y),
+                                            Size::new(gw_f, gh_f),
+                                        ),
+                                        &handle,
+                                    );
+                                }
                             }
                         }
                     }

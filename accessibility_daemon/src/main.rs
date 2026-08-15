@@ -1,4 +1,5 @@
 mod nav_graph;
+mod booocr;
 mod data;
 mod frontend;
 mod models;
@@ -496,6 +497,7 @@ fn run_ocr_viewer(
                     &image, &boxes,
                     engine.ppocr_session.get(),
                     &ppocr_vocab, batch_sz, rec_mode,
+                    engine.booocr.clone(),
                     ocr_tx2,
                     std::path::Path::new("/tmp"),
                 ) {
@@ -1008,6 +1010,7 @@ fn run_headless_batch(
             &image, &boxes,
             engine.ppocr_session.get(),
             &ppocr_vocab, batch_size, recognition_mode,
+            engine.booocr.clone(),
             tx, out_dir,
         ) {
             eprintln!("[Batch] Recognition error for {}: {e}", file.display());
