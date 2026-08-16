@@ -210,7 +210,7 @@ impl OcrEngine {
         // BOOOCR sidecar: primary recognizer when available. Spawning it
         // blocks ~3s on the font-database load; on any failure we fall back
         // to the PP-OCR recognition sessions.
-        let booocr = match crate::booocr::BooOcrClient::new(&crate::booocr::booocr_dir()) {
+        let booocr = match crate::booocr::BooOcrClient::connect_or_spawn(&crate::booocr::booocr_dir()) {
             Ok(c) => {
                 println!("[BOOOCR] sidecar ready — line recognition via BOOOCR");
                 Some(std::sync::Arc::new(std::sync::Mutex::new(c)))

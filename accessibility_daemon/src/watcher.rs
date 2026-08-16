@@ -20,7 +20,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(750);
 /// How long to wait for a newly-detected file's size to stabilize.
 const WRITE_SETTLE: Duration = Duration::from_millis(700);
 /// Image extensions accepted from the screenshot directory.
-const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "bmp", "webp"];
+const IMAGE_EXTS: [&str; 6] = ["png", "jpg", "jpeg", "bmp", "webp", "jxl"];
 
 fn pid_file(data_dir: &Path) -> PathBuf {
     data_dir.join("watcher.pid")
@@ -99,6 +99,29 @@ pub fn run(data_dir: &Path, extra_args: &[String]) {
     // pre-existing file in the watch dirs is ignored.
     let started_at = SystemTime::now();
 
+    // Shared BOOOCR pipeline: spawn it once here so every viewer launched
+    // from this watcher connects to an already-initialized, fully warm
+    // recognizer (DBs mmap'd, norms computed) instead of paying a cold
+    // start per screenshot. Viewers discover it via BOOOCR_SOCKET.
+    let socket_path = data_dir.join("booocr.sock");
+    let _ = std::fs::remove_file(&socket_path); // stale socket
+    let mut sidecar: Option<(std::process::Child, std::io::BufReader<std::process::ChildStdout>, PathBuf)> =
+        match crate::booocr::spawn_sidecar_for_watcher(&socket_path) {
+            Ok((child, reader)) => {
+                println!(
+                    "[Watcher] BOOOCR pipeline ready on {}",
+                    socket_path.display()
+                );
+                Some((child, reader, socket_path.clone()))
+            }
+            Err(e) => {
+                eprintln!(
+                    "[Watcher] BOOOCR shared pipeline failed ({e}); viewers will spawn their own"
+                );
+                None
+            }
+        };
+
     let shot_dir = screenshot_dir();
     let processed_dir = shot_dir.join(".ocr_processed");
     let _ = std::fs::create_dir_all(&shot_dir);
@@ -127,7 +150,30 @@ pub fn run(data_dir: &Path, extra_args: &[String]) {
     let mut children: Vec<std::process::Child> = Vec::new();
 
     loop {
-        scan(&shot_dir, &processed_dir, extra_args, &mut children, started_at);
+        // Respawn the shared pipeline if it died (crashed/killed). New
+        // viewers fall back to their own sidecar until it's back.
+        if let Some((child, reader, sock)) = &mut sidecar {
+            if let Ok(Some(_)) = child.try_wait() {
+                eprintln!("[Watcher] BOOOCR pipeline died — respawning");
+                match crate::booocr::spawn_sidecar_for_watcher(sock) {
+                    Ok((c, r)) => {
+                        *child = c;
+                        *reader = r;
+                        println!("[Watcher] BOOOCR pipeline respawned on {}", sock.display());
+                    }
+                    Err(e) => eprintln!("[Watcher] BOOOCR respawn failed ({e})"),
+                }
+            }
+        }
+
+        scan(
+            &shot_dir,
+            &processed_dir,
+            extra_args,
+            &mut children,
+            started_at,
+            sidecar.as_ref().map(|(_, _, s)| s.as_path()),
+        );
 
         // Reap finished viewer processes.
         children.retain_mut(|c| c.try_wait().ok().flatten().is_none());
@@ -136,6 +182,13 @@ pub fn run(data_dir: &Path, extra_args: &[String]) {
             break;
         }
         std::thread::sleep(POLL_INTERVAL);
+    }
+
+    // Stop the shared pipeline and remove its socket.
+    if let Some((mut child, _reader, sock)) = sidecar {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&sock);
     }
 
     let _ = std::fs::remove_file(pid_file(data_dir));
@@ -149,26 +202,34 @@ fn scan(
     extra_args: &[String],
     children: &mut Vec<std::process::Child>,
     started_at: SystemTime,
+    socket: Option<&Path>,
 ) {
     // Screenshots land in /tmp: gamescope_*.png from gamescope, plus any
     // other image the user drops there. The daemon's own dataset crops
-    // (ocr_line_*.png) are excluded so we never re-OCR our own output.
+    // (ocr_line_*.png) and BOOOCR temp crops (booocr_in_*.png) are
+    // excluded so we never re-OCR our own output.
     if let Ok(entries) = std::fs::read_dir("/tmp") {
         for entry in entries.flatten() {
             let p = entry.path();
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.starts_with("ocr_line_") && has_image_ext(&p) {
-                maybe_process(&p, processed_dir, extra_args, children, started_at);
+            if !name.starts_with("ocr_line_")
+                && !name.starts_with("booocr_in_")
+                && has_image_ext(&p)
+            {
+                maybe_process(&p, processed_dir, extra_args, children, started_at, socket);
             }
         }
     }
 
-    // Screenshot directory images
+    // Screenshot directory images. Also skip our own output crops — batch
+    // mode saves `ocr_line_*` next to the input (file.parent()), which for
+    // screenshots IS this directory.
     if let Ok(entries) = std::fs::read_dir(shot_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if has_image_ext(&p) {
-                maybe_process(&p, processed_dir, extra_args, children, started_at);
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if has_image_ext(&p) && !name.starts_with("ocr_line_") {
+                maybe_process(&p, processed_dir, extra_args, children, started_at, socket);
             }
         }
     }
@@ -180,6 +241,7 @@ fn maybe_process(
     extra_args: &[String],
     children: &mut Vec<std::process::Child>,
     started_at: SystemTime,
+    socket: Option<&Path>,
 ) {
     if !file.is_file() {
         return;
@@ -224,6 +286,11 @@ fn maybe_process(
         .arg(file)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Hand the shared BOOOCR pipeline to the viewer so it connects
+    // instead of spawning its own sidecar.
+    if let Some(sock) = socket {
+        cmd.env("BOOOCR_SOCKET", sock);
+    }
     match cmd.spawn() {
         Ok(child) => {
             println!("[Watcher] New screenshot: {base} → OCR");

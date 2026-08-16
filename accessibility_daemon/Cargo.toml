@@ -14,6 +14,8 @@ ort = { version = "2.0.0-rc.12", default-features = false, features = ["pkg-conf
 # Image processing
 image = "0.25"
 imageproc = "0.25"
+# JPEG XL decoding (the `image` crate has no native JXL support)
+jxl-oxide = { version = "0.12", features = ["image"] }
 ndarray = "0.16"
 ndarray-conv = "0.6.1"
 
