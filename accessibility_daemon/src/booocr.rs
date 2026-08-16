@@ -9,9 +9,9 @@
 //! The client is not `Sync` (pipes); callers serialize access with a mutex.
 
 use anyhow::{Context, Result};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// One recognized character with its alternatives (crop coordinates).
@@ -79,15 +79,68 @@ pub fn booocr_dir() -> PathBuf {
 }
 
 pub struct BooOcrClient {
-    child: Child,
-    stdin: BufWriter<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    child: Option<Child>,
+    stdin: BufWriter<Box<dyn Write + Send>>,
+    stdout: BufReader<Box<dyn Read + Send>>,
     next_id: u64,
 }
 
+/// Default Unix-socket path for the watcher-owned shared pipeline.
+pub fn socket_path() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("accessibility_daemon")
+            .join("booocr.sock")
+    } else {
+        PathBuf::from("/tmp/booocr.sock")
+    }
+}
+
+/// Locate a live shared pipeline socket: `BOOOCR_SOCKET` env var (set by
+/// the watcher when spawning viewers), else the default state-dir path.
+fn find_socket() -> Option<PathBuf> {
+    let p = std::env::var("BOOOCR_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| socket_path());
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
 impl BooOcrClient {
+    /// Connect to the watcher-owned shared pipeline if one is alive,
+    /// otherwise spawn our own stdio sidecar. The shared pipeline is
+    /// fully warm (DBs mmap'd + norms computed), so per-image cost is a
+    /// single socket connect instead of a sidecar spawn + DB load.
+    pub fn connect_or_spawn(booocr_dir: &Path) -> Result<Self> {
+        if let Some(sock) = find_socket() {
+            match std::os::unix::net::UnixStream::connect(&sock) {
+                Ok(stream) => {
+                    let reader = stream.try_clone()?;
+                    println!("[BOOOCR] connected to shared pipeline at {}", sock.display());
+                    return Ok(BooOcrClient {
+                        child: None,
+                        stdin: BufWriter::new(Box::new(stream)),
+                        stdout: BufReader::new(Box::new(reader)),
+                        next_id: 1,
+                    });
+                }
+                Err(e) => {
+                    // Stale socket (watcher died without cleanup) — fall
+                    // through to spawning our own sidecar.
+                    eprintln!("[BOOOCR] shared pipeline at {} not connectable ({e}); spawning own sidecar", sock.display());
+                }
+            }
+        }
+        Self::spawn(booocr_dir)
+    }
+
     /// Spawn the BOOOCR server and wait for its ready line (DB load done).
-    pub fn new(booocr_dir: &Path) -> Result<Self> {
+    pub fn spawn(booocr_dir: &Path) -> Result<Self> {
         let python = booocr_dir.join(".venv").join("bin").join("python");
         let server = booocr_dir.join("scripts").join("booocr_server.py");
         let db_dir = booocr_dir.join("data").join("databases");
@@ -123,9 +176,9 @@ impl BooOcrClient {
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let mut client = BooOcrClient {
-            child,
-            stdin: BufWriter::new(stdin),
-            stdout: BufReader::new(stdout),
+            child: Some(child),
+            stdin: BufWriter::new(Box::new(stdin)),
+            stdout: BufReader::new(Box::new(stdout)),
             next_id: 1,
         };
 
@@ -200,10 +253,58 @@ impl BooOcrClient {
 
 impl Drop for BooOcrClient {
     fn drop(&mut self) {
-        let _ = writeln!(self.stdin, "{{\"id\": -1, \"shutdown\": true}}");
-        let _ = self.stdin.flush();
-        let _ = self.child.wait();
+        // Only kill a sidecar we spawned ourselves. A client connected to
+        // the watcher-owned shared pipeline just drops the socket — the
+        // watcher owns that server's lifecycle.
+        if self.child.is_some() {
+            let _ = writeln!(self.stdin, "{{\"id\": -1, \"shutdown\": true}}");
+            let _ = self.stdin.flush();
+            let _ = self.child.take().unwrap().wait();
+        }
     }
+}
+
+/// Spawn the BOOOCR server in shared-pipeline mode (Unix socket) for the
+/// file watcher. Blocks until the pipeline reports READY; returns the
+/// child the watcher must keep alive (and kill on stop) plus its stdout
+/// reader — keeping the read end open prevents SIGPIPE/BrokenPipeError in
+/// the server if it ever writes to stdout after READY.
+pub fn spawn_sidecar_for_watcher(
+    socket: &Path,
+) -> Result<(Child, BufReader<std::process::ChildStdout>)> {
+    let dir = booocr_dir();
+    let python = dir.join(".venv").join("bin").join("python");
+    let server = dir.join("scripts").join("booocr_server.py");
+    let db_dir = dir.join("data").join("databases");
+    let mut child = Command::new(&python)
+        .arg(&server)
+        .arg("--db-dir")
+        .arg(&db_dir)
+        .arg("--top-k")
+        .arg("15")
+        .arg("--socket")
+        .arg(socket)
+        .env_remove("PYTHONPATH")
+        .env("OMP_NUM_THREADS", "4")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn BOOOCR shared pipeline")?;
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => anyhow::bail!("BOOOCR shared pipeline exited before ready"),
+        Ok(_) => {
+            if !line.contains("\"ready\"") {
+                anyhow::bail!("unexpected BOOOCR startup line: {line}");
+            }
+        }
+        Err(e) => anyhow::bail!("BOOOCR shared pipeline read error: {e}"),
+    }
+    Ok((child, reader))
 }
 
 /// Counter for unique temp crop filenames.

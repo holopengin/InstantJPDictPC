@@ -12,6 +12,27 @@ mod ppocr;
 mod settings_window;
 mod util;
 mod viewer;
+
+/// Open an image file, including JPEG XL (`.jxl`) which the `image` crate
+/// cannot decode natively — jxl-oxide's `ImageDecoder` integration handles
+/// it, producing the same `DynamicImage` the rest of the pipeline uses.
+/// No ICC transform is applied: screenshots are treated as opaque RGB for
+/// OCR (matching how every other format enters the pipeline).
+fn open_image(path: impl AsRef<std::path::Path>) -> Result<image::DynamicImage> {
+    let path = path.as_ref();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if ext.as_deref() == Some("jxl") {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let decoder = jxl_oxide::integration::JxlDecoder::new(file)?;
+        Ok(image::DynamicImage::from_decoder(decoder)?)
+    } else {
+        Ok(image::open(path)?)
+    }
+}
 mod watcher;
 
 use anyhow::{Context, Result};
@@ -418,7 +439,7 @@ fn run_ocr_viewer(
         .spawn(move || {
             // Phase 1: load the screenshot image and send it to the viewer
             let t_load = std::time::Instant::now();
-            let image = match image::open(&image_path2) {
+            let image = match open_image(&image_path2) {
                 Ok(img) => img,
                 Err(e) => { eprintln!("[Bootstrap] Failed to open image: {e}"); return; }
             };
@@ -533,7 +554,7 @@ fn run_ocr_viewer(
     // to physical pixels on screen. This is especially important on Steam Deck
     // where the screenshot IS the external display's true resolution, and
     // screen-detection methods may pick up the wrong display.
-    let (screen_w, screen_h) = match image::open(&image_path) {
+    let (screen_w, screen_h) = match open_image(&image_path) {
         Ok(img) => {
             let w = img.width() as f32;
             let h = img.height() as f32;
@@ -995,7 +1016,7 @@ fn run_headless_batch(
     let ppocr_vocab = engine.ppocr_vocab.clone();
 
     for file in &files {
-        let image = match image::open(file) {
+        let image = match open_image(file) {
             Ok(img) => img,
             Err(e) => { eprintln!("[Batch] Failed to open {}: {e}", file.display()); continue; }
         };
