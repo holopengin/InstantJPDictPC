@@ -31,6 +31,39 @@ pub struct BooLine {
     pub chars: Vec<BooChar>,
 }
 
+/// Parse one `{c, x, y, w, h, alts}` object from a sidecar response.
+fn parse_char(c: &serde_json::Value) -> Result<Option<BooChar>> {
+    let c = c.as_object().context("bad char object")?;
+    let ch = c.get("c").and_then(|x| x.as_str()).unwrap_or("");
+    let mut ch_it = ch.chars();
+    let Some(ch) = ch_it.next() else { return Ok(None) };
+    if ch_it.next().is_some() {
+        return Ok(None); // multi-char "c" — skip, shouldn't happen
+    }
+    let alts = c
+        .get("alts")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|pair| {
+                    let pair = pair.as_array()?;
+                    let ch = pair.first()?.as_str()?;
+                    let sc = pair.get(1)?.as_f64()?;
+                    ch.chars().next().map(|c| (c, sc as f32))
+                })
+                .collect::<Vec<(char, f32)>>()
+        })
+        .unwrap_or_default();
+    Ok(Some(BooChar {
+        c: ch,
+        x: c.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        y: c.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        w: c.get("w").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
+        h: c.get("h").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
+        alts,
+    }))
+}
+
 /// Resolve the BOOOCR checkout dir: `BOOOCR_DIR` env var, else ~/repos/BOOOCR.
 pub fn booocr_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("BOOOCR_DIR") {
@@ -77,6 +110,10 @@ impl BooOcrClient {
             // A stray PYTHONPATH (e.g. another venv) breaks numpy inside the
             // BOOOCR venv — never inherit it.
             .env_remove("PYTHONPATH")
+            // Matcher is memory-bandwidth-bound; 4 OpenBLAS threads measured
+            // optimal on the 3600X (8-16 slower, uncapped ~3x slower). The
+            // sidecar's own batch thread pool uses the same 4.
+            .env("OMP_NUM_THREADS", "4")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -105,15 +142,23 @@ impl BooOcrClient {
         Ok(client)
     }
 
-    /// Recognize one line crop saved at `png_path` (grayscale/RGB png).
-    /// Returns per-char boxes + candidate lists in crop coordinates.
-    pub fn recognize_crop(&mut self, png_path: &Path) -> Result<BooLine> {
+    /// Recognize many line crops in one batched request. The sidecar
+    /// threads the per-line phases and matches every line of a scale class
+    /// in a single matrix-matrix product (bit-identical scores). Returns
+    /// one BooLine per input path, in order.
+    pub fn recognize_crops(&mut self, png_paths: &[PathBuf]) -> Result<Vec<BooLine>> {
         let id = self.next_id;
         self.next_id += 1;
-        let req = format!(
-            "{{\"id\": {id}, \"image_path\": \"{}\"}}\n",
-            png_path.display()
-        );
+        let mut req = format!("{{\"id\": {id}, \"images\": [");
+        for (i, p) in png_paths.iter().enumerate() {
+            if i > 0 {
+                req.push(',');
+            }
+            req.push('"');
+            req.push_str(&p.display().to_string());
+            req.push('"');
+        }
+        req.push_str("]}\n");
         self.stdin.write_all(req.as_bytes())?;
         self.stdin.flush()?;
 
@@ -131,41 +176,25 @@ impl BooOcrClient {
             );
         }
 
-        let mut chars = Vec::new();
-        if let Some(arr) = v.get("chars").and_then(|c| c.as_array()) {
-            for c in arr {
-                let c = c.as_object().context("bad char object")?;
-                let ch = c.get("c").and_then(|x| x.as_str()).unwrap_or("");
-                let mut ch_it = ch.chars();
-                let Some(ch) = ch_it.next() else { continue };
-                if ch_it.next().is_some() {
-                    continue; // multi-char "c" — skip, shouldn't happen
+        let mut out = Vec::with_capacity(png_paths.len());
+        if let Some(lines) = v.get("lines").and_then(|l| l.as_array()) {
+            for lv in lines {
+                let mut chars = Vec::new();
+                if let Some(arr) = lv.get("chars").and_then(|c| c.as_array()) {
+                    for c in arr {
+                        if let Some(ch) = parse_char(c)? {
+                            chars.push(ch);
+                        }
+                    }
                 }
-                let alts = c
-                    .get("alts")
-                    .and_then(|a| a.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|pair| {
-                                let pair = pair.as_array()?;
-                                let ch = pair.first()?.as_str()?;
-                                let sc = pair.get(1)?.as_f64()?;
-                                ch.chars().next().map(|c| (c, sc as f32))
-                            })
-                            .collect::<Vec<(char, f32)>>()
-                    })
-                    .unwrap_or_default();
-                chars.push(BooChar {
-                    c: ch,
-                    x: c.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-                    y: c.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-                    w: c.get("w").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
-                    h: c.get("h").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
-                    alts,
-                });
+                out.push(BooLine { chars });
             }
         }
-        Ok(BooLine { chars })
+        // Tolerate a short response (server skipped unreadable lines).
+        while out.len() < png_paths.len() {
+            out.push(BooLine::default());
+        }
+        Ok(out)
     }
 }
 
