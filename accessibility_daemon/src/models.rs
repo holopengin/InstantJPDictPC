@@ -171,6 +171,10 @@ pub struct LineResult {
     pub text: String,
     pub char_boxes: Vec<BoundingBox>,
     pub alternatives: Vec<Vec<(char, f32)>>,
+    /// Path to the crop's `.txt` sidecar in /tmp (dataset collection).
+    /// The viewer rewrites it when the user picks an alternative, so the
+    /// saved label follows the corrected text.
+    pub sample_txt: Option<std::path::PathBuf>,
     pub is_vertical: bool,
     pub chunk_boxes: Vec<BoundingBox>,
 }

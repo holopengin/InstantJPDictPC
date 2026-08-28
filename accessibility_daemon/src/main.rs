@@ -633,6 +633,18 @@ fn run_ocr_viewer(
                         state.state.update_character(sel.line_idx, sel.char_idx, c);
                         state.annotations_sync_dirty.set(true);
                         state.edited_lines.insert(sel.line_idx);
+                        // Dataset collection: rewrite the crop's .txt sidecar
+                        // with the corrected text so /tmp yields curated
+                        // (crop, label) pairs for BOOOCR training.
+                        if let Some(line) = state.state.active_line_results.get(sel.line_idx).and_then(|l| l.as_ref()) {
+                            if let Some(txt) = line.sample_txt.as_ref() {
+                                if let Err(e) = std::fs::write(txt, &line.text) {
+                                    eprintln!("[dataset] failed to update {}: {e}", txt.display());
+                                } else {
+                                    eprintln!("[dataset] updated {}", txt.display());
+                                }
+                            }
+                        }
                         let _ = state.db.as_ref().and_then(|db| state.deinflector.as_ref().and_then(|deinf| {
             state.state.lookup(sel.line_idx, sel.char_idx, db, deinf)
         }));
@@ -836,6 +848,15 @@ fn run_ocr_viewer(
     };
 
     let app = iced::application(boot, update, OcrViewer::view)
+        // Use the SAME font as the overlay glyph cache for all iced text
+        // (dictionary panel etc.) — mixing fonts shows different stroke
+        // forms (e.g. JP vs traditional-CN variants) for the same char.
+        .font(if let Some(fp) = crate::viewer::find_jp_font_path() {
+            std::fs::read(&fp).unwrap_or_default()
+        } else {
+            Vec::new()
+        })
+        .default_font(iced::Font::with_name("Noto Sans JP"))
         .window(iced::window::Settings {
             // iced treats this as LOGICAL pixels and multiplies by the app
             // scale factor (ui_scale = screen_w / 1280) when creating the
