@@ -15,7 +15,7 @@ use crate::util::japanese::to_vertical_glyph;
 const PPOCR_DET_LONG_SIDE: u32 = 960;
 const PPOCR_DET_THRESH: f32 = 0.3;
 const PPOCR_DET_BOX_THRESH: f32 = 0.8;
-const PPOCR_DET_UNCLIP_RATIO: f32 = 1.1;
+const PPOCR_DET_UNCLIP_RATIO: f32 = 1.5;
 const X_OVERLAP_THRESHOLD: f32 = 0.3;
 
 // Box fill ratio when rendering glyphs inside detected boxes. 1.0 means match box height, <1.0 leave padding.
@@ -353,17 +353,27 @@ impl OcrEngine {
         let scale_h = orig_h / resize_h as f32;
 
         // 5. Threshold → find contours → bounding boxes
+        // DET_THRESH / DET_UNCLIP env overrides let us sweep parameters
+        // without rebuilding (defaults = the consts above).
+        let det_thresh: f32 = std::env::var("DET_THRESH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(PPOCR_DET_THRESH);
+        let det_unclip: f32 = std::env::var("DET_UNCLIP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(PPOCR_DET_UNCLIP_RATIO);
         let mut binary = vec![0u8; (out_w * out_h) as usize];
         for y in 0..out_h {
             for x in 0..out_w {
                 let idx = (y * out_w + x) as usize;
-                if idx < prob_map.len() && prob_map[idx] > PPOCR_DET_THRESH {
+                if idx < prob_map.len() && prob_map[idx] > det_thresh {
                     binary[idx] = 255;
                 }
             }
         }
 
-        let binary_img = image::GrayImage::from_raw(out_w, out_h, binary)
+        let binary_img = image::GrayImage::from_raw(out_w, out_h, binary.clone())
             .context("Failed to create binary image")?;
         let contours = contours::find_contours_with_threshold::<i32>(&binary_img, 128);
         let mut raw_pairs: Vec<(BoundingBox, RotatedBox)> = Vec::new();
@@ -382,17 +392,57 @@ impl OcrEngine {
             // distance = area * ratio / perimeter (applied in rect space)
             let area = rw * rh;
             let perimeter = 2.0 * (rw + rh);
-            let expand = if perimeter > 0.0 { area * PPOCR_DET_UNCLIP_RATIO / perimeter } else { 0.0 };
-            let rw = (rw + 2.0 * expand).max(1.0);
-            let rh = (rh + 2.0 * expand).max(1.0);
+            let expand = if perimeter > 0.0 { area * det_unclip / perimeter } else { 0.0 };
+            // Cap the expansion in ORIGINAL pixels. The det model's prob
+            // blob covers only ~85% of large text (model property), so the
+            // proportional unclip alone leaves large boxes tight (≈1.0×ink);
+            // a fixed-px cap adds real margin there without inflating the
+            // already-bloated small-text boxes.
+            let cap: f32 = std::env::var("DET_EXPAND_CAP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(48.0);
+            let contour_w_det = rw;
+            let contour_h_det = rh;
+            // Expansion in ORIGINAL pixels, capped in ORIGINAL pixels.
+            let expand_orig = (expand * scale_w).min(cap);
+            let rw = rw * scale_w + 2.0 * expand_orig;
+            let mut rh = rh * scale_h + 2.0 * expand_orig;
 
-            // Scale back to original image coords (uniform scale)
+            // Orientation-specific post-adjustments (env-tunable):
+            // - horizontal lines: nudge the box DOWN a bit — glyphs sit
+            //   slightly above the contour center on most fonts.
+            // - vertical lines: optional width trim (DET_V_SHRINK; 1.0 =
+            //   off). Disabled by default — trims risk cutting glyphs.
+            let h_angle = angle.to_degrees().abs();
+            let mut down_shift: f32 = 0.0;
+            if h_angle <= 45.0 {
+                let h_down: f32 = std::env::var("DET_H_DOWN")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4.0);
+                if rh >= 24.0 {
+                    rh += h_down;
+                    down_shift = h_down / 2.0;
+                }
+            } else {
+                let v_trim: f32 = std::env::var("DET_V_SHRINK")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1.0);
+                rh *= v_trim;
+            }
+
+            // Scale centers back to original image coords (uniform scale)
             let cx = cx * scale_w;
-            let cy = cy * scale_h;
-            let rw = rw * scale_w;
-            let rh = rh * scale_h;
+            let cy = cy * scale_h + down_shift;
 
             if rw < 4.0 || rh < 4.0 { continue; }
+
+            eprintln!(
+                "[contour] det {:.1}x{:.1} expand {:.1} -> orig {:.0}x{:.0}",
+                contour_w_det, contour_h_det, expand, rw, rh
+            );
 
             let rot = RotatedBox::new(cx, cy, rw, rh, angle, PPOCR_DET_BOX_THRESH);
             let (bx, by, bw, bh) = rot.aabb();
@@ -426,37 +476,43 @@ impl OcrEngine {
             let shrink = (b.w as f32 * 0.05).round() as i32;
             b.x += shrink;
         }
-        // 2. For stacked overlapping horizontal boxes, split at overlap midpoint
-        let h_indices: Vec<usize> = pp_pairs
-            .iter()
-            .enumerate()
-            .filter(|(_, (b, _))| b.w >= b.h)
-            .map(|(i, _)| i)
-            .collect();
-        for i in 0..h_indices.len() {
-            for j in (i + 1)..h_indices.len() {
-                let ai = h_indices[i];
-                let bi = h_indices[j];
-                // Only split if boxes are in the same column (horizontal overlap too)
-                let a_right = pp_pairs[ai].0.x + pp_pairs[ai].0.w;
-                let b_right = pp_pairs[bi].0.x + pp_pairs[bi].0.w;
-                let h_overlap = a_right.min(b_right) - pp_pairs[ai].0.x.max(pp_pairs[bi].0.x);
-                if h_overlap <= 0 {
-                    continue;
-                }
-                let (upper, lower) = if pp_pairs[ai].0.y <= pp_pairs[bi].0.y {
-                    (ai, bi)
-                } else {
-                    (bi, ai)
-                };
-                let upper_bottom = pp_pairs[upper].0.y + pp_pairs[upper].0.h;
-                let lower_bottom = pp_pairs[lower].0.y + pp_pairs[lower].0.h;
-                // Check vertical overlap: upper box bottom > lower box top
-                if upper_bottom > pp_pairs[lower].0.y {
-                    let overlap_mid = (pp_pairs[lower].0.y + upper_bottom.min(lower_bottom)) / 2;
-                    pp_pairs[upper].0.h = (overlap_mid - pp_pairs[upper].0.y).max(1);
-                    pp_pairs[lower].0.y = pp_pairs[upper].0.y + pp_pairs[upper].0.h;
-                    pp_pairs[lower].0.h = (lower_bottom - pp_pairs[lower].0.y).max(1);
+        // 2. Stacked-overlap split — DISABLED: with merging off, detection
+        // already produces per-line boxes; splitting stacked lines at the
+        // overlap midpoint shaves real text (boxes end up smaller than the
+        // glyphs, most visibly on large close-spaced text). Kept behind an
+        // env flag in case it's ever needed again.
+        if std::env::var("DET_SPLIT_OVERLAP").is_ok() {
+            let h_indices: Vec<usize> = pp_pairs
+                .iter()
+                .enumerate()
+                .filter(|(_, (b, _))| b.w >= b.h)
+                .map(|(i, _)| i)
+                .collect();
+            for i in 0..h_indices.len() {
+                for j in (i + 1)..h_indices.len() {
+                    let ai = h_indices[i];
+                    let bi = h_indices[j];
+                    // Only split if boxes are in the same column (horizontal overlap too)
+                    let a_right = pp_pairs[ai].0.x + pp_pairs[ai].0.w;
+                    let b_right = pp_pairs[bi].0.x + pp_pairs[bi].0.w;
+                    let h_overlap = a_right.min(b_right) - pp_pairs[ai].0.x.max(pp_pairs[bi].0.x);
+                    if h_overlap <= 0 {
+                        continue;
+                    }
+                    let (upper, lower) = if pp_pairs[ai].0.y <= pp_pairs[bi].0.y {
+                        (ai, bi)
+                    } else {
+                        (bi, ai)
+                    };
+                    let upper_bottom = pp_pairs[upper].0.y + pp_pairs[upper].0.h;
+                    let lower_bottom = pp_pairs[lower].0.y + pp_pairs[lower].0.h;
+                    // Check vertical overlap: upper box bottom > lower box top
+                    if upper_bottom > pp_pairs[lower].0.y {
+                        let overlap_mid = (pp_pairs[lower].0.y + upper_bottom.min(lower_bottom)) / 2;
+                        pp_pairs[upper].0.h = (overlap_mid - pp_pairs[upper].0.y).max(1);
+                        pp_pairs[lower].0.y = pp_pairs[upper].0.y + pp_pairs[upper].0.h;
+                        pp_pairs[lower].0.h = (lower_bottom - pp_pairs[lower].0.y).max(1);
+                    }
                 }
             }
         }
@@ -468,8 +524,67 @@ impl OcrEngine {
             );
         }
 
-        let boxes = pp_pairs.iter().map(|(b, _)| b.clone()).collect();
-        let rotated = pp_pairs.into_iter().map(|(_, r)| r).collect();
+        let boxes: Vec<BoundingBox> = pp_pairs.iter().map(|(b, _)| b.clone()).collect();
+        let rotated: Vec<RotatedBox> = pp_pairs.into_iter().map(|(_, r)| r).collect();
+
+        // Debug: draw the detected boxes over the original image when
+        // DET_DEBUG_DIR is set. Green = rotated quad, red = AABB.
+        if let Ok(debug_dir) = std::env::var("DET_DEBUG_DIR") {
+            let dir = std::path::Path::new(&debug_dir);
+            let _ = std::fs::create_dir_all(dir);
+            // Also dump the prob map + thresholded binary for inspection.
+            if std::env::var("DET_DUMP_MAPS").is_ok() {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let pm: Vec<u8> = prob_map
+                    .iter()
+                    .map(|&v| (v.clamp(0.0, 1.0) * 255.0) as u8)
+                    .collect();
+                if let Some(img) = image::GrayImage::from_raw(out_w, out_h, pm) {
+                    let _ = img.save(dir.join(format!("prob_{ts}.png")));
+                }
+                if let Some(img) = image::GrayImage::from_raw(out_w, out_h, binary.clone()) {
+                    let _ = img.save(dir.join(format!("binary_{ts}.png")));
+                }
+            }
+            let mut rgba = image.to_rgba8();
+            for (b, r) in boxes.iter().zip(rotated.iter()) {
+                // AABB in red
+                let rect = imageproc::rect::Rect::at(b.x, b.y).of_size(b.w.max(1) as u32, b.h.max(1) as u32);
+                imageproc::drawing::draw_hollow_rect_mut(
+                    &mut rgba, rect, Rgba([255u8, 60u8, 60u8, 255u8]));
+                // Rotated quad in green
+                let (ux, uy) = (r.angle.cos(), r.angle.sin());
+                let (vx, vy) = (-uy, ux);
+                let hw = r.w / 2.0;
+                let hh = r.h / 2.0;
+                let pts = [
+                    (r.cx + ux * hw + vx * hh, r.cy + uy * hw + vy * hh),
+                    (r.cx - ux * hw + vx * hh, r.cy - uy * hw + vy * hh),
+                    (r.cx - ux * hw - vx * hh, r.cy - uy * hw - vy * hh),
+                    (r.cx + ux * hw - vx * hh, r.cy + uy * hw - vy * hh),
+                ];
+                for k in 0..4 {
+                    let (x0, y0) = pts[k];
+                    let (x1, y1) = pts[(k + 1) % 4];
+                    imageproc::drawing::draw_line_segment_mut(
+                        &mut rgba, (x0, y0), (x1, y1), Rgba([60u8, 255u8, 60u8, 255u8]));
+                }
+            }
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let out = dir.join(format!("det_debug_{ts}.png"));
+            if let Err(e) = rgba.save(&out) {
+                eprintln!("[PP-OCR DET] debug save failed: {e}");
+            } else {
+                println!("[PP-OCR DET] debug overlay saved to {}", out.display());
+            }
+        }
+
         Ok(DetectionResult { boxes, rotated })
     }
 
@@ -646,23 +761,29 @@ impl OcrEngine {
 /// Sequential ID for dataset line samples — unique across worker threads and runs.
 static NEXT_LINE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Save a recognized line crop as `ocr_line_<ts>_<id>.png` in `out_dir`,
-/// with a sidecar `<same-stem>.txt` containing the detected text. Used to
-/// build a dataset of real OCR content for the next OCR project.
-fn save_line_sample(crop: &image::DynamicImage, text: &str, out_dir: &std::path::Path) {
+/// Save a recognized line crop as `ocr_line_<ts>_<id>.png` in the system
+/// temp dir, with a sidecar `<same-stem>.txt` containing the detected
+/// text. Returns the `.txt` path (the viewer rewrites it when the user
+/// corrects a character), or None if the crop could not be saved.
+fn save_line_sample(crop: &image::DynamicImage, text: &str) -> Option<std::path::PathBuf> {
     let id = NEXT_LINE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let stem = out_dir.join(format!("ocr_line_{ts}_{id}"));
+    // Always write to the system temp dir. The caller may pass the source
+    // image's directory (batch mode), which would clutter it and re-trigger
+    // the file watcher; /tmp gets cleared on reboot.
+    let stem = std::env::temp_dir().join(format!("ocr_line_{ts}_{id}"));
     if let Err(e) = crop.save(stem.with_extension("png")) {
         eprintln!("[dataset] failed to save line crop: {e}");
-        return;
+        return None;
     }
-    if let Err(e) = std::fs::write(stem.with_extension("txt"), text) {
+    let txt = stem.with_extension("txt");
+    if let Err(e) = std::fs::write(&txt, text) {
         eprintln!("[dataset] failed to save line text: {e}");
     }
+    Some(txt)
 }
 
 /// Run character recognition on pre-detected boxes and stream each result
@@ -831,9 +952,23 @@ pub fn recognize_boxes_streaming(
                 };
 
                 for (job, line) in batch.into_iter().zip(lines.into_iter()) {
+                let mut line = line;
                 if line.chars.is_empty() {
                     continue;
                 }
+
+                // Reading order: horizontal → left-to-right (x), vertical →
+                // top-to-bottom (y). BOOOCR sorts horizontal lines itself,
+                // but vertical lines arrive in raw segmentation order, so
+                // re-sort defensively (crop-space coords; for rotated lines
+                // the crop was un-rotated, so crop x/y ARE the reading axis).
+                line.chars.sort_by(|a, b| {
+                    if job.is_vertical {
+                        (a.y, a.x).cmp(&(b.y, b.x))
+                    } else {
+                        (a.x, a.y).cmp(&(b.x, b.y))
+                    }
+                });
 
                 let text: String = line.chars.iter().map(|c| c.c).collect();
                 let char_boxes: Vec<BoundingBox> = line
@@ -862,7 +997,7 @@ pub fn recognize_boxes_streaming(
                     line.chars.iter().map(|c| c.alts.clone()).collect();
 
                 // Dataset collection: save the line crop + detected text
-                save_line_sample(&job.crop, &text, &od);
+                let sample_txt = save_line_sample(&job.crop, &text);
 
                 // Apply glyph conversion only for vertical text
                 let (final_text, final_alts) = if job.is_vertical {
@@ -890,6 +1025,7 @@ pub fn recognize_boxes_streaming(
                         text: final_text,
                         char_boxes,
                         alternatives: final_alts,
+                        sample_txt,
                         is_vertical: job.is_vertical,
                         chunk_boxes: vec![BoundingBox::new(
                             job.crop_x as i32,
@@ -938,7 +1074,7 @@ pub fn recognize_boxes_streaming(
                         if text.is_empty() { continue; }
 
                         // Dataset collection: save the line crop + detected text
-                        save_line_sample(&job.crop, &text, &od);
+                        let sample_txt = save_line_sample(&job.crop, &text);
 
                         let n = char_cols.len();
                         let mut char_boxes = Vec::with_capacity(n);
@@ -1024,6 +1160,7 @@ pub fn recognize_boxes_streaming(
                                 text: final_text,
                                 char_boxes,
                                 alternatives: final_alts,
+                                sample_txt,
                                 is_vertical: job.is_vertical,
                                 chunk_boxes: vec![BoundingBox::new(
                                     job.crop_x as i32, job.crop_y as i32,

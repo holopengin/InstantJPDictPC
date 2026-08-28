@@ -81,6 +81,14 @@ fn has_image_ext(p: &Path) -> bool {
     }
 }
 
+/// True if this filename is a watcher-owned temp/logged image that must
+/// never be re-OCR'd. Covers BOOOCR sidecar crops (`booocr_in_*`) and
+/// dataset line samples (`ocr_line_*`) which both land in `/tmp` (and
+/// `ocr_line_*` can also appear next to the input in batch mode).
+fn is_ignored_temp_output(name: &str) -> bool {
+    name.starts_with("ocr_line_") || name.starts_with("booocr_in_")
+}
+
 /// Run the watcher loop until a stop is requested. Blocks forever.
 pub fn run(data_dir: &Path, extra_args: &[String]) {
     // Single instance: refuse to start if a watcher is already alive.
@@ -212,10 +220,7 @@ fn scan(
         for entry in entries.flatten() {
             let p = entry.path();
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.starts_with("ocr_line_")
-                && !name.starts_with("booocr_in_")
-                && has_image_ext(&p)
-            {
+            if !is_ignored_temp_output(name) && has_image_ext(&p) {
                 maybe_process(&p, processed_dir, extra_args, children, started_at, socket);
             }
         }
@@ -223,12 +228,13 @@ fn scan(
 
     // Screenshot directory images. Also skip our own output crops — batch
     // mode saves `ocr_line_*` next to the input (file.parent()), which for
-    // screenshots IS this directory.
+    // screenshots IS this directory. Also exclude BOOOCR crops if they
+    // ever land there.
     if let Ok(entries) = std::fs::read_dir(shot_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if has_image_ext(&p) && !name.starts_with("ocr_line_") {
+            if has_image_ext(&p) && !is_ignored_temp_output(name) {
                 maybe_process(&p, processed_dir, extra_args, children, started_at, socket);
             }
         }
@@ -245,6 +251,14 @@ fn maybe_process(
 ) {
     if !file.is_file() {
         return;
+    }
+    // Defense in depth: never re-OCR our own temp outputs even if the
+    // scan's prefix filter is bypassed (e.g. file moved/renamed into
+    // the watch dir after creation).
+    if let Some(name) = file.file_name().and_then(|n| n.to_str()) {
+        if is_ignored_temp_output(name) {
+            return;
+        }
     }
     let Ok(meta) = file.metadata() else {
         return;

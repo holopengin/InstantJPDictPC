@@ -724,6 +724,7 @@ pub fn recognize_long_line_static(
         text,
         char_boxes,
         alternatives: Vec::new(),
+        sample_txt: None,
         is_vertical,
         chunk_boxes: Vec::new(),
     })
@@ -903,6 +904,7 @@ pub fn recognize_single_line_with_sessions(
             text,
             char_boxes,
             alternatives,
+            sample_txt: None,
             is_vertical,
             chunk_boxes: vec![BoundingBox::new(
                 crop_x as i32,

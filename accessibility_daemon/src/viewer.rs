@@ -61,6 +61,28 @@ struct CachedGlyph {
     handles: [ImageHandle; 2], // [pink, yellow]
 }
 
+/// Resolve the Japanese UI font file used by BOTH the OCR overlay glyph
+/// cache and the iced dictionary panel (they must render identically).
+/// Binary-relative paths first (AppImage deployment), then a bundled
+/// `fonts/` dir, then system Noto CJK installs.
+pub fn find_jp_font_path() -> Option<std::path::PathBuf> {
+    let exe_path = std::env::current_exe().ok();
+    let exe_dir = exe_path.as_ref().and_then(|p| p.parent());
+    let exe_font = exe_dir.map(|d| d.join("fonts").join("NotoSansJP-Regular.ttf"));
+    let appdir = std::env::var("APPDIR").ok();
+    let appdir_font = appdir
+        .as_ref()
+        .map(|d| std::path::Path::new(d).join("usr").join("bin").join("fonts").join("NotoSansJP-Regular.ttf"));
+    let candidates = [
+        exe_font.as_ref().map(|p| p.as_path()),
+        appdir_font.as_ref().map(|p| p.as_path()),
+        Some(std::path::Path::new("fonts/NotoSansJP-Regular.ttf")),
+        Some(std::path::Path::new("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc")),
+        Some(std::path::Path::new("/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc")),
+    ];
+    candidates.iter().flatten().find(|p| p.exists()).map(|p| p.to_path_buf())
+}
+
 /// Lazily rasterizes characters at requested pixel sizes, caching RGBA
 /// image handles. Thread‑safe via RefCell for interior mutability.
 pub struct GlyphCache {
@@ -72,25 +94,8 @@ pub struct GlyphCache {
 
 impl GlyphCache {
     pub fn new() -> Option<Rc<RefCell<Self>>> {
-        // Binary-relative path for AppImage deployments
-        let exe_path = std::env::current_exe().ok();
-        let exe_dir = exe_path.as_ref().and_then(|p| p.parent());
-        let exe_font = exe_dir.map(|d| d.join("fonts").join("NotoSansJP-Regular.ttf"));
-
-        // AppImage mount point (sharun sets APPDIR; appimagetool uses /tmp/.mount_*)
-        let appdir = std::env::var("APPDIR").ok();
-        let appdir_font = appdir.as_ref()
-            .map(|d| std::path::Path::new(d).join("usr").join("bin").join("fonts").join("NotoSansJP-Regular.ttf"));
-
-        let paths = [
-            exe_font.as_ref().and_then(|p| p.to_str()),
-            appdir_font.as_ref().and_then(|p| p.to_str()),
-            Some("fonts/NotoSansJP-Regular.ttf"),
-            Some("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
-            Some("/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc"),
-        ];
-        for p in paths.iter().flatten() {
-            if let Ok(data) = std::fs::read(p) {
+        if let Some(path) = find_jp_font_path() {
+            if let Ok(data) = std::fs::read(&path) {
                 if let Ok(font) = Font::from_bytes(data, fontdue::FontSettings::default()) {
                     let lm = font.horizontal_line_metrics(16.0);
                     let baseline_below = lm.map_or(0.2, |m| {
@@ -104,6 +109,7 @@ impl GlyphCache {
                     })));
                 }
             }
+            eprintln!("[GlyphCache] failed to load font from {}", path.display());
         }
         eprintln!("[GlyphCache] no CJK font found, overlay text will not render");
         None
