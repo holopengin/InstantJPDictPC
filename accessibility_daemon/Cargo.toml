@@ -16,6 +16,9 @@ jxl-oxide = { version = "0.12", features = ["image"] }
 
 # Font rendering for labels (TTF)
 fontdue = "0.9"
+# Vertical font metrics (vmtx/vert) for the overlay. Same version and feature
+# set fontdue already pulls in, so this shares its build.
+ttf-parser = { version = "0.21", default-features = false, features = ["opentype-layout"] }
 
 # Utilities
 serde = { version = "1.0", features = ["derive"] }
