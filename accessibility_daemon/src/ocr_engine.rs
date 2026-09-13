@@ -890,6 +890,25 @@ pub fn recognize_boxes_streaming(
 
                         let n = char_cols.len();
                         let mut char_boxes = Vec::with_capacity(n);
+                        // Char cells are built in the (possibly un-rotated)
+                        // crop frame; a rotated line maps each box back to
+                        // image coordinates through the inverse rotation.
+                        let map_box = |x: f32, y: f32, w: f32, h: f32| -> BoundingBox {
+                            let w = w.max(1.0);
+                            let h = h.max(1.0);
+                            match job.rot.filter(|r| r.is_rotated()) {
+                                Some(r) => r.map_char_box(
+                                    job.crop_w, job.crop_h, job.crop_x, job.crop_y,
+                                    x.round() as i32, y.round() as i32,
+                                    w.round() as i32, h.round() as i32,
+                                ),
+                                None => BoundingBox::new(
+                                    (job.crop_x as f32 + x).round() as i32,
+                                    (job.crop_y as f32 + y).round() as i32,
+                                    w.round() as i32, h.round() as i32, 1.0,
+                                ),
+                            }
+                        };
                         if n > 0 && seq_len_total > 0 && !job.is_vertical {
                             // ---- HORIZONTAL: x-axis char boxes ----
                             let avg_col_w = job.crop_w as f32 / seq_len_total as f32;
@@ -906,10 +925,7 @@ pub fn recognize_boxes_streaming(
                                 cells[ci].1 -= half; cells[ci + 1].0 += half;
                             }
                             for &(xl, xr) in &cells {
-                                char_boxes.push(BoundingBox::new(
-                                    (job.crop_x as f32 + xl).round() as i32, job.crop_y as i32,
-                                    (xr - xl).max(1.0).round() as i32, job.crop_h as i32, 1.0,
-                                ));
+                                char_boxes.push(map_box(xl, 0.0, xr - xl, job.crop_h as f32));
                             }
                         } else if n > 0 && seq_len_total > 0 {
                             // ---- VERTICAL: y-axis char boxes with punct handling ----
@@ -950,10 +966,7 @@ pub fn recognize_boxes_streaming(
                             }
                             for &(yt, yb) in &cells {
                                 let ch = (yb - yt).max(1.0);
-                                char_boxes.push(BoundingBox::new(
-                                    job.crop_x as i32, (job.crop_y as f32 + yt).round() as i32,
-                                    job.crop_w as i32, ch.round() as i32, 1.0,
-                                ));
+                                char_boxes.push(map_box(0.0, yt, job.crop_w as f32, ch));
                             }
                         }
 

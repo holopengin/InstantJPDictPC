@@ -34,6 +34,9 @@ use iced::widget::image::Handle as ImageHandle;
 
 /// Font fill ratio for OCR character glyphs drawn on the canvas annotation layer.
 const CANVAS_CHAR_RATIO: f32 = 0.9;
+/// Mobile LineOverlayView `ASCII_GLYPH_SCALE` (#49): the shared line-height
+/// text size renders halfwidth glyphs ~10% oversized next to CJK.
+const ASCII_GLYPH_SCALE: f32 = 0.9;
 /// Font fill ratio for character buttons in the neighbor/alternatives panels.
 const BUTTON_CHAR_RATIO: f32 = 0.6;
 
@@ -115,8 +118,9 @@ impl GlyphCache {
         None
     }
 
-    /// Ensure both tinted handles exist for (char, px_size) and return one.
-    fn get_handle(&mut self, ch: char, px: u32, highlighted: bool) -> Option<(&ImageHandle, u32, u32)> {
+    /// Ensure both tinted handles exist for (char, px_size) and return one
+    /// with the ink metrics.
+    fn get_handle(&mut self, ch: char, px: u32, highlighted: bool) -> Option<(&ImageHandle, u32, u32, i32, i32)> {
         let entry = self.cache.entry((ch, px)).or_insert_with(|| {
             let (metrics, coverage) = self.font.rasterize(ch, px as f32);
             let w = metrics.width.max(1) as u32;
@@ -126,7 +130,7 @@ impl GlyphCache {
             CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
         });
         let idx = if highlighted { 1 } else { 0 };
-        Some((&entry.handles[idx], entry.w, entry.h))
+        Some((&entry.handles[idx], entry.w, entry.h, entry.xmin, entry.ymin))
     }
 
     fn make_handle(w: u32, h: u32, cov: &[u8], r: u8, g: u8, b: u8) -> ImageHandle {
@@ -153,47 +157,86 @@ impl GlyphCache {
             CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
         });
     }
-
-    /// Rasterize at `px` WITHOUT caching, returning only the ink dimensions.
-    /// Used to measure a glyph's ink-to-em ratio so the caller can compute
-    /// the em size whose ink exactly matches a tight crop box.
-    pub fn measure_ink(&self, ch: char, px: u32) -> (u32, u32) {
-        let (metrics, _) = self.font.rasterize(ch, px as f32);
-        (metrics.width.max(1) as u32, metrics.height.max(1) as u32)
-    }
 }
 
-/// Look up or rasterize a glyph, returning (handle, w, h) for drawing.
+/// A rasterized glyph ready to draw: the ink bitmap plus the font metrics
+/// needed to place it on its natural baseline.
+struct RasterGlyph {
+    handle: ImageHandle,
+    w: u32,
+    h: u32,
+    xmin: i32,
+    ymin: i32,
+}
+
+/// Look up or rasterize a glyph, returning its ink bitmap and metrics.
 /// Returns None if no glyph cache is available.
 fn draw_glyph(
     cache: &RefCell<GlyphCache>,
     ch: char,
     px_size: u32,
     highlighted: bool,
-) -> Option<(ImageHandle, u32, u32)> {
-    let glyph_metrics = {
-        let mut c = cache.borrow_mut();
-        let r = c.get_handle(ch, px_size, highlighted)?;
-        Some((r.0.clone(), r.1, r.2))
-    };
-    glyph_metrics
+) -> Option<RasterGlyph> {
+    let mut c = cache.borrow_mut();
+    let (handle, w, h, xmin, ymin) = c.get_handle(ch, px_size, highlighted)?;
+    Some(RasterGlyph { handle: handle.clone(), w, h, xmin, ymin })
 }
 
-/// Measure a glyph's ink dimensions at `px_size` without caching.
-/// Returns None if no glyph cache is available.
-fn glyph_ink(cache: &RefCell<GlyphCache>, ch: char, px_size: u32) -> Option<(u32, u32)> {
-    let c = cache.borrow();
-    Some(c.measure_ink(ch, px_size))
+/// Screen-space top-left of a glyph's ink bitmap inside its char box,
+/// mirroring mobile LineOverlayView: along the reading axis the glyph's own
+/// ink centre sits on the box centre; across it, the reference glyph (`あ`)
+/// ink centre does, so punctuation rides its natural baseline instead of
+/// being centred in the em box. Metrics are `(w, h, xmin, ymin)` with
+/// fontdue's y-up `ymin` (the ink bottom above the baseline), in pixels.
+fn glyph_ink_origin(
+    is_vertical: bool,
+    cx: f32,
+    cy: f32,
+    glyph: (f32, f32, f32, f32),
+    reference: (f32, f32, f32, f32),
+) -> (f32, f32) {
+    let (gw, gh, gxmin, gymin) = glyph;
+    let (rw_ref, rh_ref, rxmin_ref, rymin_ref) = reference;
+    if is_vertical {
+        // Reading top→bottom: centre the char's own ink; x follows the
+        // reference so the column stays optically centred.
+        (
+            cx - (rxmin_ref + rw_ref / 2.0) + gxmin,
+            cy - gh / 2.0,
+        )
+    } else {
+        // Reading left→right: centre the char's own ink; y sits on the
+        // reference's ink centre (i.e. natural baseline relative to `あ`).
+        (
+            cx - gw / 2.0,
+            cy + (rymin_ref + rh_ref / 2.0) - (gymin + gh),
+        )
+    }
 }
 
-/// Return the xmin (ink offset) for a cached glyph.
-fn draw_glyph_xmin(cache: &RefCell<GlyphCache>, ch: char, px_size: u32) -> i32 {
-    cache.borrow().cache.get(&(ch, px_size)).map_or(0, |g| g.xmin)
+/// Recover a rotated box's unrotated dimensions from its axis-aligned
+/// bounds. For a `w × h` rect rotated by `a`:
+///   W = w·|cos a| + h·|sin a|,  H = w·|sin a| + h·|cos a|
+/// Around 45° the system is singular (both bounds wash out); fall back to
+/// the AABB, which only makes the sizing conservative.
+fn unrotate_box_size(width: f32, height: f32, angle: f32) -> (f32, f32) {
+    let (s, c) = angle.sin_cos();
+    let (sa, ca) = (s.abs(), c.abs());
+    let det = ca * ca - sa * sa;
+    if det.abs() < 0.1 {
+        return (width.max(1.0), height.max(1.0));
+    }
+    let w = (ca * width - sa * height) / det;
+    let h = (-sa * width + ca * height) / det;
+    (w.max(1.0), h.max(1.0))
 }
 
-/// Return the ymin (ink offset) for a cached glyph.
-fn draw_glyph_ymin(cache: &RefCell<GlyphCache>, ch: char, px_size: u32) -> i32 {
-    cache.borrow().cache.get(&(ch, px_size)).map_or(0, |g| g.ymin)
+/// Mobile `OcrEngine.isHalfWidth`: ASCII + halfwidth katakana get the 0.5em
+/// advance-box treatment (positioning); their ink is fitted against the
+/// doubled width limit with a 0.9 trim.
+fn is_half_width(ch: char) -> bool {
+    let cp = ch as u32;
+    cp <= 0x7E || (0xFF61..=0xFFDC).contains(&cp)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -718,8 +761,33 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 }
 
                 if let Some(line) = &annotation.line {
+                    // Mobile LineOverlayView (#49) metrics: one em size per
+                    // line from the tallest char box (the line height), drawn
+                    // at 0.9 em; glyphs keep their natural font metrics and
+                    // only shrink when their ink exceeds the box. The char
+                    // boxes are CTC em columns, so ink-fitting them (the old
+                    // BOOOCR tight-box path) scaled every glyph up — and
+                    // punctuation, whose ink is a fraction of the em, went
+                    // gigantic. `あ` is the cross-axis reference: glyphs sit
+                    // on their natural baseline relative to its ink centre.
+                    // Rotated lines carry AABBs of the rotated em boxes, so
+                    // their true dimensions are recovered before sizing.
+                    let quad_angle = annotation.quad.filter(|q| q.is_rotated()).map(|q| q.angle);
+                    let line_em = line
+                        .char_boxes
+                        .iter()
+                        .map(|b| match quad_angle {
+                            Some(angle) => unrotate_box_size(b.w as f32, b.h as f32, angle).1,
+                            None => b.h as f32,
+                        })
+                        .fold(0.0f32, f32::max);
+                    let em_px = (line_em * total_scale * CANVAS_CHAR_RATIO).round().clamp(4.0, 1024.0) as u32;
+                    let ref_ink = draw_glyph(&self.glyph_cache, 'あ', em_px, false)
+                        .map(|g| (g.w as f32, g.h as f32, g.xmin as f32, g.ymin as f32));
+
                     for (i, char_box) in line.char_boxes.iter().enumerate() {
                         let (pt_c, sz_c) = transform(char_box);
+                        let (cx, cy) = (pt_c.x + sz_c.width / 2.0, pt_c.y + sz_c.height / 2.0);
 
                         // Draw cursor highlight if this is the selected character
                         if self.cursor_pos == Some((line_idx, i)) {
@@ -729,72 +797,65 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                                 CanvasStroke::default().with_color(Color::from_rgb(1.0, 1.0, 0.0)).with_width(2.0));
                         }
 
-                        // Render character to exactly fill its tight ink crop.
-                        // The per-char boxes outline the glyph, not an em-box
-                        // — and the gap between em-box and ink can be large
-                        // (punctuation, small kana), so rasterizing at the box
-                        // height and upscaling would blur. Instead, first
-                        // measure the glyph's ink-to-em
-                        // ratio at a reference size, then rasterize at the em
-                        // size whose ink equals the crop size exactly:
-                        //   ink_w(px) / px = gw_ref / ref_px
-                        //   => px = crop_w * ref_px / gw_ref  (same for h)
-                        // using the smaller ratio so the ink fits the crop
-                        // (contain), then draw at natural resolution.
-                        if let Some(ch) = line.text.chars().nth(i) {
-                            let highlighted = self.highlighted_coords.contains(&(line_idx, i))
-                                || self.cursor_pos == Some((line_idx, i));
-                            let ref_px = sz_c.height.round().max(4.0) as u32;
-                            if let Some((gw_ref, gh_ref)) = glyph_ink(&self.glyph_cache, ch, ref_px)
-                            {
-                                let px = ((sz_c.width * ref_px as f32 / gw_ref.max(1) as f32)
-                                    .min(sz_c.height * ref_px as f32 / gh_ref.max(1) as f32))
-                                    .round()
-                                    .clamp(4.0, 1024.0) as u32;
-                                if let Some((handle, gw, gh)) =
-                                    draw_glyph(&self.glyph_cache, ch, px, highlighted)
-                                {
-                                    let gw_f = (gw.max(1)) as f32;
-                                    let gh_f = (gh.max(1)) as f32;
-                                    let draw_x = pt_c.x + (sz_c.width - gw_f) / 2.0;
-                                    let draw_y = pt_c.y + (sz_c.height - gh_f) / 2.0;
-                                    if let Some(angle) = annotation.quad.map(|q| q.angle) {
-                                        // Rotated line: draw the glyph at the
-                                        // line's angle around the char box
-                                        // center so it matches the source
-                                        // orientation. The glyph ink sits
-                                        // inside the rotated char quad, which
-                                        // is contained in the AABB, so no
-                                        // overflow.
-                                        frame.with_save(|frame| {
-                                            frame.translate(iced::Vector::new(
-                                                pt_c.x + sz_c.width / 2.0,
-                                                pt_c.y + sz_c.height / 2.0,
-                                            ));
-                                            frame.rotate(angle);
-                                            frame.translate(iced::Vector::new(
-                                                -gw_f / 2.0,
-                                                -gh_f / 2.0,
-                                            ));
-                                            frame.draw_image(
-                                                Rectangle::new(
-                                                    Point::new(0.0, 0.0),
-                                                    Size::new(gw_f, gh_f),
-                                                ),
-                                                &handle,
-                                            );
-                                        });
-                                    } else {
-                                        frame.draw_image(
-                                            Rectangle::new(
-                                                Point::new(draw_x, draw_y),
-                                                Size::new(gw_f, gh_f),
-                                            ),
-                                            &handle,
-                                        );
-                                    }
-                                }
+                        let Some(ch) = line.text.chars().nth(i) else { continue };
+                        let highlighted = self.highlighted_coords.contains(&(line_idx, i))
+                            || self.cursor_pos == Some((line_idx, i));
+                        let Some(g) = draw_glyph(&self.glyph_cache, ch, em_px, highlighted) else { continue };
+                        let (gw, gh) = (g.w.max(1) as f32, g.h.max(1) as f32);
+                        let reference = ref_ink.unwrap_or((gw, gh, g.xmin as f32, g.ymin as f32));
+                        let (dx, dy) = glyph_ink_origin(
+                            line.is_vertical,
+                            cx,
+                            cy,
+                            (gw, gh, g.xmin as f32, g.ymin as f32),
+                            reference,
+                        );
+
+                        // Shrink-only fit (mobile): horizontal fits width,
+                        // vertical fits height; halfwidth ink may overrun its
+                        // 0.5em advance box by design, so it gets the doubled
+                        // limit and the 0.9 trim.
+                        let (box_w, box_h) = match quad_angle {
+                            Some(angle) => unrotate_box_size(sz_c.width, sz_c.height, angle),
+                            None => (sz_c.width, sz_c.height),
+                        };
+                        let is_half = is_half_width(ch);
+                        let max_w = box_w * 0.92;
+                        let max_h = box_h * 0.92;
+                        let mut scale = 1.0f32;
+                        if line.is_vertical {
+                            let limit = if is_half { max_h * 2.0 } else { max_h };
+                            if gh > limit {
+                                scale = limit / gh;
                             }
+                        } else {
+                            let limit = if is_half { max_w * 2.0 } else { max_w };
+                            if gw > limit {
+                                scale = limit / gw;
+                            }
+                        }
+                        let draw_scale = scale * if is_half { ASCII_GLYPH_SCALE } else { 1.0f32 };
+                        let off_x = (dx - cx) * draw_scale;
+                        let off_y = (dy - cy) * draw_scale;
+                        let draw_size = Size::new(gw * draw_scale, gh * draw_scale);
+
+                        if let Some(angle) = annotation.quad.map(|q| q.angle) {
+                            // Rotated line: draw the glyph at the line's
+                            // angle around the char box centre so it matches
+                            // the source orientation.
+                            frame.with_save(|frame| {
+                                frame.translate(iced::Vector::new(cx, cy));
+                                frame.rotate(angle);
+                                frame.draw_image(
+                                    Rectangle::new(Point::new(off_x, off_y), draw_size),
+                                    &g.handle,
+                                );
+                            });
+                        } else {
+                            frame.draw_image(
+                                Rectangle::new(Point::new(cx + off_x, cy + off_y), draw_size),
+                                &g.handle,
+                            );
                         }
                     }
                 }
@@ -1380,6 +1441,7 @@ impl OcrViewer {
     pub fn handle_ocr_recognition_result(&mut self, index: usize, annotation: DetectedAnnotation) {
         let t0 = std::time::Instant::now();
         let line = annotation.line.clone();
+        let quad_angle = annotation.quad.filter(|q| q.is_rotated()).map(|q| q.angle);
         if line.is_some() {
             let has_text = line.as_ref().map(|l| !l.text.is_empty()).unwrap_or(false);
             println!(
@@ -1426,12 +1488,21 @@ impl OcrViewer {
                 // Use cached total_scale from last view() frame — avoids
                 // computing from potentially-not-yet-loaded img_w/img_h (1 vs real).
                 let total_scale = self.last_total_scale.get();
+                // Same per-line em size the draw pass uses (mobile
+                // LineOverlayView fixedSize): tallest char box at 0.9 em,
+                // with rotated AABBs un-rotated first.
+                let line_em = line
+                    .char_boxes
+                    .iter()
+                    .map(|b| match quad_angle {
+                        Some(angle) => unrotate_box_size(b.w as f32, b.h as f32, angle).1,
+                        None => b.h as f32,
+                    })
+                    .fold(0.0f32, f32::max);
+                let px = (line_em * total_scale * CANVAS_CHAR_RATIO).round().clamp(4.0, 1024.0) as u32;
                 let mut cache = gc.borrow_mut();
-                for (i, ch) in line.text.chars().enumerate() {
-                    let px = line.char_boxes.get(i)
-                        .map(|b| (b.h as f32 * total_scale * CANVAS_CHAR_RATIO).round() as u32)
-                        .unwrap_or(24)
-                        .max(1);
+                cache.ensure_glyph('あ', px);
+                for ch in line.text.chars() {
                     cache.ensure_glyph(ch, px);
                 }
             }
@@ -2220,5 +2291,81 @@ impl<'a, Message: Clone + 'static> Widget<Message, Theme, Renderer> for TapOrDra
 impl<'a, Message: Clone + 'static> From<TapOrDrag<'a, Message>> for Element<'a, Message> {
     fn from(widget: TapOrDrag<'a, Message>) -> Self {
         Element::new(widget)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// If the glyph is its own reference, both axes land exactly on the box
+    /// centre (this is what the old ink-fit path did for every glyph).
+    #[test]
+    fn glyph_ink_origin_is_identity_for_the_reference_glyph() {
+        let g = (40.0f32, 40.0, 2.0, -4.0);
+        let (dx, dy) = glyph_ink_origin(false, 100.0, 50.0, g, g);
+        assert!((dx - 80.0).abs() < 1e-3, "horizontal dx={dx}");
+        assert!((dy - 30.0).abs() < 1e-3, "horizontal dy={dy}");
+        let (dx, dy) = glyph_ink_origin(true, 100.0, 50.0, g, g);
+        assert!((dx - 80.0).abs() < 1e-3, "vertical dx={dx}");
+        assert!((dy - 30.0).abs() < 1e-3, "vertical dy={dy}");
+    }
+
+    /// Punctuation rides its natural baseline: a small low comma must sit at
+    /// the bottom of the em box, not be centred in it (the "gigantic 、"
+    /// regression was the ink-fit path centring/scaling it).
+    #[test]
+    fn punctuation_rides_the_baseline() {
+        // あ: ink spans 40px, bottom 8px below the baseline (fontdue y-up
+        // ymin = -8), so its ink centre is 12px above the baseline.
+        let reference = (40.0f32, 40.0, 0.0, -8.0);
+        // A comma: small ink patch near the baseline.
+        let comma = (10.0f32, 10.0, 0.0, -6.0);
+        let (dx, dy) = glyph_ink_origin(false, 100.0, 50.0, comma, reference);
+        // top = cy + ref_centre - (ymin + h) = 50 + 12 - 4 = 58.
+        assert!((dy - 58.0).abs() < 1e-3, "comma dy={dy}");
+        assert!((dx - 95.0).abs() < 1e-3, "comma dx={dx}");
+    }
+
+    #[test]
+    fn halfwidth_classification_matches_mobile() {
+        assert!(is_half_width('A'));
+        assert!(is_half_width('~'));
+        assert!(is_half_width('\u{FF76}')); // ｶ halfwidth katakana
+        assert!(!is_half_width('あ'));
+        assert!(!is_half_width('漢'));
+        assert!(!is_half_width('。'));
+    }
+
+    #[test]
+    fn unrotate_box_size_recovers_dimensions() {
+        // Square em box at a few angles (vertical char boxes are squares-ish).
+        for deg in [3.0f32, 10.0, 30.0] {
+            let a = deg.to_radians();
+            let (s, c) = a.sin_cos();
+            let (w, h) = (44.0f32, 44.0f32);
+            let (rw, rh) = unrotate_box_size(
+                w * c.abs() + h * s.abs(),
+                w * s.abs() + h * c.abs(),
+                a,
+            );
+            assert!(
+                (rw - w).abs() < 0.01 && (rh - h).abs() < 0.01,
+                "deg={deg} recovered {rw}x{rh}"
+            );
+        }
+        // Non-square vertical char box (column width × pitch).
+        let (w, h) = (30.0f32, 52.0f32);
+        let a = 20.0f32.to_radians();
+        let (s, c) = a.sin_cos();
+        let (rw, rh) = unrotate_box_size(
+            w * c.abs() + h * s.abs(),
+            w * s.abs() + h * c.abs(),
+            a,
+        );
+        assert!(
+            (rw - w).abs() < 0.01 && (rh - h).abs() < 0.01,
+            "recovered {rw}x{rh}"
+        );
     }
 }
