@@ -8,7 +8,7 @@
 
 use iced::{
     alignment::Horizontal,
-    widget::{button, column, text, Button, Column, Space, Text},
+    widget::{button, column, text, Button, Space, Text},
     Element, Length, Pixels, Subscription, Task,
 };
 use std::path::PathBuf;
