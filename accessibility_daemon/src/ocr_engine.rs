@@ -474,6 +474,35 @@ fn trim_ruby_gutter_vertical(
     trimmed
 }
 
+/// Cross-axis size of a character cell: fullwidth JP occupies the line's
+/// cross size, halfwidth latin/katakana half of it.
+fn char_cell_width(ch: Option<char>, cross: f32) -> f32 {
+    match ch {
+        Some(c) if crate::util::japanese::is_half_width(c) => cross * 0.5,
+        _ => cross,
+    }
+}
+
+/// Max length of a character cell along the reading axis: 1.1x its own width
+/// (so 1.1x the line cross size for JP, 0.55x for halfwidth latin).
+fn char_cell_max_len(ch: Option<char>, cross: f32) -> f32 {
+    char_cell_width(ch, cross) * 1.1
+}
+
+/// Resolve one overlapping pair of character cells: move the shared boundary
+/// to where both boxes reach the same aspect ratio (length / width), clamped
+/// into the overlap so at worst the edges align and the boxes just touch.
+/// Cells are `(start, end)` along the reading axis.
+fn split_overlap_same_aspect(a: &mut (f32, f32), b: &mut (f32, f32), wa: f32, wb: f32) {
+    if a.1 <= b.0 {
+        return;
+    }
+    let m = (wa * b.1 + wb * a.0) / (wa + wb);
+    let m = m.clamp(b.0, a.1);
+    a.1 = m;
+    b.0 = m;
+}
+
 impl OcrEngine {
     pub fn new(model_dir: &str, recognition_mode: RecognitionMode, batch_size: usize) -> Result<Self> {
         let model_path = Path::new(model_dir);
@@ -1268,35 +1297,43 @@ pub fn recognize_boxes_streaming(
                         };
                         if n > 0 && seq_len_total > 0 && !job.is_vertical {
                             // ---- HORIZONTAL: x-axis char boxes ----
-                            let avg_col_w = job.crop_w as f32 / seq_len_total as f32;
-                            let char_w = (job.crop_h as f32).max(3.0);
-                            let mut cells: Vec<(f32, f32)> = char_cols.iter().map(|&t| {
-                                let c = (t as f32 + 0.5) * avg_col_w;
-                                let h = char_w / 2.0;
-                                ((c - h).max(0.0), (c + h).min(job.crop_w as f32))
+                            // The decoded timestep is the character's trailing
+                            // (right) edge: the cell extends back up to 1.1x
+                            // its width (0.55x for halfwidth latin), then
+                            // overlapping neighbours split to a common aspect
+                            // ratio. Horizontal punctuation has no special
+                            // rules (as before).
+                            let step = job.crop_w as f32 / seq_len_total as f32;
+                            let cross = (job.crop_h as f32).max(3.0);
+                            let text_chars: Vec<char> = text.chars().collect();
+                            let mut cells: Vec<(f32, f32)> = char_cols.iter().enumerate().map(|(idx, &t)| {
+                                let anchor = (t as f32 + 0.5) * step;
+                                let max_len = char_cell_max_len(text_chars.get(idx).copied(), cross);
+                                ((anchor - max_len).max(0.0), anchor.min(job.crop_w as f32))
                             }).collect();
-                            cells.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                             for ci in 0..n.saturating_sub(1) {
-                                if cells[ci].1 <= cells[ci + 1].0 { continue; }
-                                let half = (cells[ci].1 - cells[ci + 1].0) / 2.0;
-                                cells[ci].1 -= half; cells[ci + 1].0 += half;
+                                let wa = char_cell_width(text_chars.get(ci).copied(), cross);
+                                let wb = char_cell_width(text_chars.get(ci + 1).copied(), cross);
+                                let (left, right) = cells.split_at_mut(ci + 1);
+                                split_overlap_same_aspect(&mut left[ci], &mut right[0], wa, wb);
                             }
                             for &(xl, xr) in &cells {
                                 char_boxes.push(map_box(xl, 0.0, xr - xl, job.crop_h as f32));
                             }
                         } else if n > 0 && seq_len_total > 0 {
                             // ---- VERTICAL: y-axis char boxes with punct handling ----
-                            let avg_col_w = job.crop_h as f32 / seq_len_total as f32;
-                            let avg_ch_h = if n > 1 {
-                                let span = char_cols[n - 1] - char_cols[0];
-                                (span / (n - 1) as f32 * avg_col_w).max(3.0)
-                            } else { avg_col_w.max(3.0) };
-                            let mut cells: Vec<(f32, f32)> = char_cols.iter().map(|&t| {
-                                let c = (t as f32 + 0.5) * avg_col_w;
-                                let h = avg_ch_h / 2.0;
-                                ((c - h).max(0.0), (c + h).min(job.crop_h as f32))
+                            // Same trailing-edge geometry, with the timestep
+                            // as the character's bottom edge and the column
+                            // width as 1: max cell height 1.1x (0.55x
+                            // halfwidth). Punctuation keeps its own rules.
+                            let step = job.crop_h as f32 / seq_len_total as f32;
+                            let cross = (job.crop_w as f32).max(3.0);
+                            let text_chars: Vec<char> = text.chars().collect();
+                            let mut cells: Vec<(f32, f32)> = char_cols.iter().enumerate().map(|(idx, &t)| {
+                                let anchor = (t as f32 + 0.5) * step;
+                                let max_len = char_cell_max_len(text_chars.get(idx).copied(), cross);
+                                ((anchor - max_len).max(0.0), anchor.min(job.crop_h as f32))
                             }).collect();
-                            cells.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                             let is_cp: Vec<bool> = text.chars().map(|ch| matches!(ch, '\u{3002}'|'\u{002E}'|'\u{FF0E}'|'\u{3001}'|'\u{002C}'|'\u{FF0C}'|')'|'\u{FF09}'|'\u{3017}'|'\u{300D}'|'\u{300F}'|'\u{3015}'|'\u{3011}'|'\u{3009}'|']'|'\u{FF3D}')).collect();
                             let is_op: Vec<bool> = text.chars().map(|ch| matches!(ch, '('|'\u{FF08}'|'\u{300C}'|'\u{300E}'|'\u{3014}'|'\u{3010}'|'\u{300A}'|'\u{3008}'|'\u{3016}'|'['|'\u{FF3B}')).collect();
                             for ci in 0..n.saturating_sub(1) {
@@ -1305,7 +1342,12 @@ pub fn recognize_boxes_streaming(
                                 else if is_op[ci + 1] { cells[ci + 1].0 = cells[ci].1; }
                                 else if is_cp[ci + 1] { cells[ci + 1].0 = cells[ci].1; }
                                 else if is_op[ci] { cells[ci].1 = cells[ci + 1].0; }
-                                else { let h = (cells[ci].1 - cells[ci + 1].0) / 2.0; cells[ci].1 -= h; cells[ci + 1].0 += h; }
+                                else {
+                                    let wa = char_cell_width(text_chars.get(ci).copied(), cross);
+                                    let wb = char_cell_width(text_chars.get(ci + 1).copied(), cross);
+                                    let (left, right) = cells.split_at_mut(ci + 1);
+                                    split_overlap_same_aspect(&mut left[ci], &mut right[0], wa, wb);
+                                }
                             }
                             let avg_np_h: f32 = {
                                 let hs: Vec<f32> = cells.iter().enumerate().filter(|(ci,_)| !is_cp[*ci] && !is_op[*ci]).map(|(_,c)| c.1 - c.0).collect();
@@ -1776,5 +1818,99 @@ mod tests {
         assert!((pairs[0].1.cx - 28.0).abs() < 0.01, "quad cx {}", pairs[0].1.cx);
         assert_eq!(pairs[1].0.w, 60);
         assert_eq!(pairs[2].0.w, 60);
+    }
+    /// The new char-cell geometry: 1.1x max length for JP, 0.55x for
+    /// halfwidth, and overlaps resolve to a common aspect ratio (or just
+    /// touching edges when the equal-aspect point lies outside the overlap).
+    #[test]
+    fn char_cell_geometry_and_aspect_split() {
+        assert_eq!(char_cell_width(Some('あ'), 50.0), 50.0);
+        assert_eq!(char_cell_width(Some('漢'), 50.0), 50.0);
+        assert_eq!(char_cell_width(Some('A'), 50.0), 25.0);
+        assert_eq!(char_cell_width(Some('ｶ'), 50.0), 25.0);
+        assert_eq!(char_cell_width(None, 50.0), 50.0);
+        assert!((char_cell_max_len(Some('あ'), 50.0) - 55.0).abs() < 1e-3);
+        assert!((char_cell_max_len(Some('A'), 50.0) - 27.5).abs() < 1e-3);
+
+        // Equal widths: the shared boundary lands midway.
+        let (mut a, mut b) = ((0.0f32, 110.0f32), (30.0f32, 140.0f32));
+        split_overlap_same_aspect(&mut a, &mut b, 100.0, 100.0);
+        assert!((a.1 - 70.0).abs() < 1e-3 && (b.0 - 70.0).abs() < 1e-3);
+
+        // Different widths: both boxes end at the same aspect ratio.
+        let (mut a, mut b) = ((0.0f32, 110.0f32), (50.0f32, 160.0f32));
+        split_overlap_same_aspect(&mut a, &mut b, 50.0, 100.0);
+        let (la, lb) = ((a.1 - a.0) / 50.0, (b.1 - b.0) / 100.0);
+        assert!((la - lb).abs() < 1e-3, "aspects {la} {lb}");
+
+        // Equal-aspect point beyond the overlap: clamp, edges just touch.
+        let (mut a, mut b) = ((0.0f32, 110.0f32), (60.0f32, 170.0f32));
+        split_overlap_same_aspect(&mut a, &mut b, 100.0, 50.0);
+        assert!((a.1 - 110.0).abs() < 1e-3 && (b.0 - 110.0).abs() < 1e-3);
+
+        // Gapped pair is untouched.
+        let (mut a, mut b) = ((0.0f32, 10.0f32), (30.0f32, 40.0f32));
+        split_overlap_same_aspect(&mut a, &mut b, 100.0, 100.0);
+        assert_eq!((a, b), ((0.0, 10.0), (30.0, 40.0)));
+    }
+
+    /// End-to-end: every char box the streaming path emits must respect the
+    /// per-class caps (1.1x line cross for JP, 0.55x for halfwidth) and the
+    /// neighbours must not overlap beyond rounding.
+    #[test]
+    fn synth_char_boxes_respect_aspect_caps() {
+        let mut eng = test_engine();
+        let truth: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/test_images/synth/truth.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut checked = 0usize;
+        for line in truth["lines"].as_array().unwrap() {
+            let file = line["file"].as_str().unwrap();
+            let img =
+                image::open(format!("{}/test_images/synth/{file}", env!("CARGO_MANIFEST_DIR")))
+                    .unwrap();
+            let det = eng.detect_lines(&img).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            crate::ocr_engine::recognize_boxes_streaming(
+                &img, &det.boxes, &det.rotated,
+                eng.ppocr_rec.clone(), &eng.ppocr_vocab, &eng.rec_remap,
+                4, RecognitionMode::Both, tx, std::path::Path::new("/tmp"),
+            )
+            .unwrap();
+            for (_i, ann) in rx.into_iter() {
+                let Some(line) = ann.line else { continue };
+                if ann.quad.is_some() {
+                    continue; // rotated lines carry AABBs by design
+                }
+                let chars: Vec<char> = line.text.chars().collect();
+                let vertical = line.is_vertical;
+                let mut prev_end: Option<i32> = None;
+                for (ci, b) in line.char_boxes.iter().enumerate() {
+                    let cross = if vertical { b.w } else { b.h } as f32;
+                    let along = if vertical { b.h } else { b.w } as f32;
+                    let max_len = char_cell_max_len(chars.get(ci).copied(), cross);
+                    assert!(
+                        along <= max_len * 1.02 + 2.0,
+                        "{file} char {ci} ({:?}): along {along} > max {max_len}",
+                        chars.get(ci)
+                    );
+                    if let Some(prev) = prev_end {
+                        let start = if vertical { b.y } else { b.x };
+                        assert!(
+                            start >= prev - 2,
+                            "{file} char {ci}: boxes overlap beyond rounding"
+                        );
+                    }
+                    prev_end = Some(if vertical { b.y + b.h } else { b.x + b.w });
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 80, "expected the full synth set, checked {checked}");
     }
 }
