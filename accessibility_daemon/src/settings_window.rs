@@ -20,7 +20,7 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub enum SettingsMessage {
     ImportDictionary,
-    ImportProgress(ImportProgress),
+    ImportProgress,
     ImportDone(Result<usize, String>),
     RefreshStatus,
     DeleteDictionary(i64),
@@ -124,18 +124,10 @@ impl SettingsWindow {
                 self.import_join_handle = Some(join_handle);
 
                 // Return a task that polls the shared state once.
-                Task::perform(
-                    async { () },
-                    |_| SettingsMessage::ImportProgress(ImportProgress {
-                        entries_imported: 0,
-                        banks_done: 0,
-                        banks_total: 0,
-                        current_file: String::new(),
-                    }),
-                )
+                Task::perform(async {}, |_| SettingsMessage::ImportProgress)
             }
 
-            SettingsMessage::ImportProgress(_) => {
+            SettingsMessage::ImportProgress => {
                 // Read the latest progress from shared state.
                 let progress = self
                     .import_shared
@@ -193,7 +185,7 @@ impl SettingsWindow {
                                 current_file: String::new(),
                             })
                         },
-                        |p| SettingsMessage::ImportProgress(p),
+                        |_| SettingsMessage::ImportProgress,
                     )
                 }
             }

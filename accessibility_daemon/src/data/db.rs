@@ -25,15 +25,6 @@ impl DictionaryDatabase {
         Ok(db)
     }
 
-    /// Open an in-memory database (for testing).
-    pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
-        let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        db.init_schema()?;
-        Ok(db)
-    }
 
     fn init_schema(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -254,20 +245,7 @@ impl DictionaryDatabase {
         Ok(count)
     }
 
-    pub fn clear_all_entries(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM dictionary", [])?;
-        Ok(())
-    }
 
-    pub fn delete_entries_for_dictionary(&self, dictionary_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM dictionary WHERE dictionary_id = ?1",
-            [&dictionary_id],
-        )?;
-        Ok(())
-    }
 
     // -------------------------------------------------------------------------
     // Tag CRUD
@@ -295,44 +273,5 @@ impl DictionaryDatabase {
         Ok(())
     }
 
-    pub fn get_tag_notes(&self, tag_name: &str, dictionary_id: i64) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        let val: Option<String> = conn
-            .query_row(
-                "SELECT notes FROM dictionary_tag WHERE name = ?1 AND dictionary_id = ?2",
-                [tag_name, &dictionary_id.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(val)
-    }
 
-    pub fn get_tags_by_names(&self, tag_names: &[String]) -> Result<Vec<DictionaryTag>> {
-        if tag_names.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = tag_names.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT id, name, category, order_val, notes, popularity, dictionary_id
-             FROM dictionary_tag WHERE name IN ({})",
-            placeholders
-        );
-
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&sql)?;
-        let tags = stmt
-            .query_map(rusqlite::params_from_iter(tag_names.iter()), |row| {
-                Ok(DictionaryTag {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    category: row.get(2)?,
-                    order: row.get(3)?,
-                    notes: row.get(4)?,
-                    popularity: row.get(5)?,
-                    dictionary_id: row.get(6)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(tags)
-    }
 }

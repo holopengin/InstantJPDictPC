@@ -44,7 +44,6 @@ const ASCII_GLYPH_SCALE: f32 = 0.9;
 /// Font fill ratio for character buttons in the neighbor/alternatives panels.
 const BUTTON_CHAR_RATIO: f32 = 0.6;
 
-const TAP_THRESHOLD: f32 = 5.0;
 /// Dead zone for drag start in the TapOrDrag widget.
 /// The first few pixels of movement don't count as drag, preventing
 /// accidental drags from taps.
@@ -108,8 +107,6 @@ pub struct GlyphCache {
     /// (vmtx/vhea) fontdue does not expose.
     vface: Option<ttf_parser::Face<'static>>,
     units_per_em: f32,
-    /// Proportion of the em-box below the baseline (0.0 = baseline at em-bottom, 1.0 = em-top).
-    baseline_below: f64,
 }
 
 impl GlyphCache {
@@ -121,11 +118,6 @@ impl GlyphCache {
                 let face_data: &'static [u8] = Box::leak(data.clone().into_boxed_slice());
                 let vface = ttf_parser::Face::parse(face_data, 0).ok();
                 if let Ok(font) = Font::from_bytes(data, fontdue::FontSettings::default()) {
-                    let lm = font.horizontal_line_metrics(16.0);
-                    let baseline_below = lm.map_or(0.2, |m| {
-                        let desc = m.descent.abs() as f64;
-                        desc / (m.ascent as f64 + desc)
-                    });
                     let units_per_em = vface
                         .as_ref()
                         .map(|f| f.units_per_em() as f32)
@@ -137,7 +129,6 @@ impl GlyphCache {
                         vert_cache: HashMap::new(),
                         vface,
                         units_per_em,
-                        baseline_below,
                     })));
                 }
             }
@@ -504,9 +495,6 @@ pub struct PanState {
     pub pinch_prev_focus_x: f32,
     /// Pinch zoom: previous frame's midpoint Y.
     pub pinch_prev_focus_y: f32,
-    /// Whether we've emitted a warmup fill_text to prime the font atlas.
-    /// Set after the first draw frame.
-    pub font_atlas_warmed: bool,
 }
 
 /// OverlayProgram
@@ -528,8 +516,6 @@ pub struct OverlayProgram {
     pub panel_on_right: bool,
     /// Fixed width of the dictionary panel in pixels.
     pub dict_width: f32,
-    /// Whether the alternatives panel is visible.
-    pub alternatives_visible: bool,
     /// Current cursor position (line_idx, char_idx) for keyboard navigation.
     pub cursor_pos: Option<(usize, usize)>,
     /// Current zoom scale.
@@ -540,8 +526,6 @@ pub struct OverlayProgram {
     pub current_trans_y: f32,
     /// Whether this canvas draws annotations (true) or just the image (false).
     pub draw_annotations: bool,
-    /// Whether the user is actively zooming/panning.
-    pub is_zooming: bool,
     /// Whether this canvas instance should handle pan/zoom events.
     /// The image canvas (behind the annotation canvas) must NOT handle them,
     /// or pan/zoom would be applied twice.
@@ -1235,8 +1219,6 @@ pub struct OcrViewer {
     pub state: OcrOverlayState,
     pub selected_word: Option<SelectedWord>,
     pub alternatives_visible: bool,
-    /// Index of the highlighted alternative when using keyboard navigation.
-    pub alt_selected_idx: usize,
     pub db: Option<Arc<DictionaryDatabase>>,
     pub deinflector: Option<Arc<Deinflector>>,
     /// The index of the character that should be scrolled into view in the neighbor panel.
@@ -1291,7 +1273,6 @@ impl OcrViewer {
             state: OcrOverlayState::new(window_w, window_h),
             selected_word: None,
             alternatives_visible: false,
-            alt_selected_idx: 0,
             db: None,
             deinflector: None,
             scroll_neighbor_to: None,
@@ -1497,19 +1478,11 @@ impl OcrViewer {
     }
 
     pub(crate) fn do_lookup(&mut self, line_idx: usize, char_idx: usize) {
-        let (text, full_line_text) = {
+        let full_line_text = {
             let Some(line) = self.state.active_line_results.get(line_idx)
                 .and_then(|l| l.as_ref()) else { return; };
-            let Some(box_item) = line.char_boxes.get(char_idx) else { return; };
-            let text = line.text.chars().skip(char_idx).take(3).collect::<String>();
-            let full_line_text = line.text.clone();
-            self.selected_word = Some(SelectedWord {
-                line_idx,
-                char_idx,
-                text,
-                box_item: box_item.clone(),
-            });
-            (self.selected_word.as_ref().unwrap().text.clone(), full_line_text)
+            self.selected_word = Some(SelectedWord { line_idx, char_idx });
+            line.text.clone()
         };
         // Only look up if db/deinflector are loaded (bootstrap may not be done yet)
         if let (Some(db), Some(deinf)) = (self.db.as_ref(), self.deinflector.as_ref()) {
@@ -1524,7 +1497,7 @@ impl OcrViewer {
                 let matched_term: String =
                     full_line_text.chars().skip(char_idx).take(term_len).collect();
                 let mut append_kanji: Vec<FormattedEntry> = Vec::new();
-                for (i, ch) in matched_term.chars().enumerate() {
+                for ch in matched_term.chars() {
                     // Only CJK Unified Ideographs (kanji)
                     if !('\u{4E00}'..='\u{9FFF}').contains(&ch)
                         && !('\u{3400}'..='\u{4DBF}').contains(&ch) {
@@ -1664,7 +1637,6 @@ impl OcrViewer {
     /// Replaces the detection-only annotation (bbox + line: None) at the given
     /// index with the full annotation (bbox + line with text and char_boxes).
     pub fn handle_ocr_recognition_result(&mut self, index: usize, annotation: DetectedAnnotation) {
-        let t0 = std::time::Instant::now();
         let line = annotation.line.clone();
         let quad_angle = annotation.quad.filter(|q| q.is_rotated()).map(|q| q.angle);
         if line.is_some() {
@@ -1678,7 +1650,6 @@ impl OcrViewer {
             );
         }
         // Extend annotations vec if this is a new box beyond current length
-        let t_extend = std::time::Instant::now();
         if self.annotations.len() <= index {
             // Use make_mut to grow in-place without cloning the whole vec
             let anns = std::rc::Rc::make_mut(&mut self.annotations);
@@ -1690,10 +1661,8 @@ impl OcrViewer {
         }
 
         // Replace the annotation at the given index — in-place via make_mut
-        let t_assign = std::time::Instant::now();
         let anns = std::rc::Rc::make_mut(&mut self.annotations);
         anns[index] = annotation;
-        let t_before_set = std::time::Instant::now();
 
         // If the annotation has a line result, update the overlay state
         // UNLESS the user has edited this line's text — skip overwrite in
@@ -1703,7 +1672,6 @@ impl OcrViewer {
                 self.state.set_single_line_result(index, line.clone());
             }
         }
-        let t_after_state = std::time::Instant::now();
 
         // Pre-warm glyph cache for this annotation's characters so view()
         // doesn't rasterize them on the draw path (which causes visible
@@ -1742,15 +1710,6 @@ impl OcrViewer {
         // This way Rc::make_mut above mutates in-place without deep-copying the
         // whole Vec (which would happen if refcount > 1).
         *self.synced_annotations.borrow_mut() = Rc::new((*self.annotations).clone());
-        let t_end = std::time::Instant::now();
-        // eprintln!(
-        //     "[TIMING] handle_ocr_recognition_result idx={}: total={}us  clone={}us make_mut={}us set_state={}us",
-        //     index,
-        //     t_end.duration_since(t0).as_micros(),
-        //     t_extend.duration_since(t0).as_micros(),
-        //     t_before_set.duration_since(t_assign).as_micros(),
-        //     t_after_state.duration_since(t_before_set).as_micros(),
-        // );
     }
 
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
@@ -1800,13 +1759,11 @@ impl OcrViewer {
             panel_visible: has_panel,
             panel_on_right,
             dict_width: 300.0,
-            alternatives_visible: self.alternatives_visible,
             cursor_pos: self.state.current_cursor(),
             current_scale: self.state.current_scale,
             current_trans_x: self.state.current_trans_x,
             current_trans_y: self.state.current_trans_y,
             draw_annotations: !self.is_zooming,
-            is_zooming: self.is_zooming,
             handle_pan_zoom: true,
             highlighted_coords: self.state.last_highlighted_coords.clone(),
             nav_edges_initial: self.state.nav_graph.as_ref().map(|g| g.initial_edges.clone()),
@@ -1834,13 +1791,11 @@ impl OcrViewer {
             panel_visible: false,
             panel_on_right: false,
             dict_width: 300.0,
-            alternatives_visible: false,
             cursor_pos: None,
             current_scale: self.state.current_scale,
             current_trans_x: self.state.current_trans_x,
             current_trans_y: self.state.current_trans_y,
             draw_annotations: false,
-            is_zooming: self.is_zooming,
             handle_pan_zoom: false,
             highlighted_coords: Vec::new(),
             nav_edges_initial: None,
@@ -2117,7 +2072,7 @@ impl OcrViewer {
                                 .wrapping(iced::widget::text::Wrapping::Word),
                         );
                     }
-                    DefinitionNode::Ruby { term, reading, .. } => {
+                    DefinitionNode::Ruby { term, reading } => {
                         if term == reading {
                             nodes_col = nodes_col.push(Text::new(term.clone()).size(16).color(cyan)
                                 .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }));
@@ -2129,7 +2084,7 @@ impl OcrViewer {
                             nodes_col = nodes_col.push(rc);
                         }
                     }
-                    DefinitionNode::Tag { text, .. } => {
+                    DefinitionNode::Tag { text } => {
                         nodes_col = nodes_col.push(Text::new(format!("[{text}]")).size(14).color(gray));
                     }
                     _ => {}

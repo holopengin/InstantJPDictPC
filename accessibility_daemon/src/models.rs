@@ -22,7 +22,6 @@ impl BoundingBox {
     pub fn top(&self) -> i32 { self.y }
     pub fn right(&self) -> i32 { self.x + self.w }
     pub fn bottom(&self) -> i32 { self.y + self.h }
-    pub fn area(&self) -> i32 { self.w * self.h }
 }
 
 /// Minimum-area rotated rectangle around a detected text contour.
@@ -159,14 +158,6 @@ pub struct DetectionResult {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub struct CharCandidate {
-    pub char: char,
-    pub score: f32,
-    pub box_coords: [f32; 4],
-    pub alternatives: Vec<(char, f32)>,
-}
-
-#[derive(Debug, Clone)]
 pub struct LineResult {
     pub text: String,
     pub char_boxes: Vec<BoundingBox>,
@@ -197,15 +188,12 @@ pub struct DetectedAnnotation {
 pub struct SelectedWord {
     pub line_idx: usize,
     pub char_idx: usize,
-    pub text: String,
-    pub box_item: BoundingBox,
 }
 
 #[derive(Debug, Clone)]
 pub struct NeighborChar {
     pub text: String,
     pub is_selected: bool,
-    pub line_idx: usize,
     pub char_idx: usize,
 }
 
@@ -224,7 +212,6 @@ pub struct AlternativeChar {
 #[derive(Debug, Clone)]
 pub struct AlternativesUiState {
     pub candidates: Vec<AlternativeChar>,
-    pub show_manual_input: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +235,6 @@ pub enum RecognitionMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GamepadAction {
-    None,
     NavigateLeft,
     NavigateRight,
     NavigateUp,
@@ -266,24 +252,13 @@ pub enum GamepadAction {
 #[derive(Debug, Clone)]
 pub enum DefinitionNode {
     Text(String),
-    Ruby { term: String, reading: String, is_mini: bool },
-    Tag { text: String, category: String },
-    Example {
-        japanese: Option<String>,
-        english: Option<String>,
-        content: Option<Vec<DefinitionNode>>,
-    },
-    ListBlock {
-        items: Vec<Vec<DefinitionNode>>,
-        block_type: Option<String>,
-    },
-    Table {
-        rows: Vec<Vec<Vec<DefinitionNode>>>,
-    },
-    Group {
-        nodes: Vec<DefinitionNode>,
-        is_inline: bool,
-    },
+    Ruby { term: String, reading: String },
+    Tag { text: String },
+    /// Block-level container: rendered as nothing today, but it keeps its
+    /// content out of the inline flow (see `parse_definition_item`).
+    Example,
+    ListBlock,
+    Table,
 }
 
 #[derive(Debug, Clone)]
@@ -296,7 +271,6 @@ pub struct FormattedSense {
 pub struct FormattedSenseGroup {
     pub tags: Vec<String>,
     pub senses: Vec<FormattedSense>,
-    pub is_forms: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -333,12 +307,8 @@ pub enum Message {
     Navigate(GamepadAction),
     /// Zoom the image by a delta (positive = zoom in), centered on the given cursor position.
     ZoomOnCursor { delta: f32, cursor_x: f32, cursor_y: f32 },
-    /// Start panning — record the initial cursor position.
-    PanStart { start_x: f32, start_y: f32 },
     /// Pan by the given delta.
     PanDelta { dx: f32, dy: f32 },
-    /// End panning.
-    PanEnd,
     /// Set the zoom scale directly (for pinch zoom).
     SetScale { scale: f32 },
     /// Pinch zoom gesture: new scale + pan delta around focus point.
@@ -349,12 +319,6 @@ pub enum Message {
     ZoomTick,
     /// The window was resized.
     WindowResized { width: f32, height: f32 },
-    /// Line detection complete — show bounding boxes (no text yet).
-    OcrDetectionComplete(Vec<DetectedAnnotation>),
-    /// One line's character recognition complete.
-    OcrRecognitionResult(usize, DetectedAnnotation),
-    /// All OCR processing is done.
-    OcrAllDone,
     /// Frame tick — drains bootstrap/OCR channels so results stream smoothly.
     Tick,
 }

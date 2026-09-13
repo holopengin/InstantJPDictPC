@@ -50,7 +50,6 @@ enum BootstrapMsg {
     ImageReady(iced::widget::image::Handle, Vec<u8>, u32, u32),
     DictReady(Arc<DictionaryDatabase>),
     DeinflectReady(Arc<Deinflector>),
-    AnnotationReady(DetectedAnnotation),
 }
 
 use iced::window::settings::PlatformSpecific;
@@ -115,106 +114,7 @@ fn resolve_asset_dir() -> String {
     "./assets".to_string()
 }
 
-fn start_evdev_thread() {
-    std::thread::spawn(|| {
-        use evdev::{Device, EventType, AbsoluteAxisCode, KeyCode};
-        let mut devices: Vec<Device> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir("/dev/input") {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.to_string_lossy().contains("event") { continue; }
-                if let Ok(mut d) = Device::open(&path) {
-                    let has_btn = d.supported_keys().map_or(false, |caps| {
-                        caps.contains(KeyCode::BTN_SOUTH) || caps.contains(KeyCode::new(0x130))
-                    });
-                    if has_btn {
-                        let name = d.name().unwrap_or("?").to_string();
-                        println!("[GP] evdev gamepad found: {name} at {p}", p = path.display());
-                        // Grab the device so events are captured exclusively and
-                        // don't also reach the game running underneath.
-                        if let Err(e) = d.grab() {
-                            println!("[GP] grab {name} failed (events will pass through): {e}");
-                        } else {
-                            println!("[GP] grabbed {name} — events blocked from other apps");
-                        }
-                        devices.push(d);
-                    }
-                }
-            }
-        }
-        GP_COUNT.store(devices.len() as u32, Ordering::Relaxed);
-        println!("[GP] Found {} gamepad devices", devices.len());
-        if devices.is_empty() { return; }
 
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(4));
-            for dev in &mut devices {
-                for ev in dev.fetch_events().into_iter().flatten() {
-                    let etype = ev.event_type();
-                    let code = ev.code();
-                    let val = ev.value();
-                    // Determine which button this event is for (regardless of val)
-                    let bit = if etype == EventType::ABSOLUTE {
-                        0 // handled below
-                    } else if etype == EventType::KEY {
-                        let kc = KeyCode(code);
-                             if kc == KeyCode::BTN_DPAD_UP    || kc == KeyCode::new(0x220) { B_UP }
-                        else if kc == KeyCode::BTN_DPAD_DOWN  || kc == KeyCode::new(0x221) { B_DOWN }
-                        else if kc == KeyCode::BTN_DPAD_LEFT  || kc == KeyCode::new(0x222) { B_LEFT }
-                        else if kc == KeyCode::BTN_DPAD_RIGHT || kc == KeyCode::new(0x223) { B_RIGHT }
-                        else if kc == KeyCode::BTN_SOUTH      || kc == KeyCode::new(0x130) { B_A }
-                        else if kc == KeyCode::BTN_EAST       || kc == KeyCode::new(0x131) { B_B }
-                        else if kc == KeyCode::BTN_TL         || kc == KeyCode::new(0x136) { B_L1 }
-                        else if kc == KeyCode::BTN_TR         || kc == KeyCode::new(0x137) { B_R1 }
-                        else if kc == KeyCode::BTN_TL2        || kc == KeyCode::new(0x138) { B_L2 }
-                        else if kc == KeyCode::BTN_TR2        || kc == KeyCode::new(0x139) { B_R2 }
-                        else { 0 }
-                    } else { 0 };
-                    // HAT absolute axes: modify GP_BITS directly for both directions
-                    let hat_handled = if etype == EventType::ABSOLUTE {
-                        if code == AbsoluteAxisCode::ABS_HAT0X.0 {
-                            Some(if val == -1 { B_LEFT } else if val == 1 { B_RIGHT } else { B_LEFT | B_RIGHT })
-                        } else if code == AbsoluteAxisCode::ABS_HAT0Y.0 {
-                            Some(if val == -1 { B_UP } else if val == 1 { B_DOWN } else { B_UP | B_DOWN })
-                        } else { None }
-                    } else { None };
-                    if let Some(hat_bits) = hat_handled {
-                        if val == -1 {
-                            let set = if code == AbsoluteAxisCode::ABS_HAT0X.0 { B_LEFT } else { B_UP };
-                            let clear = if code == AbsoluteAxisCode::ABS_HAT0X.0 { B_RIGHT } else { B_DOWN };
-                            GP_BITS.fetch_or(set, Ordering::Relaxed);
-                            GP_BITS.fetch_and(!clear, Ordering::Relaxed);
-                        } else if val == 1 {
-                            let set = if code == AbsoluteAxisCode::ABS_HAT0X.0 { B_RIGHT } else { B_DOWN };
-                            let clear = if code == AbsoluteAxisCode::ABS_HAT0X.0 { B_LEFT } else { B_UP };
-                            GP_BITS.fetch_or(set, Ordering::Relaxed);
-                            GP_BITS.fetch_and(!clear, Ordering::Relaxed);
-                        } else {
-                            GP_BITS.fetch_and(!hat_bits, Ordering::Relaxed); // center: clear both
-                        }
-                        eprintln!("[GP] evdev HAT: code=0x{code:04x} val={} bits={hat_bits:08b}", val);
-                        continue;
-                    }
-                    if bit == 0 { continue; }
-
-                    eprintln!("[GP] evdev raw: type={} code=0x{code:04x} val={} bit={}",
-                        etype.0, val, bit);
-
-                    if val != 0 {
-                        GP_BITS.fetch_or(bit, Ordering::Relaxed);
-                    } else {
-                        GP_BITS.fetch_and(!bit, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn set_val(val: i32, neg_bit: u32, pos_bit: u32) -> u32 {
-    match val { -1 => neg_bit, 1 => pos_bit, _ => 0 }
-}
-fn press_flag(val: i32, bit: u32) -> u32 { if val != 0 { bit } else { 0 } }
 
 fn gp_bits_to_msg(bits: u32) -> Option<Message> {
     match bits {
@@ -525,9 +425,9 @@ fn run_ocr_viewer(
     // Don't go further in headless mode — bootstrap thread handles everything
     if headless { println!("Headless: done (bootstrap running in background)"); return Ok(()); }
 
-    // Gamepad input disabled — Steam Deck game mode prevents exclusive evdev grab.
-    // Keyboard controls (arrow keys, Enter, Esc, D/F) are always available.
-    // start_evdev_thread();
+    // Gamepad input is not wired up: Steam Deck game mode prevents exclusive
+    // evdev grabs. Keyboard controls (arrow keys, Enter, Esc, D/F) are always
+    // available.
 
     let bootstrap_rx = Arc::new(std::sync::Mutex::new(Some(bootstrap_rx)));
     let rx_for_update = Arc::clone(&bootstrap_rx);
@@ -579,7 +479,6 @@ fn run_ocr_viewer(
                         BootstrapMsg::DeinflectReady(d) => {
                             state.deinflector = Some(d);
                         }
-                        BootstrapMsg::AnnotationReady(ann) => { /* deprecated */ }
                     }
                 }
             }
@@ -691,7 +590,6 @@ fn run_ocr_viewer(
                     handle_dict_scroll(state, 1.0);
                     *GP_REPEAT_ACTION.lock().unwrap() = Some((a, Instant::now()));
                 }
-                _ => {}
             },
             Message::Back => {
                 if state.alternatives_visible { state.alternatives_visible = false; }
@@ -710,8 +608,6 @@ fn run_ocr_viewer(
                 state.is_zooming = true; state.zoom_idle_frames = 0;
             }
             Message::PanDelta { dx, dy } => { state.state.current_trans_x += dx; state.state.current_trans_y += dy; state.zoom_idle_frames = 0; }
-            Message::PanStart { .. } => { state.is_zooming = true; state.zoom_idle_frames = 0; }
-            Message::PanEnd => { state.is_zooming = false; state.zoom_idle_frames = 0; }
             Message::SetScale { scale } => { state.state.current_scale = scale.clamp(0.5, 5.0); }
             Message::PinchZoom { scale_factor, focus_x, focus_y, prev_focus_x, prev_focus_y, base_offset_y } => {
                 let old = state.state.current_scale;
@@ -801,15 +697,12 @@ fn run_ocr_viewer(
                     }
                 }
             }
-            // OCR streaming messages — receiver drained in update body above
-            Message::OcrDetectionComplete(_) | Message::OcrRecognitionResult(_, _)
-                | Message::OcrAllDone => {}
             Message::Tick => {
                 // Nav graph rebuild is deferred to navigate() — no need
                 // to rebuild here every frame during streaming.
             }
         }
-        if matches!(msg, Message::ZoomOnCursor { .. } | Message::PanDelta { .. } | Message::PanStart { .. } | Message::PinchZoom { .. }) {
+        if matches!(msg, Message::ZoomOnCursor { .. } | Message::PanDelta { .. } | Message::PinchZoom { .. }) {
             state.zoom_idle_frames = 0;
         } else { state.zoom_idle_frames = state.zoom_idle_frames.saturating_add(1); }
         let mut tasks = Vec::new();

@@ -179,10 +179,6 @@ impl<'a> DictionaryImporter<'a> {
         Ok(total_processed)
     }
 
-    /// Simple import without progress callback.
-    pub fn import_zip_simple<P: AsRef<Path>>(&self, path: P) -> Result<usize> {
-        self.import_zip(path, None)
-    }
 
     /// Extract the numeric suffix from a bank filename.
     /// E.g. "term_bank_12.json" -> 12, "kanji_bank_3.json" -> 3.

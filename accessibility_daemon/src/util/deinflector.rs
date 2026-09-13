@@ -12,8 +12,6 @@ pub struct DeinflectionRule {
     pub kana_in: String,
     #[serde(rename = "kanaOut")]
     pub kana_out: String,
-    #[serde(rename = "rulesIn")]
-    pub rules_in: Vec<String>,
     #[serde(rename = "rulesOut")]
     pub rules_out: Vec<String>,
 }
@@ -52,18 +50,6 @@ impl Deinflector {
         Ok(Self { rules })
     }
 
-    /// Load deinflection rules from a JSON string.
-    pub fn from_json_str(json: &str) -> Result<Self> {
-        let rules: Vec<DeinflectionRule> = if json.trim().starts_with('[') {
-            serde_json::from_str(json).context("Failed to parse deinflection rules JSON array")?
-        } else {
-            let map: HashMap<String, Vec<DeinflectionRule>> = serde_json::from_str(json)
-                .context("Failed to parse deinflection rules JSON object")?;
-            map.into_values().flatten().collect()
-        };
-
-        Ok(Self { rules })
-    }
 
     /// Create an empty deinflector (no rules).
     pub fn empty() -> Self {
