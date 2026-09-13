@@ -3,21 +3,16 @@ name = "accessibility_daemon"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = ["ort"]
-ort = ["dep:ort"]
+[build-dependencies]
+# Compiles the shared PP-OCRv6 ncnn core + C ABI (native/ppocr_ncnn)
+cc = "1"
 
 [dependencies]
-# ONNX Runtime for Rust
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["pkg-config", "copy-dylibs", "download-binaries", "tls-rustls", "xnnpack", "std"], optional = true }
-
 # Image processing
 image = "0.25"
 imageproc = "0.25"
 # JPEG XL decoding (the `image` crate has no native JXL support)
 jxl-oxide = { version = "0.12", features = ["image"] }
-ndarray = "0.16"
-ndarray-conv = "0.6.1"
 
 # Font rendering for labels (TTF)
 fontdue = "0.9"

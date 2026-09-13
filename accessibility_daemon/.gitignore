@@ -2,3 +2,5 @@ target/
 ../iced_sources/
 AppDir/
 dist/
+third_party/
+
