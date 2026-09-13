@@ -43,8 +43,9 @@ CPU-only static `libncnn.a`, and installs it to `third_party/ncnn-pc/install`.
   48×W, mult-of-8 zero pad, `(gray/127.5)-1`, lengthwise squish) and CTC
   decode (class remap, top-15, sub-column peak interpolation), plus the
   long-line chunk-and-stitch path above the 2000 targetW gate.
-- `src/ocr_engine.rs`: mobile's det letterbox/ImageNet normalisation, then the
-  PC app's own rotated-box post-processing on the ncnn probability map.
+- `src/ocr_engine.rs`: mobile's det letterbox/ImageNet normalisation plus its
+  furigana line rejection (#28) and ruby-gutter trim (#48), then the PC app's
+  own rotated-box post-processing on the ncnn probability map.
 
 Parity smoke tests: `cargo test synth_` runs the mobile androidTest synth set
 (`test_images/synth/`) through the same models and gates on per-line CER and
