@@ -34,6 +34,10 @@ use iced::widget::image::Handle as ImageHandle;
 
 /// Font fill ratio for OCR character glyphs drawn on the canvas annotation layer.
 const CANVAS_CHAR_RATIO: f32 = 0.9;
+/// Fraction of the line's cross-axis box a glyph's ink may occupy. The
+/// per-line font size is capped so the widest character in the set never
+/// overflows the vertical line's width (or the horizontal line's height).
+const CROSS_FIT_RATIO: f32 = 0.92;
 /// Mobile LineOverlayView `ASCII_GLYPH_SCALE` (#49): the shared line-height
 /// text size renders halfwidth glyphs ~10% oversized next to CJK.
 const ASCII_GLYPH_SCALE: f32 = 0.9;
@@ -91,6 +95,11 @@ pub fn find_jp_font_path() -> Option<std::path::PathBuf> {
 pub struct GlyphCache {
     font: Font,
     cache: HashMap<(char, u32), CachedGlyph>,
+    /// Cross-axis ink ratio (ink extent / font px) per (char, is_vertical):
+    /// width for vertical lines, height for horizontal. Used to cap the
+    /// line's font size so the widest glyph in the set cannot overflow the
+    /// line's cross axis.
+    ink_ratios: HashMap<(char, bool), f32>,
     /// Proportion of the em-box below the baseline (0.0 = baseline at em-bottom, 1.0 = em-top).
     baseline_below: f64,
 }
@@ -108,6 +117,7 @@ impl GlyphCache {
                     return Some(Rc::new(RefCell::new(GlyphCache {
                         font,
                         cache: HashMap::new(),
+                        ink_ratios: HashMap::new(),
                         baseline_below,
                     })));
                 }
@@ -156,6 +166,21 @@ impl GlyphCache {
             let yellow = Self::make_handle(w, h, &coverage, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2);
             CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
         });
+    }
+
+    /// Cross-axis ink extent per font pixel: width for vertical lines, height
+    /// for horizontal ones. Measured once per (char, orientation) at a
+    /// reference size, so the per-line size cap costs only lookups per frame.
+    fn cross_ink_ratio(&mut self, ch: char, vertical: bool) -> f32 {
+        let key = (ch, vertical);
+        if let Some(r) = self.ink_ratios.get(&key) {
+            return *r;
+        }
+        let (metrics, _) = self.font.rasterize(ch, 64.0);
+        let ink = if vertical { metrics.width } else { metrics.height } as f32;
+        let r = ink / 64.0;
+        self.ink_ratios.insert(key, r);
+        r
     }
 }
 
@@ -243,7 +268,12 @@ fn unrotate_box_size(width: f32, height: f32, angle: f32) -> (f32, f32) {
 /// pitch is the honest measure. Falls back to the median un-rotated box
 /// height (mobile's `fixedSize`) when a pitch cannot be measured at all
 /// (single-char lines).
-fn line_font_em_px(line: &LineResult, quad_angle: Option<f32>, total_scale: f32) -> u32 {
+fn line_font_em_px(
+    line: &LineResult,
+    quad_angle: Option<f32>,
+    total_scale: f32,
+    cache: Option<&RefCell<GlyphCache>>,
+) -> u32 {
     let (ax, ay) = match (quad_angle, line.is_vertical) {
         (Some(a), _) => (a.cos(), a.sin()),
         (None, true) => (0.0, 1.0),
@@ -277,6 +307,24 @@ fn line_font_em_px(line: &LineResult, quad_angle: Option<f32>, total_scale: f32)
     }
     if em_img <= 0.0 {
         em_img = cross_med * CANVAS_CHAR_RATIO;
+    }
+    // Uniform cross-axis cap: the widest glyph in the set must fit inside
+    // the line's cross axis (column width for vertical, line height for
+    // horizontal). One factor for the whole line, so every glyph keeps the
+    // same size — this replaces the old per-character shrink-to-box fit.
+    if let Some(cache) = cache {
+        if cross_med > 0.0 {
+            let mut max_ratio = 0.0f32;
+            let mut c = cache.borrow_mut();
+            for ch in line.text.chars() {
+                let r = c.cross_ink_ratio(ch, line.is_vertical);
+                let r = if is_half_width(ch) { r * ASCII_GLYPH_SCALE } else { r };
+                max_ratio = max_ratio.max(r);
+            }
+            if max_ratio > 0.0 {
+                em_img = em_img.min(CROSS_FIT_RATIO * cross_med / max_ratio);
+            }
+        }
     }
     (em_img * total_scale).round().clamp(4.0, 1024.0) as u32
 }
@@ -826,7 +874,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                     // em boxes, so their true dimensions are recovered
                     // before sizing.
                     let quad_angle = annotation.quad.filter(|q| q.is_rotated()).map(|q| q.angle);
-                    let em_px = line_font_em_px(line, quad_angle, total_scale);
+                    let em_px = line_font_em_px(line, quad_angle, total_scale, Some(self.glyph_cache.as_ref()));
                     let ref_ink = draw_glyph(&self.glyph_cache, 'あ', em_px, false)
                         .map(|g| (g.w as f32, g.h as f32, g.xmin as f32, g.ymin as f32));
 
@@ -1513,7 +1561,7 @@ impl OcrViewer {
                 // computing from potentially-not-yet-loaded img_w/img_h (1 vs real).
                 let total_scale = self.last_total_scale.get();
                 // Exactly the draw pass's normalized per-line em size.
-                let px = line_font_em_px(line, quad_angle, total_scale);
+                let px = line_font_em_px(line, quad_angle, total_scale, Some(gc.as_ref()));
                 let mut cache = gc.borrow_mut();
                 cache.ensure_glyph('あ', px);
                 for ch in line.text.chars() {
@@ -2368,7 +2416,7 @@ mod tests {
             chunk_boxes: vec![],
         };
         // Centers 30/50/70: pitch 20 despite 60px-tall boxes.
-        assert_eq!(line_font_em_px(&line, None, 1.0), 20);
+        assert_eq!(line_font_em_px(&line, None, 1.0, None), 20);
         // Single char cannot measure a pitch; median box height × 0.9.
         let single = LineResult {
             text: "あ".into(),
@@ -2378,7 +2426,7 @@ mod tests {
             is_vertical: false,
             chunk_boxes: vec![],
         };
-        assert_eq!(line_font_em_px(&single, None, 1.0), 54);
+        assert_eq!(line_font_em_px(&single, None, 1.0, None), 54);
 
         // Tracked ASCII: the halfwidth-normalized pitch (70) exceeds the
         // line box, so the raw pitch is the honest measure instead.
@@ -2392,7 +2440,38 @@ mod tests {
             is_vertical: false,
             chunk_boxes: vec![],
         };
-        assert_eq!(line_font_em_px(&tracked, None, 1.0), 35);
+        assert_eq!(line_font_em_px(&tracked, None, 1.0, None), 35);
+    }
+
+    /// Vertical lines: one size for the whole line, capped so the widest
+    /// glyph's ink cannot overflow the column width — even when the measured
+    /// pitch is larger than the column.
+    #[test]
+    fn vertical_line_size_is_capped_to_column_width() {
+        let cache = GlyphCache::new().expect("bundled JP font");
+        let line = LineResult {
+            text: "翻訳".into(),
+            char_boxes: vec![
+                BoundingBox::new(0, 0, 40, 80, 1.0),
+                BoundingBox::new(0, 80, 40, 80, 1.0),
+            ],
+            alternatives: vec![],
+            sample_txt: None,
+            is_vertical: true,
+            chunk_boxes: vec![],
+        };
+        // Pitch 80px in a 40px column: the cap must pull the size down.
+        let px = line_font_em_px(&line, None, 1.0, Some(&cache)) as f32;
+        assert!(px < 80.0, "pitch was not capped: {px}");
+        let mut c = cache.borrow_mut();
+        for ch in line.text.chars() {
+            let ratio = c.cross_ink_ratio(ch, true);
+            assert!(
+                ratio * px <= 40.0 * CROSS_FIT_RATIO + 1.0,
+                "{ch:?}: ink {:.1}px overflows the 40px column (font {px})",
+                ratio * px
+            );
+        }
     }
 
     #[test]
