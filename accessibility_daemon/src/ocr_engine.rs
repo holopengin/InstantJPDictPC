@@ -17,6 +17,24 @@ const PPOCR_DET_BOX_THRESH: f32 = 0.8;
 const PPOCR_DET_UNCLIP_RATIO: f32 = 1.5;
 const X_OVERLAP_THRESHOLD: f32 = 0.3;
 
+// Furigana (ruby) filter (#28) — conservative: better to recognize ruby than
+// to drop real small text. Matching runs on RAW contour geometry (pre-unclip:
+// unclip padding fabricates overlap for stacked fragments); only the gap test
+// uses UNCLIPPED boxes (raw gutters are real pixels, unclip closes them).
+const FURIGANA_SIZE_RATIO: f32 = 0.3; // small long-side < 30% of large long-side
+const FURIGANA_THIN_RATIO: f32 = 0.75; // horizontal ruby runs long but thin
+const FURIGANA_HSHORT_RATIO: f32 = 0.85; // horizontal short-side ceiling
+const FURIGANA_WIDTH_RATIO: f32 = 0.65; // vertical small short-side ceiling
+const FURIGANA_GAP_RATIO: f32 = 0.5;
+const FURIGANA_OVERLAP_RATIO: f32 = 0.5;
+const VERTICAL_MIN_ASPECT: f32 = 1.25;
+// Absolute ceiling: real short columns dwarf ruby runs even when the ratio
+// matches — ruby longer than 12% of the image side is not ruby.
+const FURIGANA_MAX_FRAC: f32 = 0.12;
+// Absolute floor on the annotated box: ruby hugs full-size body text, not
+// compact blocks (logo boxes, badges).
+const FURIGANA_BIG_MIN_FRAC: f32 = 0.2;
+
 // Box fill ratio when rendering glyphs inside detected boxes. 1.0 means match box height, <1.0 leave padding.
 const BOX_FILL_RATIO: f32 = 0.9;
 
@@ -181,6 +199,281 @@ fn rotate_crop(img: &DynamicImage, angle: f32) -> DynamicImage {
     DynamicImage::ImageRgba8(out)
 }
 
+/// Mobile shared orientation rule (#28): near-square boxes count as vertical
+/// for the ruby checks, so lone upright characters are tested against both
+/// rules.
+fn is_vertical_box(b: &BoundingBox) -> bool {
+    b.h as f32 >= b.w as f32 * VERTICAL_MIN_ASPECT
+}
+
+fn is_square_box(b: &BoundingBox) -> bool {
+    let (w, h) = (b.w as f32, b.h as f32);
+    w.min(h) >= w.max(h) / VERTICAL_MIN_ASPECT
+}
+
+fn overlap_len(a1: i32, a2: i32, b1: i32, b2: i32) -> i32 {
+    (a2.min(b2) - a1.max(b1)).max(0)
+}
+
+fn gap_len(a1: i32, a2: i32, b1: i32, b2: i32) -> i32 {
+    (a1.max(b1) - a2.min(b2)).max(0)
+}
+
+/// Tiny vertical box hugging a much larger vertical box (either side) (#28).
+/// The center must lie OUTSIDE the big box: stacked column fragments (tail of
+/// the column above/below, overlapping only via unclip padding) share its
+/// x-range. Size/center/overlap use RAW contour geometry; gap uses UNCLIPPED
+/// (raw gutters are real pixels, unclip closes them to ruby distance).
+fn is_ruby_vertical(
+    s_raw: &BoundingBox,
+    b_raw: &BoundingBox,
+    s_un: &BoundingBox,
+    b_un: &BoundingBox,
+    img_h: i32,
+) -> bool {
+    let img_h = img_h as f32;
+    let (sh, bh) = (s_raw.h as f32, b_raw.h as f32);
+    if bh < img_h * FURIGANA_BIG_MIN_FRAC {
+        return false;
+    }
+    if sh >= bh * FURIGANA_SIZE_RATIO {
+        return false;
+    }
+    if sh >= img_h * FURIGANA_MAX_FRAC {
+        return false;
+    }
+    if s_un.w as f32 >= b_un.w as f32 * FURIGANA_WIDTH_RATIO {
+        return false;
+    }
+    let cx = (s_raw.x + s_raw.x + s_raw.w) / 2;
+    if cx >= b_raw.x && cx <= b_raw.x + b_raw.w {
+        return false;
+    }
+    if (gap_len(s_un.x, s_un.x + s_un.w, b_un.x, b_un.x + b_un.w) as f32)
+        > b_un.w as f32 * FURIGANA_GAP_RATIO
+    {
+        return false;
+    }
+    if (overlap_len(s_raw.y, s_raw.y + s_raw.h, b_raw.y, b_raw.y + b_raw.h) as f32)
+        < sh * FURIGANA_OVERLAP_RATIO
+    {
+        return false;
+    }
+    true
+}
+
+/// Tiny horizontal box right above a much larger horizontal box (#28).
+/// Judged by THINNESS alone, not length: horizontal ruby runs long or short,
+/// but its glyphs are always smaller.
+fn is_ruby_horizontal(
+    s_raw: &BoundingBox,
+    b_raw: &BoundingBox,
+    s_un: &BoundingBox,
+    b_un: &BoundingBox,
+    img_w: i32,
+    img_h: i32,
+) -> bool {
+    let (img_w, img_h) = (img_w as f32, img_h as f32);
+    if (b_raw.w as f32) < img_w * FURIGANA_BIG_MIN_FRAC {
+        return false;
+    }
+    if (s_raw.h as f32) >= b_raw.h as f32 * FURIGANA_THIN_RATIO {
+        return false;
+    }
+    if s_raw.h as f32 >= img_h * FURIGANA_MAX_FRAC {
+        return false;
+    }
+    if (s_un.h as f32) >= b_un.h as f32 * FURIGANA_HSHORT_RATIO {
+        return false;
+    }
+    // Above-ness on RAW geometry: unclip grows both boxes toward each other,
+    // flipping genuinely-above ruby to overlapping.
+    if s_raw.y + s_raw.h > b_raw.y + 2 {
+        return false;
+    }
+    if (b_un.y - (s_un.y + s_un.h)) as f32 > (b_un.h as f32) * FURIGANA_GAP_RATIO {
+        return false;
+    }
+    if (overlap_len(s_raw.x, s_raw.x + s_raw.w, b_raw.x, b_raw.x + b_raw.w) as f32)
+        < s_raw.w as f32 * FURIGANA_OVERLAP_RATIO
+    {
+        return false;
+    }
+    true
+}
+
+/// Mobile `filterFurigana` (#28): keep-flags for likely-furigana boxes.
+/// `raw`/`uncl` are index-aligned (raw contour AABBs vs unclipped boxes).
+fn filter_furigana(raw: &[BoundingBox], uncl: &[BoundingBox], img_w: i32, img_h: i32) -> Vec<bool> {
+    if raw.len() < 2 {
+        return vec![true; raw.len()];
+    }
+    (0..raw.len())
+        .map(|i| {
+            let small = &raw[i];
+            let check_vert = is_vertical_box(small) || is_square_box(small);
+            let check_horiz = !is_vertical_box(small) || is_square_box(small);
+            !raw.iter().enumerate().any(|(j, big)| {
+                j != i
+                    && ((check_vert
+                        && is_vertical_box(big)
+                        && is_ruby_vertical(&raw[i], big, &uncl[i], &uncl[j], img_h))
+                        || (check_horiz
+                            && !is_vertical_box(big)
+                            && is_ruby_horizontal(&raw[i], big, &uncl[i], &uncl[j], img_w, img_h)))
+            })
+        })
+        .collect()
+}
+
+/// Mobile `findRubyGutterCut` (#48): cut x (image coords) for a ruby-widened
+/// vertical box, or None to keep. Per-column ink profile over the full box
+/// height; the leftmost clean gutter (>= 3 near-empty columns) with ink
+/// following it inside [L+0.40W, L+0.80W] is the main/ruby gutter — cut at
+/// its start. Touching ruby with no clean gutter but a thin spot falls back
+/// to half width. Polarity/thresholds shared with the recognizer.
+fn find_ruby_gutter_cut(b: &BoundingBox, image: &DynamicImage) -> Option<i32> {
+    let (iw, ih) = (image.width() as i32, image.height() as i32);
+    let x0 = b.x.clamp(0, iw - 1);
+    let x1 = (b.x + b.w).clamp(1, iw);
+    let y0 = b.y.clamp(0, ih - 1);
+    let y1 = (b.y + b.h).clamp(1, ih);
+    let bw = (x1 - x0) as u32;
+    let bh = (y1 - y0) as u32;
+    if bw < 24 || bh < 64 {
+        return None;
+    }
+    let (bw, bh) = (bw as usize, bh as usize);
+    let crop = image.crop_imm(x0 as u32, y0 as u32, bw as u32, bh as u32).to_rgb8();
+    let lum: Vec<f32> = crop
+        .pixels()
+        .map(|p| (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0)
+        .collect();
+    // Background polarity from border samples (shared with snapping).
+    let mut border: Vec<f32> = Vec::new();
+    let mut bi = 0usize;
+    while bi < bw {
+        border.push(lum[bi]);
+        border.push(lum[(bh - 1) * bw + bi]);
+        bi += 7;
+    }
+    bi = 0;
+    while bi < bh {
+        border.push(lum[bi * bw]);
+        border.push(lum[bi * bw + bw - 1]);
+        bi += 7;
+    }
+    if border.is_empty() {
+        return None;
+    }
+    border.sort_by(f32::total_cmp);
+    let bg_light = border[border.len() / 2] > 128.0;
+    let is_ink = |v: f32| if bg_light { v < 110.0 } else { v > 145.0 };
+    // Per-column ink fraction over the full box height.
+    let frac: Vec<f32> = (0..bw)
+        .map(|x| {
+            let mut m = 0usize;
+            for y in 0..bh {
+                if is_ink(lum[y * bw + x]) {
+                    m += 1;
+                }
+            }
+            m as f32 / bh as f32
+        })
+        .collect();
+    let lo = ((bw as f32 * 0.40) as usize).min(bw - 1);
+    let hi = (((bw as f32 * 0.80) as usize).max(lo + 1)).min(bw);
+    // Leftmost clean gutter with ink following it (not trailing padding).
+    let mut x = lo;
+    while x + 2 < hi {
+        if frac[x] < 0.04 && frac[x + 1] < 0.04 && frac[x + 2] < 0.04 {
+            let mut follows = false;
+            for k in x + 3..(x + 11).min(bw) {
+                if frac[k] >= 0.04 {
+                    follows = true;
+                    break;
+                }
+            }
+            if follows {
+                return Some(x0 + x as i32);
+            }
+            x += 3;
+        } else {
+            x += 1;
+        }
+    }
+    // Touching-ruby fallback: thin spot → half width ("remove the right half").
+    let mut min_f = f32::MAX;
+    for k in lo..hi {
+        min_f = min_f.min(frac[k]);
+    }
+    if min_f < 0.06 {
+        return Some(x0 + (bw / 2) as i32);
+    }
+    None
+}
+
+/// Mobile `trimRubyGutterVertical` (#48): furigana-widened vertical boxes are
+/// cut back to the main column here. A vertical box is a candidate when wider
+/// than 1.35x the median vertical width with a removable strip >= 12px; the
+/// cut must keep the left 40% and leave 8px on the right. Rotated quads are
+/// left alone (mobile has no rotated boxes; AABB-space cuts would desync).
+/// Returns the number of boxes trimmed.
+fn trim_ruby_gutter_vertical(
+    pairs: &mut Vec<(BoundingBox, RotatedBox)>,
+    image: &DynamicImage,
+) -> usize {
+    let mut vert_w: Vec<i32> = pairs
+        .iter()
+        .filter(|(b, _)| is_vertical_box(b))
+        .map(|(b, _)| b.w)
+        .collect();
+    if vert_w.len() < 2 {
+        return 0;
+    }
+    vert_w.sort_unstable();
+    let med_w = vert_w[vert_w.len() / 2];
+    if med_w <= 0 {
+        return 0;
+    }
+    let mut trimmed = 0usize;
+    for (b, r) in pairs.iter_mut() {
+        if r.is_rotated() || !is_vertical_box(b) {
+            continue;
+        }
+        let w = b.w;
+        if (w as f32) <= med_w as f32 * 1.35 || w - med_w < 12 {
+            continue;
+        }
+        let Some(cut) = find_ruby_gutter_cut(b, image) else {
+            continue;
+        };
+        if cut <= b.x + 20 || cut >= b.x + b.w - 8 {
+            continue;
+        }
+        if ((cut - b.x) as f32) < (w as f32 * 0.4).round() {
+            continue;
+        }
+        eprintln!(
+            "[PP-OCR DET] rubyTrim {}x{}@({},{}) -> w={} (medW={})",
+            w,
+            b.h,
+            b.x,
+            b.y,
+            cut - b.x,
+            med_w
+        );
+        let delta = (b.x + b.w - cut) as f32;
+        b.w = cut - b.x;
+        // Non-rotated vertical: the short side is the width; keep the quad
+        // in sync so crops/char boxes follow the trim.
+        r.h -= delta;
+        r.cx -= delta / 2.0;
+        trimmed += 1;
+    }
+    trimmed
+}
+
 impl OcrEngine {
     pub fn new(model_dir: &str, recognition_mode: RecognitionMode, batch_size: usize) -> Result<Self> {
         let model_path = Path::new(model_dir);
@@ -337,6 +630,10 @@ impl OcrEngine {
             .context("Failed to create binary image")?;
         let contours = contours::find_contours_with_threshold::<i32>(&binary_img, 128);
         let mut raw_pairs: Vec<(BoundingBox, RotatedBox)> = Vec::new();
+        // Index-aligned with raw_pairs: pre-unclip raw contour AABBs (mobile
+        // rawPreBoxes) and unclipped AABBs (rawBoxes) for the furigana filter.
+        let mut pre_boxes: Vec<BoundingBox> = Vec::new();
+        let mut uncl_boxes: Vec<BoundingBox> = Vec::new();
 
         for contour in &contours {
             if contour.points.len() < 3 { continue; } // noise filter
@@ -364,6 +661,12 @@ impl OcrEngine {
                 .unwrap_or(48.0);
             let contour_w_det = rw;
             let contour_h_det = rh;
+            // Raw contour box mapped to original image coords, BEFORE the
+            // unclip expansion — the furigana filter's geometry (#28).
+            let raw_cx = (cx - img_left as f32) * scale_w;
+            let raw_cy = (cy - img_top as f32) * scale_h;
+            let raw_w = rw * scale_w;
+            let raw_h = rh * scale_h;
             // Expansion in ORIGINAL pixels, capped in ORIGINAL pixels.
             let expand_orig = (expand * scale_w).min(cap);
             let rw = rw * scale_w + 2.0 * expand_orig;
@@ -414,7 +717,41 @@ impl OcrEngine {
                 bh.round() as i32,
                 PPOCR_DET_BOX_THRESH,
             );
+            let raw_rot = RotatedBox::new(raw_cx, raw_cy, raw_w, raw_h, angle, PPOCR_DET_BOX_THRESH);
+            let (rx, ry, rww, rhh) = raw_rot.aabb();
+            pre_boxes.push(BoundingBox::new(
+                rx.round() as i32,
+                ry.round() as i32,
+                rww.round() as i32,
+                rhh.round() as i32,
+                PPOCR_DET_BOX_THRESH,
+            ));
+            uncl_boxes.push(bbox.clone());
             raw_pairs.push((bbox, rot));
+        }
+
+        // Furigana line rejection (#28): drop boxes that are ruby to a nearby
+        // larger box. Mobile matches on raw contour geometry (pre-unclip, so
+        // stacked column fragments are not welded together by unclip padding)
+        // and uses the unclipped boxes only for the gap test.
+        let keep = filter_furigana(&pre_boxes, &uncl_boxes, orig_w as i32, orig_h as i32);
+        let dropped: usize = keep.iter().filter(|k| !**k).count();
+        if dropped > 0 {
+            for (pre, k) in pre_boxes.iter().zip(keep.iter()) {
+                if !k {
+                    eprintln!(
+                        "[PP-OCR DET] furigana dropped {}x{}@({}, {})",
+                        pre.w, pre.h, pre.x, pre.y
+                    );
+                }
+            }
+            let mut idx = 0usize;
+            raw_pairs.retain(|_| {
+                let k = keep[idx];
+                idx += 1;
+                k
+            });
+            eprintln!("[PP-OCR DET] furigana {} -> {} boxes", pre_boxes.len(), raw_pairs.len());
         }
 
         // Debug: print raw detected boxes
@@ -432,10 +769,30 @@ impl OcrEngine {
         let mut pp_pairs = sorted;
         // Filter out degenerate tiny boxes (noise specks)
         pp_pairs.retain(|(b, _)| b.w >= 10 && b.h >= 10);
-        // 1. Shrink vertical box widths by 10% (centered)
-        for (b, _) in pp_pairs.iter_mut().filter(|(b, _)| b.h > b.w) {
-            let shrink = (b.w as f32 * 0.05).round() as i32;
-            b.x += shrink;
+        // 1. Shrink vertical box widths by 10% (centered; mobile shrink).
+        // The old one-sided x offset never shrank the width, which both
+        // skewed the box and inflated the ruby-trim reference width.
+        for (b, r) in pp_pairs.iter_mut().filter(|(b, _)| b.h > b.w) {
+            let shrink = (b.w as f32 * 0.05).round();
+            if r.h > 2.0 * shrink {
+                r.h -= 2.0 * shrink;
+                let (nx, ny, nw, nh) = r.aabb();
+                *b = BoundingBox::new(
+                    nx.round() as i32,
+                    ny.round() as i32,
+                    nw.round() as i32,
+                    nh.round() as i32,
+                    b.confidence,
+                );
+            }
+        }
+        // 1b. Ruby-gutter trim (#48): detector boxes that swallowed the
+        // furigana strip (~2x normal column width) are cut back to the main
+        // column here, before cropping, so the ruby width never enters
+        // recognition.
+        let trimmed = trim_ruby_gutter_vertical(&mut pp_pairs, image);
+        if trimmed > 0 {
+            eprintln!("[PP-OCR DET] rubyTrim applied to {trimmed} box(es)");
         }
         // 2. Stacked-overlap split — DISABLED: with merging off, detection
         // already produces per-line boxes; splitting stacked lines at the
@@ -1336,5 +1693,88 @@ mod tests {
             worst.1,
             worst.0
         );
+    }
+    /// Mobile #28's filter: small ruby beside/above a large line is dropped,
+    /// but a stacked column fragment (center inside the big box's x-range)
+    /// and a merely-short real line survive.
+    #[test]
+    fn furigana_filter_drops_ruby_keeps_stacked_fragments() {
+        // Vertical: ruby to the right of a big column.
+        let big_raw = BoundingBox::new(100, 100, 50, 300, 1.0);
+        let big_un = BoundingBox::new(90, 90, 70, 320, 1.0);
+        let ruby_raw = BoundingBox::new(170, 150, 30, 80, 1.0);
+        let ruby_un = BoundingBox::new(165, 145, 40, 90, 1.0);
+        // Stacked fragment: same x-range as the big column -> never ruby.
+        let stack_raw = BoundingBox::new(110, 150, 30, 80, 1.0);
+        let stack_un = BoundingBox::new(100, 145, 50, 90, 1.0);
+        let raw = vec![big_raw, ruby_raw, stack_raw];
+        let un = vec![big_un, ruby_un, stack_un];
+        assert_eq!(
+            filter_furigana(&raw, &un, 1000, 1000),
+            vec![true, false, true],
+            "vertical ruby must be dropped, stacked fragment kept"
+        );
+
+        // Horizontal: thin ruby above a big line is dropped; a taller short
+        // line above it is not.
+        let hbig_raw = BoundingBox::new(100, 100, 400, 60, 1.0);
+        let hbig_un = BoundingBox::new(90, 90, 420, 80, 1.0);
+        let hruby_raw = BoundingBox::new(150, 60, 200, 20, 1.0);
+        let hruby_un = BoundingBox::new(140, 55, 220, 25, 1.0);
+        let tall_raw = BoundingBox::new(600, 60, 200, 50, 1.0);
+        let tall_un = BoundingBox::new(590, 55, 220, 55, 1.0);
+        let raw = vec![hbig_raw, hruby_raw, tall_raw];
+        let un = vec![hbig_un, hruby_un, tall_un];
+        assert_eq!(
+            filter_furigana(&raw, &un, 1000, 1000),
+            vec![true, false, true],
+            "horizontal ruby must be dropped, tall short line kept"
+        );
+    }
+
+    /// Mobile #48's trim: a column that swallowed a ruby strip (clean gutter
+    /// between main and ruby ink) is cut at the gutter start, and the rotated
+    /// rect stays in sync with the AABB.
+    #[test]
+    fn ruby_gutter_trim_cuts_the_ruby_side() {
+        let mut img = image::RgbaImage::from_pixel(400, 300, Rgba([255, 255, 255, 255]));
+        for y in 10..230 {
+            for x in 30..56 {
+                img.put_pixel(x, y, Rgba([0, 0, 0, 255])); // main column ink
+            }
+            for x in 66..90 {
+                img.put_pixel(x, y, Rgba([0, 0, 0, 255])); // ruby ink
+            }
+            for x in 200..260 {
+                img.put_pixel(x, y, Rgba([0, 0, 0, 255])); // normal box ink
+            }
+            for x in 300..360 {
+                img.put_pixel(x, y, Rgba([0, 0, 0, 255])); // normal box ink
+            }
+        }
+        let image = DynamicImage::ImageRgba8(img);
+        // Three vertical boxes so the median width is the normal 60, and one
+        // wide (120) swallowed the ruby.
+        let mut pairs = vec![
+            (
+                BoundingBox::new(0, 0, 120, 240, 1.0),
+                RotatedBox::new(60.0, 120.0, 240.0, 120.0, std::f32::consts::FRAC_PI_2, 1.0),
+            ),
+            (
+                BoundingBox::new(200, 0, 60, 240, 1.0),
+                RotatedBox::new(230.0, 120.0, 240.0, 60.0, std::f32::consts::FRAC_PI_2, 1.0),
+            ),
+            (
+                BoundingBox::new(300, 0, 60, 240, 1.0),
+                RotatedBox::new(330.0, 120.0, 240.0, 60.0, std::f32::consts::FRAC_PI_2, 1.0),
+            ),
+        ];
+        assert_eq!(trim_ruby_gutter_vertical(&mut pairs, &image), 1);
+        // Gutter starts at x=56; the quad is a +90° vertical (h = width).
+        assert_eq!(pairs[0].0.w, 56);
+        assert!((pairs[0].1.h - 56.0).abs() < 0.01, "quad h {}", pairs[0].1.h);
+        assert!((pairs[0].1.cx - 28.0).abs() < 0.01, "quad cx {}", pairs[0].1.cx);
+        assert_eq!(pairs[1].0.w, 60);
+        assert_eq!(pairs[2].0.w, 60);
     }
 }
