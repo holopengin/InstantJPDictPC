@@ -27,7 +27,7 @@ use crate::data::models::DictionaryEntry;
 use crate::models::*;
 use crate::overlay_state::OcrOverlayState;
 use crate::util::deinflector::Deinflector;
-use crate::util::japanese::to_vertical_glyph;
+use crate::util::japanese::{estimate_em, is_half_width, to_vertical_glyph};
 
 use fontdue::Font;
 use iced::widget::image::Handle as ImageHandle;
@@ -231,12 +231,68 @@ fn unrotate_box_size(width: f32, height: f32, angle: f32) -> (f32, f32) {
     (w.max(1.0), h.max(1.0))
 }
 
-/// Mobile `OcrEngine.isHalfWidth`: ASCII + halfwidth katakana get the 0.5em
-/// advance-box treatment (positioning); their ink is fitted against the
-/// doubled width limit with a 0.9 trim.
-fn is_half_width(ch: char) -> bool {
-    let cp = ch as u32;
-    cp <= 0x7E || (0xFF61..=0xFFDC).contains(&cp)
+/// The one font pixel size every glyph on the line draws at. The em comes
+/// from the char centres projected onto the reading axis (the line's own
+/// direction when rotated, +x horizontal, +y vertical), so the rendered size
+/// no longer varies with each char box — and it no longer inherits the
+/// detector's unclip padding the way a box-height estimate does.
+///
+/// A font cannot be larger than the line it sits in: when the normalized
+/// estimate exceeds the line box (heavily tracked text, e.g. wide-spaced
+/// ASCII UI labels, defeats the halfwidth 0.5em assumption), the raw median
+/// pitch is the honest measure. Falls back to the median un-rotated box
+/// height (mobile's `fixedSize`) when a pitch cannot be measured at all
+/// (single-char lines).
+fn line_font_em_px(line: &LineResult, quad_angle: Option<f32>, total_scale: f32) -> u32 {
+    let (ax, ay) = match (quad_angle, line.is_vertical) {
+        (Some(a), _) => (a.cos(), a.sin()),
+        (None, true) => (0.0, 1.0),
+        (None, false) => (1.0, 0.0),
+    };
+    let centers: Vec<f32> = line
+        .char_boxes
+        .iter()
+        .map(|b| (b.x as f32 + b.w as f32 / 2.0) * ax + (b.y as f32 + b.h as f32 / 2.0) * ay)
+        .collect();
+    // Cross-axis (un-rotated) box size: the line's own cap on the em.
+    let mut cross: Vec<f32> = line
+        .char_boxes
+        .iter()
+        .map(|b| {
+            let (bw, bh) = match quad_angle {
+                Some(angle) => unrotate_box_size(b.w as f32, b.h as f32, angle),
+                None => (b.w as f32, b.h as f32),
+            };
+            if line.is_vertical { bw } else { bh }
+        })
+        .collect();
+    cross.sort_by(f32::total_cmp);
+    let cross_med = cross.get(cross.len() / 2).copied().unwrap_or(0.0);
+
+    let mut em_img = estimate_em(&line.text, &centers);
+    if em_img > 0.0 && cross_med > 0.0 && em_img > cross_med {
+        // The halfwidth normalization doubled a tracked advance; the raw
+        // pitch (all chars about one em apart) is the better measure.
+        em_img = raw_median_gap(&centers);
+    }
+    if em_img <= 0.0 {
+        em_img = cross_med * CANVAS_CHAR_RATIO;
+    }
+    (em_img * total_scale).round().clamp(4.0, 1024.0) as u32
+}
+
+/// Median of the consecutive centre gaps along the reading axis, without the
+/// halfwidth normalization.
+fn raw_median_gap(centers: &[f32]) -> f32 {
+    let mut gaps: Vec<f32> = (0..centers.len().saturating_sub(1))
+        .map(|i| (centers[i + 1] - centers[i]).abs())
+        .filter(|g| *g > 0.0)
+        .collect();
+    if gaps.is_empty() {
+        return 0.0;
+    }
+    gaps.sort_by(f32::total_cmp);
+    gaps[gaps.len() / 2]
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -761,27 +817,16 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 }
 
                 if let Some(line) = &annotation.line {
-                    // Mobile LineOverlayView (#49) metrics: one em size per
-                    // line from the tallest char box (the line height), drawn
-                    // at 0.9 em; glyphs keep their natural font metrics and
-                    // only shrink when their ink exceeds the box. The char
-                    // boxes are CTC em columns, so ink-fitting them (the old
-                    // BOOOCR tight-box path) scaled every glyph up — and
-                    // punctuation, whose ink is a fraction of the em, went
-                    // gigantic. `あ` is the cross-axis reference: glyphs sit
-                    // on their natural baseline relative to its ink centre.
-                    // Rotated lines carry AABBs of the rotated em boxes, so
-                    // their true dimensions are recovered before sizing.
+                    // One normalized em size per line (mobile estimateEm,
+                    // #49): every glyph draws at the same size measured from
+                    // the line's own pitch, rather than being fitted to its
+                    // detector-padded box. `あ` is the cross-axis reference:
+                    // glyphs sit on their natural baseline relative to its
+                    // ink centre. Rotated lines carry AABBs of the rotated
+                    // em boxes, so their true dimensions are recovered
+                    // before sizing.
                     let quad_angle = annotation.quad.filter(|q| q.is_rotated()).map(|q| q.angle);
-                    let line_em = line
-                        .char_boxes
-                        .iter()
-                        .map(|b| match quad_angle {
-                            Some(angle) => unrotate_box_size(b.w as f32, b.h as f32, angle).1,
-                            None => b.h as f32,
-                        })
-                        .fold(0.0f32, f32::max);
-                    let em_px = (line_em * total_scale * CANVAS_CHAR_RATIO).round().clamp(4.0, 1024.0) as u32;
+                    let em_px = line_font_em_px(line, quad_angle, total_scale);
                     let ref_ink = draw_glyph(&self.glyph_cache, 'あ', em_px, false)
                         .map(|g| (g.w as f32, g.h as f32, g.xmin as f32, g.ymin as f32));
 
@@ -811,30 +856,9 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                             reference,
                         );
 
-                        // Shrink-only fit (mobile): horizontal fits width,
-                        // vertical fits height; halfwidth ink may overrun its
-                        // 0.5em advance box by design, so it gets the doubled
-                        // limit and the 0.9 trim.
-                        let (box_w, box_h) = match quad_angle {
-                            Some(angle) => unrotate_box_size(sz_c.width, sz_c.height, angle),
-                            None => (sz_c.width, sz_c.height),
-                        };
-                        let is_half = is_half_width(ch);
-                        let max_w = box_w * 0.92;
-                        let max_h = box_h * 0.92;
-                        let mut scale = 1.0f32;
-                        if line.is_vertical {
-                            let limit = if is_half { max_h * 2.0 } else { max_h };
-                            if gh > limit {
-                                scale = limit / gh;
-                            }
-                        } else {
-                            let limit = if is_half { max_w * 2.0 } else { max_w };
-                            if gw > limit {
-                                scale = limit / gw;
-                            }
-                        }
-                        let draw_scale = scale * if is_half { ASCII_GLYPH_SCALE } else { 1.0f32 };
+                        // Natural size; only the halfwidth trim varies per
+                        // glyph (mobile #49), never a shrink-to-box fit.
+                        let draw_scale = if is_half_width(ch) { ASCII_GLYPH_SCALE } else { 1.0f32 };
                         let off_x = (dx - cx) * draw_scale;
                         let off_y = (dy - cy) * draw_scale;
                         let draw_size = Size::new(gw * draw_scale, gh * draw_scale);
@@ -1488,18 +1512,8 @@ impl OcrViewer {
                 // Use cached total_scale from last view() frame — avoids
                 // computing from potentially-not-yet-loaded img_w/img_h (1 vs real).
                 let total_scale = self.last_total_scale.get();
-                // Same per-line em size the draw pass uses (mobile
-                // LineOverlayView fixedSize): tallest char box at 0.9 em,
-                // with rotated AABBs un-rotated first.
-                let line_em = line
-                    .char_boxes
-                    .iter()
-                    .map(|b| match quad_angle {
-                        Some(angle) => unrotate_box_size(b.w as f32, b.h as f32, angle).1,
-                        None => b.h as f32,
-                    })
-                    .fold(0.0f32, f32::max);
-                let px = (line_em * total_scale * CANVAS_CHAR_RATIO).round().clamp(4.0, 1024.0) as u32;
+                // Exactly the draw pass's normalized per-line em size.
+                let px = line_font_em_px(line, quad_angle, total_scale);
                 let mut cache = gc.borrow_mut();
                 cache.ensure_glyph('あ', px);
                 for ch in line.text.chars() {
@@ -2335,6 +2349,50 @@ mod tests {
         assert!(!is_half_width('あ'));
         assert!(!is_half_width('漢'));
         assert!(!is_half_width('。'));
+    }
+
+    /// The line's font size follows the measured pitch, not the (detector
+    /// padded) box height — that padding is what made glyphs 10-20% large.
+    #[test]
+    fn line_font_uses_pitch_not_box_height() {
+        let line = LineResult {
+            text: "日本語".into(),
+            char_boxes: vec![
+                BoundingBox::new(10, 0, 40, 60, 1.0),
+                BoundingBox::new(30, 0, 40, 60, 1.0),
+                BoundingBox::new(50, 0, 40, 60, 1.0),
+            ],
+            alternatives: vec![],
+            sample_txt: None,
+            is_vertical: false,
+            chunk_boxes: vec![],
+        };
+        // Centers 30/50/70: pitch 20 despite 60px-tall boxes.
+        assert_eq!(line_font_em_px(&line, None, 1.0), 20);
+        // Single char cannot measure a pitch; median box height × 0.9.
+        let single = LineResult {
+            text: "あ".into(),
+            char_boxes: vec![BoundingBox::new(0, 0, 40, 60, 1.0)],
+            alternatives: vec![],
+            sample_txt: None,
+            is_vertical: false,
+            chunk_boxes: vec![],
+        };
+        assert_eq!(line_font_em_px(&single, None, 1.0), 54);
+
+        // Tracked ASCII: the halfwidth-normalized pitch (70) exceeds the
+        // line box, so the raw pitch is the honest measure instead.
+        let tracked = LineResult {
+            text: "Memo1Memo".into(),
+            char_boxes: (0..9)
+                .map(|i| BoundingBox::new(i * 35, 0, 35, 49, 1.0))
+                .collect(),
+            alternatives: vec![],
+            sample_txt: None,
+            is_vertical: false,
+            chunk_boxes: vec![],
+        };
+        assert_eq!(line_font_em_px(&tracked, None, 1.0), 35);
     }
 
     #[test]
