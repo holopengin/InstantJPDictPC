@@ -236,3 +236,67 @@ pub fn to_vertical_glyph(ch: char) -> char {
         _ => ch,
     }
 }
+
+/// Mobile `OcrEngine.isHalfWidth` (#49): ASCII + halfwidth katakana advance
+/// at 0.5 em; everything else (JP, fullwidth latin, punctuation) at 1.0 em.
+pub fn is_half_width(ch: char) -> bool {
+    let cp = ch as u32;
+    cp <= 0x7E || (0xFF61..=0xFFDC).contains(&cp)
+}
+
+/// Mobile `OcrEngine.estimateEm` (#49): the line's em from width-normalized
+/// pitches. Every gap is divided by the mean advance of its two characters
+/// (0.5 halfwidth, 1.0 fullwidth), so ASCII-majority mixed lines cannot drag
+/// the estimate to ~0.5×; the median of the normalized gaps is the em.
+/// Returns 0 when unestimable (fewer than 2 chars, mismatched lengths).
+pub fn estimate_em(text: &str, centers: &[f32]) -> f32 {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() != centers.len() || centers.len() < 2 {
+        return 0.0;
+    }
+    let mut norm: Vec<f32> = Vec::with_capacity(centers.len() - 1);
+    for i in 0..centers.len() - 1 {
+        let gap = (centers[i + 1] - centers[i]).abs();
+        if gap <= 0.0 {
+            continue;
+        }
+        let units = ((if is_half_width(chars[i]) { 0.5 } else { 1.0 })
+            + (if is_half_width(chars[i + 1]) { 0.5 } else { 1.0 }))
+            / 2.0;
+        norm.push(gap / units);
+    }
+    if norm.is_empty() {
+        return 0.0;
+    }
+    norm.sort_by(f32::total_cmp);
+    norm[norm.len() / 2]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirror of mobile `UniformEmTest`: true em 20px in every case.
+    #[test]
+    fn estimate_em_normalizes_halfwidth_advances() {
+        let assert_em = |got: f32| assert!((got - 20.0).abs() < 1e-3, "em={got}");
+        assert_em(estimate_em("AB日本CD", &[5.0, 15.0, 30.0, 50.0, 65.0, 75.0]));
+        assert_em(estimate_em("日本語", &[10.0, 30.0, 50.0]));
+        assert_em(estimate_em("ABCD", &[5.0, 15.0, 25.0, 35.0]));
+        assert_em(estimate_em("ＡＢ", &[10.0, 30.0]));
+        assert_em(estimate_em("ｱｲ", &[5.0, 15.0]));
+        assert_eq!(estimate_em("あ", &[10.0]), 0.0);
+        assert_eq!(estimate_em("", &[]), 0.0);
+        assert_eq!(estimate_em("あい", &[10.0]), 0.0);
+    }
+
+    #[test]
+    fn halfwidth_classification_matches_mobile() {
+        assert!(is_half_width('A'));
+        assert!(is_half_width('~'));
+        assert!(is_half_width('\u{FF76}')); // ｶ halfwidth katakana
+        assert!(!is_half_width('あ'));
+        assert!(!is_half_width('漢'));
+        assert!(!is_half_width('。'));
+    }
+}

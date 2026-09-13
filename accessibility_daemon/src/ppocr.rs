@@ -862,6 +862,70 @@ mod tests {
         );
     }
 
+    /// The overlay sizes every glyph from the line's measured pitch. On the
+    /// synth set the drawn em is exactly 44px, so the char centers the
+    /// recognizer produces must yield ~44 through the same normalization
+    /// (halfwidth-aware median, mobile estimateEm).
+    #[test]
+    fn synth_pitch_recovers_drawn_em() {
+        let f = fixture();
+        let truth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(repo_path("test_images/synth/truth.json")).unwrap())
+                .unwrap();
+        let mut checked = 0usize;
+        for line in truth["lines"].as_array().unwrap() {
+            if line["orientation"].as_str() != Some("H") {
+                continue;
+            }
+            let file = line["file"].as_str().unwrap();
+            let boxes = line["boxes"].as_array().unwrap();
+            let (mut left, mut top, mut right, mut bottom) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+            for b in boxes {
+                let b = b.as_array().unwrap();
+                let (x, y, w, h) = (
+                    b[0].as_i64().unwrap(),
+                    b[1].as_i64().unwrap(),
+                    b[2].as_i64().unwrap(),
+                    b[3].as_i64().unwrap(),
+                );
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x + w);
+                bottom = bottom.max(y + h);
+            }
+            let img = image::open(repo_path(&format!("test_images/synth/{file}"))).unwrap();
+            let crop = img.crop_imm(
+                left.max(0) as u32,
+                top.max(0) as u32,
+                (right - left).max(1) as u32,
+                (bottom - top).max(1) as u32,
+            );
+            let res = recognize_crop(&f.rec, &crop, &f.vocab, &f.remap).unwrap();
+            assert_eq!(
+                res.char_cols.len(),
+                res.text.chars().count(),
+                "{file}: cols/text mismatch"
+            );
+            let centers: Vec<f32> = res
+                .char_cols
+                .iter()
+                .map(|&t| (t + 0.5) * (right - left) as f32 / res.seq_len_total as f32)
+                .collect();
+            let em = crate::util::japanese::estimate_em(&res.text, &centers);
+            // 4+ char lines land within ~1% (the median averages the CTC
+            // half-timestep quantization); a 2-char line has a single gap to
+            // average, so it gets the wider bound.
+            let tol = if res.text.chars().count() >= 4 { 0.15 } else { 0.25 };
+            assert!(
+                (em - 44.0).abs() <= 44.0 * tol,
+                "{file}: em={em:.1} (drawn em 44) text={:?}",
+                res.text
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 8, "expected 8 horizontal synth lines");
+    }
+
     /// Mobile's androidTest synth set (truth.json + line crops): the shared
     /// ncnn backend on PC must read every line, with the per-line character
     /// error rate staying in the same band the device shows. Truth punctuation
