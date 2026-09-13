@@ -41,7 +41,8 @@ CPU-only static `libncnn.a`, and installs it to `third_party/ncnn-pc/install`.
   (one `Net` per model, one `Extractor` per inference).
 - `src/ppocr.rs`: mobile's preprocessing (rotate 270° portrait, resize to
   48×W, mult-of-8 zero pad, `(gray/127.5)-1`, lengthwise squish) and CTC
-  decode (class remap, top-15, sub-column peak interpolation).
+  decode (class remap, top-15, sub-column peak interpolation), plus the
+  long-line chunk-and-stitch path above the 2000 targetW gate.
 - `src/ocr_engine.rs`: mobile's det letterbox/ImageNet normalisation, then the
   PC app's own rotated-box post-processing on the ncnn probability map.
 

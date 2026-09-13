@@ -1,5 +1,4 @@
 mod nav_graph;
-mod booocr;
 mod data;
 mod frontend;
 mod models;
@@ -516,7 +515,6 @@ fn run_ocr_viewer(
                     &image, &boxes, &rotated,
                     engine.ppocr_rec.clone(),
                     &ppocr_vocab, &rec_remap, batch_sz, rec_mode,
-                    engine.booocr.clone(),
                     ocr_tx2,
                     std::path::Path::new("/tmp"),
                 ) {
@@ -628,7 +626,7 @@ fn run_ocr_viewer(
                         state.edited_lines.insert(sel.line_idx);
                         // Dataset collection: rewrite the crop's .txt sidecar
                         // with the corrected text so /tmp yields curated
-                        // (crop, label) pairs for BOOOCR training.
+                        // (crop, label) pairs for recognizer training.
                         if let Some(line) = state.state.active_line_results.get(sel.line_idx).and_then(|l| l.as_ref()) {
                             if let Some(txt) = line.sample_txt.as_ref() {
                                 if let Err(e) = std::fs::write(txt, &line.text) {
@@ -1050,7 +1048,6 @@ fn run_headless_batch(
             &image, &boxes, &rotated,
             engine.ppocr_rec.clone(),
             &ppocr_vocab, &rec_remap, batch_size, recognition_mode,
-            engine.booocr.clone(),
             tx, out_dir,
         ) {
             eprintln!("[Batch] Recognition error for {}: {e}", file.display());
