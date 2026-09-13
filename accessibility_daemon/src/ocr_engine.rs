@@ -1269,6 +1269,7 @@ pub fn recognize_boxes_streaming(
                         let alternatives = res.alternatives;
                         let char_cols = res.char_cols;
                         let seq_len_total = res.seq_len_total;
+                        let step_px = res.step_px;
                         if text.is_empty() { continue; }
 
                         // Dataset collection: save the line crop + detected text
@@ -1297,19 +1298,19 @@ pub fn recognize_boxes_streaming(
                         };
                         if n > 0 && seq_len_total > 0 && !job.is_vertical {
                             // ---- HORIZONTAL: x-axis char boxes ----
-                            // The decoded timestep is the character's trailing
-                            // (right) edge: the cell extends back up to 1.1x
-                            // its width (0.55x for halfwidth latin), then
+                            // The decoded timestep is the character's centre;
+                            // the cell is centred on it with length capped at
+                            // 1.1x its width (0.55x for halfwidth latin), then
                             // overlapping neighbours split to a common aspect
                             // ratio. Horizontal punctuation has no special
                             // rules (as before).
-                            let step = job.crop_w as f32 / seq_len_total as f32;
+                            let step = if step_px > 0.0 { step_px } else { job.crop_w as f32 / seq_len_total as f32 };
                             let cross = (job.crop_h as f32).max(3.0);
                             let text_chars: Vec<char> = text.chars().collect();
                             let mut cells: Vec<(f32, f32)> = char_cols.iter().enumerate().map(|(idx, &t)| {
                                 let anchor = (t as f32 + 0.5) * step;
-                                let max_len = char_cell_max_len(text_chars.get(idx).copied(), cross);
-                                ((anchor - max_len).max(0.0), anchor.min(job.crop_w as f32))
+                                let half = char_cell_max_len(text_chars.get(idx).copied(), cross) / 2.0;
+                                ((anchor - half).max(0.0), (anchor + half).min(job.crop_w as f32))
                             }).collect();
                             for ci in 0..n.saturating_sub(1) {
                                 let wa = char_cell_width(text_chars.get(ci).copied(), cross);
@@ -1322,17 +1323,16 @@ pub fn recognize_boxes_streaming(
                             }
                         } else if n > 0 && seq_len_total > 0 {
                             // ---- VERTICAL: y-axis char boxes with punct handling ----
-                            // Same trailing-edge geometry, with the timestep
-                            // as the character's bottom edge and the column
-                            // width as 1: max cell height 1.1x (0.55x
-                            // halfwidth). Punctuation keeps its own rules.
-                            let step = job.crop_h as f32 / seq_len_total as f32;
+                            // Same centred geometry with the column width as
+                            // 1: max cell height 1.1x (0.55x halfwidth).
+                            // Punctuation keeps its own rules.
+                            let step = if step_px > 0.0 { step_px } else { job.crop_h as f32 / seq_len_total as f32 };
                             let cross = (job.crop_w as f32).max(3.0);
                             let text_chars: Vec<char> = text.chars().collect();
                             let mut cells: Vec<(f32, f32)> = char_cols.iter().enumerate().map(|(idx, &t)| {
                                 let anchor = (t as f32 + 0.5) * step;
-                                let max_len = char_cell_max_len(text_chars.get(idx).copied(), cross);
-                                ((anchor - max_len).max(0.0), anchor.min(job.crop_h as f32))
+                                let half = char_cell_max_len(text_chars.get(idx).copied(), cross) / 2.0;
+                                ((anchor - half).max(0.0), (anchor + half).min(job.crop_h as f32))
                             }).collect();
                             let is_cp: Vec<bool> = text.chars().map(|ch| matches!(ch, '\u{3002}'|'\u{002E}'|'\u{FF0E}'|'\u{3001}'|'\u{002C}'|'\u{FF0C}'|')'|'\u{FF09}'|'\u{3017}'|'\u{300D}'|'\u{300F}'|'\u{3015}'|'\u{3011}'|'\u{3009}'|']'|'\u{FF3D}')).collect();
                             let is_op: Vec<bool> = text.chars().map(|ch| matches!(ch, '('|'\u{FF08}'|'\u{300C}'|'\u{300E}'|'\u{3014}'|'\u{3010}'|'\u{300A}'|'\u{3008}'|'\u{3016}'|'['|'\u{FF3B}')).collect();
@@ -1869,6 +1869,7 @@ mod tests {
         )
         .unwrap();
         let mut checked = 0usize;
+        let mut position_checked = 0usize;
         for line in truth["lines"].as_array().unwrap() {
             let file = line["file"].as_str().unwrap();
             let img =
@@ -1882,10 +1883,48 @@ mod tests {
                 4, RecognitionMode::Both, tx, std::path::Path::new("/tmp"),
             )
             .unwrap();
+            let truth_boxes: Vec<(f64, f64)> = line["boxes"].as_array().unwrap().iter().map(|b| {
+                let b = b.as_array().unwrap();
+                let (x, y, w, h) = (b[0].as_f64().unwrap(), b[1].as_f64().unwrap(), b[2].as_f64().unwrap(), b[3].as_f64().unwrap());
+                (x + w / 2.0, y + h / 2.0)
+            }).collect();
+            let truth_text = line["text"].as_str().unwrap();
             for (_i, ann) in rx.into_iter() {
                 let Some(line) = ann.line else { continue };
                 if ann.quad.is_some() {
                     continue; // rotated lines carry AABBs by design
+                }
+                // Position regression: on synth the truth boxes are the drawn
+                // em boxes, so a correctly recognised line's char centres must
+                // land on them (this is what caught the trailing-edge shift and
+                // the padded-width timestep scale).
+                // Position regression: on synth the truth boxes are the drawn
+                // em boxes, so a plain-glyph line's char centres must land on
+                // them along the reading axis (this is what caught the
+                // trailing-edge half-box shift and the padded timestep scale).
+                // Punctuation and bracket-led lines are excluded: their ink
+                // sits off the em centre, and a leading whitespace glyph
+                // shifts the whole detection crop.
+                let is_punct = |ch: char| {
+                    matches!(ch, '\u{3002}'|'\u{002E}'|'\u{FF0E}'|'\u{3001}'|'\u{002C}'|'\u{FF0C}'|')'|'\u{FF09}'|'\u{3017}'|'\u{300D}'|'\u{300F}'|'\u{3015}'|'\u{3011}'|'\u{3009}'|']'|'\u{FF3D}')
+                        || matches!(ch, '('|'\u{FF08}'|'\u{300C}'|'\u{300E}'|'\u{3014}'|'\u{3010}'|'\u{300A}'|'\u{3008}'|'\u{3016}'|'['|'\u{FF3B}')
+                };
+                if line.text == truth_text
+                    && line.char_boxes.len() == truth_boxes.len()
+                    && !line.text.chars().any(is_punct)
+                {
+                    for (ci, b) in line.char_boxes.iter().enumerate() {
+                        let (tcx, tcy) = truth_boxes[ci];
+                        let cx = b.x as f64 + b.w as f64 / 2.0;
+                        let cy = b.y as f64 + b.h as f64 / 2.0;
+                        let err = if line.is_vertical { cy - tcy } else { cx - tcx };
+                        assert!(
+                            err.abs() <= 13.0,
+                            "{file} char {ci} ({:?}): along error {err:.1}px",
+                            line.text.chars().nth(ci)
+                        );
+                    }
+                    position_checked += 1;
                 }
                 let chars: Vec<char> = line.text.chars().collect();
                 let vertical = line.is_vertical;
@@ -1912,5 +1951,9 @@ mod tests {
             }
         }
         assert!(checked >= 80, "expected the full synth set, checked {checked}");
+        assert!(
+            position_checked >= 6,
+            "expected at least 6 plain-glyph lines for the position check, got {position_checked}"
+        );
     }
 }

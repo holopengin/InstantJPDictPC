@@ -41,6 +41,10 @@ pub struct PpocrResult {
     pub alternatives: Vec<Vec<(char, f32)>>,
     pub char_cols: Vec<f32>,
     pub seq_len_total: usize,
+    /// Source pixels per timestep along the reading axis (of the oriented
+    /// crop). Exact, unlike `seq_len_total` which counts padded model
+    /// timesteps: the content only spans `target_w` of `model_w`.
+    pub step_px: f32,
 }
 
 impl PpocrResult {
@@ -50,6 +54,7 @@ impl PpocrResult {
             alternatives: Vec::new(),
             char_cols: Vec::new(),
             seq_len_total: 0,
+            step_px: 0.0,
         }
     }
 }
@@ -211,6 +216,7 @@ fn ctc_decode_topk(
         alternatives: alts,
         char_cols,
         seq_len_total: seq_len,
+        step_px: 0.0,
     }
 }
 
@@ -279,6 +285,7 @@ fn ctc_decode_full(
         alternatives: alts,
         char_cols,
         seq_len_total: seq_len,
+        step_px: 0.0,
     }
 }
 
@@ -350,6 +357,9 @@ fn infer_resized(
 ) -> Result<PpocrResult> {
     let model_w = target_w.div_ceil(REC_STRIDE) * REC_STRIDE;
     let seq_len = (model_w / REC_STRIDE) as usize;
+    // Exact source px per timestep: the resized content spans `target_w`
+    // model px (not the zero-padded `model_w`), over `src.width()` source px.
+    let step_px = src.width() as f32 * REC_STRIDE as f32 / target_w as f32;
 
     let resized = src.resize_exact(target_w, REC_TARGET_H, image::imageops::FilterType::Triangle);
     let rgb = resized.to_rgb8();
@@ -389,7 +399,9 @@ fn infer_resized(
         let logits: Vec<Vec<f32>> = (0..seq_len)
             .map(|t| flat[t * num_out..(t + 1) * num_out].to_vec())
             .collect();
-        return Ok(ctc_decode_full(vocab, remap, &logits, num_out, seq_len));
+        let mut decoded = ctc_decode_full(vocab, remap, &logits, num_out, seq_len);
+        decoded.step_px = step_px;
+        return Ok(decoded);
     }
 
     let mut top_pruned: Vec<Vec<i32>> = Vec::with_capacity(seq_len);
@@ -406,7 +418,9 @@ fn infer_resized(
         top_pruned.push(ids);
         top_chars.push(chars);
     }
-    Ok(ctc_decode_topk(vocab, remap, &top_pruned, &top_chars, seq_len))
+    let mut decoded = ctc_decode_topk(vocab, remap, &top_pruned, &top_chars, seq_len);
+    decoded.step_px = step_px;
+    Ok(decoded)
 }
 
 // ——— Long-line stitch (lines wider than 2000 @48px; CTC crush fix) ———
@@ -425,6 +439,8 @@ struct Chunk {
     char_cols: Vec<f32>,
     alts: Vec<Vec<(char, f32)>>,
     seq_len: usize,
+    /// Source px per chunk-local timestep (for the single-chunk fast path).
+    step_px: f32,
     offset_px: f32,
 }
 
@@ -495,6 +511,7 @@ fn stitch_long_line(
             char_cols: decoded.char_cols,
             alts: decoded.alternatives,
             seq_len,
+            step_px: decoded.step_px,
             offset_px: pos as f32,
         });
         if pos + len as i32 >= along as i32 {
@@ -525,6 +542,7 @@ fn stitch_long_line(
             alternatives: c.alts.clone(),
             char_cols: c.char_cols.clone(),
             seq_len_total: c.seq_len,
+            step_px: c.step_px,
         }));
     }
 
@@ -743,6 +761,7 @@ fn stitch_phase2(
         alternatives: alts,
         char_cols: cols,
         seq_len_total: total_seq_len,
+        step_px: timestep_px,
     }
 }
 
@@ -909,7 +928,7 @@ mod tests {
             let centers: Vec<f32> = res
                 .char_cols
                 .iter()
-                .map(|&t| (t + 0.5) * (right - left) as f32 / res.seq_len_total as f32)
+                .map(|&t| (t + 0.5) * res.step_px)
                 .collect();
             let em = crate::util::japanese::estimate_em(&res.text, &centers);
             // 4+ char lines land within ~1% (the median averages the CTC
