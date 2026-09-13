@@ -3,12 +3,10 @@ mod booocr;
 mod data;
 mod frontend;
 mod models;
-#[cfg(feature = "ort")]
 mod ocr_engine;
-#[cfg(feature = "ort")]
-mod ocr_parallel;
 mod overlay_state;
 mod ppocr;
+mod ppocr_ncnn;
 mod settings_window;
 mod util;
 mod viewer;
@@ -419,10 +417,7 @@ fn run_ocr_viewer(
     // Headless batch mode: OCR a directory or a list of images, saving line
     // crops + sidecar text files next to each source image.
     if headless {
-        #[cfg(feature = "ort")]
-        { return run_headless_batch(image_paths, recognition_mode, batch_size); }
-        #[cfg(not(feature = "ort"))]
-        { eprintln!("ORT not compiled. Rebuild with --features ort"); return Ok(()); }
+        return run_headless_batch(image_paths, recognition_mode, batch_size);
     }
 
     let image_path = image_paths.first().cloned().context("No image path provided")?;
@@ -480,7 +475,6 @@ fn run_ocr_viewer(
             if bootstrap_tx.send(BootstrapMsg::DeinflectReady(Arc::new(deinf))).is_err() { return; }
 
             // Phase 4: OCR pipeline (engine creation → detection → recognition)
-            #[cfg(feature = "ort")]
             {
                 let t_engine = std::time::Instant::now();
                 let mut engine = match ocr_engine::OcrEngine::new(&resolve_asset_dir(), recognition_mode, batch_size) {
@@ -514,13 +508,14 @@ fn run_ocr_viewer(
 
                 // Recognition
                 let ppocr_vocab = engine.ppocr_vocab.clone();
+                let rec_remap = engine.rec_remap.clone();
                 let batch_sz = engine.batch_size;
                 let rec_mode = engine.recognition_mode;
                 let t_recognize = std::time::Instant::now();
                 if let Err(e) = ocr_engine::recognize_boxes_streaming(
                     &image, &boxes, &rotated,
-                    engine.ppocr_session.get(),
-                    &ppocr_vocab, batch_sz, rec_mode,
+                    engine.ppocr_rec.clone(),
+                    &ppocr_vocab, &rec_remap, batch_sz, rec_mode,
                     engine.booocr.clone(),
                     ocr_tx2,
                     std::path::Path::new("/tmp"),
@@ -530,8 +525,6 @@ fn run_ocr_viewer(
                 let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;
                 println!("[OCR timing] Character recognition: {:>8.2} ms", recognize_ms);
             }
-            #[cfg(not(feature = "ort"))]
-            { eprintln!("ORT not compiled. Rebuild with --features ort"); }
         })?;
 
     // Don't go further in headless mode — bootstrap thread handles everything
@@ -983,7 +976,6 @@ fn run_ocr_viewer(
 /// Headless batch OCR: process a directory or a list of images, saving each
 /// detected line crop + sidecar text file into the same folder as the source
 /// image. The OCR engine is loaded once and reused across all images.
-#[cfg(feature = "ort")]
 fn run_headless_batch(
     image_paths: Vec<String>,
     recognition_mode: RecognitionMode,
@@ -1035,6 +1027,7 @@ fn run_headless_batch(
     println!("[Batch] OCR engine created in {:.0} ms", t_engine.elapsed().as_secs_f64() * 1000.0);
 
     let ppocr_vocab = engine.ppocr_vocab.clone();
+    let rec_remap = engine.rec_remap.clone();
 
     for file in &files {
         let image = match open_image(file) {
@@ -1055,8 +1048,8 @@ fn run_headless_batch(
         let (tx, rx) = std::sync::mpsc::channel::<(usize, DetectedAnnotation)>();
         if let Err(e) = ocr_engine::recognize_boxes_streaming(
             &image, &boxes, &rotated,
-            engine.ppocr_session.get(),
-            &ppocr_vocab, batch_size, recognition_mode,
+            engine.ppocr_rec.clone(),
+            &ppocr_vocab, &rec_remap, batch_size, recognition_mode,
             engine.booocr.clone(),
             tx, out_dir,
         ) {

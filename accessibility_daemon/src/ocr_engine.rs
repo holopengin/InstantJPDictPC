@@ -1,17 +1,16 @@
 use anyhow::{Context, Result};
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use imageproc::contours;
-use ort::session::Session;
-use ort::value::Tensor;
-use rayon::prelude::*;
-use fontdue::{Font, FontSettings, LineMetrics};
+use fontdue::Font;
 use std::path::Path;
-use std::time::Instant;
 
 use crate::models::*;
-use crate::util::japanese::to_vertical_glyph;
+use crate::ppocr_ncnn::{DetNet, RecNet};
 
-// PP-OCRv6 detection constants
+// PP-OCRv6 detection constants. The ncnn det model runs on a square
+// letterboxed input (mobile #51 default 896); its output map is thresholded
+// and turned into rotated boxes by the PC pipeline below.
+const PPOCR_DET_MODEL_SIZE: u32 = 896;
 const PPOCR_DET_LONG_SIDE: u32 = 960;
 const PPOCR_DET_THRESH: f32 = 0.3;
 const PPOCR_DET_BOX_THRESH: f32 = 0.8;
@@ -21,73 +20,84 @@ const X_OVERLAP_THRESHOLD: f32 = 0.3;
 // Box fill ratio when rendering glyphs inside detected boxes. 1.0 means match box height, <1.0 leave padding.
 const BOX_FILL_RATIO: f32 = 0.9;
 
-/// Number of sessions in the PP-OCRv6 pool.
-/// Each session adds ~21 MB of RAM.
-const PPOCR_SESSION_POOL_SIZE: usize = 4;
+/// Rec workers sharing the one loaded ncnn net (mobile fans out to 4;
+/// `PPOCR_REC_WORKERS` overrides for tuning).
+const DEFAULT_REC_WORKERS: usize = 4;
+
 pub struct OcrEngine {
-    pub detect_session: Session,
-    /// PP-OCRv6 recognition sessions — used for both horizontal and vertical text.
-    pub ppocr_session: RecognizeSessionPool,
+    /// PP-OCRv6 detection (ncnn DB) — shared core with the Android app.
+    pub det_net: DetNet,
+    /// PP-OCRv6 dynamic-width recognition (ncnn rec_dyn). `None` when the
+    /// model files are missing; recognition then falls back to BOOOCR only.
+    pub ppocr_rec: Option<std::sync::Arc<RecNet>>,
     pub ppocr_vocab: Vec<String>,
+    /// Pruned CTC head remap: remap[pruned_id] = original class id (#39).
+    pub rec_remap: Vec<i32>,
     pub recognition_mode: RecognitionMode,
     pub batch_size: usize,
     /// BOOOCR sidecar (feature-vector recognizer). When present, recognition
     /// goes through it instead of the PP-OCR rec sessions.
     pub booocr: Option<std::sync::Arc<std::sync::Mutex<crate::booocr::BooOcrClient>>>,
-    model_dir: String,
 }
 
-/// Lazily-initialized pool of recognition sessions.
-///
-/// On first access, all sessions are loaded in parallel.
-pub struct RecognizeSessionPool {
-    sessions: std::sync::OnceLock<Vec<std::sync::Arc<std::sync::Mutex<Session>>>>,
-    model_path: std::path::PathBuf,
-    pool_size: usize,
-}
+/// Load the PP-OCRv6 ncnn models + vocab/remap from `model_dir`.
+/// Returns `(rec, vocab, remap)`; `rec` is None when rec_dyn is absent.
+fn load_ppocr_models(
+    model_dir: &Path,
+) -> Result<(Option<std::sync::Arc<RecNet>>, Vec<String>, Vec<i32>)> {
+    let ncnn_dir = model_dir.join("PP-OCRv6_small_ncnn");
 
-impl RecognizeSessionPool {
-    fn new(model_path: std::path::PathBuf) -> Self {
-        RecognizeSessionPool {
-            sessions: std::sync::OnceLock::new(),
-            model_path,
-            pool_size: PPOCR_SESSION_POOL_SIZE,
-        }
-    }
-
-    fn empty() -> Self {
-        RecognizeSessionPool {
-            sessions: std::sync::OnceLock::new(),
-            model_path: std::path::PathBuf::new(),
-            pool_size: 0,
-        }
-    }
-
-    fn with_size(model_path: std::path::PathBuf, pool_size: usize) -> Self {
-        RecognizeSessionPool {
-            sessions: std::sync::OnceLock::new(),
-            model_path,
-            pool_size,
-        }
-    }
-
-    /// Get the session pool, initializing it on first call.
-    pub fn get(&self) -> &[std::sync::Arc<std::sync::Mutex<Session>>] {
-        let n = self.pool_size;
-        self.sessions.get_or_init(|| {
-            let mut sessions = Vec::with_capacity(n);
-            for _ in 0..n {
-                let s = Session::builder()
-                    .expect("Failed to create session builder")
-                    .with_execution_providers([ort::ep::XNNPACK::default().build()])
-                    .expect("Failed to configure XNNPACK execution provider")
-                    .commit_from_file(&self.model_path)
-                    .expect("Failed to load recognition model");
-                sessions.push(std::sync::Arc::new(std::sync::Mutex::new(s)));
+    let rec_param = ncnn_dir.join("rec_dyn.param");
+    let rec_bin = ncnn_dir.join("rec_dyn.bin");
+    let ppocr_rec = if rec_param.exists() && rec_bin.exists() {
+        // target_w only seeds the handle; inference width comes from the
+        // actual input (dynamic width, mobile #23). 1 thread per net like
+        // mobile REC_THREADS; workers run in parallel instead.
+        match RecNet::create(&rec_param, &rec_bin, 64, 1) {
+            Ok(r) => Some(std::sync::Arc::new(r)),
+            Err(e) => {
+                eprintln!("[PP-OCR] rec_dyn load failed ({e}); recognition disabled");
+                None
             }
-            sessions
-        })
+        }
+    } else {
+        eprintln!("[PP-OCR] Model not found at {rec_param:?}, recognition disabled");
+        None
+    };
+
+    let vocab_path = ncnn_dir.join("vocab.json");
+    let ppocr_vocab: Vec<String> = match std::fs::read_to_string(&vocab_path) {
+        Ok(content) => serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse PP-OCR vocab {vocab_path:?}"))?,
+        Err(_) => {
+            eprintln!("[PP-OCR] Vocab not found at {vocab_path:?}");
+            Vec::new()
+        }
+    };
+
+    // CTC-head remap: one original class id per pruned output (#39/#44).
+    // The head width is derived from this file, never hardcoded, so a
+    // re-pruned model and this loader cannot silently disagree.
+    let remap_path = ncnn_dir.join("rec_remap.txt");
+    let rec_remap: Vec<i32> = match std::fs::read_to_string(&remap_path) {
+        Ok(s) => s
+            .lines()
+            .filter_map(|l| l.trim().parse::<i32>().ok())
+            .collect(),
+        Err(_) => {
+            eprintln!("[PP-OCR] remap not found at {remap_path:?}");
+            Vec::new()
+        }
+    };
+    if ppocr_rec.is_some() {
+        println!(
+            "[PP-OCR] ncnn rec loaded, vocab {} chars, head width {}",
+            ppocr_vocab.len(),
+            rec_remap.len()
+        );
     }
+
+    Ok((ppocr_rec, ppocr_vocab, rec_remap))
 }
 
 /// Minimum-area rotated rectangle around a contour (cv2.minAreaRect
@@ -176,64 +186,63 @@ fn rotate_crop(img: &DynamicImage, angle: f32) -> DynamicImage {
 
 impl OcrEngine {
     pub fn new(model_dir: &str, recognition_mode: RecognitionMode, batch_size: usize) -> Result<Self> {
+        Self::new_with_booocr(model_dir, recognition_mode, batch_size, true)
+    }
+
+    /// `with_booocr: false` skips spawning the sidecar (tests / headless use).
+    pub(crate) fn new_with_booocr(
+        model_dir: &str,
+        recognition_mode: RecognitionMode,
+        batch_size: usize,
+        with_booocr: bool,
+    ) -> Result<Self> {
         let model_path = Path::new(model_dir);
 
-        let detect_session = Session::builder()
-            .expect("Failed to create session builder")
-            .with_execution_providers([ort::ep::XNNPACK::default().build()])
-            .expect("Failed to configure XNNPACK for detection")
-            .commit_from_file(model_path.join("PP-OCRv6_small_det_onnx").join("inference.onnx"))
-            .expect("Failed to load PP-OCRv6 detection model");
+        // PP-OCRv6 ncnn detection (shared core with the mobile app).
+        let det_param = model_path.join("PP-OCRv6_small_ncnn").join("det.param");
+        let det_bin = model_path.join("PP-OCRv6_small_ncnn").join("det.bin");
+        let det_net = DetNet::create(&det_param, &det_bin)
+            .with_context(|| format!("Failed to load PP-OCRv6 detection model at {det_param:?}"))?;
+        println!("Detection model loaded (ncnn).");
 
-        println!("Detection model loaded. Recognition models will be loaded on first use.");
-
-        // PP-OCRv6 recognition model
-        let ppocr_model_path = model_path.join("PP-OCRv6_small_rec_onnx").join("inference.onnx");
-        let ppocr_pool = if ppocr_model_path.exists() {
-            RecognizeSessionPool::with_size(ppocr_model_path, PPOCR_SESSION_POOL_SIZE)
-        } else {
-            eprintln!("[PP-OCR] Model not found at {ppocr_model_path:?}, recognition disabled");
-            RecognizeSessionPool::empty()
-        };
-        let ppocr_vocab_path = model_path.join("PP-OCRv6_small_rec_onnx").join("vocab.json");
-        let ppocr_vocab: Vec<String> = match std::fs::read_to_string(&ppocr_vocab_path) {
-            Ok(content) => serde_json::from_str(&content)
-                .with_context(|| format!("Failed to parse PP-OCR vocab"))?,
-            Err(_) => {
-                eprintln!("[PP-OCR] Vocab not found at {ppocr_vocab_path:?}");
-                Vec::new()
-            }
-        };
+        let (ppocr_rec, ppocr_vocab, rec_remap) = load_ppocr_models(model_path)?;
+        if ppocr_rec.is_none() {
+            eprintln!("[PP-OCR] ncnn rec unavailable — recognition disabled");
+        }
 
         println!("Recognition mode: {:?}, batch size: {}", recognition_mode, batch_size);
 
         // BOOOCR sidecar: primary recognizer when available. Spawning it
         // blocks ~3s on the font-database load; on any failure we fall back
         // to the PP-OCR recognition sessions.
-        let booocr = match crate::booocr::BooOcrClient::connect_or_spawn(&crate::booocr::booocr_dir()) {
-            Ok(c) => {
-                println!("[BOOOCR] sidecar ready — line recognition via BOOOCR");
-                Some(std::sync::Arc::new(std::sync::Mutex::new(c)))
+        let booocr = if with_booocr {
+            match crate::booocr::BooOcrClient::connect_or_spawn(&crate::booocr::booocr_dir()) {
+                Ok(c) => {
+                    println!("[BOOOCR] sidecar ready — line recognition via BOOOCR");
+                    Some(std::sync::Arc::new(std::sync::Mutex::new(c)))
+                }
+                Err(e) => {
+                    eprintln!("[BOOOCR] unavailable ({e}) — falling back to PP-OCR recognition");
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!("[BOOOCR] unavailable ({e}) — falling back to PP-OCR recognition");
-                None
-            }
+        } else {
+            None
         };
 
         Ok(OcrEngine {
-            detect_session,
-            ppocr_session: ppocr_pool,
+            det_net,
+            ppocr_rec,
             ppocr_vocab,
+            rec_remap,
             recognition_mode,
             batch_size,
             booocr,
-            model_dir: model_dir.to_string(),
         })
     }
 
     pub fn is_ready(&self) -> bool {
-        !self.ppocr_vocab.is_empty()
+        self.ppocr_rec.is_some() && !self.ppocr_vocab.is_empty() && !self.rec_remap.is_empty()
     }
 
     /// Detects bounding boxes using PP-OCRv6 segmentation-based detection model.
@@ -245,34 +254,38 @@ impl OcrEngine {
         let orig_w = image.width() as f32;
         let orig_h = image.height() as f32;
 
-        // 1. Resize: keep aspect ratio, longest side = PPOCR_DET_LONG_SIDE, pad to 32
-        let scale = PPOCR_DET_LONG_SIDE as f32 / orig_w.max(orig_h);
-        let resize_w = (orig_w * scale).round() as u32;
-        let resize_h = (orig_h * scale).round() as u32;
-        let resize_w = resize_w.max(32);
-        let resize_h = resize_h.max(32);
-        let pad_w = ((resize_w + 31) / 32) * 32;
-        let pad_h = ((resize_h + 31) / 32) * 32;
+        // 1. Letterbox: keep aspect ratio, longest side = the net input side
+        // (mobile #51: 896 by default, DET_MODEL_SIZE env for A/B), center the
+        // content in a square and fill the border with gray. This matches the
+        // mobile detect() preprocessing (and therefore the model's training
+        // geometry) instead of the old top-left 32-multiple padding.
+        let model_size = std::env::var("DET_MODEL_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(PPOCR_DET_MODEL_SIZE)
+            .clamp(320, 960);
+        let target_long = PPOCR_DET_LONG_SIDE.min(model_size);
+        let scale = target_long as f32 / orig_w.max(orig_h);
+        let resize_w = ((orig_w * scale).round() as u32).max(32);
+        let resize_h = ((orig_h * scale).round() as u32).max(32);
+        let img_left = (model_size - resize_w) / 2;
+        let img_top = (model_size - resize_h) / 2;
 
         let resized = image.resize_exact(resize_w, resize_h, image::imageops::FilterType::Triangle);
-        let mut padded = RgbaImage::from_pixel(pad_w, pad_h, Rgba([128u8, 128u8, 128u8, 255u8]));
-        for y in 0..resize_h {
-            for x in 0..resize_w {
-                let px = resized.get_pixel(x, y);
-                padded.put_pixel(x, y, px);
-            }
-        }
+        let mut letterbox =
+            RgbaImage::from_pixel(model_size, model_size, Rgba([128u8, 128u8, 128u8, 255u8]));
+        image::imageops::replace(&mut letterbox, &resized.to_rgba8(), img_left as i64, img_top as i64);
 
-        // 2. Convert to NCHW float with ImageNet normalization
-        let num_elements = (3 * pad_h * pad_w) as usize;
-        let mut data = vec![0.0f32; num_elements];
+        // 2. Convert to NCHW float with ImageNet normalization, same per-pixel
+        // math as the mobile DET_NORM_LUT ((v/255 - mean) / std per channel).
+        let w = model_size as usize;
+        let h = w;
+        let mut data = vec![0.0f32; 3 * h * w];
         let mean = [0.485f32, 0.456, 0.406];
         let std = [0.229f32, 0.224, 0.225];
-        let w = pad_w as usize;
-        let h = pad_h as usize;
         for y in 0..h {
             for x in 0..w {
-                let px = padded.get_pixel(x as u32, y as u32);
+                let px = letterbox.get_pixel(x as u32, y as u32);
                 let r = (px.0[0] as f32 / 255.0 - mean[0]) / std[0];
                 let g = (px.0[1] as f32 / 255.0 - mean[1]) / std[1];
                 let b = (px.0[2] as f32 / 255.0 - mean[2]) / std[2];
@@ -283,58 +296,37 @@ impl OcrEngine {
             }
         }
 
-        let input_tensor = Tensor::from_array((
-            [1i64, 3, pad_h as i64, pad_w as i64],
-            data.into_boxed_slice(),
-        ))?;
+        // 3. Run the shared ncnn DB segmentation net.
+        let raw_map = self.det_net.infer(&data, w, h).with_context(|| {
+            format!("PP-OCRv6 det ncnn inference failed ({model_size}x{model_size})")
+        })?;
 
-        // 3. Build inputs
-        let input_name = self
-            .detect_session
-            .inputs()
-            .iter()
-            .next()
-            .context("No input found")?
-            .name()
-            .to_string();
-        let inputs = ort::inputs! { input_name.as_str() => input_tensor };
-
-        // 4. Extract output name before running (avoids double borrow)
-        let output_name = self
-            .detect_session
-            .outputs()
-            .iter()
-            .next()
-            .context("No output found")?
-            .name()
-            .to_string();
-
-        // 5. Run inference, extract prob map [1,1,H,W]
-        let (prob_map, out_w, out_h) = {
-            let run_outputs = self.detect_session.run(inputs)?;
-            let output_val = run_outputs
-                .get(output_name.as_str())
-                .context("Failed to get output")?;
-            let arr = output_val.try_extract_array::<f32>()?.to_owned();
-            eprintln!("[PP-OCR DET] output shape: {:?}", arr.shape());
-            // Shape [1,1,out_h,out_w] — squeeze to 2D
-            let out_h = if arr.ndim() == 4 { arr.shape()[2] as usize } else { pad_h as usize };
-            let out_w = if arr.ndim() == 4 { arr.shape()[3] as usize } else { pad_w as usize };
-            let raw: Vec<f32> = arr.iter().copied().collect();
-            // Reshape to 2D grid
-            let mut map = vec![0.0f32; out_h * out_w];
-            if arr.ndim() == 4 {
-                // [1,1,out_h,out_w]
-                for y in 0..out_h {
-                    for x in 0..out_w {
-                        map[y * out_w + x] = raw[y * out_w + x];
-                    }
-                }
-            } else {
-                // fallback: 1D flat
-                map = raw;
+        // The net should emit model_size²; a smaller square (stride) gets
+        // nearest-upsampled like mobile, so downstream coords are always in
+        // letterbox space.
+        let prob_map: Vec<f32> = if raw_map.len() == h * w {
+            raw_map
+        } else {
+            let dim = (raw_map.len() as f64).sqrt() as u32;
+            if dim == 0 || (dim * dim) as usize != raw_map.len() || dim > model_size {
+                anyhow::bail!(
+                    "unexpected det output size {} for {}x{} input",
+                    raw_map.len(),
+                    model_size,
+                    model_size
+                );
             }
-            (map, out_w, out_h)
+            let mut up = vec![0.0f32; h * w];
+            let step = dim as f32 / model_size as f32;
+            for y in 0..h {
+                for x in 0..w {
+                    let sx = ((x as f32 * step) as u32).min(dim - 1) as usize;
+                    let sy = ((y as f32 * step) as u32).min(dim - 1) as usize;
+                    up[y * w + x] = raw_map[sy * dim as usize + sx];
+                }
+            }
+            eprintln!("[PP-OCR DET] upsampled det output {dim}x{dim} -> {model_size}x{model_size}");
+            up
         };
         // Debug: print prob_map statistics to understand value range
         if !prob_map.is_empty() {
@@ -344,11 +336,11 @@ impl OcrEngine {
             let mean = sum / prob_map.len() as f32;
             eprintln!("[PP-OCR DET] prob_map: min={min_val:.4} max={max_val:.4} mean={mean:.4}");
         }
-        let out_w = out_w as u32;
-        let out_h = out_h as u32;
+        let out_w = model_size;
+        let out_h = model_size;
 
-        // Scale factor from model output (padded) to original image
-        // The image content occupies resize_w × resize_h within the padded space
+        // Scale factors from letterbox space to the original image; content
+        // sits at (img_left, img_top) after centering.
         let scale_w = orig_w / resize_w as f32;
         let scale_h = orig_h / resize_h as f32;
 
@@ -433,9 +425,10 @@ impl OcrEngine {
                 rh *= v_trim;
             }
 
-            // Scale centers back to original image coords (uniform scale)
-            let cx = cx * scale_w;
-            let cy = cy * scale_h + down_shift;
+            // Scale centers back to original image coords: undo the centered
+            // letterbox offset first, then the uniform resize scale.
+            let cx = (cx - img_left as f32) * scale_w;
+            let cy = (cy - img_top as f32) * scale_h + down_shift;
 
             if rw < 4.0 || rh < 4.0 { continue; }
 
@@ -794,26 +787,17 @@ pub fn recognize_boxes_streaming(
     image: &DynamicImage,
     sorted: &[BoundingBox],
     rotated: &[RotatedBox],
-    rec_sessions_ppocr: &[std::sync::Arc<std::sync::Mutex<Session>>],
+    rec: Option<std::sync::Arc<RecNet>>,
     ppocr_vocab: &[String],
-    batch_size: usize,
-    recognition_mode: RecognitionMode,
+    rec_remap: &[i32],
+    _batch_size: usize,
+    _recognition_mode: RecognitionMode,
     booocr: Option<std::sync::Arc<std::sync::Mutex<crate::booocr::BooOcrClient>>>,
     sender: std::sync::mpsc::Sender<(usize, DetectedAnnotation)>,
-    out_dir: &std::path::Path,
+    _out_dir: &std::path::Path,
 ) -> Result<()> {
     use std::time::Instant;
     let t_recognize = Instant::now();
-    // Owned copy so worker threads (which require 'static captures) can use it.
-    let out_dir = out_dir.to_path_buf();
-
-    let horizontal_boxes: Vec<_> = sorted.iter().filter(|b| b.w >= b.h).cloned().collect();
-    let vertical_boxes: Vec<_> = sorted.iter().filter(|b| b.h > b.w).cloned().collect();
-    // Pre-compute sorted indices for each horizontal/vertical box
-    let h_indices: Vec<usize> = sorted.iter().enumerate()
-        .filter(|(_, b)| b.w >= b.h).map(|(i, _)| i).collect();
-    let v_indices: Vec<usize> = sorted.iter().enumerate()
-        .filter(|(_, b)| b.h > b.w).map(|(i, _)| i).collect();
 
     // Build a single job queue from ALL boxes (horizontal + vertical).
     // Each job carries its orientation so workers can choose the right
@@ -904,7 +888,6 @@ pub fn recognize_boxes_streaming(
             let q = std::sync::Arc::clone(&job_queue);
             let client = client.clone();
             let snd = sender.clone();
-            let od = out_dir.clone();
             handles.push(std::thread::spawn(move || loop {
                 // Drain the whole queue: one batched BOOOCR call per
                 // screenshot. The sidecar threads the per-line phases and
@@ -1042,35 +1025,40 @@ pub fn recognize_boxes_streaming(
                 std::thread::yield_now();
                 }
             }));
-        } else if !ppocr_vocab.is_empty() && !rec_sessions_ppocr.is_empty() {
+        } else if !ppocr_vocab.is_empty() && !rec_remap.is_empty() && rec.is_some() {
+            let rec = rec.clone().expect("rec is Some");
+            // Workers share the one loaded ncnn net; each inference creates
+            // its own extractor (the mobile app fans out the same way).
+            let workers = std::env::var("PPOCR_REC_WORKERS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_REC_WORKERS)
+                .clamp(1, n_jobs);
             println!(
-                "[PP-OCR] Processing {} boxes ({} workers)",
-                n_jobs,
-                rec_sessions_ppocr.len().min(n_jobs)
+                "[PP-OCR] Processing {} boxes ({} workers, ncnn rec)",
+                n_jobs, workers
             );
-            for worker_id in 0..rec_sessions_ppocr
-                .len()
-                .min(job_queue.lock().unwrap().len())
-                .max(1)
-            {
+            for _worker_id in 0..workers {
             let q = std::sync::Arc::clone(&job_queue);
-            let sess = rec_sessions_ppocr[worker_id % rec_sessions_ppocr.len()].clone();
+            let rec = std::sync::Arc::clone(&rec);
             let voc = ppocr_vocab.to_vec();
+            let remap = rec_remap.to_vec();
             let snd = sender.clone();
-            let od = out_dir.clone();
 
             handles.push(std::thread::spawn(move || loop {
                 let job = { let mut ql = q.lock().unwrap(); ql.pop_front() };
                 let job = match job { Some(j) => j, None => return };
 
-                let mut session = sess.lock().unwrap();
                 let result = crate::ppocr::recognize_ppocr_batch(
-                    &mut session, &[&job.crop], &voc,
+                    &rec, &[&job.crop], &voc, &remap,
                 );
-                drop(session);
 
                 if let Ok(mut results) = result {
-                    if let Some((text, alternatives, char_cols, seq_len_total)) = results.pop() {
+                    if let Some(res) = results.pop() {
+                        let text = res.text;
+                        let alternatives = res.alternatives;
+                        let char_cols = res.char_cols;
+                        let seq_len_total = res.seq_len_total;
                         if text.is_empty() { continue; }
 
                         // Dataset collection: save the line crop + detected text
@@ -1423,5 +1411,93 @@ fn draw_text_ttf(
             }
         }
         cursor_x += metrics.advance_width;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_engine() -> OcrEngine {
+        let dir = format!("{}/assets", env!("CARGO_MANIFEST_DIR"));
+        OcrEngine::new_with_booocr(&dir, RecognitionMode::Both, 4, false).expect("engine loads")
+    }
+
+    /// Detection parity smoke on the mobile synth set: the ncnn det model +
+    /// PC post-processing must find each line's box (IoU against the mobile
+    /// truth boxes), and every returned box must stay in image bounds.
+    #[test]
+    fn synth_det_finds_truth_line() {
+        let mut eng = test_engine();
+        let truth: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/test_images/synth/truth.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut failures: Vec<String> = Vec::new();
+        let mut worst = (1.0f32, String::new());
+        let mut lines = 0usize;
+        for line in truth["lines"].as_array().unwrap() {
+            let file = line["file"].as_str().unwrap();
+            let boxes = line["boxes"].as_array().unwrap();
+            let (mut left, mut top, mut right, mut bottom) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+            for b in boxes {
+                let b = b.as_array().unwrap();
+                let (x, y, w, h) = (
+                    b[0].as_i64().unwrap(),
+                    b[1].as_i64().unwrap(),
+                    b[2].as_i64().unwrap(),
+                    b[3].as_i64().unwrap(),
+                );
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x + w);
+                bottom = bottom.max(y + h);
+            }
+            let img =
+                image::open(format!("{}/test_images/synth/{file}", env!("CARGO_MANIFEST_DIR")))
+                    .unwrap();
+            let (iw, ih) = img.dimensions();
+            let det = eng.detect(&img).unwrap();
+            lines += 1;
+            for b in &det.boxes {
+                if b.x < 0 || b.y < 0 || b.x + b.w > iw as i32 || b.y + b.h > ih as i32 {
+                    failures.push(format!("{file}: box out of bounds {:?}", (b.x, b.y, b.w, b.h)));
+                }
+            }
+            let best = det.boxes.iter().max_by_key(|b| (b.w as i64) * (b.h as i64));
+            let Some(b) = best else {
+                failures.push(format!("{file}: no boxes detected"));
+                continue;
+            };
+            let ix1 = left.max(b.x as i64);
+            let iy1 = top.max(b.y as i64);
+            let ix2 = right.min(b.x as i64 + b.w as i64);
+            let iy2 = bottom.min(b.y as i64 + b.h as i64);
+            let inter = ((ix2 - ix1).max(0) * (iy2 - iy1).max(0)) as f32;
+            let truth_area = ((right - left) * (bottom - top)) as f32;
+            let box_area = (b.w * b.h) as f32;
+            let iou = inter / (truth_area + box_area - inter);
+            if iou < 0.5 {
+                failures.push(format!(
+                    "{file}: best box IoU {iou:.2} det=({},{},{},{}) truth=({},{},{},{})",
+                    b.x, b.y, b.w, b.h, left, top, right, bottom
+                ));
+            }
+            if iou < worst.0 {
+                worst = (iou, file.to_string());
+            }
+        }
+        assert_eq!(lines, 16, "expected the full synth set");
+        assert!(
+            failures.is_empty(),
+            "det failures:\n{}\nworst: {} {:.2}",
+            failures.join("\n"),
+            worst.1,
+            worst.0
+        );
     }
 }

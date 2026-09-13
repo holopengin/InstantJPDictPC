@@ -12,6 +12,11 @@ export OUTNAME=InstantJPDict-"$ARCH".AppImage
 
 unset WAYLAND_DISPLAY
 
+# Shared PP-OCRv6 backend: build the pinned ncnn fork first (static libncnn.a).
+if [ ! -f third_party/ncnn-pc/install/lib/libncnn.a ]; then
+    ./tools/build_ncnn_pc.sh
+fi
+
 # Install your application (example using pacman)
 cargo build --release
 
