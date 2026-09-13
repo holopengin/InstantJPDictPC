@@ -783,8 +783,8 @@ impl OcrEngine {
             eprintln!("[PP-OCR DET] furigana {} -> {} boxes", pre_boxes.len(), raw_pairs.len());
         }
 
-        // Debug: print raw detected boxes
-        eprintln!("[PP-OCR DET] raw {} boxes:", raw_pairs.len());
+        // Debug: print the contour boxes (after furigana rejection)
+        eprintln!("[PP-OCR DET] {} boxes:", raw_pairs.len());
         for (i, (b, r)) in raw_pairs.iter().enumerate() {
             eprintln!(
                 "  [{i}] x={} y={} w={} h={} angle={:.1}° c={:.3}",
@@ -1852,10 +1852,11 @@ mod tests {
     }
 
     /// End-to-end: every char box the streaming path emits must respect the
-    /// per-class caps (1.1x line cross for JP, 0.55x for halfwidth) and the
-    /// neighbours must not overlap beyond rounding.
+    /// per-class caps (1.1x line cross for JP, 0.55x for halfwidth), the
+    /// neighbours must not overlap beyond rounding, and plain-glyph lines
+    /// must land on the synth truth centres along the reading axis.
     #[test]
-    fn synth_char_boxes_respect_aspect_caps() {
+    fn synth_char_boxes_aspect_and_position() {
         let mut eng = test_engine();
         let truth: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(format!(

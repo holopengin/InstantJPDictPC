@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use iced::widget::canvas::{
     self, Canvas, Frame, Geometry, Path as CanvasPath, Stroke as CanvasStroke,
-    Text as CanvasText,
 };
 use iced::widget::{
     Column, Container, Image as IcedImage, Row, Scrollable, Stack, Text,
@@ -32,7 +31,8 @@ use crate::util::japanese::{estimate_em, is_half_width, to_vertical_glyph};
 use fontdue::Font;
 use iced::widget::image::Handle as ImageHandle;
 
-/// Font fill ratio for OCR character glyphs drawn on the canvas annotation layer.
+/// Fallback font size ratio (of the box's across-axis size) for lines whose
+/// pitch cannot be measured — single-character lines only, in practice.
 const CANVAS_CHAR_RATIO: f32 = 0.9;
 /// Fraction of the line's cross-axis box a glyph's ink may occupy. The
 /// per-line font size is capped so the widest character in the set never
@@ -200,8 +200,17 @@ impl GlyphCache {
     /// font has no entry for a character (e.g. ！ ？ … ；), the Unicode
     /// vertical presentation form is used as the fallback.
     fn glyph_id(&mut self, ch: char, vertical: bool) -> Option<u16> {
-        let face = self.vface.as_ref()?;
-        let gid = face.glyph_index(ch)?.0;
+        let gid = match self.vface.as_ref() {
+            Some(face) => match face.glyph_index(ch) {
+                Some(g) => g.0,
+                // Not in the font: fontdue's lookup returns .notdef (0),
+                // which is what rasterize-by-char used to draw.
+                None => return Some(self.font.lookup_glyph_index(ch)),
+            },
+            // No parser view (font tables unreadable): keep drawing the
+            // plain horizontal glyph rather than nothing.
+            None => return Some(self.font.lookup_glyph_index(ch)),
+        };
         if !vertical {
             return Some(gid);
         }
@@ -226,7 +235,6 @@ impl GlyphCache {
     /// their single-substitution subtables is applied.
     fn gsub_vert_glyph(&self, gid: u16) -> Option<u16> {
         use ttf_parser::gsub::{SingleSubstitution, SubstitutionSubtable};
-        use ttf_parser::opentype_layout::LookupSubtable as _;
 
         let face = self.vface.as_ref()?;
         let gsub = face.tables().gsub?;
@@ -992,11 +1000,11 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                     // One normalized em size per line (mobile estimateEm,
                     // #49): every glyph draws at the same size measured from
                     // the line's own pitch, rather than being fitted to its
-                    // detector-padded box. `あ` is the cross-axis reference:
-                    // glyphs sit on their natural baseline relative to its
-                    // ink centre. Rotated lines carry AABBs of the rotated
-                    // em boxes, so their true dimensions are recovered
-                    // before sizing.
+                    // detector-padded box. Horizontal glyphs use `あ` as the
+                    // cross-axis ink reference; vertical ones use the font's
+                    // own vmtx origin (see below). Rotated lines carry AABBs
+                    // of the rotated em boxes, so their true dimensions are
+                    // recovered before sizing.
                     let quad_angle = annotation.quad.filter(|q| q.is_rotated()).map(|q| q.angle);
                     let em_px = line_font_em_px(line, quad_angle, total_scale, Some(self.glyph_cache.as_ref()));
                     let ref_gid = self.glyph_cache.borrow_mut().glyph_id('あ', false);

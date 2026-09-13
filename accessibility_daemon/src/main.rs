@@ -35,7 +35,6 @@ mod watcher;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::data::db::DictionaryDatabase;
@@ -44,7 +43,6 @@ use crate::models::*;
 use crate::util::deinflector::Deinflector;
 use crate::viewer::OcrViewer;
 
-use directories;
 /// Messages from the bootstrap thread to the Iced UI update function.
 /// The bootstrap thread loads everything (image, dict, engine) so the
 /// window can appear in << 100 ms.
@@ -56,7 +54,6 @@ enum BootstrapMsg {
 }
 
 use iced::window::settings::PlatformSpecific;
-use iced_futures::futures;
 
 // ── evdev statics ──────────────────────────────────────────────────────
 static GP_BITS: AtomicU32 = AtomicU32::new(0);
