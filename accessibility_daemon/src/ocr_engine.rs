@@ -1369,13 +1369,10 @@ pub fn recognize_boxes_streaming(
                             }
                         }
 
-                        // Apply glyph conversion only for vertical text
-                        let (final_text, final_alts) = if job.is_vertical {
-                            (text.chars().map(|c| crate::util::japanese::to_vertical_glyph(c)).collect::<String>(),
-                             alternatives.into_iter().map(|alts| alts.into_iter().map(|(c, s)| (crate::util::japanese::to_vertical_glyph(c), s)).collect()).collect())
-                        } else {
-                            (text, alternatives)
-                        };
+                        // Text stays as recognised: the overlay picks the
+                        // vertical presentation glyphs from the font's GSUB
+                        // `vert`/`vrt2` at draw time.
+                        let (final_text, final_alts) = (text, alternatives);
 
                         let annotation = DetectedAnnotation {
                             bbox: job.bbox.clone(),

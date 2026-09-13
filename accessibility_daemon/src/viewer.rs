@@ -94,12 +94,16 @@ pub fn find_jp_font_path() -> Option<std::path::PathBuf> {
 /// image handles. Thread‑safe via RefCell for interior mutability.
 pub struct GlyphCache {
     font: Font,
-    cache: HashMap<(char, u32), CachedGlyph>,
-    /// Cross-axis ink ratio (ink extent / font px) per (char, is_vertical):
+    /// Rasterized glyphs keyed by `(glyph id, px)`: the id may be a GSUB
+    /// substitution (vertical forms), not just the cmap glyph of the char.
+    cache: HashMap<(u16, u32), CachedGlyph>,
+    /// Cross-axis ink ratio (ink extent / font px) per (glyph id, vertical):
     /// width for vertical lines, height for horizontal. Used to cap the
     /// line's font size so the widest glyph in the set cannot overflow the
     /// line's cross axis.
-    ink_ratios: HashMap<(char, bool), f32>,
+    ink_ratios: HashMap<(u16, bool), f32>,
+    /// GSUB `vert`/`vrt2` resolution results (source glyph -> vertical glyph).
+    vert_cache: HashMap<u16, u16>,
     /// Font-parser view of the same bytes, for the vertical metrics
     /// (vmtx/vhea) fontdue does not expose.
     vface: Option<ttf_parser::Face<'static>>,
@@ -130,6 +134,7 @@ impl GlyphCache {
                         font,
                         cache: HashMap::new(),
                         ink_ratios: HashMap::new(),
+                        vert_cache: HashMap::new(),
                         vface,
                         units_per_em,
                         baseline_below,
@@ -144,9 +149,13 @@ impl GlyphCache {
 
     /// Ensure both tinted handles exist for (char, px_size) and return one
     /// with the ink metrics.
-    fn get_handle(&mut self, ch: char, px: u32, highlighted: bool) -> Option<(&ImageHandle, u32, u32, i32, i32)> {
-        let entry = self.cache.entry((ch, px)).or_insert_with(|| {
-            let (metrics, coverage) = self.font.rasterize(ch, px as f32);
+    fn get_handle(&mut self, gid: u16, px: u32, highlighted: bool) -> Option<(&ImageHandle, u32, u32, i32, i32)> {
+        let entry = self.cache.entry((gid, px)).or_insert_with(|| {
+            let (metrics, coverage) = self.font.rasterize_config(fontdue::layout::GlyphRasterConfig {
+                glyph_index: gid,
+                px: px as f32,
+                font_hash: 0,
+            });
             let w = metrics.width.max(1) as u32;
             let h = metrics.height.max(1) as u32;
             let pink = Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2);
@@ -168,12 +177,16 @@ impl GlyphCache {
         ImageHandle::from_rgba(w, h, rgba)
     }
 
-    /// Pre-warm the cache for a character at the given pixel size.
+    /// Pre-warm the cache for a glyph at the given pixel size.
     /// Called from the update handler so glyph rasterization happens off
     /// the view/draw path, preventing first-frame stutter.
-    pub fn ensure_glyph(&mut self, ch: char, px_size: u32) {
-        self.cache.entry((ch, px_size)).or_insert_with(|| {
-            let (metrics, coverage) = self.font.rasterize(ch, px_size as f32);
+    pub fn ensure_glyph(&mut self, gid: u16, px_size: u32) {
+        self.cache.entry((gid, px_size)).or_insert_with(|| {
+            let (metrics, coverage) = self.font.rasterize_config(fontdue::layout::GlyphRasterConfig {
+                glyph_index: gid,
+                px: px_size as f32,
+                font_hash: 0,
+            });
             let w = metrics.width.max(1) as u32;
             let h = metrics.height.max(1) as u32;
             let pink = Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2);
@@ -182,15 +195,92 @@ impl GlyphCache {
         });
     }
 
+    /// The glyph to rasterize for `ch` in this line orientation. Vertical
+    /// text uses the font's own GSUB `vert`/`vrt2` substitution; where the
+    /// font has no entry for a character (e.g. ！ ？ … ；), the Unicode
+    /// vertical presentation form is used as the fallback.
+    fn glyph_id(&mut self, ch: char, vertical: bool) -> Option<u16> {
+        let face = self.vface.as_ref()?;
+        let gid = face.glyph_index(ch)?.0;
+        if !vertical {
+            return Some(gid);
+        }
+        if let Some(v) = self.vert_cache.get(&gid) {
+            return Some(*v);
+        }
+        let fallback = self.vface.as_ref().and_then(|face| {
+            let vch = crate::util::japanese::to_vertical_glyph(ch);
+            if vch != ch {
+                face.glyph_index(vch).map(|g| g.0)
+            } else {
+                None
+            }
+        });
+        let vert = self.gsub_vert_glyph(gid).or(fallback).unwrap_or(gid);
+        self.vert_cache.insert(gid, vert);
+        Some(vert)
+    }
+
+    /// GSUB `vert`/`vrt2` single substitution for a glyph, if the font has
+    /// one. Both features carry the same lookups in this font; the union of
+    /// their single-substitution subtables is applied.
+    fn gsub_vert_glyph(&self, gid: u16) -> Option<u16> {
+        use ttf_parser::gsub::{SingleSubstitution, SubstitutionSubtable};
+        use ttf_parser::opentype_layout::LookupSubtable as _;
+
+        let face = self.vface.as_ref()?;
+        let gsub = face.tables().gsub?;
+        let vert = ttf_parser::Tag::from_bytes(b"vert");
+        let vrt2 = ttf_parser::Tag::from_bytes(b"vrt2");
+        for fi in 0..gsub.features.len() {
+            let Some(feature) = gsub.features.get(fi) else { continue };
+            if feature.tag != vert && feature.tag != vrt2 {
+                continue;
+            }
+            for li in feature.lookup_indices {
+                let Some(lookup) = gsub.lookups.get(li) else { continue };
+                for sub in lookup
+                    .subtables
+                    .into_iter::<SubstitutionSubtable>()
+                {
+                    if let SubstitutionSubtable::Single(single) = sub {
+                        match single {
+                            SingleSubstitution::Format1 { coverage, delta } => {
+                                if coverage.get(ttf_parser::GlyphId(gid)).is_some() {
+                                    return Some(gid.wrapping_add(delta as u16));
+                                }
+                            }
+                            SingleSubstitution::Format2 {
+                                coverage,
+                                substitutes,
+                            } => {
+                                if let Some(idx) = coverage.get(ttf_parser::GlyphId(gid)) {
+                                    if let Some(sub) = substitutes.get(idx) {
+                                        return Some(sub.0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Cross-axis ink extent per font pixel: width for vertical lines, height
-    /// for horizontal ones. Measured once per (char, orientation) at a
+    /// for horizontal ones. Measured once per (glyph, orientation) at a
     /// reference size, so the per-line size cap costs only lookups per frame.
-    fn cross_ink_ratio(&mut self, ch: char, vertical: bool) -> f32 {
-        let key = (ch, vertical);
+    fn cross_ink_ratio(&mut self, gid: u16, vertical: bool) -> f32 {
+        let key = (gid, vertical);
         if let Some(r) = self.ink_ratios.get(&key) {
             return *r;
         }
-        let (metrics, _) = self.font.rasterize(ch, 64.0);
+        let (metrics, _) = self.font.rasterize_config(fontdue::layout::GlyphRasterConfig {
+            glyph_index: gid,
+            px: 64.0,
+            font_hash: 0,
+        });
         let ink = if vertical { metrics.width } else { metrics.height } as f32;
         let r = ink / 64.0;
         self.ink_ratios.insert(key, r);
@@ -202,9 +292,9 @@ impl GlyphCache {
     /// the 1em vertical cell (vmtx: `yMax + topSideBearing`, no VORG in this
     /// font); `advance` is the cell height. None when the font has no
     /// vertical metrics for the glyph.
-    fn vertical_metrics(&self, ch: char, px: u32) -> Option<(f32, f32, f32)> {
+    fn vertical_metrics(&self, gid: u16, px: u32) -> Option<(f32, f32, f32)> {
         let face = self.vface.as_ref()?;
-        let gid = face.glyph_index(ch)?;
+        let gid = ttf_parser::GlyphId(gid);
         let advance = face.glyph_ver_advance(gid)? as f32;
         let tsb = face.glyph_ver_side_bearing(gid)? as f32;
         let bbox = face.glyph_bounding_box(gid)?;
@@ -231,12 +321,12 @@ struct RasterGlyph {
 /// Returns None if no glyph cache is available.
 fn draw_glyph(
     cache: &RefCell<GlyphCache>,
-    ch: char,
+    gid: u16,
     px_size: u32,
     highlighted: bool,
 ) -> Option<RasterGlyph> {
     let mut c = cache.borrow_mut();
-    let (handle, w, h, xmin, ymin) = c.get_handle(ch, px_size, highlighted)?;
+    let (handle, w, h, xmin, ymin) = c.get_handle(gid, px_size, highlighted)?;
     Some(RasterGlyph { handle: handle.clone(), w, h, xmin, ymin })
 }
 
@@ -350,7 +440,8 @@ fn line_font_em_px(
             let mut max_ratio = 0.0f32;
             let mut c = cache.borrow_mut();
             for ch in line.text.chars() {
-                let r = c.cross_ink_ratio(ch, line.is_vertical);
+                let Some(gid) = c.glyph_id(ch, line.is_vertical) else { continue };
+                let r = c.cross_ink_ratio(gid, line.is_vertical);
                 let r = if is_half_width(ch) { r * ASCII_GLYPH_SCALE } else { r };
                 max_ratio = max_ratio.max(r);
             }
@@ -908,7 +999,9 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                     // before sizing.
                     let quad_angle = annotation.quad.filter(|q| q.is_rotated()).map(|q| q.angle);
                     let em_px = line_font_em_px(line, quad_angle, total_scale, Some(self.glyph_cache.as_ref()));
-                    let ref_ink = draw_glyph(&self.glyph_cache, 'あ', em_px, false)
+                    let ref_gid = self.glyph_cache.borrow_mut().glyph_id('あ', false);
+                    let ref_ink = ref_gid
+                        .and_then(|gid| draw_glyph(&self.glyph_cache, gid, em_px, false))
                         .map(|g| (g.w as f32, g.h as f32, g.xmin as f32, g.ymin as f32));
 
                     for (i, char_box) in line.char_boxes.iter().enumerate() {
@@ -926,7 +1019,11 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         let Some(ch) = line.text.chars().nth(i) else { continue };
                         let highlighted = self.highlighted_coords.contains(&(line_idx, i))
                             || self.cursor_pos == Some((line_idx, i));
-                        let Some(g) = draw_glyph(&self.glyph_cache, ch, em_px, highlighted) else { continue };
+                        // GSUB `vert`/`vrt2` picks the vertical presentation
+                        // glyph for vertical lines (Unicode form fallback for
+                        // what the font does not cover).
+                        let Some(gid) = self.glyph_cache.borrow_mut().glyph_id(ch, line.is_vertical) else { continue };
+                        let Some(g) = draw_glyph(&self.glyph_cache, gid, em_px, highlighted) else { continue };
                         let (gw, gh) = (g.w.max(1) as f32, g.h.max(1) as f32);
                         let reference = ref_ink.unwrap_or((gw, gh, g.xmin as f32, g.ymin as f32));
                         let glyph_metrics = (gw, gh, g.xmin as f32, g.ymin as f32);
@@ -934,13 +1031,11 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         // the 1em cell (vmtx advance, origin at the top) is
                         // centred on the char box, and the glyph keeps its
                         // position inside it — that is what puts the vertical
-                        // comma top-right and the corner brackets low. We
-                        // cannot get this from fontdue, which is horizontal-
-                        // only and applies no `vert` shaping (the OCR text is
-                        // already mapped to the Unicode vertical forms).
+                        // comma top-right and the corner brackets low. The
+                        // glyph itself is the font's GSUB `vert` choice.
                         let (dx, dy) = if line.is_vertical {
                             let borrowed = self.glyph_cache.borrow();
-                            match borrowed.vertical_metrics(ch, em_px) {
+                            match borrowed.vertical_metrics(gid, em_px) {
                                 Some((origin_x, origin_y, advance)) => {
                                     let cell_center = origin_y - advance / 2.0;
                                     (
@@ -1613,9 +1708,14 @@ impl OcrViewer {
                 // Exactly the draw pass's normalized per-line em size.
                 let px = line_font_em_px(line, quad_angle, total_scale, Some(gc.as_ref()));
                 let mut cache = gc.borrow_mut();
-                cache.ensure_glyph('あ', px);
+                let vertical = line.is_vertical;
+                if let Some(gid) = cache.glyph_id('あ', false) {
+                    cache.ensure_glyph(gid, px);
+                }
                 for ch in line.text.chars() {
-                    cache.ensure_glyph(ch, px);
+                    if let Some(gid) = cache.glyph_id(ch, vertical) {
+                        cache.ensure_glyph(gid, px);
+                    }
                 }
             }
         }
@@ -2515,7 +2615,8 @@ mod tests {
         assert!(px < 80.0, "pitch was not capped: {px}");
         let mut c = cache.borrow_mut();
         for ch in line.text.chars() {
-            let ratio = c.cross_ink_ratio(ch, true);
+            let gid = c.glyph_id(ch, true).expect("glyph id");
+            let ratio = c.cross_ink_ratio(gid, true);
             assert!(
                 ratio * px <= 40.0 * CROSS_FIT_RATIO + 1.0,
                 "{ch:?}: ink {:.1}px overflows the 40px column (font {px})",
@@ -2565,11 +2666,12 @@ mod tests {
         let px = 54u32;
         let (cx, cy) = (100.0f32, 100.0f32);
         let place = |ch: char| -> (f32, f32, f32, f32) {
-            let g = draw_glyph(&cache, ch, px, false).expect("glyph");
+            let gid = cache.borrow_mut().glyph_id(ch, true).expect("glyph id");
+            let g = draw_glyph(&cache, gid, px, false).expect("glyph");
             let (gw, gh) = (g.w as f32, g.h as f32);
             let borrowed = cache.borrow();
             let (ox, oy, adv) = borrowed
-                .vertical_metrics(ch, px)
+                .vertical_metrics(gid, px)
                 .expect("vertical metrics");
             let cell_center = oy - adv / 2.0;
             (
@@ -2596,5 +2698,35 @@ mod tests {
             dy + gh / 2.0 > cy,
             "vertical corner bracket should sit below centre"
         );
+    }
+    /// Vertical glyph selection comes from the font's GSUB `vert`/`vrt2`
+    /// feature, with the Unicode vertical form only filling the entries the
+    /// font does not cover.
+    #[test]
+    fn vertical_glyphs_come_from_gsub() {
+        let cache = GlyphCache::new().expect("bundled JP font");
+        let gid_of = |ch: char| -> u16 {
+            let borrowed = cache.borrow();
+            let face = borrowed.vface.as_ref().expect("vface");
+            face.glyph_index(ch).expect("cmap").0
+        };
+        // GSUB-covered: 、 resolves to the font's vertical ideographic comma
+        // glyph (the same glyph U+FE11 maps to), and horizontally it stays.
+        let comma_v = cache.borrow_mut().glyph_id('、', true);
+        let comma_h = cache.borrow_mut().glyph_id('、', false);
+        let stop_v = cache.borrow_mut().glyph_id('。', true);
+        let bracket_v = cache.borrow_mut().glyph_id('「', true);
+        let dash_v = cache.borrow_mut().glyph_id('ー', true).unwrap();
+        let bang_v = cache.borrow_mut().glyph_id('！', true);
+        assert_eq!(comma_v, Some(gid_of('\u{FE11}')));
+        assert_eq!(comma_h, Some(gid_of('、')));
+        assert_eq!(stop_v, Some(gid_of('\u{FE12}')));
+        assert_eq!(bracket_v, Some(gid_of('\u{FE41}')));
+        // ー has its own GSUB vertical glyph, distinct from the horizontal and
+        // from the manual table's FE31 pick.
+        assert_ne!(dash_v, gid_of('ー'));
+        assert_ne!(dash_v, gid_of('\u{FE31}'));
+        // ！ has no vert entry; the Unicode vertical form is the fallback.
+        assert_eq!(bang_v, Some(gid_of('\u{FE15}')));
     }
 }
