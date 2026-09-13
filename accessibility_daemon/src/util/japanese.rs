@@ -191,10 +191,10 @@ lazy_static::lazy_static! {
 }
 
 /// Convert a CJK character to its vertical-mode presentation form.
-/// Replaces standard CJK punctuation and fullwidth forms with Unicode
-/// vertical presentation forms (U+FE10–U+FE48) so the font renders
-/// them in the correct vertical writing position (periods/comma at top-right,
-/// brackets rotated 90°, etc.).
+/// Unicode vertical presentation form (U+FE10–U+FE48), used by the overlay
+/// only as a fallback for characters the font's GSUB `vert`/`vrt2` feature
+/// does not cover (e.g. ！ ？ … ；). GSUB-covered characters (、。「」 etc.)
+/// never reach this table — the font's own vertical glyph wins.
 pub fn to_vertical_glyph(ch: char) -> char {
     match ch {
         // ── FE10-FE19: Vertical Forms block ──
