@@ -730,11 +730,11 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         }
 
                         // Render character to exactly fill its tight ink crop.
-                        // The per-char boxes are tight component boxes from
-                        // BOOOCR, not em-boxes — and the gap between em-box
-                        // and ink can be large (punctuation, small kana), so
-                        // rasterizing at the box height and upscaling would
-                        // blur. Instead, first measure the glyph's ink-to-em
+                        // The per-char boxes outline the glyph, not an em-box
+                        // — and the gap between em-box and ink can be large
+                        // (punctuation, small kana), so rasterizing at the box
+                        // height and upscaling would blur. Instead, first
+                        // measure the glyph's ink-to-em
                         // ratio at a reference size, then rasterize at the em
                         // size whose ink equals the crop size exactly:
                         //   ink_w(px) / px = gw_ref / ref_px

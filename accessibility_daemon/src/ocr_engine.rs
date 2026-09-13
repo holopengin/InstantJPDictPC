@@ -28,16 +28,13 @@ pub struct OcrEngine {
     /// PP-OCRv6 detection (ncnn DB) — shared core with the Android app.
     pub det_net: DetNet,
     /// PP-OCRv6 dynamic-width recognition (ncnn rec_dyn). `None` when the
-    /// model files are missing; recognition then falls back to BOOOCR only.
+    /// model files are missing; recognition is then disabled.
     pub ppocr_rec: Option<std::sync::Arc<RecNet>>,
     pub ppocr_vocab: Vec<String>,
     /// Pruned CTC head remap: remap[pruned_id] = original class id (#39).
     pub rec_remap: Vec<i32>,
     pub recognition_mode: RecognitionMode,
     pub batch_size: usize,
-    /// BOOOCR sidecar (feature-vector recognizer). When present, recognition
-    /// goes through it instead of the PP-OCR rec sessions.
-    pub booocr: Option<std::sync::Arc<std::sync::Mutex<crate::booocr::BooOcrClient>>>,
 }
 
 /// Load the PP-OCRv6 ncnn models + vocab/remap from `model_dir`.
@@ -186,16 +183,6 @@ fn rotate_crop(img: &DynamicImage, angle: f32) -> DynamicImage {
 
 impl OcrEngine {
     pub fn new(model_dir: &str, recognition_mode: RecognitionMode, batch_size: usize) -> Result<Self> {
-        Self::new_with_booocr(model_dir, recognition_mode, batch_size, true)
-    }
-
-    /// `with_booocr: false` skips spawning the sidecar (tests / headless use).
-    pub(crate) fn new_with_booocr(
-        model_dir: &str,
-        recognition_mode: RecognitionMode,
-        batch_size: usize,
-        with_booocr: bool,
-    ) -> Result<Self> {
         let model_path = Path::new(model_dir);
 
         // PP-OCRv6 ncnn detection (shared core with the mobile app).
@@ -212,24 +199,6 @@ impl OcrEngine {
 
         println!("Recognition mode: {:?}, batch size: {}", recognition_mode, batch_size);
 
-        // BOOOCR sidecar: primary recognizer when available. Spawning it
-        // blocks ~3s on the font-database load; on any failure we fall back
-        // to the PP-OCR recognition sessions.
-        let booocr = if with_booocr {
-            match crate::booocr::BooOcrClient::connect_or_spawn(&crate::booocr::booocr_dir()) {
-                Ok(c) => {
-                    println!("[BOOOCR] sidecar ready — line recognition via BOOOCR");
-                    Some(std::sync::Arc::new(std::sync::Mutex::new(c)))
-                }
-                Err(e) => {
-                    eprintln!("[BOOOCR] unavailable ({e}) — falling back to PP-OCR recognition");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         Ok(OcrEngine {
             det_net,
             ppocr_rec,
@@ -237,7 +206,6 @@ impl OcrEngine {
             rec_remap,
             recognition_mode,
             batch_size,
-            booocr,
         })
     }
 
@@ -792,7 +760,6 @@ pub fn recognize_boxes_streaming(
     rec_remap: &[i32],
     _batch_size: usize,
     _recognition_mode: RecognitionMode,
-    booocr: Option<std::sync::Arc<std::sync::Mutex<crate::booocr::BooOcrClient>>>,
     sender: std::sync::mpsc::Sender<(usize, DetectedAnnotation)>,
     _out_dir: &std::path::Path,
 ) -> Result<()> {
@@ -821,7 +788,7 @@ pub fn recognize_boxes_streaming(
         let (crop, crop_x, crop_y, crop_w, crop_h, is_vertical, job_rot) = match rot {
             Some(r) if r.is_rotated() => {
                 // Angled line: crop the quad's axis-aligned bounds, then
-                // un-rotate so the text axis is axis-aligned (BOOOCR sees a
+                // un-rotate so the text axis is axis-aligned (the recogniser sees a
                 // clean horizontal or vertical line instead of one huge
                 // orthogonal crop covering the whole span).
                 let (rx, ry, rw, rh) = r.aabb();
@@ -882,150 +849,7 @@ pub fn recognize_boxes_streaming(
         let job_queue = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::from(jobs)));
         let mut handles = Vec::new();
 
-        if let Some(client) = booocr {
-            // BOOOCR backend: one worker, serialized through the shared
-            // sidecar connection. Per-char boxes come straight from BOOOCR.
-            let q = std::sync::Arc::clone(&job_queue);
-            let client = client.clone();
-            let snd = sender.clone();
-            handles.push(std::thread::spawn(move || loop {
-                // Drain the whole queue: one batched BOOOCR call per
-                // screenshot. The sidecar threads the per-line phases and
-                // matches every line of a scale class against its databases
-                // in a single matrix-matrix product (bit-identical scores,
-                // ~2-3x faster than per-line round trips).
-                let batch: Vec<Job> = {
-                    let mut ql = q.lock().unwrap();
-                    ql.drain(..).collect()
-                };
-                if batch.is_empty() {
-                    return;
-                }
-
-                let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(batch.len());
-                let mut all_saved = true;
-                for job in &batch {
-                    match crate::booocr::save_crop_png(&job.crop, job.idx) {
-                        Ok(p) => paths.push(p),
-                        Err(e) => {
-                            eprintln!("[BOOOCR] crop save failed: {e}");
-                            all_saved = false;
-                            break;
-                        }
-                    }
-                }
-                if !all_saved {
-                    for p in &paths {
-                        let _ = std::fs::remove_file(p);
-                    }
-                    continue;
-                }
-
-                let lines = {
-                    let mut c = client.lock().unwrap();
-                    c.recognize_crops(&paths)
-                };
-                for p in &paths {
-                    let _ = std::fs::remove_file(p);
-                }
-
-                let Ok(lines) = lines else {
-                    eprintln!("[BOOOCR] batch recognition failed");
-                    continue;
-                };
-
-                for (job, line) in batch.into_iter().zip(lines.into_iter()) {
-                let mut line = line;
-                if line.chars.is_empty() {
-                    continue;
-                }
-
-                // Reading order: horizontal → left-to-right (x), vertical →
-                // top-to-bottom (y). BOOOCR sorts horizontal lines itself,
-                // but vertical lines arrive in raw segmentation order, so
-                // re-sort defensively (crop-space coords; for rotated lines
-                // the crop was un-rotated, so crop x/y ARE the reading axis).
-                line.chars.sort_by(|a, b| {
-                    if job.is_vertical {
-                        (a.y, a.x).cmp(&(b.y, b.x))
-                    } else {
-                        (a.x, a.y).cmp(&(b.x, b.y))
-                    }
-                });
-
-                let text: String = line.chars.iter().map(|c| c.c).collect();
-                let char_boxes: Vec<BoundingBox> = line
-                    .chars
-                    .iter()
-                    .map(|c| {
-                        if let Some(rot) = job.rot {
-                            // Crop was un-rotated: map BOOOCR's char box back
-                            // to image coords via the inverse rotation.
-                            rot.map_char_box(
-                                job.crop_w, job.crop_h, job.crop_x, job.crop_y,
-                                c.x, c.y, c.w, c.h,
-                            )
-                        } else {
-                            BoundingBox::new(
-                                job.crop_x as i32 + c.x,
-                                job.crop_y as i32 + c.y,
-                                c.w.max(1),
-                                c.h.max(1),
-                                c.alts.first().map(|(_, s)| *s).unwrap_or(1.0),
-                            )
-                        }
-                    })
-                    .collect();
-                let alternatives: Vec<Vec<(char, f32)>> =
-                    line.chars.iter().map(|c| c.alts.clone()).collect();
-
-                // Dataset collection: save the line crop + detected text
-                let sample_txt = save_line_sample(&job.crop, &text);
-
-                // Apply glyph conversion only for vertical text
-                let (final_text, final_alts) = if job.is_vertical {
-                    (
-                        text.chars()
-                            .map(|c| crate::util::japanese::to_vertical_glyph(c))
-                            .collect::<String>(),
-                        alternatives
-                            .into_iter()
-                            .map(|alts| {
-                                alts.into_iter()
-                                    .map(|(c, s)| (crate::util::japanese::to_vertical_glyph(c), s))
-                                    .collect()
-                            })
-                            .collect(),
-                    )
-                } else {
-                    (text, alternatives)
-                };
-
-                let annotation = DetectedAnnotation {
-                    bbox: job.bbox.clone(),
-                    quad: job.rot,
-                    line: Some(LineResult {
-                        text: final_text,
-                        char_boxes,
-                        alternatives: final_alts,
-                        sample_txt,
-                        is_vertical: job.is_vertical,
-                        chunk_boxes: vec![BoundingBox::new(
-                            job.crop_x as i32,
-                            job.crop_y as i32,
-                            job.crop_w as i32,
-                            job.crop_h as i32,
-                            1.0,
-                        )],
-                    }),
-                };
-                if snd.send((job.idx, annotation)).is_err() {
-                    return;
-                }
-                std::thread::yield_now();
-                }
-            }));
-        } else if !ppocr_vocab.is_empty() && !rec_remap.is_empty() && rec.is_some() {
+        if !ppocr_vocab.is_empty() && !rec_remap.is_empty() && rec.is_some() {
             let rec = rec.clone().expect("rec is Some");
             // Workers share the one loaded ncnn net; each inference creates
             // its own extractor (the mobile app fans out the same way).
@@ -1420,7 +1244,7 @@ mod tests {
 
     fn test_engine() -> OcrEngine {
         let dir = format!("{}/assets", env!("CARGO_MANIFEST_DIR"));
-        OcrEngine::new_with_booocr(&dir, RecognitionMode::Both, 4, false).expect("engine loads")
+        OcrEngine::new(&dir, RecognitionMode::Both, 4).expect("engine loads")
     }
 
     /// Detection parity smoke on the mobile synth set: the ncnn det model +

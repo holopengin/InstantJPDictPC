@@ -17,10 +17,18 @@ use crate::ppocr_ncnn::{top_k, RecNet};
 
 pub const REC_TARGET_H: u32 = 48;
 const REC_STRIDE: u32 = 8;
-/// Single-pass targetW cap; the mobile long-line stitch gate. PC has no
-/// stitch path, so this is only a sanity clamp (a 2000-px-wide line at 48px
-/// height is as far as exact-width CTC was validated).
+/// Single-pass targetW cap; the mobile long-line stitch gate. Beyond it lines
+/// are chunked and stitched (see `stitch_long_line`).
 const LONG_LINE_GATE: u32 = 2000;
+/// Per-chunk targetW cap in the stitch paths.
+const CHUNK_TARGET_MAX: u32 = 480;
+/// Stitch best-pair window (last N stitched × first N current).
+const STITCH_WINDOW: usize = 10;
+/// Stitch best-pair gates: center distance and prediction overlap.
+const STITCH_MAX_DIST_PX: f32 = 30.0;
+const STITCH_MIN_PRED: f32 = 0.4;
+/// Stitch append rule: chars past last center + this gap start a new tail.
+const STITCH_APPEND_GAP_PX: f32 = 10.0;
 /// Softmax row of the head: 0 = blank, 1..=18708 = chars, 18709 = space.
 const SPACE_CLASS: i32 = 18709;
 const FULLWIDTH_SPACE_CLASS: i32 = 18708;
@@ -274,11 +282,11 @@ fn ctc_decode_full(
     }
 }
 
-/// Run the dynamic-width recognizer on a single line crop. Mirrors mobile
-/// `inferResizedRec`: portrait crops rotate 270°, the resize target is the
-/// aspect-preserving width, squish applies before inference (with the mobile
-/// >=32-timestep floor), and the model width snaps up to a multiple of 8
-/// (zero-padded). `remap` length is the pruned CTC head width.
+/// Recognizer output for one line crop. Mirrors mobile `recognizePpocrBatch`:
+/// portrait crops rotate 270°, extreme-aspect lines (>2000 targetW) take the
+/// chunk-and-stitch path (unsquished chunks), everything else takes the
+/// single-pass path with the live squish factor. `remap` length is the
+/// pruned CTC head width.
 pub fn recognize_crop(rec: &RecNet, crop: &DynamicImage, vocab: &[String], remap: &[i32]) -> Result<PpocrResult> {
     recognize_crop_with_squish(rec, crop, vocab, remap, rec_squish())
 }
@@ -303,17 +311,47 @@ fn recognize_crop_with_squish(
     };
     let (rw, rh) = rotated.dimensions();
 
-    // Dynamic width (#23): exact targetW capped at LONG_LINE_GATE, then
-    // squish (#24) applied pre-inference; model width snaps to mult-of-8.
+    // Long-line split for extreme aspects (targetW > 2000): very long lines
+    // crush timesteps in one pass; split into overlapping exact-width chunks
+    // and stitch them (#24). After the portrait rotation a long vertical line
+    // is a long horizontal one, so the X path carries both in practice.
+    let is_long_horiz = rw >= rh * 3 / 2
+        && (rw as f32 * REC_TARGET_H as f32 / rh as f32) > LONG_LINE_GATE as f32;
+    let is_long_vert = rh >= rw * 3 / 2
+        && (rh as f32 * REC_TARGET_H as f32 / rw as f32) > LONG_LINE_GATE as f32;
+    if is_long_horiz || is_long_vert {
+        let axis = if is_long_horiz { Axis::X } else { Axis::Y };
+        if let Some(stitched) = stitch_long_line(rec, &rotated, axis, vocab, remap)? {
+            return Ok(stitched);
+        }
+        eprintln!("[PP-OCR] long-line stitch failed rw={rw} rh={rh} — falling through to crush");
+    }
+
+    // Dynamic width (#23): exact targetW capped at LONG_LINE_GATE (validated
+    // #24), then squish (#24) applied pre-inference; stitch paths skip squish.
+    // Model width snaps to mult-of-8 (≤7px pad).
     let target_w = ((rw as f32 * REC_TARGET_H as f32 / rh as f32).round() as u32)
         .max(4)
         .min(LONG_LINE_GATE);
     let squished = squish_target(target_w, squish);
     let target_w = if squished / REC_STRIDE < 32 { target_w } else { squished };
+    infer_resized(rec, &rotated, target_w, vocab, remap)
+}
+
+/// Mobile `inferResizedRec` for one already-oriented crop: resize to
+/// `target_w × 48`, mult-of-8 zero pad, grey `(gray/127.5)-1` 3-channel
+/// input, then the native top-K decode with the full-logits fallback.
+fn infer_resized(
+    rec: &RecNet,
+    src: &DynamicImage,
+    target_w: u32,
+    vocab: &[String],
+    remap: &[i32],
+) -> Result<PpocrResult> {
     let model_w = target_w.div_ceil(REC_STRIDE) * REC_STRIDE;
     let seq_len = (model_w / REC_STRIDE) as usize;
 
-    let resized = rotated.resize_exact(target_w, REC_TARGET_H, image::imageops::FilterType::Triangle);
+    let resized = src.resize_exact(target_w, REC_TARGET_H, image::imageops::FilterType::Triangle);
     let rgb = resized.to_rgb8();
     let input = build_rec_input(rgb.as_raw(), target_w, REC_TARGET_H, model_w);
 
@@ -369,6 +407,343 @@ fn recognize_crop_with_squish(
         top_chars.push(chars);
     }
     Ok(ctc_decode_topk(vocab, remap, &top_pruned, &top_chars, seq_len))
+}
+
+// ——— Long-line stitch (lines wider than 2000 @48px; CTC crush fix) ———
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    X,
+    Y,
+}
+
+/// One inferred chunk: decoded text plus the geometry to place it globally.
+/// `offset_px` is along the reading axis in full-res source pixels; `char_cols`
+/// are chunk-local timesteps; `seq_len` trims mult-of-8 padding.
+struct Chunk {
+    chars: Vec<char>,
+    char_cols: Vec<f32>,
+    alts: Vec<Vec<(char, f32)>>,
+    seq_len: usize,
+    offset_px: f32,
+}
+
+/// Stitch a long line (>2000 targetW, mobile #24). Phase 1 chunks from the
+/// reading start with a second-to-last-char anchor (10% fallback step); each
+/// chunk is inferred unsquished at full resolution. Phase 2 aligns chunks by
+/// identical timestep size (`cross/6` source px): the best pair in the
+/// [STITCH_WINDOW] tail/head window with center distance ≤ 30px and
+/// prediction overlap ≥ 0.4 wins (`score = 0.3·(1-dist/30) + 0.7·pred`); the
+/// winner's alternatives merge via [interleave_alternatives] and later chars
+/// re-base onto it. No winner → append chars past the last global center
+/// (+10px), or single-char chunks unconditionally; total stall → +1-timestep
+/// fallback offset. Double spaces collapse at the end. Mirrors mobile
+/// `recognizeAndStitchLongHoriz` / `...Vert` (after the portrait rotation the
+/// vertical variant is unreachable, kept for parity).
+///
+/// Returns None when there is nothing to stitch or a chunk failed to infer,
+/// so the caller can fall through to the single-pass crush.
+fn stitch_long_line(
+    rec: &RecNet,
+    rotated: &DynamicImage,
+    axis: Axis,
+    vocab: &[String],
+    remap: &[i32],
+) -> Result<Option<PpocrResult>> {
+    let (rw, rh) = rotated.dimensions();
+    let (along, cross) = if axis == Axis::X { (rw, rh) } else { (rh, rw) };
+    let scale = REC_TARGET_H as f32 / cross as f32;
+    let max_chunk_len = ((CHUNK_TARGET_MAX as f32 / scale) as i32).max(64) as u32;
+    if max_chunk_len == 0 {
+        return Ok(None);
+    }
+    let chunk_margin = ((cross as f32 * 0.1) as i32).max(2);
+
+    // ——— Phase 1: chunk with anchor-driven next position ———
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut pos: i32 = 0;
+    while pos < along as i32 {
+        let len = (max_chunk_len as i32).min(along as i32 - pos);
+        if len < 16 {
+            break;
+        }
+        let chunk = match axis {
+            Axis::X => rotated.crop_imm(pos as u32, 0, len as u32, cross),
+            Axis::Y => rotated.crop_imm(0, pos as u32, cross, len as u32),
+        };
+        // Preserve aspect len→targetW (not stretch); cap at CHUNK_TARGET_MAX.
+        let target_w = ((len as f32 * REC_TARGET_H as f32 / cross as f32).round() as i32)
+            .clamp(4, CHUNK_TARGET_MAX as i32) as u32;
+        let decoded = match infer_resized(rec, &chunk, target_w, vocab, remap) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[PP-OCR] rec stitch chunk w{target_w} infer failed: {e}");
+                return Ok(None);
+            }
+        };
+        let chars: Vec<char> = decoded.text.chars().collect();
+        let anchor_idx = if chars.len() >= 2 { chars.len() - 2 } else { 0 };
+        let anchor_t = decoded
+            .char_cols
+            .get(anchor_idx)
+            .copied()
+            .or_else(|| decoded.char_cols.last().copied());
+        let seq_len = decoded.seq_len_total.max(1);
+        let chars_empty = chars.is_empty();
+        chunks.push(Chunk {
+            chars,
+            char_cols: decoded.char_cols,
+            alts: decoded.alternatives,
+            seq_len,
+            offset_px: pos as f32,
+        });
+        if pos + len as i32 >= along as i32 {
+            break;
+        }
+        // Anchor on the second-to-last char: it is fully observed, the last
+        // char may be cut by the chunk edge.
+        let next = match anchor_t {
+            Some(anchor_t) if !chars_empty => {
+                let local = ((anchor_t + 0.5) / seq_len as f32) * len as f32;
+                (pos + local as i32 - chunk_margin).max(0)
+            }
+            _ => -1,
+        };
+        if next <= pos || next >= pos + len as i32 - 10 {
+            pos += ((len as f32 * 0.9) as i32).max(16);
+        } else {
+            pos = next;
+        }
+    }
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+    if chunks.len() == 1 {
+        let c = &chunks[0];
+        return Ok(Some(PpocrResult {
+            text: c.chars.iter().collect(),
+            alternatives: c.alts.clone(),
+            char_cols: c.char_cols.clone(),
+            seq_len_total: c.seq_len,
+        }));
+    }
+
+    // ——— Phase 2: stitch via anchor alignment with identical timestep size ———
+    // Each timestep is cross/6 px source (48px height / stride 8); all chunks
+    // share the size. totalSeqLen rescales the result to the full line.
+    let timestep_px = cross as f32 / 6.0;
+    let total_seq_len = ((((along as f32 * REC_TARGET_H as f32) / cross as f32)
+        / REC_STRIDE as f32)
+        .ceil() as usize)
+        .max(1);
+    let centers: Vec<Vec<f32>> = chunks
+        .iter()
+        .map(|c| {
+            c.char_cols
+                .iter()
+                .map(|t| c.offset_px + (t + 0.5) * timestep_px)
+                .collect()
+        })
+        .collect();
+    Ok(Some(stitch_phase2(
+        &chunks,
+        &centers,
+        timestep_px,
+        total_seq_len,
+    )))
+}
+
+/// Prediction overlap 0–1 for a stitch candidate pair: 0.6–1.0 when top-1
+/// agrees (scaled by top-5 overlap), 0.5 when either top-1 appears in the
+/// other's top-3, else 0. Pairs below [STITCH_MIN_PRED] never stitch.
+fn compare_prediction_vectors(alt1: &[(char, f32)], alt2: &[(char, f32)]) -> f32 {
+    if alt1.is_empty() || alt2.is_empty() {
+        return 0.0;
+    }
+    if alt1[0].0 == alt2[0].0 {
+        let set2: Vec<char> = alt2.iter().take(5).map(|(c, _)| *c).collect();
+        let m = alt1.iter().take(5).filter(|(c, _)| set2.contains(c)).count();
+        return 0.6 + (m as f32 / 5.0) * 0.4;
+    }
+    let c1 = alt1[0].0;
+    let c2 = alt2[0].0;
+    if alt2.iter().take(3).any(|(c, _)| *c == c1) || alt1.iter().take(3).any(|(c, _)| *c == c2) {
+        0.5
+    } else {
+        0.0
+    }
+}
+
+/// Merge two alternative lists at a stitch anchor: shared chars average up
+/// (×0.8), unique chars discount (×0.6), keep top 15 by score. First-seen
+/// order is preserved for score ties (mobile LinkedHashMap + stable sort).
+fn interleave_alternatives(alt1: &[(char, f32)], alt2: &[(char, f32)]) -> Vec<(char, f32)> {
+    let mut merged: Vec<(char, f32)> = Vec::new();
+    for &(ch, sc) in alt1 {
+        match merged.iter_mut().find(|(c, _)| *c == ch) {
+            Some(e) => e.1 = sc,
+            None => merged.push((ch, sc)),
+        }
+    }
+    for &(ch, sc) in alt2 {
+        match merged.iter_mut().find(|(c, _)| *c == ch) {
+            Some(e) if e.1 > 0.0 => e.1 = (e.1 + sc) * 0.8,
+            Some(e) => e.1 = sc * 0.6,
+            None => merged.push((ch, sc * 0.6)),
+        }
+    }
+    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    merged.truncate(top_k());
+    merged
+}
+
+/// Phase 2 of the stitch: align every chunk after the first onto the
+/// accumulated text (`stitchedGlobal` holds global pixel centers, `cols`
+/// global timesteps). Mirrors the mobile loop statement-for-statement.
+fn stitch_phase2(
+    chunks: &[Chunk],
+    centers: &[Vec<f32>],
+    timestep_px: f32,
+    total_seq_len: usize,
+) -> PpocrResult {
+    let mut text: Vec<char> = chunks[0].chars.clone();
+    let mut alts: Vec<Vec<(char, f32)>> = chunks[0].alts.clone();
+    let mut cols: Vec<f32> = chunks[0].char_cols.clone();
+    let mut global: Vec<f32> = centers[0].clone();
+
+    for i in 1..chunks.len() {
+        let curr = &chunks[i];
+        let curr_global = &centers[i];
+        if curr.alts.is_empty() || alts.is_empty() {
+            let last_px = global.last().copied().unwrap_or(-100.0);
+            let offset_geom_t = curr.offset_px / timestep_px;
+            for j in 0..curr.alts.len() {
+                let Some(&cand_px) = curr_global.get(j) else { continue };
+                if cand_px > last_px + STITCH_APPEND_GAP_PX {
+                    let Some(&ch) = curr.chars.get(j) else { continue };
+                    if text.last() == Some(&' ') && ch == ' ' {
+                        continue;
+                    }
+                    let Some(&t) = curr.char_cols.get(j) else { continue };
+                    text.push(ch);
+                    alts.push(curr.alts[j].clone());
+                    cols.push(offset_geom_t + t);
+                    global.push(cand_px);
+                }
+            }
+            continue;
+        }
+
+        let mut best_prev: i32 = -1;
+        let mut best_curr: i32 = -1;
+        let mut best_score = -1.0f32;
+        let p_start = alts.len().saturating_sub(STITCH_WINDOW);
+        let c_end = curr.alts.len().min(STITCH_WINDOW);
+        for p_idx in (p_start..alts.len()).rev() {
+            let p_gc = global[p_idx];
+            for c_idx in 0..c_end {
+                let c_gx = curr_global[c_idx];
+                let dist = (p_gc - c_gx).abs();
+                if dist > STITCH_MAX_DIST_PX {
+                    continue;
+                }
+                let pred = compare_prediction_vectors(&alts[p_idx], &curr.alts[c_idx]);
+                if pred < STITCH_MIN_PRED {
+                    continue;
+                }
+                let score = (1.0 - dist / STITCH_MAX_DIST_PX) * 0.3 + pred * 0.7;
+                if score > best_score {
+                    best_score = score;
+                    best_prev = p_idx as i32;
+                    best_curr = c_idx as i32;
+                }
+            }
+        }
+        if best_prev != -1 {
+            let (bp, bc) = (best_prev as usize, best_curr as usize);
+            let merged = interleave_alternatives(&alts[bp], &curr.alts[bc]);
+            let to_keep = bp + 1;
+            text.truncate(to_keep);
+            alts.truncate(to_keep);
+            cols.truncate(to_keep);
+            global.truncate(to_keep);
+            alts[bp] = merged;
+            let offset_t = cols[bp] - curr.char_cols[bc];
+            let offset_px = global[bp] - curr_global[bc];
+            for j in bc + 1..curr.alts.len() {
+                let Some(&ch) = curr.chars.get(j) else { continue };
+                if text.last() == Some(&' ') && ch == ' ' {
+                    continue;
+                }
+                let Some(&t) = curr.char_cols.get(j) else { continue };
+                text.push(ch);
+                alts.push(curr.alts[j].clone());
+                cols.push(t + offset_t);
+                global.push(curr_global[j] + offset_px);
+            }
+        } else {
+            let last_px = global.last().copied().unwrap_or(-100.0);
+            let mut appended = 0usize;
+            for j in 0..curr.alts.len() {
+                let cand_px = curr_global[j];
+                if cand_px > last_px + STITCH_APPEND_GAP_PX
+                    || (appended == 0 && curr.alts.len() == 1)
+                {
+                    let Some(&ch) = curr.chars.get(j) else { continue };
+                    if text.last() == Some(&' ') && ch == ' ' {
+                        continue;
+                    }
+                    let Some(&t) = curr.char_cols.get(j) else { continue };
+                    text.push(ch);
+                    alts.push(curr.alts[j].clone());
+                    cols.push(curr.offset_px / timestep_px + t);
+                    global.push(cand_px);
+                    appended += 1;
+                }
+            }
+            if appended == 0 {
+                let last_t = cols.last().copied().unwrap_or(0.0);
+                let last_px2 = global.last().copied().unwrap_or(0.0);
+                let fallback_offset_t = (last_t + 1.0) - curr.char_cols[0];
+                let fallback_offset_px = (last_px2 + timestep_px) - curr_global[0];
+                for j in 0..curr.alts.len() {
+                    let Some(&ch) = curr.chars.get(j) else { continue };
+                    if text.last() == Some(&' ') && ch == ' ' {
+                        continue;
+                    }
+                    let Some(&t) = curr.char_cols.get(j) else { continue };
+                    text.push(ch);
+                    alts.push(curr.alts[j].clone());
+                    cols.push(t + fallback_offset_t);
+                    global.push(curr_global[j] + fallback_offset_px);
+                }
+            }
+        }
+    }
+
+    // Collapse double spaces. Mobile rewrites the text only; we drop the
+    // matching column/alt too, so charCols and the text stay index-aligned
+    // for the char-box pass downstream.
+    let mut i = 1;
+    while i < text.len() {
+        if text[i] == ' ' && text[i - 1] == ' ' {
+            text.remove(i);
+            if i < cols.len() {
+                cols.remove(i);
+            }
+            if i < alts.len() {
+                alts.remove(i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    PpocrResult {
+        text: text.into_iter().collect(),
+        alternatives: alts,
+        char_cols: cols,
+        seq_len_total: total_seq_len,
+    }
 }
 
 /// Batched entry point kept for the existing streaming call sites: runs each
@@ -431,6 +806,60 @@ mod tests {
             std::mem::swap(&mut prev, &mut cur);
         }
         prev[b.len()]
+    }
+
+    /// Repeat a synth crop into a strip; the text inside repeats too.
+    fn tile(src: &DynamicImage, count: u32, horizontal: bool) -> DynamicImage {
+        let (w, h) = src.dimensions();
+        let (ow, oh) = if horizontal { (w * count, h) } else { (w, h * count) };
+        let mut out = image::RgbaImage::new(ow, oh);
+        for i in 0..count {
+            let (x, y) = if horizontal { (i * w, 0) } else { (0, i * h) };
+            image::imageops::overlay(&mut out, &src.to_rgba8(), x as i64, y as i64);
+        }
+        DynamicImage::ImageRgba8(out)
+    }
+
+    /// Long-line stitch (#24): a strip past the 2000 targetW gate must take
+    /// the chunk-and-stitch path and come back as one line, with `charCols`
+    /// and the text the same length and `seqLenTotal` rescaled to the strip.
+    #[test]
+    fn synth_long_line_stitches() {
+        let f = fixture();
+        // 32 × 168px → targetW ≈ 2081, just past the 2000 gate.
+        let line = image::open(repo_path("test_images/synth/line_00_h.png")).unwrap();
+        let strip = tile(&line, 32, true);
+        let target = strip.width() as f32 * REC_TARGET_H as f32 / strip.height() as f32;
+        assert!(
+            target > LONG_LINE_GATE as f32,
+            "test strip must exceed the gate (got {target})"
+        );
+        let res = recognize_crop_with_squish(&f.rec, &strip, &f.vocab, &f.remap, 0.5).unwrap();
+        let expected = "漢字".repeat(32);
+        // Tile boundaries decode as spaces (the seam is wider than the
+        // in-glyph gap); compare the glyphs only.
+        let glyphs: String = res.text.chars().filter(|c| *c != ' ').collect();
+        let dist = levenshtein(&glyphs, &expected);
+        assert_eq!(
+            res.char_cols.len(),
+            res.text.chars().count(),
+            "charCols/text lengths differ: {} vs {}",
+            res.char_cols.len(),
+            res.text.chars().count()
+        );
+        assert!(
+            glyphs.chars().count() * 100 >= expected.chars().count() * 80,
+            "stitched only {} of {} glyphs: {:?}",
+            glyphs.chars().count(),
+            expected.chars().count(),
+            res.text
+        );
+        assert!(
+            dist * 100 <= expected.chars().count() * 5,
+            "stitch glyph CER {dist}/{}: {:?}",
+            expected.chars().count(),
+            res.text
+        );
     }
 
     /// Mobile's androidTest synth set (truth.json + line crops): the shared
