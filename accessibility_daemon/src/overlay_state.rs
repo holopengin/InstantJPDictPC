@@ -13,7 +13,6 @@ use crate::util::japanese;
 pub struct LookupResult {
     pub matches: Rc<Vec<FormattedEntry>>,
     pub max_len: usize,
-    pub tapped_box: BoundingBox,
 }
 
 pub struct OcrOverlayState {
@@ -31,9 +30,7 @@ pub struct OcrOverlayState {
     pub last_highlighted_coords: Vec<(usize, usize)>,
     pub last_landscape_gravity: Gravity,
     pub last_portrait_gravity: Gravity,
-    pub is_controller_navigation: bool,
     pub is_dictionary_visible: bool,
-    pub is_alternatives_visible: bool,
     /// Cached formatted entries from the last lookup (Rc for O(1) clone in view()).
     pub cached_entries: Rc<Vec<FormattedEntry>>,
     /// Cache of parsed definition JSON strings -> DefinitionNode vecs
@@ -42,8 +39,6 @@ pub struct OcrOverlayState {
     pub cached_lookup_term: String,
     /// Per-session cache of kanji readings to avoid repeated SQLite queries.
     pub kanji_cache: HashMap<String, Vec<DictionaryEntry>>,
-    /// The bounding box of the tapped character, used to compute panel gravity.
-    pub tapped_box_for_gravity: Option<BoundingBox>,
     /// Screenshot dimensions, needed to compute the base transform for gravity.
     pub img_w: u32,
     pub img_h: u32,
@@ -74,14 +69,11 @@ impl OcrOverlayState {
             last_highlighted_coords: Vec::new(),
             last_landscape_gravity: Gravity::Start,
             last_portrait_gravity: Gravity::Top,
-            is_controller_navigation: false,
             is_dictionary_visible: false,
-            is_alternatives_visible: false,
             cached_entries: Rc::new(Vec::new()),
             def_cache: HashMap::new(),
             cached_lookup_term: String::new(),
             kanji_cache: HashMap::new(),
-            tapped_box_for_gravity: None,
             img_w: 0,
             img_h: 0,
             window_width: Cell::new(window_width),
@@ -91,11 +83,6 @@ impl OcrOverlayState {
         }
     }
 
-    pub fn reset(&mut self) {
-        let w = self.window_width.get();
-        let h = self.window_height.get();
-        *self = Self::new(w, h);
-    }
 
     pub fn update_global_data(&mut self) {
         self.active_all_chars.clear();
@@ -108,18 +95,6 @@ impl OcrOverlayState {
         }
     }
 
-    pub fn set_line_results(&mut self, lines: Vec<Option<LineResult>>) {
-        self.active_line_results = lines;
-        self.active_line_boxes.clear();
-        self.active_line_boxes.extend(
-            self.active_line_results
-                .iter()
-                .flatten()
-                .flat_map(|line| line.chunk_boxes.clone()),
-        );
-        self.update_global_data();
-        self.build_nav_graph();
-    }
 
     /// Replace a single line result at the given index, expanding the vec if needed.
     pub fn set_single_line_result(&mut self, index: usize, line: LineResult) {
@@ -281,7 +256,6 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                                 text: ch.to_string(),
                                 is_selected: line_idx as isize == self.current_tapped_line_idx
                                     && char_idx as isize == self.current_tapped_char_idx_in_line,
-                                line_idx,
                                 char_idx,
                             })
                             .collect()
@@ -310,26 +284,9 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                     is_selected: *ch == current_char,
                 })
                 .collect(),
-            show_manual_input: true,
         })
     }
 
-    pub fn panel_dimensions(&self) -> (f32, f32) {
-        let root_width = self.window_width.get();
-        let root_height = self.window_height.get();
-        let is_landscape = root_width > root_height;
-        let panel_width = if is_landscape {
-            (root_width * 0.4).min(500.0)
-        } else {
-            root_width
-        };
-        let panel_height = if is_landscape {
-            root_height
-        } else {
-            root_height * 0.4
-        };
-        (panel_width, panel_height)
-    }
 
     /// Determine which side the panel should open on.
     /// Default: left (Start) in landscape, top (Top) in portrait.
@@ -361,7 +318,6 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
             + total_offset_y
             + (tapped_box.h as f32 / 2.0) * total_scale;
         // Character's left edge in screen space (for overlap check)
-        let char_left = tapped_box.left() as f32 * total_scale + total_offset_x;
         let char_top = tapped_box.top() as f32 * total_scale + total_offset_y;
 
         eprintln!(
@@ -428,60 +384,6 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
         }
     }
 
-    pub fn calculate_display_boxes(&self, line: &LineResult) -> Vec<BoundingBox> {
-        let fixed_size = if line.is_vertical {
-            line.char_boxes.iter().map(|b| b.w).max().unwrap_or(0)
-        } else {
-            line.char_boxes.iter().map(|b| b.h).max().unwrap_or(0)
-        };
-
-        let mut refined_boxes = Vec::new();
-        if let Some(first) = line.char_boxes.first() {
-            refined_boxes.push(first.clone());
-        }
-        for i in 1..line.char_boxes.len() {
-            let prev_original = &line.char_boxes[i - 1];
-            let cur_original = &line.char_boxes[i];
-            let advance = fixed_size;
-
-            if line.is_vertical {
-                let new_top = prev_original
-                    .top()
-                    .saturating_add(advance)
-                    .max(cur_original.top());
-                refined_boxes.push(BoundingBox::new(
-                    cur_original.left(),
-                    new_top,
-                    cur_original.w,
-                    cur_original.h,
-                    cur_original.confidence,
-                ));
-            } else {
-                let new_left = prev_original
-                    .left()
-                    .saturating_add(advance)
-                    .max(cur_original.left());
-                refined_boxes.push(BoundingBox::new(
-                    new_left,
-                    cur_original.top(),
-                    cur_original.w,
-                    cur_original.h,
-                    cur_original.confidence,
-                ));
-            }
-        }
-
-        refined_boxes
-            .iter()
-            .map(|box_item| {
-                let center_x = box_item.left() as f32 + (box_item.w as f32 / 2.0);
-                let center_y = box_item.top() as f32 + (box_item.h as f32 / 2.0);
-                let left = (center_x - fixed_size as f32 / 2.0).round() as i32;
-                let top = (center_y - fixed_size as f32 / 2.0).round() as i32;
-                BoundingBox::new(left, top, fixed_size, fixed_size, 1.0)
-            })
-            .collect()
-    }
 
     // -------------------------------------------------------------------------
     // Dictionary lookup
@@ -502,7 +404,7 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
         self.current_tapped_char_idx_in_line = char_idx as isize;
 
         let line = self.active_line_results.get(line_idx)?.as_ref()?;
-        let tapped_box = line.char_boxes.get(char_idx)?.clone();
+        line.char_boxes.get(char_idx)?;
 
         // Tapping on a full-width space (void/blank placeholder) → no results
         if line.text.chars().nth(char_idx) == Some('\u{3000}') {
@@ -530,7 +432,6 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
             return Some(LookupResult {
                 matches: Rc::clone(&self.cached_entries),
                 max_len: self.current_word_length,
-                tapped_box,
             });
         }
 
@@ -585,7 +486,6 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
         Some(LookupResult {
             matches: Rc::clone(&self.cached_entries),
             max_len,
-            tapped_box,
         })
     }
 
@@ -840,9 +740,6 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                             });
                         } else {
                             let tags_to_render = current_group_tags.take().unwrap();
-                            let is_forms = tags_to_render.iter().any(|t| {
-                                t.eq_ignore_ascii_case("Forms") || t.eq_ignore_ascii_case("Other forms")
-                            });
                             let filtered_tags: Vec<String> = tags_to_render
                                 .into_iter()
                                 .filter(|t| group_seen_tags.insert(t.clone()))
@@ -850,7 +747,6 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                             sense_groups.push(FormattedSenseGroup {
                                 tags: filtered_tags,
                                 senses: current_group_senses.clone(),
-                                is_forms,
                             });
                             current_group_tags = Some(tags);
                             current_group_senses = vec![FormattedSense {
@@ -861,9 +757,6 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                     }
 
                     if let Some(tags_to_render) = current_group_tags.take() {
-                        let is_forms = tags_to_render.iter().any(|t| {
-                            t.eq_ignore_ascii_case("Forms") || t.eq_ignore_ascii_case("Other forms")
-                        });
                         let filtered_tags: Vec<String> = tags_to_render
                             .into_iter()
                             .filter(|t| group_seen_tags.insert(t.clone()))
@@ -871,7 +764,6 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                         sense_groups.push(FormattedSenseGroup {
                             tags: filtered_tags,
                             senses: current_group_senses,
-                            is_forms,
                         });
                     }
 
@@ -951,36 +843,14 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                 let sc_class = Self::get_attr(map, "class");
 
                 if Self::is_example(map) {
-                    let jp = map
-                        .get("japanese")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| content.and_then(|v| v.as_str()));
-                    let en = map.get("english").and_then(|v| v.as_str());
-                    if let Some(jp_str) = jp {
-                        nodes.push(DefinitionNode::Example {
-                            japanese: Some(jp_str.to_string()),
-                            english: en.map(|s| s.to_string()),
-                            content: None,
-                        });
-                    } else {
-                        let mut sub = Vec::new();
-                        if let Some(c) = content {
-                            Self::parse_definition_item(c, true, &mut sub);
-                        }
-                        nodes.push(DefinitionNode::Example {
-                            japanese: None,
-                            english: en.map(|s| s.to_string()),
-                            content: Some(sub),
-                        });
-                    }
+                    // Block-level: pushed as an opaque node so its content
+                    // stays out of the inline flow (not rendered today).
+                    nodes.push(DefinitionNode::Example);
                 } else if sc_class.as_deref() == Some("tag")
                     || (tag == Some("span") && sc_content.as_deref().map_or(false, |s| s.ends_with("-info")))
                 {
                     let text = content.and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    nodes.push(DefinitionNode::Tag {
-                        text,
-                        category: String::new(),
-                    });
+                    nodes.push(DefinitionNode::Tag { text });
                 } else if tag == Some("ruby") {
                     if let Some(serde_json::Value::Array(ruby_list)) = content {
                         if ruby_list.len() >= 2 {
@@ -992,15 +862,11 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            nodes.push(DefinitionNode::Ruby {
-                                term,
-                                reading,
-                                is_mini: true,
-                            });
+                            nodes.push(DefinitionNode::Ruby { term, reading });
                         }
                     }
                 } else if tag == Some("table") {
-                    nodes.push(DefinitionNode::Table { rows: Vec::new() });
+                    nodes.push(DefinitionNode::Table);
                 } else if tag == Some("ul") || tag == Some("ol") {
                     let is_inline_list = matches!(
                         sc_content.as_deref(),
@@ -1011,21 +877,8 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                             Self::parse_definition_item(c, in_example, nodes);
                         }
                     } else {
-                        let items: Vec<Vec<DefinitionNode>> = match content {
-                            Some(serde_json::Value::Array(arr)) => arr
-                                .iter()
-                                .map(|item| {
-                                    let mut sub = Vec::new();
-                                    Self::parse_definition_item(item, in_example, &mut sub);
-                                    sub
-                                })
-                                .collect(),
-                            _ => Vec::new(),
-                        };
-                        nodes.push(DefinitionNode::ListBlock {
-                            items,
-                            block_type: sc_content.clone(),
-                        });
+                        // Block-level list: opaque node, content not rendered.
+                        nodes.push(DefinitionNode::ListBlock);
                     }
                 } else if let Some(c) = content {
                     Self::parse_definition_item(c, in_example, nodes);

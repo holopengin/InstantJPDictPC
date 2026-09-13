@@ -66,13 +66,3 @@ impl DictionaryEntry {
     }
 }
 
-impl DictionaryMeta {
-    pub fn new(name: String, priority: i32) -> Self {
-        Self {
-            id: 0,
-            name,
-            priority,
-            enabled: true,
-        }
-    }
-}

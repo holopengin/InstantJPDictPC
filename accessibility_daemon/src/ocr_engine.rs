@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use imageproc::contours;
-use fontdue::Font;
 use std::path::Path;
 
 use crate::models::*;
@@ -15,7 +14,6 @@ const PPOCR_DET_LONG_SIDE: u32 = 960;
 const PPOCR_DET_THRESH: f32 = 0.3;
 const PPOCR_DET_BOX_THRESH: f32 = 0.8;
 const PPOCR_DET_UNCLIP_RATIO: f32 = 1.5;
-const X_OVERLAP_THRESHOLD: f32 = 0.3;
 
 // Furigana (ruby) filter (#28) — conservative: better to recognize ruby than
 // to drop real small text. Matching runs on RAW contour geometry (pre-unclip:
@@ -35,8 +33,6 @@ const FURIGANA_MAX_FRAC: f32 = 0.12;
 // compact blocks (logo boxes, badges).
 const FURIGANA_BIG_MIN_FRAC: f32 = 0.2;
 
-// Box fill ratio when rendering glyphs inside detected boxes. 1.0 means match box height, <1.0 leave padding.
-const BOX_FILL_RATIO: f32 = 0.9;
 
 /// Rec workers sharing the one loaded ncnn net (mobile fans out to 4;
 /// `PPOCR_REC_WORKERS` overrides for tuning).
@@ -531,9 +527,6 @@ impl OcrEngine {
         })
     }
 
-    pub fn is_ready(&self) -> bool {
-        self.ppocr_rec.is_some() && !self.ppocr_vocab.is_empty() && !self.rec_remap.is_empty()
-    }
 
     /// Detects bounding boxes using PP-OCRv6 segmentation-based detection model.
     /// The model outputs a probability map [1,1,H,W]. Post-processing:
@@ -935,84 +928,7 @@ impl OcrEngine {
         Ok(DetectionResult { boxes, rotated })
     }
 
-    pub fn merge_overlapping_boxes(&self, boxes: Vec<BoundingBox>) -> Vec<BoundingBox> {
-        if boxes.is_empty() {
-            return boxes;
-        }
 
-        let mut result: Vec<BoundingBox> = Vec::new();
-        let mut handled = vec![false; boxes.len()];
-
-        for (idx, box_a) in boxes.iter().enumerate() {
-            if handled[idx] {
-                continue;
-            }
-
-            let mut current_merged = box_a.clone();
-
-            for (idx_b, box_b) in boxes.iter().enumerate() {
-                if idx == idx_b || handled[idx_b] {
-                    continue;
-                }
-
-                if self.should_merge_boxes(&current_merged, box_b) {
-                    // Merge box_b into current_merged
-                    let new_x = current_merged.left().min(box_b.left());
-                    let new_y = current_merged.top().min(box_b.top());
-                    let new_right = current_merged.right().max(box_b.right());
-                    let new_bottom = current_merged.bottom().max(box_b.bottom());
-
-                    current_merged = BoundingBox::new(
-                        new_x,
-                        new_y,
-                        new_right - new_x,
-                        new_bottom - new_y,
-                        current_merged.confidence.max(box_b.confidence),
-                    );
-                    handled[idx_b] = true;
-                }
-            }
-
-            result.push(current_merged);
-        }
-
-        result
-    }
-
-    pub fn should_merge_boxes(&self, a: &BoundingBox, b: &BoundingBox) -> bool {
-        let inter_left = a.left().max(b.left());
-        let inter_top = a.top().max(b.top());
-        let inter_right = a.right().min(b.right());
-        let inter_bottom = a.bottom().min(b.bottom());
-
-        if inter_left >= inter_right || inter_top >= inter_bottom {
-            return false;
-        }
-
-        let inter_area = (inter_right - inter_left) * (inter_bottom - inter_top);
-        let area_a = a.area();
-        let area_b = b.area();
-        let min_area = area_a.min(area_b);
-
-        if min_area == 0 {
-            return false;
-        }
-
-        let iom = inter_area as f32 / min_area as f32;
-        if iom < X_OVERLAP_THRESHOLD as f32 {
-            return false;
-        }
-
-        // Check if boxes are on the same row (vertical overlap)
-        let y_diff = (a.y + a.h / 2) - (b.y + b.h / 2);
-        let avg_height = (a.h + b.h) / 2;
-
-        if y_diff.abs() > avg_height {
-            return false;
-        }
-
-        true
-    }
 
     pub fn sort_detected_boxes(&self, mut boxes: Vec<(BoundingBox, RotatedBox)>) -> Vec<(BoundingBox, RotatedBox)> {
         // Separate by orientation
@@ -1039,53 +955,8 @@ impl OcrEngine {
         boxes
     }
 
-    pub fn image_to_nchw(&self, img: &RgbaImage, width: u32, height: u32) -> Vec<f32> {
-        let mut img_data = vec![0.0f32; 3 * width as usize * height as usize];
-        let w_usize = width as usize;
-        let h_usize = height as usize;
-        for y in 0..height {
-            for x in 0..width {
-                let p = img.get_pixel(x, y);
-                let r = p[0] as f32 / 255.0;
-                let g = p[1] as f32 / 255.0;
-                let b = p[2] as f32 / 255.0;
-                let x_usize = x as usize;
-                let y_usize = y as usize;
-                img_data[0 * h_usize * w_usize + y_usize * w_usize + x_usize] = r;
-                img_data[1 * h_usize * w_usize + y_usize * w_usize + x_usize] = g;
-                img_data[2 * h_usize * w_usize + y_usize * w_usize + x_usize] = b;
-            }
-        }
-        img_data
-    }
 
-    pub fn calculate_x_overlap(&self, box1: &[f32; 4], box2: &[f32; 4]) -> f32 {
-        let x1_min = box1[0];
-        let x1_max = box1[2];
-        let x2_min = box2[0];
-        let x2_max = box2[2];
-        let intersection = (x1_max.min(x2_max) - x1_min.max(x2_min)).max(0.0);
-        let w1 = x1_max - x1_min;
-        let w2 = x2_max - x2_min;
-        if w1 <= 0.0 || w2 <= 0.0 {
-            return 0.0;
-        }
-        intersection / w1.min(w2)
-    }
 
-    pub fn calculate_y_overlap(&self, box1: &[f32; 4], box2: &[f32; 4]) -> f32 {
-        let y1_min = box1[1];
-        let y1_max = box1[3];
-        let y2_min = box2[1];
-        let y2_max = box2[3];
-        let intersection = (y1_max.min(y2_max) - y1_min.max(y2_min)).max(0.0);
-        let h1 = y1_max - y1_min;
-        let h2 = y2_max - y2_min;
-        if h1 <= 0.0 || h2 <= 0.0 {
-            return 0.0;
-        }
-        intersection / h1.min(h2)
-    }
 
     // Modified: return the annotated image in-memory when `render` is true
     /// Just line detection — returns raw bounding boxes (fast, no character recognition).
@@ -1404,247 +1275,6 @@ pub fn recognize_boxes_streaming(
         recognize_ms, sorted.len()
     );
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Private helper functions
-// ---------------------------------------------------------------------------
-
-fn draw_rectangle(img: &mut RgbaImage, bbox: &BoundingBox, color: Rgba<u8>, thickness: u32) {
-    let img_w = img.width() as i32;
-    let img_h = img.height() as i32;
-    if img_w <= 0 || img_h <= 0 {
-        return;
-    }
-
-    let left = bbox.left().max(0).min(img_w - 1);
-    let top = bbox.top().max(0).min(img_h - 1);
-    let right = bbox.right().max(0).min(img_w);
-    let bottom = bbox.bottom().max(0).min(img_h);
-
-    for t in 0..(thickness as i32) {
-        let lt = left + t;
-        let tp = top + t;
-        let rt = right - t;
-        let bm = bottom - t;
-
-        if lt >= rt || tp >= bm {
-            break;
-        }
-
-        // top horizontal line
-        if tp >= 0 && tp < img_h {
-            for x in lt..rt {
-                if x >= 0 && x < img_w {
-                    img.put_pixel(x as u32, tp as u32, color);
-                }
-            }
-        }
-
-        // bottom horizontal line (at y = bm - 1)
-        let yb = bm - 1;
-        if yb >= 0 && yb < img_h {
-            for x in lt..rt {
-                if x >= 0 && x < img_w {
-                    img.put_pixel(x as u32, yb as u32, color);
-                }
-            }
-        }
-
-        // left vertical line
-        if lt >= 0 && lt < img_w {
-            for y in tp..bm {
-                if y >= 0 && y < img_h {
-                    img.put_pixel(lt as u32, y as u32, color);
-                }
-            }
-        }
-
-        // right vertical line (at x = rt - 1)
-        let xr = rt - 1;
-        if xr >= 0 && xr < img_w {
-            for y in tp..bm {
-                if y >= 0 && y < img_h {
-                    img.put_pixel(xr as u32, y as u32, color);
-                }
-            }
-        }
-    }
-}
-
-fn draw_filled_rect(img: &mut RgbaImage, x: i32, y: i32, w: i32, h: i32, color: Rgba<u8>) {
-    let img_w = img.width() as i32;
-    let img_h = img.height() as i32;
-    if img_w <= 0 || img_h <= 0 {
-        return;
-    }
-
-    let left = x.max(0).min(img_w - 1);
-    let top = y.max(0).min(img_h - 1);
-    let right = (x + w).max(0).min(img_w);
-    let bottom = (y + h).max(0).min(img_h);
-
-    if left >= right || top >= bottom {
-        return;
-    }
-
-    for yy in top..bottom {
-        for xx in left..right {
-            img.put_pixel(xx as u32, yy as u32, color);
-        }
-    }
-}
-
-fn draw_text_small(
-    img: &mut RgbaImage,
-    x: i32,
-    y: i32,
-    text: &str,
-    fg: Rgba<u8>,
-    bg: Rgba<u8>,
-    scale: u32,
-) {
-    // Tiny 3x5 font for digits and '.' only. Each entry is 5 rows, bits (2..0) left->right.
-    fn glyph(c: char) -> Option<[u8; 5]> {
-        match c {
-            '0' => Some([0b111, 0b101, 0b101, 0b101, 0b111]),
-            '1' => Some([0b010, 0b110, 0b010, 0b010, 0b111]),
-            '2' => Some([0b111, 0b001, 0b111, 0b100, 0b111]),
-            '3' => Some([0b111, 0b001, 0b111, 0b001, 0b111]),
-            '4' => Some([0b101, 0b101, 0b111, 0b001, 0b001]),
-            '5' => Some([0b111, 0b100, 0b111, 0b001, 0b111]),
-            '6' => Some([0b111, 0b100, 0b111, 0b101, 0b111]),
-            '7' => Some([0b111, 0b001, 0b001, 0b001, 0b001]),
-            '8' => Some([0b111, 0b101, 0b111, 0b101, 0b111]),
-            '9' => Some([0b111, 0b101, 0b111, 0b001, 0b111]),
-            '.' => Some([0b000, 0b000, 0b000, 0b000, 0b010]),
-            _ => None,
-        }
-    }
-
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len() as i32;
-    if n == 0 {
-        return;
-    }
-
-    let s = scale as i32;
-    let char_w = 3 * s;
-    let char_h = 5 * s;
-    let spacing = s; // spacing between chars
-    let padding = s; // padding inside bg
-    let total_w = n * char_w + (n - 1) * spacing;
-    let total_h = char_h;
-
-    // Try to position above the provided y; if not enough space, put below
-    let mut label_x = x;
-    let mut label_y = y - (total_h + 2 * padding);
-
-    let img_w = img.width() as i32;
-    let img_h = img.height() as i32;
-
-    if label_x + total_w + 2 * padding > img_w {
-        label_x = img_w - (total_w + 2 * padding);
-    }
-    if label_x < 0 {
-        label_x = 0;
-    }
-
-    if label_y < 0 {
-        label_y = y + padding;
-        if label_y + total_h + 2 * padding > img_h {
-            label_y = img_h - (total_h + 2 * padding);
-        }
-    }
-
-    // Draw background
-    draw_filled_rect(
-        img,
-        label_x,
-        label_y,
-        total_w + 2 * padding,
-        total_h + 2 * padding,
-        bg,
-    );
-
-    // Draw each glyph
-    let mut cx = label_x + padding;
-    for ch in chars.iter() {
-        if let Some(g) = glyph(*ch) {
-            for row in 0..5 {
-                for col in 0..3 {
-                    let mask = 1 << (2 - col);
-                    if (g[row] & mask) != 0 {
-                        let px = cx + (col as i32) * s;
-                        let py = label_y + padding + (row as i32) * s;
-                        // draw scaled pixel block
-                        draw_filled_rect(img, px, py, s, s, fg);
-                    }
-                }
-            }
-        }
-        cx += char_w + spacing;
-    }
-}
-
-fn draw_text_ttf(
-    img: &mut RgbaImage,
-    font: &Font,
-    text: &str,
-    x: i32,
-    y: i32,
-    size_px: f32,
-    color: Rgba<u8>,
-) {
-    let img_w = img.width() as i32;
-    let img_h = img.height() as i32;
-    let line_metrics = font.horizontal_line_metrics(size_px).unwrap_or_else(|| {
-        fontdue::LineMetrics {
-            ascent: size_px,
-            descent: 0.0,
-            line_gap: 0.0,
-            new_line_size: size_px,
-        }
-    });
-    // Baseline is at y + ascent
-    let mut cursor_x = x as f32;
-    let baseline_y = y as f32 + line_metrics.ascent;
-
-    for ch in text.chars() {
-        let (metrics, bitmap) = font.rasterize(ch, size_px);
-        if metrics.width == 0 || metrics.height == 0 {
-            cursor_x += metrics.advance_width;
-            continue;
-        }
-        // metrics.xmin/ymin are offsets from the cursor position
-        let origin_x = cursor_x + metrics.xmin as f32;
-        let origin_y = baseline_y + metrics.ymin as f32;
-
-        for row in 0..metrics.height {
-            for col in 0..metrics.width {
-                let cov = bitmap[row * metrics.width + col];
-                if cov == 0 {
-                    continue;
-                }
-                let px = origin_x.round() as i32 + col as i32;
-                let py = origin_y.round() as i32 + row as i32;
-                if px < 0 || px >= img_w || py < 0 || py >= img_h {
-                    continue;
-                }
-                let alpha = cov as i32;
-                let existing = img.get_pixel(px as u32, py as u32);
-                let mut out = [0u8; 4];
-                for c in 0..3 {
-                    let fg = color[c] as i32;
-                    let bgc = existing[c] as i32;
-                    out[c] = ((fg * alpha + bgc * (255 - alpha)) / 255) as u8;
-                }
-                out[3] = 255;
-                img.put_pixel(px as u32, py as u32, Rgba(out));
-            }
-        }
-        cursor_x += metrics.advance_width;
-    }
 }
 
 #[cfg(test)]

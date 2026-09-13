@@ -295,7 +295,7 @@ fn greedy_assignment(
 ) -> [usize; 4] {
     // Pick top choice for each direction. Empty = n (sentinel).
     let mut result = [n; 4];
-    let mut dir_candidates = [
+    let dir_candidates = [
         north.first().copied(),
         south.first().copied(),
         east.first().copied(),
