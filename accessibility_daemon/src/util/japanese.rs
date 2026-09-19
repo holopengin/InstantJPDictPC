@@ -249,6 +249,10 @@ pub fn is_half_width(ch: char) -> bool {
 /// (0.5 halfwidth, 1.0 fullwidth), so ASCII-majority mixed lines cannot drag
 /// the estimate to ~0.5×; the median of the normalized gaps is the em.
 /// Returns 0 when unestimable (fewer than 2 chars, mismatched lengths).
+///
+/// The overlay no longer sizes from a pitch (it uses the box height, like
+/// mobile); the ppocr synth tests still pin the formula.
+#[allow(dead_code)]
 pub fn estimate_em(text: &str, centers: &[f32]) -> f32 {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() != centers.len() || centers.len() < 2 {
