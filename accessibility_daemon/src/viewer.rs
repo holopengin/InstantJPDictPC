@@ -124,25 +124,38 @@ pub struct GlyphCache {
 
 impl GlyphCache {
     pub fn new() -> Option<Rc<RefCell<Self>>> {
-        if let Some(path) = find_jp_font_path() {
-            if let Ok(data) = std::fs::read(&path) {
-                // ttf-parser borrows the font bytes; they live for the
-                // process (one font, one cache), so leak that copy.
-                let face_data: &'static [u8] = Box::leak(data.clone().into_boxed_slice());
-                let vface = ttf_parser::Face::parse(face_data, 0).ok();
-                if let Ok(font) = Font::from_bytes(data, fontdue::FontSettings::default()) {
-                    return Some(Rc::new(RefCell::new(GlyphCache {
-                        font,
-                        cache: HashMap::new(),
-                        vert_cache: HashMap::new(),
-                        vface,
-                    })));
-                }
+        Self::from_path(find_jp_font_path())
+    }
+
+    /// Load the cache from a specific font file. A missing path or an
+    /// unreadable face yields `None` and the overlay draws boxes without
+    /// glyphs — mobile falls back to the platform face and never crashes the
+    /// overlay for a missing bundled font (OverlayFont #84).
+    fn from_path(path: Option<std::path::PathBuf>) -> Option<Rc<RefCell<Self>>> {
+        let Some(path) = path else {
+            eprintln!("[GlyphCache] no CJK font found, overlay text will not render");
+            return None;
+        };
+        let Ok(data) = std::fs::read(&path) else {
+            eprintln!("[GlyphCache] failed to read font {}", path.display());
+            return None;
+        };
+        // ttf-parser borrows the font bytes; they live for the process (one
+        // font, one cache), so leak that copy.
+        let face_data: &'static [u8] = Box::leak(data.clone().into_boxed_slice());
+        let vface = ttf_parser::Face::parse(face_data, 0).ok();
+        match Font::from_bytes(data, fontdue::FontSettings::default()) {
+            Ok(font) => Some(Rc::new(RefCell::new(GlyphCache {
+                font,
+                cache: HashMap::new(),
+                vert_cache: HashMap::new(),
+                vface,
+            }))),
+            Err(_) => {
+                eprintln!("[GlyphCache] failed to parse font {}", path.display());
+                None
             }
-            eprintln!("[GlyphCache] failed to load font from {}", path.display());
         }
-        eprintln!("[GlyphCache] no CJK font found, overlay text will not render");
-        None
     }
 
     /// Ensure both tinted handles exist for (char, px_size) and return one
@@ -539,7 +552,9 @@ pub struct PanState {
 #[derive(Clone)]
 pub struct OverlayProgram {
     pub annotations: Rc<Vec<DetectedAnnotation>>,
-    pub glyph_cache: Rc<RefCell<GlyphCache>>,
+    /// None when no CJK font was found: boxes still draw, glyphs are skipped
+    /// (mobile falls back to the platform face rather than crashing).
+    pub glyph_cache: Option<Rc<RefCell<GlyphCache>>>,
     pub img_w: u32,
     pub img_h: u32,
     /// The screenshot image to draw on the canvas.
@@ -1036,6 +1051,10 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 }
 
                 if let Some(line) = &annotation.line {
+                    // No font: the box above is all this line gets.
+                    let Some(cache) = self.glyph_cache.as_ref() else {
+                        continue;
+                    };
                     // Mobile `LineOverlayView`: one text size per line, the
                     // line's own box height ×0.90 (the upright frame's cross
                     // axis for rotated lines) — never a measured pitch, and
@@ -1048,9 +1067,9 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         continue;
                     }
                     let em_px = text_px.round().clamp(1.0, 1024.0) as u32;
-                    let ref_gid = self.glyph_cache.borrow_mut().glyph_id('あ', line.is_vertical);
+                    let ref_gid = cache.borrow_mut().glyph_id('あ', line.is_vertical);
                     let ref_ink = ref_gid
-                        .and_then(|gid| draw_glyph(&self.glyph_cache, gid, em_px, false))
+                        .and_then(|gid| draw_glyph(cache, gid, em_px, false))
                         .map(|g| (g.w as f32, g.h as f32, g.xmin as f32, g.ymin as f32));
 
                     for (i, char_box) in line.char_boxes.iter().enumerate() {
@@ -1082,8 +1101,8 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         // GSUB `vert`/`vrt2` picks the vertical presentation
                         // glyph for vertical lines (Unicode form fallback for
                         // what the font does not cover).
-                        let Some(gid) = self.glyph_cache.borrow_mut().glyph_id(ch, line.is_vertical) else { continue };
-                        let Some(g) = draw_glyph(&self.glyph_cache, gid, em_px, highlighted) else { continue };
+                        let Some(gid) = cache.borrow_mut().glyph_id(ch, line.is_vertical) else { continue };
+                        let Some(g) = draw_glyph(cache, gid, em_px, highlighted) else { continue };
                         // Mobile skips a glyph with no ink (space, .notdef).
                         if g.w == 0 || g.h == 0 {
                             continue;
@@ -1829,9 +1848,7 @@ impl OcrViewer {
         let overlay = OverlayProgram {
             annotations: synced_annotations.clone(),
             img_w: self.img_w,
-            glyph_cache: self.glyph_cache.clone().unwrap_or_else(|| GlyphCache::new().expect(
-                "no glyph cache — verify fonts/NotoSansJP-Regular.ttf is bundled with the AppImage"
-            )),
+            glyph_cache: self.glyph_cache.clone(),
             img_h: self.img_h,
             image: None,
             panel_visible: has_panel,
@@ -1859,11 +1876,7 @@ impl OcrViewer {
         let image_canvas = Canvas::new(OverlayProgram {
             annotations: Rc::clone(&self.annotations),
             img_w: self.img_w,
-            glyph_cache: self.glyph_cache.clone().unwrap_or_else(|| {
-                GlyphCache::new().expect(
-                    "no glyph cache — verify fonts/NotoSansJP-Regular.ttf is bundled with the AppImage"
-                )
-            }),
+            glyph_cache: self.glyph_cache.clone(),
             img_h: self.img_h,
             image: self.image_handle.as_ref().cloned(),
             panel_visible: false,
@@ -2578,6 +2591,16 @@ mod tests {
         // top = cy + ref_centre - (ymin + h) = 50 + 12 - 4 = 58.
         assert!((dy - 58.0).abs() < 1e-3, "comma dy={dy}");
         assert!((dx - 95.0).abs() < 1e-3, "comma dx={dx}");
+    }
+
+    /// Mobile degrades to a platform face and keeps rendering when the
+    /// bundled font is missing; the PC must not panic for the same case.
+    #[test]
+    fn missing_font_degrades_instead_of_panicking() {
+        assert!(GlyphCache::from_path(None).is_none());
+        assert!(GlyphCache::from_path(Some("/nonexistent/font.ttf".into())).is_none());
+        // The bundled asset still loads when present.
+        assert!(GlyphCache::new().is_some());
     }
 
     /// Mobile skips glyphs whose measured ink is degenerate (`glyphW <= 0 ||
