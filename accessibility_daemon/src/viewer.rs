@@ -26,21 +26,19 @@ use crate::data::models::DictionaryEntry;
 use crate::models::*;
 use crate::overlay_state::OcrOverlayState;
 use crate::util::deinflector::Deinflector;
-use crate::util::japanese::{estimate_em, is_half_width, to_vertical_glyph};
+use crate::util::japanese::{is_half_width, to_vertical_glyph};
 
 use fontdue::Font;
 use iced::widget::image::Handle as ImageHandle;
 
-/// Fallback font size ratio (of the box's across-axis size) for lines whose
-/// pitch cannot be measured — single-character lines only, in practice.
-const CANVAS_CHAR_RATIO: f32 = 0.9;
-/// Fraction of the line's cross-axis box a glyph's ink may occupy. The
-/// per-line font size is capped so the widest character in the set never
-/// overflows the vertical line's width (or the horizontal line's height).
-const CROSS_FIT_RATIO: f32 = 0.92;
+/// Mobile `LineOverlayView.textSize = fixedSize * 0.90f`: the one glyph size
+/// per line, taken from the line's own box (never a measured pitch).
+const TEXT_SIZE_RATIO: f32 = 0.9;
 /// Mobile LineOverlayView `ASCII_GLYPH_SCALE` (#49): the shared line-height
 /// text size renders halfwidth glyphs ~10% oversized next to CJK.
 const ASCII_GLYPH_SCALE: f32 = 0.9;
+/// Mobile LineOverlayView per-glyph box fit: `maxW = boxW * 0.92f`.
+const GLYPH_FIT_RATIO: f32 = 0.92;
 /// Font fill ratio for character buttons in the neighbor/alternatives panels.
 const BUTTON_CHAR_RATIO: f32 = 0.6;
 
@@ -96,11 +94,6 @@ pub struct GlyphCache {
     /// Rasterized glyphs keyed by `(glyph id, px)`: the id may be a GSUB
     /// substitution (vertical forms), not just the cmap glyph of the char.
     cache: HashMap<(u16, u32), CachedGlyph>,
-    /// Cross-axis ink ratio (ink extent / font px) per (glyph id, vertical):
-    /// width for vertical lines, height for horizontal. Used to cap the
-    /// line's font size so the widest glyph in the set cannot overflow the
-    /// line's cross axis.
-    ink_ratios: HashMap<(u16, bool), f32>,
     /// GSUB `vert`/`vrt2` resolution results (source glyph -> vertical glyph).
     vert_cache: HashMap<u16, u16>,
     /// Font-parser view of the same bytes, for the vertical metrics
@@ -125,7 +118,6 @@ impl GlyphCache {
                     return Some(Rc::new(RefCell::new(GlyphCache {
                         font,
                         cache: HashMap::new(),
-                        ink_ratios: HashMap::new(),
                         vert_cache: HashMap::new(),
                         vface,
                         units_per_em,
@@ -267,25 +259,6 @@ impl GlyphCache {
         None
     }
 
-    /// Cross-axis ink extent per font pixel: width for vertical lines, height
-    /// for horizontal ones. Measured once per (glyph, orientation) at a
-    /// reference size, so the per-line size cap costs only lookups per frame.
-    fn cross_ink_ratio(&mut self, gid: u16, vertical: bool) -> f32 {
-        let key = (gid, vertical);
-        if let Some(r) = self.ink_ratios.get(&key) {
-            return *r;
-        }
-        let (metrics, _) = self.font.rasterize_config(fontdue::layout::GlyphRasterConfig {
-            glyph_index: gid,
-            px: 64.0,
-            font_hash: 0,
-        });
-        let ink = if vertical { metrics.width } else { metrics.height } as f32;
-        let r = ink / 64.0;
-        self.ink_ratios.insert(key, r);
-        r
-    }
-
     /// Vertical-layout metrics for a glyph at `px`: `(origin_x, origin_y,
     /// advance)` in pixels, y-up font coordinates. The origin is the top of
     /// the 1em vertical cell (vmtx: `yMax + topSideBearing`, no VORG in this
@@ -361,23 +334,6 @@ fn glyph_ink_origin(
     }
 }
 
-/// Recover a rotated box's unrotated dimensions from its axis-aligned
-/// bounds. For a `w × h` rect rotated by `a`:
-///   W = w·|cos a| + h·|sin a|,  H = w·|sin a| + h·|cos a|
-/// Around 45° the system is singular (both bounds wash out); fall back to
-/// the AABB, which only makes the sizing conservative.
-fn unrotate_box_size(width: f32, height: f32, angle: f32) -> (f32, f32) {
-    let (s, c) = angle.sin_cos();
-    let (sa, ca) = (s.abs(), c.abs());
-    let det = ca * ca - sa * sa;
-    if det.abs() < 0.1 {
-        return (width.max(1.0), height.max(1.0));
-    }
-    let w = (ca * width - sa * height) / det;
-    let h = (-sa * width + ca * height) / det;
-    (w.max(1.0), h.max(1.0))
-}
-
 /// Clockwise radians to rotate a line's glyphs by, about their char-box
 /// centres (mobile `LineOverlayView.tiltDeg`). `RotatedBox.angle` is the
 /// *long axis* angle normalised to [-90°, 90°), so for a vertical line it
@@ -399,92 +355,42 @@ fn glyph_tilt(quad: Option<&RotatedBox>, is_vertical: bool) -> f32 {
     tilt
 }
 
-/// The one font pixel size every glyph on the line draws at. The em comes
-/// from the char centres projected onto the reading axis (the line's own
-/// direction when rotated, +x horizontal, +y vertical), so the rendered size
-/// no longer varies with each char box — and it no longer inherits the
-/// detector's unclip padding the way a box-height estimate does.
-///
-/// A font cannot be larger than the line it sits in: when the normalized
-/// estimate exceeds the line box (heavily tracked text, e.g. wide-spaced
-/// ASCII UI labels, defeats the halfwidth 0.5em assumption), the raw median
-/// pitch is the honest measure. Falls back to the median un-rotated box
-/// height (mobile's `fixedSize`) when a pitch cannot be measured at all
-/// (single-char lines).
-fn line_font_em_px(
-    line: &LineResult,
-    quad_angle: Option<f32>,
-    total_scale: f32,
-    cache: Option<&RefCell<GlyphCache>>,
-) -> u32 {
-    let (ax, ay) = match (quad_angle, line.is_vertical) {
-        (Some(a), _) => (a.cos(), a.sin()),
-        (None, true) => (0.0, 1.0),
-        (None, false) => (1.0, 0.0),
-    };
-    let centers: Vec<f32> = line
-        .char_boxes
-        .iter()
-        .map(|b| (b.x as f32 + b.w as f32 / 2.0) * ax + (b.y as f32 + b.h as f32 / 2.0) * ay)
-        .collect();
-    // Cross-axis (un-rotated) box size: the line's own cap on the em.
-    let mut cross: Vec<f32> = line
-        .char_boxes
-        .iter()
-        .map(|b| {
-            let (bw, bh) = match quad_angle {
-                Some(angle) => unrotate_box_size(b.w as f32, b.h as f32, angle),
-                None => (b.w as f32, b.h as f32),
-            };
-            if line.is_vertical { bw } else { bh }
-        })
-        .collect();
-    cross.sort_by(f32::total_cmp);
-    let cross_med = cross.get(cross.len() / 2).copied().unwrap_or(0.0);
-
-    let mut em_img = estimate_em(&line.text, &centers);
-    if em_img > 0.0 && cross_med > 0.0 && em_img > cross_med {
-        // The halfwidth normalization doubled a tracked advance; the raw
-        // pitch (all chars about one em apart) is the better measure.
-        em_img = raw_median_gap(&centers);
+/// Mobile `LineResult.glyphSizePx()`: the source-pixel size the overlay
+/// measures a line's glyphs against. The default path is the tallest char
+/// box — the detector box height for a horizontal line, the 1em cell for a
+/// vertical one. A rotated line measures its upright frame's cross axis
+/// instead (`RotatedBox.h`, the short side of the fitted rect), because its
+/// char boxes are AABBs of rotated cells and would oversize the glyphs.
+/// Zero means the line has no measurable box: mobile skips it.
+fn line_glyph_px(line: &LineResult, quad: Option<&RotatedBox>) -> f32 {
+    if let Some(q) = quad.filter(|q| q.is_rotated()) {
+        return q.h.max(1.0);
     }
-    if em_img <= 0.0 {
-        em_img = cross_med * CANVAS_CHAR_RATIO;
-    }
-    // Uniform cross-axis cap: the widest glyph in the set must fit inside
-    // the line's cross axis (column width for vertical, line height for
-    // horizontal). One factor for the whole line, so every glyph keeps the
-    // same size — this replaces the old per-character shrink-to-box fit.
-    if let Some(cache) = cache {
-        if cross_med > 0.0 {
-            let mut max_ratio = 0.0f32;
-            let mut c = cache.borrow_mut();
-            for ch in line.text.chars() {
-                let Some(gid) = c.glyph_id(ch, line.is_vertical) else { continue };
-                let r = c.cross_ink_ratio(gid, line.is_vertical);
-                let r = if is_half_width(ch) { r * ASCII_GLYPH_SCALE } else { r };
-                max_ratio = max_ratio.max(r);
-            }
-            if max_ratio > 0.0 {
-                em_img = em_img.min(CROSS_FIT_RATIO * cross_med / max_ratio);
-            }
-        }
-    }
-    (em_img * total_scale).round().clamp(4.0, 1024.0) as u32
+    line.char_boxes.iter().map(|b| b.h as f32).fold(0.0, f32::max)
 }
 
-/// Median of the consecutive centre gaps along the reading axis, without the
-/// halfwidth normalization.
-fn raw_median_gap(centers: &[f32]) -> f32 {
-    let mut gaps: Vec<f32> = (0..centers.len().saturating_sub(1))
-        .map(|i| (centers[i + 1] - centers[i]).abs())
-        .filter(|g| *g > 0.0)
-        .collect();
-    if gaps.is_empty() {
-        return 0.0;
+/// The font pixel size a line's glyphs are rasterized at: mobile's
+/// `fixedSize * 0.90`, in source pixels, scaled to screen pixels by the
+/// content transform. Zero (no measurable box) means the line draws nothing.
+fn line_text_px(line: &LineResult, quad: Option<&RotatedBox>, total_scale: f32) -> f32 {
+    line_glyph_px(line, quad) * TEXT_SIZE_RATIO * total_scale
+}
+
+/// Mobile `LineOverlayView` per-glyph shrink-to-box: the glyph is measured
+/// along the reading axis (height for a vertical line, width for a
+/// horizontal one) against its own char box ×0.92 — doubled for halfwidth
+/// ink, whose true advance is 0.5em but whose face may overflow it — and
+/// scaled about the box centre when it overflows. One factor per glyph;
+/// there is no line-wide cross-axis cap.
+fn glyph_fit_scale(is_vertical: bool, is_half: bool, cell: (f32, f32), ink: (f32, f32)) -> f32 {
+    let limit = if is_vertical { cell.1 } else { cell.0 } * GLYPH_FIT_RATIO;
+    let limit = if is_half { limit * 2.0 } else { limit };
+    let measured = if is_vertical { ink.1 } else { ink.0 };
+    if measured > limit {
+        limit / measured
+    } else {
+        1.0
     }
-    gaps.sort_by(f32::total_cmp);
-    gaps[gaps.len() / 2]
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1002,17 +908,19 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 }
 
                 if let Some(line) = &annotation.line {
-                    // One normalized em size per line (mobile estimateEm,
-                    // #49): every glyph draws at the same size measured from
-                    // the line's own pitch, rather than being fitted to its
-                    // detector-padded box. Horizontal glyphs use `あ` as the
-                    // cross-axis ink reference; vertical ones use the font's
-                    // own vmtx origin (see below). Rotated lines carry AABBs
-                    // of the rotated em boxes, so their true dimensions are
-                    // recovered before sizing.
-                    let quad_angle = annotation.quad.filter(|q| q.is_rotated()).map(|q| q.angle);
-                    let em_px = line_font_em_px(line, quad_angle, total_scale, Some(self.glyph_cache.as_ref()));
-                    let ref_gid = self.glyph_cache.borrow_mut().glyph_id('あ', false);
+                    // Mobile `LineOverlayView`: one text size per line, the
+                    // line's own box height ×0.90 (the upright frame's cross
+                    // axis for rotated lines) — never a measured pitch, and
+                    // never a line-wide cross-axis cap. Horizontal glyphs use
+                    // `あ` as the ink reference; vertical ones centre their own
+                    // ink (see below). A line with no measurable box draws no
+                    // glyphs, exactly as mobile returns early on `fixedSize == 0`.
+                    let text_px = line_text_px(line, annotation.quad.as_ref(), total_scale);
+                    if text_px <= 0.0 || line.text.is_empty() || line.char_boxes.is_empty() {
+                        continue;
+                    }
+                    let em_px = text_px.round().clamp(1.0, 1024.0) as u32;
+                    let ref_gid = self.glyph_cache.borrow_mut().glyph_id('あ', line.is_vertical);
                     let ref_ink = ref_gid
                         .and_then(|gid| draw_glyph(&self.glyph_cache, gid, em_px, false))
                         .map(|g| (g.w as f32, g.h as f32, g.xmin as f32, g.ymin as f32));
@@ -1037,34 +945,37 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         // what the font does not cover).
                         let Some(gid) = self.glyph_cache.borrow_mut().glyph_id(ch, line.is_vertical) else { continue };
                         let Some(g) = draw_glyph(&self.glyph_cache, gid, em_px, highlighted) else { continue };
-                        let (gw, gh) = (g.w.max(1) as f32, g.h.max(1) as f32);
+                        // Mobile skips a glyph with no ink (space, .notdef).
+                        if g.w == 0 || g.h == 0 {
+                            continue;
+                        }
+                        let (gw, gh) = (g.w as f32, g.h as f32);
                         let reference = ref_ink.unwrap_or((gw, gh, g.xmin as f32, g.ymin as f32));
                         let glyph_metrics = (gw, gh, g.xmin as f32, g.ymin as f32);
-                        // Vertical text uses the font's own vertical layout:
-                        // the 1em cell (vmtx advance, origin at the top) is
-                        // centred on the char box, and the glyph keeps its
-                        // position inside it — that is what puts the vertical
-                        // comma top-right and the corner brackets low. The
-                        // glyph itself is the font's GSUB `vert` choice.
-                        let (dx, dy) = if line.is_vertical {
-                            let borrowed = self.glyph_cache.borrow();
-                            match borrowed.vertical_metrics(gid, em_px) {
-                                Some((origin_x, origin_y, advance)) => {
-                                    let cell_center = origin_y - advance / 2.0;
-                                    (
-                                        cx - origin_x + g.xmin as f32,
-                                        cy + cell_center - (g.ymin as f32 + gh),
-                                    )
-                                }
-                                None => glyph_ink_origin(true, cx, cy, glyph_metrics, reference),
-                            }
-                        } else {
-                            glyph_ink_origin(false, cx, cy, glyph_metrics, reference)
-                        };
+                        // Mobile centres the glyph's own ink on the char box
+                        // along the reading axis; across it the reference `あ`
+                        // anchors the baseline so punctuation keeps its
+                        // position. Vertical text is no different: the font's
+                        // GSUB `vert` form is centred, not laid out on vmtx.
+                        let (dx, dy) = glyph_ink_origin(
+                            line.is_vertical,
+                            cx,
+                            cy,
+                            glyph_metrics,
+                            reference,
+                        );
 
-                        // Natural size; only the halfwidth trim varies per
-                        // glyph (mobile #49), never a shrink-to-box fit.
-                        let draw_scale = if is_half_width(ch) { ASCII_GLYPH_SCALE } else { 1.0f32 };
+                        // Mobile per-glyph shrink-to-box along the reading
+                        // axis, then the halfwidth trim — both about the box
+                        // centre.
+                        let is_half = is_half_width(ch);
+                        let fit = glyph_fit_scale(
+                            line.is_vertical,
+                            is_half,
+                            (sz_c.width.max(1.0), sz_c.height.max(1.0)),
+                            (gw, gh),
+                        );
+                        let draw_scale = fit * if is_half { ASCII_GLYPH_SCALE } else { 1.0f32 };
                         let off_x = (dx - cx) * draw_scale;
                         let off_y = (dy - cy) * draw_scale;
                         let draw_size = Size::new(gw * draw_scale, gh * draw_scale);
@@ -1660,7 +1571,7 @@ impl OcrViewer {
     /// index with the full annotation (bbox + line with text and char_boxes).
     pub fn handle_ocr_recognition_result(&mut self, index: usize, annotation: DetectedAnnotation) {
         let line = annotation.line.clone();
-        let quad_angle = annotation.quad.filter(|q| q.is_rotated()).map(|q| q.angle);
+        let quad = annotation.quad;
         if line.is_some() {
             let has_text = line.as_ref().map(|l| !l.text.is_empty()).unwrap_or(false);
             println!(
@@ -1703,8 +1614,8 @@ impl OcrViewer {
                 // Use cached total_scale from last view() frame — avoids
                 // computing from potentially-not-yet-loaded img_w/img_h (1 vs real).
                 let total_scale = self.last_total_scale.get();
-                // Exactly the draw pass's normalized per-line em size.
-                let px = line_font_em_px(line, quad_angle, total_scale, Some(gc.as_ref()));
+                // Exactly the draw pass's per-line text size.
+                let px = line_text_px(line, quad.as_ref(), total_scale).round().clamp(1.0, 1024.0) as u32;
                 let mut cache = gc.borrow_mut();
                 let vertical = line.is_vertical;
                 if let Some(gid) = cache.glyph_id('あ', false) {
@@ -2534,80 +2445,81 @@ mod tests {
         assert!(!is_half_width('。'));
     }
 
-    /// The line's font size follows the measured pitch, not the (detector
-    /// padded) box height — that padding is what made glyphs 10-20% large.
+    fn line_with_boxes(text: &str, boxes: Vec<BoundingBox>, is_vertical: bool) -> LineResult {
+        LineResult {
+            text: text.into(),
+            char_boxes: boxes,
+            alternatives: vec![],
+            sample_txt: None,
+            is_vertical,
+            chunk_boxes: vec![],
+        }
+    }
+
+    /// Mobile `LineResult.glyphSizePx()`: the tallest char box (the detector
+    /// box height, unclip padding included), drawn at ×0.90.
     #[test]
-    fn line_font_uses_pitch_not_box_height() {
-        let line = LineResult {
-            text: "日本語".into(),
-            char_boxes: vec![
+    fn line_text_size_uses_box_height_like_mobile() {
+        // Horizontal: 60px-tall boxes, however the centres are spaced.
+        let line = line_with_boxes(
+            "日本語",
+            vec![
                 BoundingBox::new(10, 0, 40, 60, 1.0),
                 BoundingBox::new(30, 0, 40, 60, 1.0),
                 BoundingBox::new(50, 0, 40, 60, 1.0),
             ],
-            alternatives: vec![],
-            sample_txt: None,
-            is_vertical: false,
-            chunk_boxes: vec![],
-        };
-        // Centers 30/50/70: pitch 20 despite 60px-tall boxes.
-        assert_eq!(line_font_em_px(&line, None, 1.0, None), 20);
-        // Single char cannot measure a pitch; median box height × 0.9.
-        let single = LineResult {
-            text: "あ".into(),
-            char_boxes: vec![BoundingBox::new(0, 0, 40, 60, 1.0)],
-            alternatives: vec![],
-            sample_txt: None,
-            is_vertical: false,
-            chunk_boxes: vec![],
-        };
-        assert_eq!(line_font_em_px(&single, None, 1.0, None), 54);
-
-        // Tracked ASCII: the halfwidth-normalized pitch (70) exceeds the
-        // line box, so the raw pitch is the honest measure instead.
-        let tracked = LineResult {
-            text: "Memo1Memo".into(),
-            char_boxes: (0..9)
-                .map(|i| BoundingBox::new(i * 35, 0, 35, 49, 1.0))
-                .collect(),
-            alternatives: vec![],
-            sample_txt: None,
-            is_vertical: false,
-            chunk_boxes: vec![],
-        };
-        assert_eq!(line_font_em_px(&tracked, None, 1.0, None), 35);
-    }
-
-    /// Vertical lines: one size for the whole line, capped so the widest
-    /// glyph's ink cannot overflow the column width — even when the measured
-    /// pitch is larger than the column.
-    #[test]
-    fn vertical_line_size_is_capped_to_column_width() {
-        let cache = GlyphCache::new().expect("bundled JP font");
-        let line = LineResult {
-            text: "翻訳".into(),
-            char_boxes: vec![
+            false,
+        );
+        assert!((line_glyph_px(&line, None) - 60.0).abs() < 1e-3);
+        assert!((line_text_px(&line, None, 1.0) - 54.0).abs() < 1e-3);
+        // Single char: same box-height rule, no pitch fallback.
+        let single = line_with_boxes("あ", vec![BoundingBox::new(0, 0, 40, 60, 1.0)], false);
+        assert!((line_text_px(&single, None, 1.0) - 54.0).abs() < 1e-3);
+        // Tracked ASCII: the box height still wins (49 × 0.9), not the pitch.
+        let tracked = line_with_boxes(
+            "Memo1Memo",
+            (0..9).map(|i| BoundingBox::new(i * 35, 0, 35, 49, 1.0)).collect(),
+            false,
+        );
+        assert!((line_text_px(&tracked, None, 1.0) - 44.1).abs() < 1e-3);
+        // Vertical: the cell length (height) is the basis.
+        let vertical = line_with_boxes(
+            "翻訳",
+            vec![
                 BoundingBox::new(0, 0, 40, 80, 1.0),
                 BoundingBox::new(0, 80, 40, 80, 1.0),
             ],
-            alternatives: vec![],
-            sample_txt: None,
-            is_vertical: true,
-            chunk_boxes: vec![],
-        };
-        // Pitch 80px in a 40px column: the cap must pull the size down.
-        let px = line_font_em_px(&line, None, 1.0, Some(&cache)) as f32;
-        assert!(px < 80.0, "pitch was not capped: {px}");
-        let mut c = cache.borrow_mut();
-        for ch in line.text.chars() {
-            let gid = c.glyph_id(ch, true).expect("glyph id");
-            let ratio = c.cross_ink_ratio(gid, true);
-            assert!(
-                ratio * px <= 40.0 * CROSS_FIT_RATIO + 1.0,
-                "{ch:?}: ink {:.1}px overflows the 40px column (font {px})",
-                ratio * px
-            );
-        }
+            true,
+        );
+        assert!((line_text_px(&vertical, None, 1.0) - 72.0).abs() < 1e-3);
+        // Rotated line: the upright frame's cross axis (the fitted rect's
+        // short side), not the AABB-inflated char box height.
+        let quad = RotatedBox::new(50.0, 50.0, 120.0, 30.0, 10.0f32.to_radians(), 1.0);
+        assert!((line_glyph_px(&vertical, Some(&quad)) - 30.0).abs() < 1e-3);
+        // No measurable box: mobile returns before drawing.
+        let empty = line_with_boxes("あ", vec![], false);
+        assert_eq!(line_text_px(&empty, None, 1.0), 0.0);
+        // The zoom transform scales the source size.
+        assert!((line_text_px(&line, None, 2.0) - 108.0).abs() < 1e-3);
+    }
+
+    /// Mobile per-glyph fit: only the overflowing glyph shrinks, along the
+    /// reading axis, and halfwidth ink gets 2× the box before the fit.
+    #[test]
+    fn glyph_fit_scales_only_the_overflowing_axis() {
+        // Horizontal: a 100px-wide glyph in a 40px-wide box scales to 0.368.
+        let s = glyph_fit_scale(false, false, (40.0, 60.0), (100.0, 30.0));
+        assert!((s - 40.0 * 0.92 / 100.0).abs() < 1e-4, "s={s}");
+        // Its height is irrelevant (cross-axis ink is not capped).
+        assert_eq!(glyph_fit_scale(false, false, (40.0, 60.0), (30.0, 500.0)), 1.0);
+        // Vertical: fit runs on the height.
+        let s = glyph_fit_scale(true, false, (40.0, 60.0), (100.0, 120.0));
+        assert!((s - 60.0 * 0.92 / 120.0).abs() < 1e-4, "s={s}");
+        // Halfwidth: the limit doubles, so the same ink fits.
+        assert_eq!(glyph_fit_scale(false, true, (40.0, 60.0), (60.0, 30.0)), 1.0);
+        assert!((glyph_fit_scale(false, true, (40.0, 60.0), (100.0, 30.0))
+            - 40.0 * 0.92 * 2.0 / 100.0)
+            .abs() < 1e-4);
     }
 
     /// Mobile `tiltDeg`: a vertical column's long-axis angle reads 90° off
@@ -2634,37 +2546,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unrotate_box_size_recovers_dimensions() {
-        // Square em box at a few angles (vertical char boxes are squares-ish).
-        for deg in [3.0f32, 10.0, 30.0] {
-            let a = deg.to_radians();
-            let (s, c) = a.sin_cos();
-            let (w, h) = (44.0f32, 44.0f32);
-            let (rw, rh) = unrotate_box_size(
-                w * c.abs() + h * s.abs(),
-                w * s.abs() + h * c.abs(),
-                a,
-            );
-            assert!(
-                (rw - w).abs() < 0.01 && (rh - h).abs() < 0.01,
-                "deg={deg} recovered {rw}x{rh}"
-            );
-        }
-        // Non-square vertical char box (column width × pitch).
-        let (w, h) = (30.0f32, 52.0f32);
-        let a = 20.0f32.to_radians();
-        let (s, c) = a.sin_cos();
-        let (rw, rh) = unrotate_box_size(
-            w * c.abs() + h * s.abs(),
-            w * s.abs() + h * c.abs(),
-            a,
-        );
-        assert!(
-            (rw - w).abs() < 0.01 && (rh - h).abs() < 0.01,
-            "recovered {rw}x{rh}"
-        );
-    }
     /// Vertical forms must keep their place inside the font's 1em vertical
     /// cell (vmtx): the ideographic comma sits top-right, a kanji centred, an
     /// opening corner bracket low. This is the placement fontdue's
