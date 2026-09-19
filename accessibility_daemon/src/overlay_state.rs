@@ -452,8 +452,99 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
             return None;
         }
 
+        // ── Redirect pass (#65): JMdict pointer entries (variant spellings)
+        // carry only `?query=` links and render as dead "⟶, X" text. Resolve
+        // them breadth-first (visited set + hop cap, so A→B→A cycles always
+        // terminate), then splice each target directly below its source entry
+        // so a redirect reads as pointer → target.
+        let mut redirect_via: HashMap<String, String> = HashMap::new();
+        let mut resolved_by_term: HashMap<String, TermMatch> = HashMap::new();
+        let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let mut visited: HashSet<String> =
+                matches.iter().map(|m| m.term.clone()).collect();
+            let mut queue: std::collections::VecDeque<TermMatch> =
+                matches.iter().cloned().collect();
+            let mut hops = 0;
+            while !queue.is_empty() && hops < 3 {
+                for _ in 0..queue.len() {
+                    let Some(m) = queue.pop_front() else { break };
+                    for entry in &m.entries {
+                        for target in Self::extract_redirect_targets(&entry.definitions, 3) {
+                            if !visited.insert(target.clone()) {
+                                continue;
+                            }
+                            let target_results =
+                                db.find_by_texts(&[target.clone()]).unwrap_or_default();
+                            if target_results.is_empty() {
+                                continue;
+                            }
+                            let mut seen = HashSet::new();
+                            let entries: Vec<DictionaryEntry> = target_results
+                                .into_iter()
+                                .filter(|e| seen.insert(e.id))
+                                .collect();
+                            redirect_via.insert(target.clone(), m.term.clone());
+                            let resolved = TermMatch {
+                                term: target.clone(),
+                                entries,
+                                chain: None,
+                            };
+                            resolved_by_term.insert(target.clone(), resolved.clone());
+                            children_of
+                                .entry(m.term.clone())
+                                .or_default()
+                                .push(target.clone());
+                            queue.push_back(resolved);
+                        }
+                    }
+                }
+                hops += 1;
+            }
+        }
+        fn emit(
+            term: &str,
+            originals: &[TermMatch],
+            resolved: &HashMap<String, TermMatch>,
+            children: &HashMap<String, Vec<String>>,
+            out: &mut Vec<TermMatch>,
+        ) {
+            if let Some(m) = originals.iter().find(|m| m.term == term) {
+                out.push(m.clone());
+            } else if let Some(m) = resolved.get(term) {
+                out.push(m.clone());
+            }
+            if let Some(kids) = children.get(term) {
+                for child in kids {
+                    emit(child, originals, resolved, children, out);
+                }
+            }
+        }
+        let mut resolved_matches: Vec<TermMatch> = Vec::new();
+        for m in &matches {
+            emit(
+                &m.term,
+                &matches,
+                &resolved_by_term,
+                &children_of,
+                &mut resolved_matches,
+            );
+        }
+
         // Format results
-        let formatted = self.format_dictionary_results(&matches, &dict_names);
+        let mut formatted = self.format_dictionary_results(&resolved_matches, &dict_names);
+        for entry in formatted.iter_mut() {
+            // The redirect hop joins the deinflection chain ("via → term
+            // · redirect") instead of a separate caption.
+            if entry.deinflection.is_none() {
+                if let Some(via) = redirect_via.get(&entry.term) {
+                    entry.deinflection = Some(DeinflectionChain {
+                        surface: via.clone(),
+                        steps: vec!["redirect".to_string()],
+                    });
+                }
+            }
+        }
         self.current_word_length = max_len;
         self.cached_entries = Rc::new(formatted);
         self.cached_lookup_term = following_text;
@@ -1434,6 +1525,86 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
         }
     }
 
+    /// The matched surface text, taken across the whole OCR stream rather than
+    /// only the tapped line, so a word that crosses a line boundary keeps its
+    /// trailing kanji lookups (Android slices `activeAllChars`).
+    pub fn matched_term_at(&self, global_idx: usize, term_len: usize) -> String {
+        self.active_all_chars
+            .iter()
+            .skip(global_idx)
+            .filter(|c| c.as_str() != "\u{3000}")
+            .take(term_len)
+            .cloned()
+            .collect()
+    }
+
+    /// #65: JMdict pointer entries (variant spellings) carry only `?query=`
+    /// links; [extract_redirect_targets] returns those headwords so lookup can
+    /// resolve them. Entries with any real definitional content yield nothing
+    /// (their `see also` links are not redirects). Mirrors
+    /// `DictionaryRedirects.extractTargets`.
+    pub fn extract_redirect_targets(definitions_json: &str, max_targets: usize) -> Vec<String> {
+        let Ok(root) = serde_json::from_str::<serde_json::Value>(definitions_json) else {
+            return Vec::new();
+        };
+        let mut targets: Vec<String> = Vec::new();
+        let mut has_definitional = false;
+
+        fn visit(
+            node: &serde_json::Value,
+            targets: &mut Vec<String>,
+            has_definitional: &mut bool,
+        ) {
+            match node {
+                serde_json::Value::Object(o) => {
+                    if o.get("tag").and_then(|v| v.as_str()) == Some("a") {
+                        let href = o.get("href").and_then(|v| v.as_str()).unwrap_or("");
+                        let raw = href
+                            .split("?query=")
+                            .nth(1)
+                            .unwrap_or("")
+                            .split('&')
+                            .next()
+                            .unwrap_or("");
+                        if !raw.is_empty() {
+                            let target = percent_decode(raw);
+                            if !target.trim().is_empty() {
+                                targets.push(target);
+                            }
+                        }
+                    }
+                    if let Some(dc) = o
+                        .get("data")
+                        .and_then(|d| d.as_object())
+                        .and_then(|d| d.get("content"))
+                        .and_then(|v| v.as_str())
+                    {
+                        if dc != "references" && dc != "refGlosses" {
+                            *has_definitional = true;
+                        }
+                    }
+                    for value in o.values() {
+                        visit(value, targets, has_definitional);
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    for value in arr {
+                        visit(value, targets, has_definitional);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        visit(&root, &mut targets, &mut has_definitional);
+        if has_definitional {
+            return Vec::new();
+        }
+        targets.dedup();
+        targets.truncate(max_targets);
+        targets
+    }
+
     /// Downstep positions from a stored pitch payload, or None when the entry
     /// is not pitch data. Detection is by payload shape
     /// (`{"reading":…, "pitches":[{"position":N},…]}`).
@@ -2012,6 +2183,125 @@ mod tests {
         assert_eq!(p.last_portrait_gravity, Gravity::Top);
     }
 
+    // ——— redirects, cross-line lookup and chains ————————————————
+
+    // Verbatim shapes from Android's `DictionaryRedirectsTest`.
+    const PURE_SINGLE: &str = r#"[{"content": {"content": ["⟶", {"content": "あかん", "href": "?query=あかん&wildcards=off", "lang": "ja", "tag": "a"}], "style": {"fontSize": "130%"}, "tag": "span"}, "type": "structured-content"}]"#;
+    const PURE_DUAL: &str = r#"[{"content": {"content": ["⟶", {"content": "阿呆陀羅", "href": "?query=阿呆陀羅&wildcards=off", "lang": "ja", "tag": "a"}, "（", {"content": "あほんだら", "href": "?query=あほんだら&wildcards=off", "lang": "ja", "tag": "a"}, "）"], "style": {"fontSize": "130%"}, "tag": "span"}, "type": "structured-content"}]"#;
+    const GLOSS_WITH_REFS: &str = r#"[{"content": [{"content": {"content": "repetition mark in katakana", "tag": "li"}, "data": {"content": "glossary"}, "lang": "en", "style": {"listStyleType": "circle"}, "tag": "ul"}, {"content": {"content": ["see: ", {"content": "一の字点", "href": "?query=一の字点&wildcards=off", "lang": "ja", "tag": "a"}, {"content": " kana iteration mark", "data": {"content": "refGlosses"}, "style": {"fontSize": "65%", "verticalAlign": "middle"}, "tag": "span"}], "tag": "li"}, "data": {"content": "references"}, "lang": "en", "style": {"listStyleType": "'➡️ '"}, "tag": "ul"}], "type": "structured-content"}]"#;
+
+    #[test]
+    fn pure_single_redirect_resolves() {
+        assert_eq!(
+            OcrOverlayState::extract_redirect_targets(PURE_SINGLE, 3),
+            vec!["あかん"]
+        );
+    }
+
+    #[test]
+    fn pure_dual_redirect_resolves_both() {
+        assert_eq!(
+            OcrOverlayState::extract_redirect_targets(PURE_DUAL, 3),
+            vec!["阿呆陀羅", "あほんだら"]
+        );
+    }
+
+    #[test]
+    fn gloss_with_see_also_does_not_redirect() {
+        assert!(OcrOverlayState::extract_redirect_targets(GLOSS_WITH_REFS, 3).is_empty());
+    }
+
+    #[test]
+    fn plain_gloss_does_not_redirect() {
+        assert!(OcrOverlayState::extract_redirect_targets("\"ただの定義\"", 3).is_empty());
+    }
+
+    #[test]
+    fn malformed_and_empty_redirects_yield_nothing() {
+        for json in ["not json{[", "", "[]"] {
+            assert!(OcrOverlayState::extract_redirect_targets(json, 3).is_empty());
+        }
+    }
+
+    #[test]
+    fn redirect_target_cap_applies() {
+        assert_eq!(
+            OcrOverlayState::extract_redirect_targets(PURE_DUAL, 1).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn lookup_splices_redirect_targets_below_their_source() {
+        let dir = std::env::temp_dir().join(format!("ijd_redirect_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = DictionaryDatabase::open(dir.join("d.db")).unwrap();
+        let did = db.insert_dictionary("JMdict", 0).unwrap();
+        db.insert_entries(&[
+            DictionaryEntry::new(
+                "あかーん".into(),
+                "あかーん".into(),
+                PURE_SINGLE.to_string(),
+                String::new(),
+                0,
+                did,
+            ),
+            DictionaryEntry::new(
+                "あかん".into(),
+                "あかん".into(),
+                r#"["to not do"]"#.to_string(),
+                String::new(),
+                0,
+                did,
+            ),
+        ])
+        .unwrap();
+
+        let mut state = OcrOverlayState::new(1024.0, 768.0);
+        state.active_line_results = vec![Some(LineResult {
+            text: "あかーん".into(),
+            char_boxes: (0..4)
+                .map(|i| BoundingBox::new(i * 20, 0, 20, 20, 1.0))
+                .collect(),
+            alternatives: vec![],
+            sample_txt: None,
+            is_vertical: false,
+            chunk_boxes: vec![],
+        })];
+        state.update_global_data();
+
+        let result = state
+            .lookup(0, 0, &db, &Deinflector::empty())
+            .expect("lookup result");
+        let terms: Vec<&str> = result.matches.iter().map(|e| e.term.as_str()).collect();
+        assert_eq!(terms, vec!["あかーん", "あかん"]);
+        let target = result
+            .matches
+            .iter()
+            .find(|e| e.term == "あかん")
+            .expect("resolved target");
+        let chain = target.deinflection.as_ref().expect("redirect chain");
+        assert_eq!(chain.surface, "あかーん");
+        assert_eq!(chain.steps, vec!["redirect"]);
+    }
+
+    #[test]
+    fn matched_term_spans_line_boundaries() {
+        let mut s = OcrOverlayState::new(1024.0, 768.0);
+        s.active_all_chars = ["日", "本", "語", "を", "学", "ぶ"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(s.matched_term_at(1, 3), "本語を");
+        // Full-width spaces are skipped, matching the filtered search text.
+        s.active_all_chars = ["分", "\u{3000}", "野"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(s.matched_term_at(0, 3), "分野");
+    }
+
     // ——— small helpers to keep the assertions above readable ————
 
     trait SingleLike<T> {
@@ -2032,4 +2322,27 @@ mod tests {
             &self[0]
         }
     }
+}
+
+/// Decode `%XX` escapes (UTF-8 lossily), as `java.net.URLDecoder` does for
+/// the redirect hrefs.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Some(byte) = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

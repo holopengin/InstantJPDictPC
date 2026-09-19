@@ -1479,12 +1479,16 @@ impl OcrViewer {
     }
 
     pub(crate) fn do_lookup(&mut self, line_idx: usize, char_idx: usize) {
-        let full_line_text = {
-            let Some(line) = self.state.active_line_results.get(line_idx)
-                .and_then(|l| l.as_ref()) else { return; };
-            self.selected_word = Some(SelectedWord { line_idx, char_idx });
-            line.text.clone()
-        };
+        if self
+            .state
+            .active_line_results
+            .get(line_idx)
+            .and_then(|l| l.as_ref())
+            .is_none()
+        {
+            return;
+        }
+        self.selected_word = Some(SelectedWord { line_idx, char_idx });
         // Only look up if db/deinflector are loaded (bootstrap may not be done yet)
         if let (Some(db), Some(deinf)) = (self.db.as_ref(), self.deinflector.as_ref()) {
             if let Some(result) = self.state.lookup(line_idx, char_idx, db, deinf) {
@@ -1495,8 +1499,12 @@ impl OcrViewer {
 
                 // ── Second pass: look up each individual kanji with per-session cache ──
                 let term_len = result.max_len;
-                let matched_term: String =
-                    full_line_text.chars().skip(char_idx).take(term_len).collect();
+                // Take the matched surface from the whole OCR stream, not just
+                // the tapped line, so a word crossing a line boundary keeps its
+                // trailing kanji.
+                let matched_term = self
+                    .state
+                    .matched_term_at(self.state.get_global_idx(line_idx, char_idx), term_len);
                 let mut append_kanji: Vec<FormattedEntry> = Vec::new();
                 for ch in matched_term.chars() {
                     // Only CJK Unified Ideographs (kanji)
