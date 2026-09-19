@@ -172,7 +172,7 @@ impl GlyphCache {
             let w = metrics.width as u32;
             let h = metrics.height as u32;
             let pink = Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2);
-            let bold = embolden(&coverage, w , h, fake_bold_radius(px));
+            let bold = embolden(&coverage, w, h, fake_bold_radius(px));
             let yellow = Self::make_handle(w, h, &bold, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2);
             CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
         });
