@@ -44,6 +44,11 @@ const GLYPH_FIT_RATIO: f32 = 0.92;
 const CURSOR_PAD: f32 = 2.0;
 const CURSOR_RADIUS: f32 = 4.0;
 const CURSOR_STROKE: f32 = 2.0;
+/// Mobile line-box / quad-border fill: `Color.argb(100, 0, 0, 0)`.
+const BOX_FILL_ALPHA: f32 = 100.0 / 255.0;
+/// Mobile corner radius on the box fill (raw source px, scaled by the
+/// content transform): `cornerRadius = 4f` / `CornerPathEffect(4f)`.
+const BOX_CORNER_RADIUS: f32 = 4.0;
 /// Mobile `OverlayBackdrop.SCREENSHOT_ALPHA` (#64): the screenshot is shown
 /// dimmed behind the overlay.
 const SCREENSHOT_ALPHA: f32 = 0.7;
@@ -411,6 +416,50 @@ fn line_glyph_px(line: &LineResult, quad: Option<&RotatedBox>) -> f32 {
 /// content transform. Zero (no measurable box) means the line draws nothing.
 fn line_text_px(line: &LineResult, quad: Option<&RotatedBox>, total_scale: f32) -> f32 {
     line_glyph_px(line, quad) * TEXT_SIZE_RATIO * total_scale
+}
+
+/// Fillet radius for one polygon corner: the requested radius, clamped so
+/// it cannot eat more than 45% of either adjacent edge (Android's
+/// `CornerPathEffect` degrades the same way on tiny boxes).
+fn fillet_radius(prev: (f32, f32), corner: (f32, f32), next: (f32, f32), radius: f32) -> f32 {
+    let edge = |a: (f32, f32), b: (f32, f32)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    radius
+        .min(edge(prev, corner) * 0.45)
+        .min(edge(corner, next) * 0.45)
+        .max(0.0)
+}
+
+/// A closed polygon with every corner rounded by `radius` — the iced
+/// equivalent of Android's `CornerPathEffect` on a rotated quad's path.
+fn rounded_polygon(points: &[(f32, f32)], radius: f32) -> CanvasPath {
+    CanvasPath::new(|p| {
+        let n = points.len();
+        if n < 3 {
+            let Some(&(x, y)) = points.first() else { return };
+            p.move_to(Point::new(x, y));
+            for &(x, y) in &points[1..] {
+                p.line_to(Point::new(x, y));
+            }
+            return;
+        }
+        // Start mid-edge so the first corner gets its fillet too.
+        let start = (
+            (points[n - 1].0 + points[0].0) / 2.0,
+            (points[n - 1].1 + points[0].1) / 2.0,
+        );
+        p.move_to(Point::new(start.0, start.1));
+        for i in 0..n {
+            let corner = points[i];
+            let next = points[(i + 1) % n];
+            let prev = points[(i + n - 1) % n];
+            p.arc_to(
+                Point::new(corner.0, corner.1),
+                Point::new(next.0, next.1),
+                fillet_radius(prev, corner, next, radius),
+            );
+        }
+        p.close();
+    })
 }
 
 /// Mobile chip rule (`OcrOverlayView` neighbour and alternatives panels):
@@ -945,10 +994,15 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                     continue;
                 }
 
-                let fill_color = Color::from_rgba(0.0, 0.0, 0.0, 0.40); // argb(51,0,0,0)
+                // Mobile `borderDrawable` / `QuadBorderView`: argb(100,0,0,0)
+                // with the corners rounded at 4 source px.
+                let fill_color = Color::from_rgba(0.0, 0.0, 0.0, BOX_FILL_ALPHA);
                 if let Some(q) = annotation.quad {
                     // Angled line: draw the rotated quad (min-area rect)
-                    // instead of its axis-aligned AABB.
+                    // instead of its axis-aligned AABB. The rounded corners
+                    // are the iced equivalent of Android's CornerPathEffect;
+                    // no view padding is needed because the canvas does not
+                    // clip the path.
                     let (ux, uy) = (q.angle.cos(), q.angle.sin());
                     let (vx, vy) = (-uy, ux);
                     let hw = q.w / 2.0;
@@ -959,18 +1013,26 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         (q.cx - ux * hw - vx * hh, q.cy - uy * hw - vy * hh),
                         (q.cx + ux * hw - vx * hh, q.cy + uy * hw - vy * hh),
                     ];
-                    let mut pb = iced::widget::canvas::path::Builder::new();
-                    for &(cx, cy) in &corners {
-                        pb.line_to(Point::new(
-                            cx * total_scale + total_offset_x,
-                            cy * total_scale + total_offset_y,
-                        ));
-                    }
-                    pb.close();
-                    frame.fill(&pb.build(), fill_color);
+                    let screen: Vec<(f32, f32)> = corners
+                        .iter()
+                        .map(|&(cx, cy)| {
+                            (cx * total_scale + total_offset_x, cy * total_scale + total_offset_y)
+                        })
+                        .collect();
+                    frame.fill(
+                        &rounded_polygon(&screen, BOX_CORNER_RADIUS * total_scale),
+                        fill_color,
+                    );
                 } else {
                     let (pt, sz) = transform(bbox);
-                    frame.fill_rectangle(pt, sz, fill_color);
+                    frame.fill(
+                        &CanvasPath::rounded_rectangle(
+                            pt,
+                            sz,
+                            (BOX_CORNER_RADIUS * total_scale).into(),
+                        ),
+                        fill_color,
+                    );
                 }
 
                 if let Some(line) = &annotation.line {
@@ -2529,6 +2591,23 @@ mod tests {
         let gid = cache.borrow_mut().glyph_id('あ', false).expect("glyph id");
         let g = draw_glyph(&cache, gid, 54, false).expect("glyph");
         assert!(g.w > 0 && g.h > 0, "kana has ink");
+    }
+
+    /// Mobile box appearance constants: argb(100,0,0,0) and 4px corners.
+    #[test]
+    fn box_fill_and_corners_match_mobile() {
+        assert!((BOX_FILL_ALPHA - 100.0 / 255.0).abs() < 1e-6);
+        assert!((BOX_FILL_ALPHA - 0.40).abs() < 0.01, "was argb(102)");
+        assert_eq!(BOX_CORNER_RADIUS, 4.0);
+        // A 4px fillet fits a 10px edge, clamps on a 2px one.
+        assert_eq!(
+            fillet_radius((0.0, 0.0), (10.0, 0.0), (10.0, 10.0), 4.0),
+            4.0
+        );
+        assert!((fillet_radius((0.0, 0.0), (2.0, 0.0), (2.0, 2.0), 4.0) - 0.9).abs() < 1e-4);
+        // Degenerate input must not panic.
+        let _ = rounded_polygon(&[(0.0, 0.0), (1.0, 1.0)], 4.0);
+        let _ = rounded_polygon(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)], 4.0);
     }
 
     /// The folded scrim equals mobile's two layers over black.
