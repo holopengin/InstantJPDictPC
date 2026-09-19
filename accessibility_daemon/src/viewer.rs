@@ -39,6 +39,11 @@ const TEXT_SIZE_RATIO: f32 = 0.9;
 const ASCII_GLYPH_SCALE: f32 = 0.9;
 /// Mobile LineOverlayView per-glyph box fit: `maxW = boxW * 0.92f`.
 const GLYPH_FIT_RATIO: f32 = 0.92;
+/// Mobile `updateCursor`: a 2dp white outline (no fill) with 4px rounded
+/// corners, on a box inflated 2dp per side (a 4dp oversize in each axis).
+const CURSOR_PAD: f32 = 2.0;
+const CURSOR_RADIUS: f32 = 4.0;
+const CURSOR_STROKE: f32 = 2.0;
 /// Font fill ratio for character buttons in the neighbor/alternatives panels.
 const BUTTON_CHAR_RATIO: f32 = 0.6;
 
@@ -397,6 +402,16 @@ fn line_glyph_px(line: &LineResult, quad: Option<&RotatedBox>) -> f32 {
 /// content transform. Zero (no measurable box) means the line draws nothing.
 fn line_text_px(line: &LineResult, quad: Option<&RotatedBox>, total_scale: f32) -> f32 {
     line_glyph_px(line, quad) * TEXT_SIZE_RATIO * total_scale
+}
+
+/// Mobile `updateCursor` geometry: the cursor box is the char box inflated
+/// by 2dp per side, in the same (content-transform) space as the boxes.
+fn cursor_rect(box_pt: Point, box_size: Size, total_scale: f32) -> (Point, Size) {
+    let pad = CURSOR_PAD * total_scale;
+    (
+        Point::new(box_pt.x - pad, box_pt.y - pad),
+        Size::new(box_size.width + 2.0 * pad, box_size.height + 2.0 * pad),
+    )
 }
 
 /// Mobile `LineOverlayView` per-glyph shrink-to-box: the glyph is measured
@@ -952,12 +967,22 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         let (pt_c, sz_c) = transform(char_box);
                         let (cx, cy) = (pt_c.x + sz_c.width / 2.0, pt_c.y + sz_c.height / 2.0);
 
-                        // Draw cursor highlight if this is the selected character
+                        // Mobile cursor chrome: a white rounded outline, no
+                        // fill, inflated 2dp per side and scaling with the
+                        // content transform like the boxes themselves.
                         if self.cursor_pos == Some((line_idx, i)) {
-                            let cursor_rect = CanvasPath::rectangle(pt_c, sz_c);
-                            frame.fill(&cursor_rect, Color::from_rgba(1.0, 1.0, 0.0, 0.3));
-                            frame.stroke(&cursor_rect,
-                                CanvasStroke::default().with_color(Color::from_rgb(1.0, 1.0, 0.0)).with_width(2.0));
+                            let (c_pt, c_sz) = cursor_rect(pt_c, sz_c, total_scale);
+                            let cursor_path = CanvasPath::rounded_rectangle(
+                                c_pt,
+                                c_sz,
+                                (CURSOR_RADIUS * total_scale).into(),
+                            );
+                            frame.stroke(
+                                &cursor_path,
+                                CanvasStroke::default()
+                                    .with_color(Color::WHITE)
+                                    .with_width(CURSOR_STROKE * total_scale),
+                            );
                         }
 
                         let Some(ch) = line.text.chars().nth(i) else { continue };
@@ -2470,6 +2495,18 @@ mod tests {
         let gid = cache.borrow_mut().glyph_id('あ', false).expect("glyph id");
         let g = draw_glyph(&cache, gid, 54, false).expect("glyph");
         assert!(g.w > 0 && g.h > 0, "kana has ink");
+    }
+
+    /// Mobile cursor: 2dp inflation per side, scaling with the transform.
+    #[test]
+    fn cursor_box_is_inflated_like_mobile() {
+        let (pt, sz) = cursor_rect(Point::new(10.0, 20.0), Size::new(30.0, 40.0), 1.0);
+        assert_eq!(pt, Point::new(8.0, 18.0));
+        assert_eq!(sz, Size::new(34.0, 44.0));
+        // At 2× zoom the whole cursor scales with the content.
+        let (pt, sz) = cursor_rect(Point::new(10.0, 20.0), Size::new(30.0, 40.0), 2.0);
+        assert_eq!(pt, Point::new(6.0, 16.0));
+        assert_eq!(sz, Size::new(38.0, 48.0));
     }
 
     /// Fake bold: a single lit pixel grows into a (2r+1)² block, and the
