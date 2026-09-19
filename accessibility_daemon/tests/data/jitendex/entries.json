@@ -1,0 +1,3040 @@
+{
+  "comment": [
+    "Real Jitendex term rows, trimmed to their definitions, from the pinned",
+    "jitendex-yomitan.zip release 2026.08.11.0 (index.json title",
+    "\"Jitendex.org [2026-08-11]\"). These are the inputs to",
+    "OcrOverlayStateController.parseDefinition / Definitions.plain in",
+    "JitendexStructuredContentTest; term and reading are kept so a failure",
+    "names the real entry. Do not edit by hand."
+  ],
+  "entries": [
+    {
+      "term": "支持杭",
+      "reading": "しじぐい",
+      "definitions": [
+        {
+          "type": "structured-content",
+          "content": [
+            {
+              "tag": "div",
+              "data": {
+                "content": "sense-group"
+              },
+              "content": [
+                {
+                  "tag": "span",
+                  "title": "noun (common) (futsuumeishi)",
+                  "data": {
+                    "class": "tag",
+                    "code": "n",
+                    "content": "part-of-speech-info"
+                  },
+                  "content": "noun"
+                },
+                {
+                  "tag": "span",
+                  "title": "architecture",
+                  "data": {
+                    "class": "tag",
+                    "code": "archit",
+                    "content": "field-info"
+                  },
+                  "content": "architecture"
+                },
+                {
+                  "tag": "div",
+                  "data": {
+                    "content": "sense"
+                  },
+                  "content": {
+                    "tag": "ul",
+                    "data": {
+                      "content": "glossary"
+                    },
+                    "content": {
+                      "tag": "li",
+                      "content": "bearing pile"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "forms"
+              },
+              "content": [
+                {
+                  "tag": "span",
+                  "title": "spelling and reading variants",
+                  "data": {
+                    "class": "tag",
+                    "content": "forms-label"
+                  },
+                  "content": "forms"
+                },
+                {
+                  "tag": "table",
+                  "content": [
+                    {
+                      "tag": "tr",
+                      "data": {
+                        "content": "forms-header-row"
+                      },
+                      "content": [
+                        {
+                          "tag": "th"
+                        },
+                        {
+                          "tag": "th",
+                          "content": "支持杭"
+                        }
+                      ]
+                    },
+                    {
+                      "tag": "tr",
+                      "content": [
+                        {
+                          "tag": "th",
+                          "content": "しじぐい"
+                        },
+                        {
+                          "tag": "td",
+                          "data": {
+                            "class": "form-valid"
+                          },
+                          "content": {
+                            "tag": "span",
+                            "title": "valid form/reading combination"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "tag": "tr",
+                      "content": [
+                        {
+                          "tag": "th",
+                          "content": "しじくい"
+                        },
+                        {
+                          "tag": "td",
+                          "data": {
+                            "class": "form-valid"
+                          },
+                          "content": {
+                            "tag": "span",
+                            "title": "valid form/reading combination"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "attribution"
+              },
+              "content": {
+                "tag": "a",
+                "href": "https://www.edrdg.org/jmwsgi/entr.py?svc=jmdict&q=1917900",
+                "content": "JMdict"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "term": "ダイニングキッチン",
+      "reading": "ダイニングキッチン",
+      "definitions": [
+        {
+          "type": "structured-content",
+          "content": [
+            {
+              "tag": "div",
+              "data": {
+                "content": "sense-group"
+              },
+              "content": [
+                {
+                  "tag": "span",
+                  "title": "noun (common) (futsuumeishi)",
+                  "data": {
+                    "class": "tag",
+                    "code": "n",
+                    "content": "part-of-speech-info"
+                  },
+                  "content": "noun"
+                },
+                {
+                  "tag": "div",
+                  "data": {
+                    "content": "sense"
+                  },
+                  "content": [
+                    {
+                      "tag": "ul",
+                      "data": {
+                        "content": "glossary"
+                      },
+                      "content": [
+                        {
+                          "tag": "li",
+                          "content": "eat-in kitchen"
+                        },
+                        {
+                          "tag": "li",
+                          "content": "combination kitchen-dining room"
+                        }
+                      ]
+                    },
+                    {
+                      "tag": "div",
+                      "data": {
+                        "content": "extra-info"
+                      },
+                      "content": {
+                        "tag": "div",
+                        "data": {
+                          "class": "extra-box",
+                          "content": "lang-source"
+                        },
+                        "content": [
+                          {
+                            "tag": "div",
+                            "data": {
+                              "class": "extra-label",
+                              "content": "lang-source-label"
+                            },
+                            "content": "Language of Origin"
+                          },
+                          {
+                            "tag": "div",
+                            "data": {
+                              "class": "extra-content",
+                              "content": "lang-source-content"
+                            },
+                            "content": [
+                              "English: \"dining kitchen\"",
+                              {
+                                "tag": "span",
+                                "title": "Loanwords coined in Japan",
+                                "data": {
+                                  "class": "tag",
+                                  "content": "lang-source-wasei"
+                                },
+                                "content": "wasei"
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "forms"
+              },
+              "content": [
+                {
+                  "tag": "span",
+                  "title": "spelling and reading variants",
+                  "data": {
+                    "class": "tag",
+                    "content": "forms-label"
+                  },
+                  "content": "forms"
+                },
+                {
+                  "tag": "ul",
+                  "content": [
+                    {
+                      "tag": "li",
+                      "content": "ダイニングキッチン"
+                    },
+                    {
+                      "tag": "li",
+                      "content": "ダイニング・キッチン"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "attribution"
+              },
+              "content": {
+                "tag": "a",
+                "href": "https://www.edrdg.org/jmwsgi/entr.py?svc=jmdict&q=1918450",
+                "content": "JMdict"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "term": "湾内",
+      "reading": "わんない",
+      "definitions": [
+        {
+          "type": "structured-content",
+          "content": [
+            {
+              "tag": "div",
+              "data": {
+                "content": "sense-group"
+              },
+              "content": [
+                {
+                  "tag": "span",
+                  "title": "noun (common) (futsuumeishi)",
+                  "data": {
+                    "class": "tag",
+                    "code": "n",
+                    "content": "part-of-speech-info"
+                  },
+                  "content": "noun"
+                },
+                {
+                  "tag": "div",
+                  "data": {
+                    "content": "sense"
+                  },
+                  "content": [
+                    {
+                      "tag": "ul",
+                      "data": {
+                        "content": "glossary"
+                      },
+                      "content": {
+                        "tag": "li",
+                        "content": "inside the bay"
+                      }
+                    },
+                    {
+                      "tag": "div",
+                      "data": {
+                        "content": "extra-info"
+                      },
+                      "content": [
+                        {
+                          "tag": "div",
+                          "content": {
+                            "tag": "div",
+                            "data": {
+                              "class": "extra-box",
+                              "content": "example-sentence",
+                              "sentence-key": "湾内",
+                              "source": "186099",
+                              "source-type": "tat"
+                            },
+                            "content": [
+                              {
+                                "tag": "div",
+                                "data": {
+                                  "content": "example-sentence-a"
+                                },
+                                "content": {
+                                  "tag": "span",
+                                  "lang": "ja",
+                                  "content": [
+                                    {
+                                      "tag": "ruby",
+                                      "content": [
+                                        "我々",
+                                        {
+                                          "tag": "rt",
+                                          "content": "われわれ"
+                                        }
+                                      ]
+                                    },
+                                    "はこの",
+                                    {
+                                      "tag": "span",
+                                      "data": {
+                                        "content": "example-keyword"
+                                      },
+                                      "content": [
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "湾",
+                                            {
+                                              "tag": "rt",
+                                              "content": "わん"
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "内",
+                                            {
+                                              "tag": "rt",
+                                              "content": "ない"
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    },
+                                    "で",
+                                    {
+                                      "tag": "ruby",
+                                      "content": [
+                                        "漁",
+                                        {
+                                          "tag": "rt",
+                                          "content": "ぎょ"
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "tag": "ruby",
+                                      "content": [
+                                        "獲",
+                                        {
+                                          "tag": "rt",
+                                          "content": "かく"
+                                        }
+                                      ]
+                                    },
+                                    "する",
+                                    {
+                                      "tag": "ruby",
+                                      "content": [
+                                        "特",
+                                        {
+                                          "tag": "rt",
+                                          "content": "とっ"
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "tag": "ruby",
+                                      "content": [
+                                        "権",
+                                        {
+                                          "tag": "rt",
+                                          "content": "けん"
+                                        }
+                                      ]
+                                    },
+                                    "を",
+                                    {
+                                      "tag": "ruby",
+                                      "content": [
+                                        "与",
+                                        {
+                                          "tag": "rt",
+                                          "content": "あた"
+                                        }
+                                      ]
+                                    },
+                                    "えられた。"
+                                  ]
+                                }
+                              },
+                              {
+                                "tag": "div",
+                                "data": {
+                                  "content": "example-sentence-b"
+                                },
+                                "content": {
+                                  "tag": "span",
+                                  "lang": "en",
+                                  "content": "We were granted the privilege of fishing in this bay."
+                                }
+                              }
+                            ]
+                          }
+                        },
+                        {
+                          "tag": "div",
+                          "content": {
+                            "tag": "div",
+                            "data": {
+                              "class": "extra-box",
+                              "content": "xref"
+                            },
+                            "content": [
+                              {
+                                "tag": "div",
+                                "data": {
+                                  "content": "xref-content"
+                                },
+                                "content": [
+                                  {
+                                    "tag": "span",
+                                    "lang": "en",
+                                    "data": {
+                                      "content": "reference-label"
+                                    },
+                                    "content": "See also"
+                                  },
+                                  {
+                                    "tag": "a",
+                                    "lang": "ja",
+                                    "href": "?query=%E6%B9%BE%E5%A4%96&wildcards=off&primary_reading=%E3%82%8F%E3%82%93%E3%81%8C%E3%81%84",
+                                    "content": [
+                                      {
+                                        "tag": "ruby",
+                                        "content": [
+                                          "湾",
+                                          {
+                                            "tag": "rt",
+                                            "content": "わん"
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "tag": "ruby",
+                                        "content": [
+                                          "外",
+                                          {
+                                            "tag": "rt",
+                                            "content": "がい"
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "tag": "div",
+                                "data": {
+                                  "content": "xref-glossary"
+                                },
+                                "content": "beyond the bay"
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "attribution"
+              },
+              "content": [
+                {
+                  "tag": "a",
+                  "href": "https://www.edrdg.org/jmwsgi/entr.py?svc=jmdict&q=1917750",
+                  "content": "JMdict"
+                },
+                " | ",
+                {
+                  "tag": "a",
+                  "href": "https://tatoeba.org/en/sentences/show/186099",
+                  "content": "Tatoeba"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "term": "あかんべえ",
+      "reading": "あかんべえ",
+      "definitions": [
+        {
+          "type": "structured-content",
+          "content": [
+            {
+              "tag": "ul",
+              "lang": "ja",
+              "data": {
+                "content": "sense-groups"
+              },
+              "content": [
+                {
+                  "tag": "li",
+                  "style": {
+                    "listStyleType": "\"①\""
+                  },
+                  "data": {
+                    "content": "sense-group"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "noun (common) (futsuumeishi)",
+                      "data": {
+                        "class": "tag",
+                        "code": "n",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "noun"
+                    },
+                    {
+                      "tag": "div",
+                      "data": {
+                        "content": "sense"
+                      },
+                      "content": [
+                        {
+                          "tag": "ul",
+                          "data": {
+                            "content": "glossary"
+                          },
+                          "content": {
+                            "tag": "li",
+                            "content": "pulling down one's lower eyelid and sticking out one's tongue (as a taunt or gesture of contempt or rejection)"
+                          }
+                        },
+                        {
+                          "tag": "div",
+                          "data": {
+                            "content": "extra-info"
+                          },
+                          "content": [
+                            {
+                              "tag": "div",
+                              "data": {
+                                "class": "extra-box",
+                                "content": "sense-note"
+                              },
+                              "content": [
+                                {
+                                  "tag": "div",
+                                  "data": {
+                                    "class": "extra-label",
+                                    "content": "sense-note-label"
+                                  },
+                                  "content": "Note"
+                                },
+                                {
+                                  "tag": "div",
+                                  "data": {
+                                    "class": "extra-content",
+                                    "content": "sense-note-content"
+                                  },
+                                  "content": "from 赤目"
+                                }
+                              ]
+                            },
+                            {
+                              "tag": "div",
+                              "content": {
+                                "tag": "div",
+                                "data": {
+                                  "class": "extra-box",
+                                  "content": "xref"
+                                },
+                                "content": [
+                                  {
+                                    "tag": "div",
+                                    "data": {
+                                      "content": "xref-content"
+                                    },
+                                    "content": [
+                                      {
+                                        "tag": "span",
+                                        "lang": "en",
+                                        "data": {
+                                          "content": "reference-label"
+                                        },
+                                        "content": "See also"
+                                      },
+                                      {
+                                        "tag": "a",
+                                        "lang": "ja",
+                                        "href": "?query=%E8%B5%A4%E7%9B%AE&wildcards=off&primary_reading=%E3%81%82%E3%81%8B%E3%81%B9",
+                                        "content": [
+                                          {
+                                            "tag": "ruby",
+                                            "content": [
+                                              "赤",
+                                              {
+                                                "tag": "rt",
+                                                "content": "あか"
+                                              }
+                                            ]
+                                          },
+                                          {
+                                            "tag": "ruby",
+                                            "content": [
+                                              "目",
+                                              {
+                                                "tag": "rt",
+                                                "content": "べ"
+                                              }
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "tag": "div",
+                                    "data": {
+                                      "content": "xref-glossary"
+                                    },
+                                    "content": "facial gesture of pulling one's eyelid down and sticking out one's tongue"
+                                  }
+                                ]
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "tag": "li",
+                  "style": {
+                    "listStyleType": "\"②\""
+                  },
+                  "data": {
+                    "content": "sense-group"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "interjection (kandoushi)",
+                      "data": {
+                        "class": "tag",
+                        "code": "int",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "interjection"
+                    },
+                    {
+                      "tag": "div",
+                      "data": {
+                        "content": "sense"
+                      },
+                      "content": {
+                        "tag": "ul",
+                        "data": {
+                          "content": "glossary"
+                        },
+                        "content": [
+                          {
+                            "tag": "li",
+                            "content": "no way!"
+                          },
+                          {
+                            "tag": "li",
+                            "content": "no!"
+                          },
+                          {
+                            "tag": "li",
+                            "content": "get lost!"
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                {
+                  "tag": "li",
+                  "data": {
+                    "content": "forms"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "spelling and reading variants",
+                      "data": {
+                        "class": "tag",
+                        "content": "forms-label"
+                      },
+                      "content": "forms"
+                    },
+                    {
+                      "tag": "ul",
+                      "content": [
+                        {
+                          "tag": "li",
+                          "content": "あかんべえ"
+                        },
+                        {
+                          "tag": "li",
+                          "content": "あかんべ"
+                        },
+                        {
+                          "tag": "li",
+                          "content": "あっかんべー"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "attribution"
+              },
+              "content": {
+                "tag": "a",
+                "href": "https://www.edrdg.org/jmwsgi/entr.py?svc=jmdict&q=1917755",
+                "content": "JMdict"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "term": "袋小路文",
+      "reading": "ふくろこうじぶん",
+      "definitions": [
+        {
+          "type": "structured-content",
+          "content": [
+            {
+              "tag": "div",
+              "data": {
+                "content": "sense-group"
+              },
+              "content": [
+                {
+                  "tag": "span",
+                  "title": "noun (common) (futsuumeishi)",
+                  "data": {
+                    "class": "tag",
+                    "code": "n",
+                    "content": "part-of-speech-info"
+                  },
+                  "content": "noun"
+                },
+                {
+                  "tag": "div",
+                  "data": {
+                    "content": "sense"
+                  },
+                  "content": [
+                    {
+                      "tag": "ul",
+                      "data": {
+                        "content": "glossary"
+                      },
+                      "content": [
+                        {
+                          "tag": "li",
+                          "content": "easily misunderstood sentence"
+                        },
+                        {
+                          "tag": "li",
+                          "content": "garden-path sentence"
+                        }
+                      ]
+                    },
+                    {
+                      "tag": "div",
+                      "data": {
+                        "content": "extra-info"
+                      },
+                      "content": {
+                        "tag": "div",
+                        "content": {
+                          "tag": "div",
+                          "data": {
+                            "class": "extra-box",
+                            "content": "info-gloss"
+                          },
+                          "content": [
+                            {
+                              "tag": "div",
+                              "data": {
+                                "class": "extra-label",
+                                "content": "info-gloss-label"
+                              },
+                              "content": "Literally"
+                            },
+                            {
+                              "tag": "div",
+                              "data": {
+                                "class": "extra-content",
+                                "content": "info-gloss-content"
+                              },
+                              "content": "cul-de-sac sentence"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "attribution"
+              },
+              "content": {
+                "tag": "a",
+                "href": "https://www.edrdg.org/jmwsgi/entr.py?svc=jmdict&q=1921680",
+                "content": "JMdict"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "term": "ディフェンシブ",
+      "reading": "ディフェンシブ",
+      "definitions": [
+        {
+          "type": "structured-content",
+          "content": [
+            {
+              "tag": "div",
+              "data": {
+                "content": "sense-group"
+              },
+              "content": [
+                {
+                  "tag": "span",
+                  "title": "adjectival nouns or quasi-adjectives (keiyodoshi)",
+                  "data": {
+                    "class": "tag",
+                    "code": "adj-na",
+                    "content": "part-of-speech-info"
+                  },
+                  "content": "na-adj"
+                },
+                {
+                  "tag": "div",
+                  "data": {
+                    "content": "sense"
+                  },
+                  "content": [
+                    {
+                      "tag": "ul",
+                      "data": {
+                        "content": "glossary"
+                      },
+                      "content": {
+                        "tag": "li",
+                        "content": "defensive"
+                      }
+                    },
+                    {
+                      "tag": "div",
+                      "data": {
+                        "content": "extra-info"
+                      },
+                      "content": {
+                        "tag": "div",
+                        "content": {
+                          "tag": "div",
+                          "data": {
+                            "class": "extra-box",
+                            "content": "antonym"
+                          },
+                          "content": [
+                            {
+                              "tag": "div",
+                              "data": {
+                                "content": "antonym-content"
+                              },
+                              "content": [
+                                {
+                                  "tag": "span",
+                                  "lang": "en",
+                                  "data": {
+                                    "content": "reference-label"
+                                  },
+                                  "content": "Antonym"
+                                },
+                                {
+                                  "tag": "a",
+                                  "lang": "ja",
+                                  "href": "?query=%E3%82%AA%E3%83%95%E3%82%A7%E3%83%B3%E3%82%B7%E3%83%96&wildcards=off",
+                                  "content": "オフェンシブ"
+                                }
+                              ]
+                            },
+                            {
+                              "tag": "div",
+                              "data": {
+                                "content": "antonym-glossary"
+                              },
+                              "content": "offensive"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "attribution"
+              },
+              "content": {
+                "tag": "a",
+                "href": "https://www.edrdg.org/jmwsgi/entr.py?svc=jmdict&q=2828543",
+                "content": "JMdict"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "term": "いじらしい",
+      "reading": "いじらしい",
+      "definitions": [
+        {
+          "type": "structured-content",
+          "content": [
+            {
+              "tag": "ul",
+              "lang": "ja",
+              "data": {
+                "content": "sense-groups"
+              },
+              "content": {
+                "tag": "li",
+                "data": {
+                  "content": "sense-group"
+                },
+                "content": [
+                  {
+                    "tag": "span",
+                    "title": "adjective (keiyoushi)",
+                    "data": {
+                      "class": "tag",
+                      "code": "adj-i",
+                      "content": "part-of-speech-info"
+                    },
+                    "content": "adjective"
+                  },
+                  {
+                    "tag": "ol",
+                    "content": [
+                      {
+                        "tag": "li",
+                        "style": {
+                          "listStyleType": "\"①\""
+                        },
+                        "data": {
+                          "content": "sense"
+                        },
+                        "content": {
+                          "tag": "ul",
+                          "data": {
+                            "content": "glossary"
+                          },
+                          "content": [
+                            {
+                              "tag": "li",
+                              "content": "lovable"
+                            },
+                            {
+                              "tag": "li",
+                              "content": "sweet"
+                            },
+                            {
+                              "tag": "li",
+                              "content": "charming"
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "tag": "li",
+                        "style": {
+                          "listStyleType": "\"②\""
+                        },
+                        "data": {
+                          "content": "sense"
+                        },
+                        "content": {
+                          "tag": "ul",
+                          "data": {
+                            "content": "glossary"
+                          },
+                          "content": [
+                            {
+                              "tag": "li",
+                              "content": "pitiful"
+                            },
+                            {
+                              "tag": "li",
+                              "content": "pathetic"
+                            },
+                            {
+                              "tag": "li",
+                              "content": "touching"
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "attribution"
+              },
+              "content": {
+                "tag": "a",
+                "href": "https://www.edrdg.org/jmwsgi/entr.py?svc=jmdict&q=1000800",
+                "content": "JMdict"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "term": "お前",
+      "reading": "おまえ",
+      "definitions": [
+        {
+          "type": "structured-content",
+          "content": [
+            {
+              "tag": "ul",
+              "lang": "ja",
+              "data": {
+                "content": "sense-groups"
+              },
+              "content": [
+                {
+                  "tag": "li",
+                  "style": {
+                    "listStyleType": "\"①\""
+                  },
+                  "data": {
+                    "content": "sense-group"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "pronoun",
+                      "data": {
+                        "class": "tag",
+                        "code": "pn",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "pronoun"
+                    },
+                    {
+                      "tag": "span",
+                      "title": "familiar language",
+                      "data": {
+                        "class": "tag",
+                        "code": "fam",
+                        "content": "misc-info"
+                      },
+                      "content": "familiar"
+                    },
+                    {
+                      "tag": "span",
+                      "title": "male term or language",
+                      "data": {
+                        "class": "tag",
+                        "code": "male",
+                        "content": "misc-info"
+                      },
+                      "content": "masculine"
+                    },
+                    {
+                      "tag": "div",
+                      "data": {
+                        "content": "sense"
+                      },
+                      "content": [
+                        {
+                          "tag": "ul",
+                          "data": {
+                            "content": "glossary"
+                          },
+                          "content": {
+                            "tag": "li",
+                            "content": "you"
+                          }
+                        },
+                        {
+                          "tag": "div",
+                          "data": {
+                            "content": "extra-info"
+                          },
+                          "content": [
+                            {
+                              "tag": "div",
+                              "data": {
+                                "class": "extra-box",
+                                "content": "sense-note"
+                              },
+                              "content": [
+                                {
+                                  "tag": "div",
+                                  "data": {
+                                    "class": "extra-label",
+                                    "content": "sense-note-label"
+                                  },
+                                  "content": "Note"
+                                },
+                                {
+                                  "tag": "div",
+                                  "data": {
+                                    "class": "extra-content",
+                                    "content": "sense-note-content"
+                                  },
+                                  "content": "formerly honorific, now very informal"
+                                }
+                              ]
+                            },
+                            {
+                              "tag": "div",
+                              "content": {
+                                "tag": "div",
+                                "data": {
+                                  "class": "extra-box",
+                                  "content": "example-sentence",
+                                  "sentence-key": "お前",
+                                  "source": "226919",
+                                  "source-type": "tat"
+                                },
+                                "content": [
+                                  {
+                                    "tag": "div",
+                                    "data": {
+                                      "content": "example-sentence-a"
+                                    },
+                                    "content": {
+                                      "tag": "span",
+                                      "lang": "ja",
+                                      "content": [
+                                        {
+                                          "tag": "span",
+                                          "data": {
+                                            "content": "example-keyword"
+                                          },
+                                          "content": [
+                                            "お",
+                                            {
+                                              "tag": "ruby",
+                                              "content": [
+                                                "前",
+                                                {
+                                                  "tag": "rt",
+                                                  "content": "まえ"
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        },
+                                        "を",
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "娘",
+                                            {
+                                              "tag": "rt",
+                                              "content": "むすめ"
+                                            }
+                                          ]
+                                        },
+                                        "の",
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "夫",
+                                            {
+                                              "tag": "rt",
+                                              "content": "おっと"
+                                            }
+                                          ]
+                                        },
+                                        "にしよう。"
+                                      ]
+                                    }
+                                  },
+                                  {
+                                    "tag": "div",
+                                    "data": {
+                                      "content": "example-sentence-b"
+                                    },
+                                    "content": {
+                                      "tag": "span",
+                                      "lang": "en",
+                                      "content": "You shall be my daughter's husband."
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "tag": "li",
+                  "style": {
+                    "listStyleType": "\"②\""
+                  },
+                  "data": {
+                    "content": "sense-group"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "noun (common) (futsuumeishi)",
+                      "data": {
+                        "class": "tag",
+                        "code": "n",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "noun"
+                    },
+                    {
+                      "tag": "span",
+                      "title": "valid only for these forms and/or readings",
+                      "content": [
+                        {
+                          "tag": "span",
+                          "data": {
+                            "class": "form-special"
+                          },
+                          "content": "〔"
+                        },
+                        {
+                          "tag": "span",
+                          "lang": "ja",
+                          "content": "おまえ only"
+                        },
+                        {
+                          "tag": "span",
+                          "data": {
+                            "class": "form-special"
+                          },
+                          "content": "〕"
+                        }
+                      ]
+                    },
+                    {
+                      "tag": "div",
+                      "data": {
+                        "content": "sense"
+                      },
+                      "content": {
+                        "tag": "ul",
+                        "data": {
+                          "content": "glossary"
+                        },
+                        "content": [
+                          {
+                            "tag": "li",
+                            "content": "before (a god, nobleman, etc.)"
+                          },
+                          {
+                            "tag": "li",
+                            "content": "in front of"
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                {
+                  "tag": "li",
+                  "data": {
+                    "content": "forms"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "spelling and reading variants",
+                      "data": {
+                        "class": "tag",
+                        "content": "forms-label"
+                      },
+                      "content": "forms"
+                    },
+                    {
+                      "tag": "table",
+                      "content": [
+                        {
+                          "tag": "tr",
+                          "data": {
+                            "content": "forms-header-row"
+                          },
+                          "content": [
+                            {
+                              "tag": "th",
+                              "colSpan": 2
+                            },
+                            {
+                              "tag": "th",
+                              "content": "お前"
+                            },
+                            {
+                              "tag": "th",
+                              "content": "御前"
+                            }
+                          ]
+                        },
+                        {
+                          "tag": "tr",
+                          "content": [
+                            {
+                              "tag": "th",
+                              "data": {
+                                "content": "forms-row-senses"
+                              },
+                              "content": {
+                                "tag": "span",
+                                "title": "reading applies to every sense number above",
+                                "content": "＊"
+                              }
+                            },
+                            {
+                              "tag": "th",
+                              "content": "おまえ"
+                            },
+                            {
+                              "tag": "td",
+                              "data": {
+                                "class": "form-pri"
+                              },
+                              "content": {
+                                "tag": "span",
+                                "title": "high priority form"
+                              }
+                            },
+                            {
+                              "tag": "td",
+                              "data": {
+                                "class": "form-rare"
+                              },
+                              "content": {
+                                "tag": "span",
+                                "title": "rarely used form"
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "tag": "tr",
+                          "content": [
+                            {
+                              "tag": "th",
+                              "data": {
+                                "content": "forms-row-senses"
+                              },
+                              "content": {
+                                "tag": "span",
+                                "title": "reading applies only to this sense number",
+                                "content": "①"
+                              }
+                            },
+                            {
+                              "tag": "th",
+                              "content": "おまい"
+                            },
+                            {
+                              "tag": "td",
+                              "data": {
+                                "class": "form-valid"
+                              },
+                              "content": {
+                                "tag": "span",
+                                "title": "valid form/reading combination"
+                              }
+                            },
+                            {
+                              "tag": "td",
+                              "data": {
+                                "class": "form-rare"
+                              },
+                              "content": {
+                                "tag": "span",
+                                "title": "rarely used form"
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "attribution"
+              },
+              "content": [
+                {
+                  "tag": "a",
+                  "href": "https://www.edrdg.org/jmwsgi/entr.py?svc=jmdict&q=1002290",
+                  "content": "JMdict"
+                },
+                " | ",
+                {
+                  "tag": "a",
+                  "href": "https://tatoeba.org/en/sentences/show/226919",
+                  "content": "Tatoeba"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "term": "分",
+      "reading": "ふん",
+      "definitions": [
+        {
+          "type": "structured-content",
+          "content": [
+            {
+              "tag": "ul",
+              "lang": "ja",
+              "data": {
+                "content": "sense-groups"
+              },
+              "content": {
+                "tag": "li",
+                "data": {
+                  "content": "sense-group"
+                },
+                "content": [
+                  {
+                    "tag": "span",
+                    "title": "noun (common) (futsuumeishi)",
+                    "data": {
+                      "class": "tag",
+                      "code": "n",
+                      "content": "part-of-speech-info"
+                    },
+                    "content": "noun"
+                  },
+                  {
+                    "tag": "ol",
+                    "content": [
+                      {
+                        "tag": "li",
+                        "style": {
+                          "listStyleType": "\"①\""
+                        },
+                        "data": {
+                          "content": "sense"
+                        },
+                        "content": [
+                          {
+                            "tag": "ul",
+                            "data": {
+                              "content": "glossary"
+                            },
+                            "content": {
+                              "tag": "li",
+                              "content": "minute (unit of time)"
+                            }
+                          },
+                          {
+                            "tag": "div",
+                            "data": {
+                              "content": "extra-info"
+                            },
+                            "content": {
+                              "tag": "div",
+                              "content": {
+                                "tag": "div",
+                                "data": {
+                                  "class": "extra-box",
+                                  "content": "example-sentence",
+                                  "sentence-key": "分",
+                                  "source": "236056",
+                                  "source-type": "tat"
+                                },
+                                "content": [
+                                  {
+                                    "tag": "div",
+                                    "data": {
+                                      "content": "example-sentence-a"
+                                    },
+                                    "content": {
+                                      "tag": "span",
+                                      "lang": "ja",
+                                      "content": [
+                                        "１０時４０",
+                                        {
+                                          "tag": "span",
+                                          "data": {
+                                            "content": "example-keyword"
+                                          },
+                                          "content": "分"
+                                        },
+                                        "から１１時まで休み時間です。"
+                                      ]
+                                    }
+                                  },
+                                  {
+                                    "tag": "div",
+                                    "data": {
+                                      "content": "example-sentence-b"
+                                    },
+                                    "content": {
+                                      "tag": "span",
+                                      "lang": "en",
+                                      "content": "We have a break from 10:40 to 11:00."
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          }
+                        ]
+                      },
+                      {
+                        "tag": "li",
+                        "style": {
+                          "listStyleType": "\"②\""
+                        },
+                        "data": {
+                          "content": "sense"
+                        },
+                        "content": {
+                          "tag": "ul",
+                          "data": {
+                            "content": "glossary"
+                          },
+                          "content": {
+                            "tag": "li",
+                            "content": "fun (one tenth of a monme, 5.787 grains)"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "attribution"
+              },
+              "content": [
+                {
+                  "tag": "a",
+                  "href": "https://www.edrdg.org/jmwsgi/entr.py?svc=jmdict&q=1502840",
+                  "content": "JMdict"
+                },
+                " | ",
+                {
+                  "tag": "a",
+                  "href": "https://tatoeba.org/en/sentences/show/236056",
+                  "content": "Tatoeba"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "term": "分",
+      "reading": "ぶ",
+      "definitions": [
+        {
+          "type": "structured-content",
+          "content": [
+            {
+              "tag": "ul",
+              "lang": "ja",
+              "data": {
+                "content": "sense-groups"
+              },
+              "content": [
+                {
+                  "tag": "li",
+                  "data": {
+                    "content": "sense-group"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "numeric",
+                      "data": {
+                        "class": "tag",
+                        "code": "num",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "numeric"
+                    },
+                    {
+                      "tag": "ol",
+                      "content": {
+                        "tag": "li",
+                        "style": {
+                          "listStyleType": "\"①\""
+                        },
+                        "data": {
+                          "content": "sense"
+                        },
+                        "content": [
+                          {
+                            "tag": "ul",
+                            "data": {
+                              "content": "glossary"
+                            },
+                            "content": [
+                              {
+                                "tag": "li",
+                                "content": "one-tenth"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "one percent (one-tenth of a wari)"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "3 mm (one-tenth of a sun)"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "2.4 mm (one-tenth of a mon, a traditional unit used to measure shoe sizes)"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "0.1 degree (one-tenth of a do, used to measure body temperature on any temperature scale)"
+                              }
+                            ]
+                          },
+                          {
+                            "tag": "div",
+                            "data": {
+                              "content": "extra-info"
+                            },
+                            "content": {
+                              "tag": "div",
+                              "content": {
+                                "tag": "div",
+                                "data": {
+                                  "class": "extra-box",
+                                  "content": "example-sentence",
+                                  "sentence-key": "分",
+                                  "source": "208276",
+                                  "source-type": "tat"
+                                },
+                                "content": [
+                                  {
+                                    "tag": "div",
+                                    "data": {
+                                      "content": "example-sentence-a"
+                                    },
+                                    "content": {
+                                      "tag": "span",
+                                      "lang": "ja",
+                                      "content": [
+                                        "その貸付金は、８",
+                                        {
+                                          "tag": "span",
+                                          "data": {
+                                            "content": "example-keyword"
+                                          },
+                                          "content": "分"
+                                        },
+                                        "の利益を生む。"
+                                      ]
+                                    }
+                                  },
+                                  {
+                                    "tag": "div",
+                                    "data": {
+                                      "content": "example-sentence-b"
+                                    },
+                                    "content": [
+                                      {
+                                        "tag": "span",
+                                        "lang": "en",
+                                        "content": "The loan bears an 8% interest."
+                                      },
+                                      {
+                                        "tag": "span",
+                                        "data": {
+                                          "content": "attribution-footnote"
+                                        },
+                                        "content": "[1]"
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                {
+                  "tag": "li",
+                  "data": {
+                    "content": "sense-group"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "noun (common) (futsuumeishi)",
+                      "data": {
+                        "class": "tag",
+                        "code": "n",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "noun"
+                    },
+                    {
+                      "tag": "ol",
+                      "content": [
+                        {
+                          "tag": "li",
+                          "style": {
+                            "listStyleType": "\"②\""
+                          },
+                          "data": {
+                            "content": "sense"
+                          },
+                          "content": {
+                            "tag": "ul",
+                            "data": {
+                              "content": "glossary"
+                            },
+                            "content": {
+                              "tag": "li",
+                              "content": "one-quarter of a ryō (obsolete unit of currency)"
+                            }
+                          }
+                        },
+                        {
+                          "tag": "li",
+                          "style": {
+                            "listStyleType": "\"③\""
+                          },
+                          "data": {
+                            "content": "sense"
+                          },
+                          "content": {
+                            "tag": "ul",
+                            "data": {
+                              "content": "glossary"
+                            },
+                            "content": {
+                              "tag": "li",
+                              "content": "thickness"
+                            }
+                          }
+                        },
+                        {
+                          "tag": "li",
+                          "style": {
+                            "listStyleType": "\"④\""
+                          },
+                          "data": {
+                            "content": "sense"
+                          },
+                          "content": [
+                            {
+                              "tag": "ul",
+                              "data": {
+                                "content": "glossary"
+                              },
+                              "content": {
+                                "tag": "li",
+                                "content": "advantageous circumstances"
+                              }
+                            },
+                            {
+                              "tag": "div",
+                              "data": {
+                                "content": "extra-info"
+                              },
+                              "content": {
+                                "tag": "div",
+                                "content": {
+                                  "tag": "div",
+                                  "data": {
+                                    "class": "extra-box",
+                                    "content": "example-sentence",
+                                    "sentence-key": "分",
+                                    "source": "118244",
+                                    "source-type": "tat"
+                                  },
+                                  "content": [
+                                    {
+                                      "tag": "div",
+                                      "data": {
+                                        "content": "example-sentence-a"
+                                      },
+                                      "content": {
+                                        "tag": "span",
+                                        "lang": "ja",
+                                        "content": [
+                                          {
+                                            "tag": "ruby",
+                                            "content": [
+                                              "彼",
+                                              {
+                                                "tag": "rt",
+                                                "content": "かれ"
+                                              }
+                                            ]
+                                          },
+                                          "のほうに",
+                                          {
+                                            "tag": "span",
+                                            "data": {
+                                              "content": "example-keyword"
+                                            },
+                                            "content": {
+                                              "tag": "ruby",
+                                              "content": [
+                                                "分",
+                                                {
+                                                  "tag": "rt",
+                                                  "content": "ぶん"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "がある。"
+                                        ]
+                                      }
+                                    },
+                                    {
+                                      "tag": "div",
+                                      "data": {
+                                        "content": "example-sentence-b"
+                                      },
+                                      "content": [
+                                        {
+                                          "tag": "span",
+                                          "lang": "en",
+                                          "content": "The odds are in his favor."
+                                        },
+                                        {
+                                          "tag": "span",
+                                          "data": {
+                                            "content": "attribution-footnote"
+                                          },
+                                          "content": "[2]"
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "tag": "li",
+                          "style": {
+                            "listStyleType": "\"⑤\""
+                          },
+                          "data": {
+                            "content": "sense"
+                          },
+                          "content": [
+                            {
+                              "tag": "ul",
+                              "data": {
+                                "content": "glossary"
+                              },
+                              "content": {
+                                "tag": "li",
+                                "content": "one-tenth of a monme of silver"
+                              }
+                            },
+                            {
+                              "tag": "div",
+                              "data": {
+                                "content": "extra-info"
+                              },
+                              "content": {
+                                "tag": "div",
+                                "content": {
+                                  "tag": "div",
+                                  "data": {
+                                    "class": "extra-box",
+                                    "content": "xref"
+                                  },
+                                  "content": [
+                                    {
+                                      "tag": "div",
+                                      "data": {
+                                        "content": "xref-content"
+                                      },
+                                      "content": [
+                                        {
+                                          "tag": "span",
+                                          "lang": "en",
+                                          "data": {
+                                            "content": "reference-label"
+                                          },
+                                          "content": "See also"
+                                        },
+                                        {
+                                          "tag": "a",
+                                          "lang": "ja",
+                                          "href": "?query=%E5%8C%81&wildcards=off&primary_reading=%E3%82%82%E3%82%93%E3%82%81",
+                                          "content": {
+                                            "tag": "ruby",
+                                            "content": [
+                                              "匁",
+                                              {
+                                                "tag": "rt",
+                                                "content": "もんめ"
+                                              }
+                                            ]
+                                          }
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "tag": "div",
+                                      "data": {
+                                        "content": "xref-glossary"
+                                      },
+                                      "content": "① monme (unit of weight, 3.75 g)"
+                                    }
+                                  ]
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "attribution"
+              },
+              "content": [
+                {
+                  "tag": "a",
+                  "href": "https://www.edrdg.org/jmwsgi/entr.py?svc=jmdict&q=1502850",
+                  "content": "JMdict"
+                },
+                " | Tatoeba ",
+                {
+                  "tag": "a",
+                  "href": "https://tatoeba.org/en/sentences/show/208276",
+                  "content": "[1]"
+                },
+                {
+                  "tag": "a",
+                  "href": "https://tatoeba.org/en/sentences/show/118244",
+                  "content": "[2]"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "term": "分",
+      "reading": "ぶん",
+      "definitions": [
+        {
+          "type": "structured-content",
+          "content": [
+            {
+              "tag": "ul",
+              "lang": "ja",
+              "data": {
+                "content": "sense-groups"
+              },
+              "content": [
+                {
+                  "tag": "li",
+                  "data": {
+                    "content": "sense-group"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "noun (common) (futsuumeishi)",
+                      "data": {
+                        "class": "tag",
+                        "code": "n",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "noun"
+                    },
+                    {
+                      "tag": "span",
+                      "title": "noun, used as a suffix",
+                      "data": {
+                        "class": "tag",
+                        "code": "n-suf",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "suffix"
+                    },
+                    {
+                      "tag": "ol",
+                      "content": {
+                        "tag": "li",
+                        "style": {
+                          "listStyleType": "\"①\""
+                        },
+                        "data": {
+                          "content": "sense"
+                        },
+                        "content": [
+                          {
+                            "tag": "ul",
+                            "data": {
+                              "content": "glossary"
+                            },
+                            "content": [
+                              {
+                                "tag": "li",
+                                "content": "part"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "portion"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "share"
+                              }
+                            ]
+                          },
+                          {
+                            "tag": "div",
+                            "data": {
+                              "content": "extra-info"
+                            },
+                            "content": {
+                              "tag": "div",
+                              "content": [
+                                {
+                                  "tag": "div",
+                                  "data": {
+                                    "class": "extra-box",
+                                    "content": "example-sentence",
+                                    "sentence-key": "分",
+                                    "source": "218933",
+                                    "source-type": "tat"
+                                  },
+                                  "content": [
+                                    {
+                                      "tag": "div",
+                                      "data": {
+                                        "content": "example-sentence-a"
+                                      },
+                                      "content": {
+                                        "tag": "span",
+                                        "lang": "ja",
+                                        "content": [
+                                          "これが",
+                                          {
+                                            "tag": "ruby",
+                                            "content": [
+                                              "君",
+                                              {
+                                                "tag": "rt",
+                                                "content": "きみ"
+                                              }
+                                            ]
+                                          },
+                                          "の",
+                                          {
+                                            "tag": "span",
+                                            "data": {
+                                              "content": "example-keyword"
+                                            },
+                                            "content": {
+                                              "tag": "ruby",
+                                              "content": [
+                                                "分",
+                                                {
+                                                  "tag": "rt",
+                                                  "content": "ぶん"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "のケーキだよ。"
+                                        ]
+                                      }
+                                    },
+                                    {
+                                      "tag": "div",
+                                      "data": {
+                                        "content": "example-sentence-b"
+                                      },
+                                      "content": [
+                                        {
+                                          "tag": "span",
+                                          "lang": "en",
+                                          "content": "Here is your share of the cake."
+                                        },
+                                        {
+                                          "tag": "span",
+                                          "data": {
+                                            "content": "attribution-footnote"
+                                          },
+                                          "content": "[1]"
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                },
+                                {
+                                  "tag": "div",
+                                  "data": {
+                                    "class": "extra-box",
+                                    "content": "example-sentence",
+                                    "sentence-key": "分",
+                                    "source": "220103",
+                                    "source-type": "tat"
+                                  },
+                                  "content": [
+                                    {
+                                      "tag": "div",
+                                      "data": {
+                                        "content": "example-sentence-a"
+                                      },
+                                      "content": {
+                                        "tag": "span",
+                                        "lang": "ja",
+                                        "content": [
+                                          "この品の税金",
+                                          {
+                                            "tag": "span",
+                                            "data": {
+                                              "content": "example-keyword"
+                                            },
+                                            "content": "分"
+                                          },
+                                          "はむこうでお支払い下さい。"
+                                        ]
+                                      }
+                                    },
+                                    {
+                                      "tag": "div",
+                                      "data": {
+                                        "content": "example-sentence-b"
+                                      },
+                                      "content": [
+                                        {
+                                          "tag": "span",
+                                          "lang": "en",
+                                          "content": "Please pay the tax on the items over there."
+                                        },
+                                        {
+                                          "tag": "span",
+                                          "data": {
+                                            "content": "attribution-footnote"
+                                          },
+                                          "content": "[2]"
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                {
+                  "tag": "li",
+                  "data": {
+                    "content": "sense-group"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "noun, used as a suffix",
+                      "data": {
+                        "class": "tag",
+                        "code": "n-suf",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "suffix"
+                    },
+                    {
+                      "tag": "ol",
+                      "content": {
+                        "tag": "li",
+                        "style": {
+                          "listStyleType": "\"②\""
+                        },
+                        "data": {
+                          "content": "sense"
+                        },
+                        "content": [
+                          {
+                            "tag": "ul",
+                            "data": {
+                              "content": "glossary"
+                            },
+                            "content": [
+                              {
+                                "tag": "li",
+                                "content": "amount"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "worth (as in \"two days' worth\")"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "enough (for)"
+                              }
+                            ]
+                          },
+                          {
+                            "tag": "div",
+                            "data": {
+                              "content": "extra-info"
+                            },
+                            "content": {
+                              "tag": "div",
+                              "content": {
+                                "tag": "div",
+                                "data": {
+                                  "class": "extra-box",
+                                  "content": "example-sentence",
+                                  "sentence-key": "分",
+                                  "source": "232177",
+                                  "source-type": "tat"
+                                },
+                                "content": [
+                                  {
+                                    "tag": "div",
+                                    "data": {
+                                      "content": "example-sentence-a"
+                                    },
+                                    "content": {
+                                      "tag": "span",
+                                      "lang": "ja",
+                                      "content": [
+                                        "あなたは",
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "家",
+                                            {
+                                              "tag": "rt",
+                                              "content": "や"
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "賃",
+                                            {
+                                              "tag": "rt",
+                                              "content": "ちん"
+                                            }
+                                          ]
+                                        },
+                                        "の",
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "三",
+                                            {
+                                              "tag": "rt",
+                                              "content": "さん"
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "ヶ月",
+                                            {
+                                              "tag": "rt",
+                                              "content": "かげつ"
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "tag": "span",
+                                          "data": {
+                                            "content": "example-keyword"
+                                          },
+                                          "content": {
+                                            "tag": "ruby",
+                                            "content": [
+                                              "分",
+                                              {
+                                                "tag": "rt",
+                                                "content": "ぶん"
+                                              }
+                                            ]
+                                          }
+                                        },
+                                        "を",
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "資",
+                                            {
+                                              "tag": "rt",
+                                              "content": "し"
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "金",
+                                            {
+                                              "tag": "rt",
+                                              "content": "きん"
+                                            }
+                                          ]
+                                        },
+                                        "として",
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "払",
+                                            {
+                                              "tag": "rt",
+                                              "content": "はら"
+                                            }
+                                          ]
+                                        },
+                                        "わなければならない。"
+                                      ]
+                                    }
+                                  },
+                                  {
+                                    "tag": "div",
+                                    "data": {
+                                      "content": "example-sentence-b"
+                                    },
+                                    "content": [
+                                      {
+                                        "tag": "span",
+                                        "lang": "en",
+                                        "content": "You are required to provide three months' rent in deposit."
+                                      },
+                                      {
+                                        "tag": "span",
+                                        "data": {
+                                          "content": "attribution-footnote"
+                                        },
+                                        "content": "[3]"
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                {
+                  "tag": "li",
+                  "data": {
+                    "content": "sense-group"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "noun (common) (futsuumeishi)",
+                      "data": {
+                        "class": "tag",
+                        "code": "n",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "noun"
+                    },
+                    {
+                      "tag": "ol",
+                      "content": [
+                        {
+                          "tag": "li",
+                          "style": {
+                            "listStyleType": "\"③\""
+                          },
+                          "data": {
+                            "content": "sense"
+                          },
+                          "content": {
+                            "tag": "ul",
+                            "data": {
+                              "content": "glossary"
+                            },
+                            "content": [
+                              {
+                                "tag": "li",
+                                "content": "one's means"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "one's place"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "one's lot"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "one's social position"
+                              }
+                            ]
+                          }
+                        },
+                        {
+                          "tag": "li",
+                          "style": {
+                            "listStyleType": "\"④\""
+                          },
+                          "data": {
+                            "content": "sense"
+                          },
+                          "content": {
+                            "tag": "ul",
+                            "data": {
+                              "content": "glossary"
+                            },
+                            "content": [
+                              {
+                                "tag": "li",
+                                "content": "one's duty"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "one's part"
+                              }
+                            ]
+                          }
+                        },
+                        {
+                          "tag": "li",
+                          "style": {
+                            "listStyleType": "\"⑤\""
+                          },
+                          "data": {
+                            "content": "sense"
+                          },
+                          "content": {
+                            "tag": "ul",
+                            "data": {
+                              "content": "glossary"
+                            },
+                            "content": [
+                              {
+                                "tag": "li",
+                                "content": "condition"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "state (of affairs)"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "extent"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "rate (as in \"at this rate\")"
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "tag": "li",
+                  "data": {
+                    "content": "sense-group"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "noun (common) (futsuumeishi)",
+                      "data": {
+                        "class": "tag",
+                        "code": "n",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "noun"
+                    },
+                    {
+                      "tag": "span",
+                      "title": "adverb (fukushi)",
+                      "data": {
+                        "class": "tag",
+                        "code": "adv",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "adverb"
+                    },
+                    {
+                      "tag": "ol",
+                      "content": {
+                        "tag": "li",
+                        "style": {
+                          "listStyleType": "\"⑥\""
+                        },
+                        "data": {
+                          "content": "sense"
+                        },
+                        "content": [
+                          {
+                            "tag": "ul",
+                            "data": {
+                              "content": "glossary"
+                            },
+                            "content": [
+                              {
+                                "tag": "li",
+                                "content": "in proportion to"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "just as much as"
+                              },
+                              {
+                                "tag": "li",
+                                "content": "to the same degree"
+                              }
+                            ]
+                          },
+                          {
+                            "tag": "div",
+                            "data": {
+                              "content": "extra-info"
+                            },
+                            "content": {
+                              "tag": "div",
+                              "content": {
+                                "tag": "div",
+                                "data": {
+                                  "class": "extra-box",
+                                  "content": "example-sentence",
+                                  "sentence-key": "分",
+                                  "source": "224220",
+                                  "source-type": "tat"
+                                },
+                                "content": [
+                                  {
+                                    "tag": "div",
+                                    "data": {
+                                      "content": "example-sentence-a"
+                                    },
+                                    "content": {
+                                      "tag": "span",
+                                      "lang": "ja",
+                                      "content": [
+                                        "ここ",
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "品",
+                                            {
+                                              "tag": "rt",
+                                              "content": "しな"
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "物",
+                                            {
+                                              "tag": "rt",
+                                              "content": "もの"
+                                            }
+                                          ]
+                                        },
+                                        "は",
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "高",
+                                            {
+                                              "tag": "rt",
+                                              "content": "たか"
+                                            }
+                                          ]
+                                        },
+                                        "いけど、その",
+                                        {
+                                          "tag": "span",
+                                          "data": {
+                                            "content": "example-keyword"
+                                          },
+                                          "content": {
+                                            "tag": "ruby",
+                                            "content": [
+                                              "分",
+                                              {
+                                                "tag": "rt",
+                                                "content": "ぶん"
+                                              }
+                                            ]
+                                          }
+                                        },
+                                        "アフターサービスが",
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "充",
+                                            {
+                                              "tag": "rt",
+                                              "content": "じゅう"
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "tag": "ruby",
+                                          "content": [
+                                            "実",
+                                            {
+                                              "tag": "rt",
+                                              "content": "じつ"
+                                            }
+                                          ]
+                                        },
+                                        "してるから。"
+                                      ]
+                                    }
+                                  },
+                                  {
+                                    "tag": "div",
+                                    "data": {
+                                      "content": "example-sentence-b"
+                                    },
+                                    "content": [
+                                      {
+                                        "tag": "span",
+                                        "lang": "en",
+                                        "content": "Prices are high here but that's because the after-sale service is really good."
+                                      },
+                                      {
+                                        "tag": "span",
+                                        "data": {
+                                          "content": "attribution-footnote"
+                                        },
+                                        "content": "[4]"
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                {
+                  "tag": "li",
+                  "data": {
+                    "content": "sense-group"
+                  },
+                  "content": [
+                    {
+                      "tag": "span",
+                      "title": "noun, used as a suffix",
+                      "data": {
+                        "class": "tag",
+                        "code": "n-suf",
+                        "content": "part-of-speech-info"
+                      },
+                      "content": "suffix"
+                    },
+                    {
+                      "tag": "ol",
+                      "content": [
+                        {
+                          "tag": "li",
+                          "style": {
+                            "listStyleType": "\"⑦\""
+                          },
+                          "data": {
+                            "content": "sense"
+                          },
+                          "content": [
+                            {
+                              "tag": "ul",
+                              "data": {
+                                "content": "glossary"
+                              },
+                              "content": [
+                                {
+                                  "tag": "li",
+                                  "content": "content (e.g. alcohol)"
+                                },
+                                {
+                                  "tag": "li",
+                                  "content": "percentage"
+                                }
+                              ]
+                            },
+                            {
+                              "tag": "div",
+                              "data": {
+                                "content": "extra-info"
+                              },
+                              "content": {
+                                "tag": "div",
+                                "content": {
+                                  "tag": "div",
+                                  "data": {
+                                    "class": "extra-box",
+                                    "content": "example-sentence",
+                                    "sentence-key": "分",
+                                    "source": "223288",
+                                    "source-type": "tat"
+                                  },
+                                  "content": [
+                                    {
+                                      "tag": "div",
+                                      "data": {
+                                        "content": "example-sentence-a"
+                                      },
+                                      "content": {
+                                        "tag": "span",
+                                        "lang": "ja",
+                                        "content": [
+                                          "このビールはアルコール",
+                                          {
+                                            "tag": "span",
+                                            "data": {
+                                              "content": "example-keyword"
+                                            },
+                                            "content": "分"
+                                          },
+                                          "が５％だ。"
+                                        ]
+                                      }
+                                    },
+                                    {
+                                      "tag": "div",
+                                      "data": {
+                                        "content": "example-sentence-b"
+                                      },
+                                      "content": [
+                                        {
+                                          "tag": "span",
+                                          "lang": "en",
+                                          "content": "This beer contains 5% alcohol."
+                                        },
+                                        {
+                                          "tag": "span",
+                                          "data": {
+                                            "content": "attribution-footnote"
+                                          },
+                                          "content": "[5]"
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "tag": "li",
+                          "style": {
+                            "listStyleType": "\"⑧\""
+                          },
+                          "data": {
+                            "content": "sense"
+                          },
+                          "content": [
+                            {
+                              "tag": "ul",
+                              "data": {
+                                "content": "glossary"
+                              },
+                              "content": {
+                                "tag": "li",
+                                "content": "equivalent to (e.g. an old brother)"
+                              }
+                            },
+                            {
+                              "tag": "div",
+                              "data": {
+                                "content": "extra-info"
+                              },
+                              "content": {
+                                "tag": "div",
+                                "content": {
+                                  "tag": "div",
+                                  "data": {
+                                    "class": "extra-box",
+                                    "content": "xref"
+                                  },
+                                  "content": [
+                                    {
+                                      "tag": "div",
+                                      "data": {
+                                        "content": "xref-content"
+                                      },
+                                      "content": [
+                                        {
+                                          "tag": "span",
+                                          "lang": "en",
+                                          "data": {
+                                            "content": "reference-label"
+                                          },
+                                          "content": "See also"
+                                        },
+                                        {
+                                          "tag": "a",
+                                          "lang": "ja",
+                                          "href": "?query=%E5%85%84%E8%B2%B4%E5%88%86&wildcards=off&primary_reading=%E3%81%82%E3%81%AB%E3%81%8D%E3%81%B6%E3%82%93",
+                                          "content": [
+                                            {
+                                              "tag": "ruby",
+                                              "content": [
+                                                "兄",
+                                                {
+                                                  "tag": "rt",
+                                                  "content": "あに"
+                                                }
+                                              ]
+                                            },
+                                            {
+                                              "tag": "ruby",
+                                              "content": [
+                                                "貴",
+                                                {
+                                                  "tag": "rt",
+                                                  "content": "き"
+                                                }
+                                              ]
+                                            },
+                                            {
+                                              "tag": "ruby",
+                                              "content": [
+                                                "分",
+                                                {
+                                                  "tag": "rt",
+                                                  "content": "ぶん"
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "tag": "div",
+                                      "data": {
+                                        "content": "xref-glossary"
+                                      },
+                                      "content": "② (like) one's older brother; big brother"
+                                    }
+                                  ]
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "tag": "div",
+              "data": {
+                "content": "attribution"
+              },
+              "content": [
+                {
+                  "tag": "a",
+                  "href": "https://www.edrdg.org/jmwsgi/entr.py?svc=jmdict&q=1502860",
+                  "content": "JMdict"
+                },
+                " | Tatoeba ",
+                {
+                  "tag": "a",
+                  "href": "https://tatoeba.org/en/sentences/show/218933",
+                  "content": "[1]"
+                },
+                {
+                  "tag": "a",
+                  "href": "https://tatoeba.org/en/sentences/show/220103",
+                  "content": "[2]"
+                },
+                {
+                  "tag": "a",
+                  "href": "https://tatoeba.org/en/sentences/show/232177",
+                  "content": "[3]"
+                },
+                {
+                  "tag": "a",
+                  "href": "https://tatoeba.org/en/sentences/show/224220",
+                  "content": "[4]"
+                },
+                {
+                  "tag": "a",
+                  "href": "https://tatoeba.org/en/sentences/show/223288",
+                  "content": "[5]"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
