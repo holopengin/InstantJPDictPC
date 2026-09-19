@@ -382,6 +382,181 @@ pub fn align_furigana(term: &str, reading: &str) -> Option<Vec<RubySegment>> {
     Some(segments)
 }
 
+// ---------------------------------------------------------------------------
+// Pre-reform kana normalisation (#75, #81)
+// ---------------------------------------------------------------------------
+
+/// The committed `variants/kana_variants.txt` pairs (variant -> modern), in
+/// file order. Query-side only: callers search the raw form alongside this.
+const KANA_VARIANT_PAIRS: &[(char, char)] = &[
+    // wagyou ワ行
+    ('ゐ', 'い'), ('ゑ', 'え'), ('ヰ', 'イ'), ('ヱ', 'エ'),
+    // dakugyou だ行
+    ('ぢ', 'じ'), ('づ', 'ず'), ('ヂ', 'ジ'), ('ヅ', 'ズ'),
+    // sokuon 促音
+    ('つ', 'っ'), ('ツ', 'ッ'),
+    // yoon 拗音
+    ('や', 'ゃ'), ('ゆ', 'ゅ'), ('よ', 'ょ'), ('ヤ', 'ャ'), ('ユ', 'ュ'), ('ヨ', 'ョ'),
+];
+
+fn kana_orthography_canonical(variant: char) -> char {
+    KANA_VARIANT_PAIRS
+        .iter()
+        .find(|(v, _)| *v == variant)
+        .map(|(_, c)| *c)
+        .unwrap_or(variant)
+}
+
+/// Whether a table pair applies in context (see `KanaOrthography.applies`).
+fn orthography_applies(variant: char, prev: Option<char>, next: Option<char>) -> bool {
+    const WAGYOU: &str = "ゐゑヰヱ";
+    const DAKUGYOU: &str = "ぢづヂヅ";
+    const SOKUON: &str = "つツ";
+    const YOON: &str = "やゆよヤユヨ";
+    const DAKUTEN_PREV: &str = "つちツチ";
+    const SOKUON_TRIGGERS: &str =
+        "たちつてとさしすせそぱぴぷぺぽタチツテトサシスセソパピプペポ";
+    const YOON_BASE: &str = "きしちにひみりぎじびぴキシチニヒミリギジビピ";
+
+    if WAGYOU.contains(variant) {
+        true
+    } else if DAKUGYOU.contains(variant) {
+        prev.map_or(true, |p| !DAKUTEN_PREV.contains(p))
+    } else if SOKUON.contains(variant) {
+        next.map_or(false, |n| SOKUON_TRIGGERS.contains(n))
+    } else if YOON.contains(variant) {
+        prev.map_or(false, |p| YOON_BASE.contains(p))
+    } else {
+        false
+    }
+}
+
+/// #75: rewrite a lookup query from pre-reform orthography (旧仮名遣い) onto
+/// the modern form the dictionary keys on. Identity when nothing is a variant.
+/// Mirrors `KanaOrthography.modernise`.
+pub fn kana_orthography_modernise(query: &str) -> String {
+    if query.is_empty() {
+        return query.to_string();
+    }
+    let chars: Vec<char> = query.chars().collect();
+    let mut out = String::with_capacity(query.len());
+    for i in 0..chars.len() {
+        let c = chars[i];
+        let mapped = kana_orthography_canonical(c);
+        if mapped == c {
+            out.push(c);
+            continue;
+        }
+        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+        let next = chars.get(i + 1).copied();
+        out.push(if orthography_applies(c, prev, next) {
+            mapped
+        } else {
+            c
+        });
+    }
+    out
+}
+
+/// The committed `variants/kana_sound_changes.txt` rows.
+const KANA_HA: &[(char, char)] = &[('は', 'わ'), ('ひ', 'い'), ('ふ', 'う'), ('へ', 'え')];
+const KANA_AU: &[(char, char)] = &[
+    ('か', 'こ'), ('が', 'ご'), ('さ', 'そ'), ('ざ', 'ぞ'), ('た', 'と'), ('だ', 'ど'),
+    ('な', 'の'), ('は', 'ほ'), ('ば', 'ぼ'), ('ぱ', 'ぽ'), ('ゃ', 'ょ'), ('や', 'よ'),
+    ('ら', 'ろ'), ('わ', 'お'),
+];
+const KANA_EU: &[(char, &str)] = &[
+    ('え', "よ"), ('け', "きょ"), ('げ', "ぎょ"), ('せ', "しょ"), ('ぜ', "じょ"),
+    ('て', "ちょ"), ('で', "じょ"), ('ね', "にょ"), ('へ', "ひょ"), ('べ', "びょ"),
+    ('ぺ', "ぴょ"), ('め', "みょ"), ('れ', "りょ"),
+];
+
+fn is_kana_char(c: char) -> bool {
+    ('\u{3041}'..='\u{3096}').contains(&c) || ('\u{30A1}'..='\u{30F6}').contains(&c)
+}
+
+/// Whether a ハ行 character folds at this grammatical ending.
+fn ha_gyouten_applies(variant: char, prev: Option<char>, next: Option<char>) -> bool {
+    const PARTICLES: &str = "はがのにをともやかぞなよねだでどばへこそしかまでより";
+    const HI_SUFFIX: &str = "てつな";
+    const HE_SUFFIX: &str = "したてばどきけるれりま";
+    const HA_SUFFIX: &str = "ずぬむば";
+    match variant {
+        // 終止形・連体形: word-final or before a particle. Not after ウ.
+        'ふ' => {
+            prev.is_some()
+                && prev != Some('う')
+                && next.map_or(true, |n| !is_kana_char(n) || PARTICLES.contains(n))
+        }
+        // 連用形.
+        'ひ' => next.map_or(false, |n| HI_SUFFIX.contains(n)),
+        // 仮定形・已然形 and the 下二段 連用形.
+        'へ' => next.map_or(false, |n| HE_SUFFIX.contains(n)),
+        // 未然形 + ず/ぬ/む/ば.
+        'は' => prev.is_some() && next.map_or(false, |n| HA_SUFFIX.contains(n)),
+        _ => false,
+    }
+}
+
+fn ha_gyouten(query: &str) -> String {
+    let chars: Vec<char> = query.chars().collect();
+    let mut out = String::with_capacity(query.len());
+    for i in 0..chars.len() {
+        let c = chars[i];
+        let mapped = KANA_HA.iter().find(|(v, _)| *v == c).map(|(_, m)| *m);
+        let Some(mapped) = mapped else {
+            out.push(c);
+            continue;
+        };
+        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+        let next = chars.get(i + 1).copied();
+        out.push(if ha_gyouten_applies(c, prev, next) {
+            mapped
+        } else {
+            c
+        });
+    }
+    out
+}
+
+/// 母音の変化 before `う`: アウ→オウ and エウ→ヨウ (`けう` -> `きょう`).
+fn vowel_changes(query: &str) -> String {
+    let chars: Vec<char> = query.chars().collect();
+    let mut out = String::with_capacity(query.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if next == Some('う') {
+            if let Some((_, mapped)) = KANA_AU.iter().find(|(v, _)| *v == c) {
+                out.push(*mapped);
+                out.push('う');
+                i += 2;
+                continue;
+            }
+            if let Some((_, mapped)) = KANA_EU.iter().find(|(v, _)| *v == c) {
+                out.push_str(mapped);
+                out.push('う');
+                i += 2;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// #81: the historical sound changes JMdict's entry-local variants cannot
+/// reach (やう→よう, けふ→きょう, 思ふ→思う). Compose after
+/// [kana_orthography_modernise]. Mirrors `KanaSoundChanges.modernise`.
+pub fn kana_sound_changes_modernise(query: &str) -> String {
+    if query.is_empty() {
+        return query.to_string();
+    }
+    vowel_changes(&ha_gyouten(query))
+}
+
 /// Small kana (拗音) fuse with the preceding kana into one mora.
 const FUSING_KANA: &str = "ぁぃぅぇぉゃゅょゎゕゖァィゥェォャュョヮヵヶ";
 
@@ -502,5 +677,90 @@ mod tests {
         assert!(falls_beyond_word(4, 4));
         assert!(!falls_beyond_word(4, 3));
         assert!(!falls_beyond_word(0, 0));
+    }
+
+    /// Mirrors `KanaOrthographyTest`: the committed 16-pair table, pinned.
+    #[test]
+    fn kana_orthography_normalises_pre_reform_forms() {
+        assert_eq!(kana_orthography_modernise("いつしよ"), "いっしょ");
+        assert_eq!(kana_orthography_modernise("しゆつぱつ"), "しゅっぱつ");
+        assert_eq!(kana_orthography_modernise("ちよつと"), "ちょっと");
+        // きやう only reaches the 拗音 half of the change: やう->よう is #81.
+        assert_eq!(kana_orthography_modernise("きやう"), "きゃう");
+        assert_eq!(kana_orthography_modernise("ゐる"), "いる");
+        assert_eq!(kana_orthography_modernise("植ゑた"), "植えた");
+        assert_eq!(kana_orthography_modernise("あづま"), "あずま");
+        assert_eq!(kana_orthography_modernise("おのづから"), "おのずから");
+        assert_eq!(kana_orthography_modernise("はなぢ"), "はなじ");
+        assert_eq!(kana_orthography_modernise("ウヰスキー"), "ウイスキー");
+        assert_eq!(kana_orthography_modernise("ヱビス"), "エビス");
+        // 連濁 is the modern form itself; を and the 小書き row are excluded.
+        assert_eq!(kana_orthography_modernise("つづく"), "つづく");
+        assert_eq!(kana_orthography_modernise("ちぢむ"), "ちぢむ");
+        assert_eq!(kana_orthography_modernise("ツヅク"), "ツヅク");
+        assert_eq!(kana_orthography_modernise("本を読む"), "本を読む");
+        assert_eq!(kana_orthography_modernise("ヲタク"), "ヲタク");
+        assert_eq!(kana_orthography_modernise("ああ"), "ああ");
+        assert_eq!(kana_orthography_modernise("そうそう"), "そうそう");
+        // 促音 fires only before た行/さ行/ぱ行.
+        assert_eq!(kana_orthography_modernise("つかう"), "つかう");
+        assert_eq!(kana_orthography_modernise("つくえ"), "つくえ");
+        assert_eq!(kana_orthography_modernise("あつた"), "あった");
+        assert_eq!(kana_orthography_modernise("いつて"), "いって");
+        assert_eq!(kana_orthography_modernise("いつぱい"), "いっぱい");
+        for modern in ["", "あ", "ABC", "日本語", "コーヒー", "12月", "、。"] {
+            assert_eq!(kana_orthography_modernise(modern), modern);
+        }
+    }
+
+    /// Mirrors `KanaSoundChangesTest`: the shipped composition
+    /// (orthography fold, then sound changes), with every headline form pinned.
+    #[test]
+    fn kana_sound_changes_normalise_legacy_grammar() {
+        fn normalise(q: &str) -> String {
+            kana_sound_changes_modernise(&kana_orthography_modernise(q))
+        }
+        assert_eq!(normalise("やう"), "よう");
+        assert_eq!(normalise("きやう"), "きょう");
+        assert_eq!(normalise("けふ"), "きょう");
+        assert_eq!(normalise("てふ"), "ちょう");
+        assert_eq!(normalise("しやう"), "しょう");
+        assert_eq!(normalise("でせう"), "でしょう");
+        assert_eq!(normalise("だらう"), "だろう");
+        assert_eq!(normalise("ありがたう"), "ありがとう");
+        assert_eq!(normalise("たふとし"), "とうとし");
+        assert_eq!(normalise("といふのは"), "というのは");
+        // ハ行転呼 only at its grammatical ending.
+        assert_eq!(normalise("思ふ"), "思う");
+        assert_eq!(normalise("思ふが"), "思うが");
+        assert_eq!(normalise("思ふ人"), "思う人");
+        assert_eq!(normalise("思ひつ"), "思いつ");
+        assert_eq!(normalise("戦ひながら"), "戦いながら");
+        assert_eq!(normalise("数へて"), "数えて");
+        assert_eq!(normalise("言へば"), "言えば");
+        assert_eq!(normalise("添へた"), "添えた");
+        assert_eq!(normalise("言はず"), "言わず");
+        assert_eq!(normalise("思はぬ"), "思わぬ");
+        assert_eq!(normalise("思はば"), "思わば");
+        // ...and nowhere else.
+        assert_eq!(normalise("ふね"), "ふね");
+        assert_eq!(normalise("吹く"), "吹く");
+        assert_eq!(normalise("ふうふ"), "ふうふ");
+        assert_eq!(normalise("ひる"), "ひる");
+        assert_eq!(normalise("へや"), "へや");
+        assert_eq!(normalise("本は"), "本は");
+        assert_eq!(normalise("はな"), "はな");
+        // Withheld アウ rows fold to themselves.
+        assert_eq!(normalise("あう"), "あう");
+        assert_eq!(normalise("まう"), "まう");
+        assert_eq!(normalise("おほ"), "おほ");
+        assert_eq!(normalise("本を読む"), "本を読む");
+        // Modern text is the identity.
+        for modern in [
+            "", "あ", "ABC", "日本語", "つくえ", "にっぽん", "がっこう", "コーヒー",
+            "12月", "、。", "つづく", "ちぢむ", "買う", "会う", "クラウン",
+        ] {
+            assert_eq!(normalise(modern), modern);
+        }
     }
 }

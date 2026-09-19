@@ -573,14 +573,49 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
             let query_text_raw: String = following_text.chars().take(len).collect();
             let query_text = japanese::normalize(&query_text_raw);
 
-            let variants = vec![
+            // #75: pre-reform orthography. The modern form of the prefix is
+            // searched as one more variant — the raw prefix stays in the list,
+            // so this can only add a reachable headword, never take one away.
+            let modernised = japanese::kana_orthography_modernise(&query_text);
+            // #81: the historical sound changes JMdict's entry-local variants
+            // cannot reach (やう→よう, けふ→きょう, 思ふ→思う). Composed after
+            // #75, so きやう → きゃう → きょう; both forms stay in the
+            // candidate set.
+            let sound_changed = japanese::kana_sound_changes_modernise(&modernised);
+
+            // The RAW prefix is searched alongside its folded form, so an old
+            // form's own entries are never lost to the fold.
+            let mut variants: Vec<String> = Vec::new();
+            for v in [
+                query_text_raw.clone(),
                 query_text.clone(),
                 japanese::katakana_to_hiragana(&query_text),
                 japanese::collapse_emphatic(&query_text),
-            ];
-            let variants: Vec<String> = variants.into_iter().collect();
+                modernised.clone(),
+                japanese::katakana_to_hiragana(&modernised),
+                sound_changed.clone(),
+                japanese::katakana_to_hiragana(&sound_changed),
+            ] {
+                if !variants.contains(&v) {
+                    variants.push(v);
+                }
+            }
 
             let deinflections = deinflector.deinflect(&query_text);
+            // The deinflection rules are modern orthography; a legacy surface
+            // has to be normalised before they can fire at all, so the modern
+            // forms are deinflected too — additive, like the variants above.
+            let modernised_deinflections = if modernised != query_text {
+                deinflector.deinflect(&modernised)
+            } else {
+                Vec::new()
+            };
+            let sound_changed_deinflections = if sound_changed != modernised {
+                deinflector.deinflect(&sound_changed)
+            } else {
+                Vec::new()
+            };
+
             let mut length_candidates: Vec<(String, Option<Vec<String>>, Option<DeinflectionChain>)> =
                 Vec::new();
 
@@ -589,10 +624,16 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                 all_terms.insert(v.clone());
             }
 
-            for d in &deinflections {
-                // Android requires a reason list too, so a no-op deinflection
-                // never adds a duplicate candidate (or a chain row).
-                if d.term != query_text && !d.reasons.is_empty() {
+            let push_deinflections = |deinflections: &[crate::util::deinflector::DeinflectionResult],
+                                          same_as: &str,
+                                          all_terms: &mut HashSet<String>,
+                                          length_candidates: &mut Vec<(String, Option<Vec<String>>, Option<DeinflectionChain>)>| {
+                for d in deinflections {
+                    // Android requires a reason list too, so a no-op
+                    // deinflection never adds a duplicate candidate.
+                    if d.term == same_as || d.reasons.is_empty() {
+                        continue;
+                    }
                     let types = if d.rule_types.is_empty() {
                         None
                     } else {
@@ -605,7 +646,25 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                     length_candidates.push((d.term.clone(), types, chain));
                     all_terms.insert(d.term.clone());
                 }
-            }
+            };
+            push_deinflections(
+                &deinflections,
+                &query_text,
+                &mut all_terms,
+                &mut length_candidates,
+            );
+            push_deinflections(
+                &modernised_deinflections,
+                &modernised,
+                &mut all_terms,
+                &mut length_candidates,
+            );
+            push_deinflections(
+                &sound_changed_deinflections,
+                &sound_changed,
+                &mut all_terms,
+                &mut length_candidates,
+            );
 
             candidates_by_length.push((len, length_candidates));
         }
