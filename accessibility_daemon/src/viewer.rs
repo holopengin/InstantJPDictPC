@@ -44,6 +44,15 @@ const GLYPH_FIT_RATIO: f32 = 0.92;
 const CURSOR_PAD: f32 = 2.0;
 const CURSOR_RADIUS: f32 = 4.0;
 const CURSOR_STROKE: f32 = 2.0;
+/// Mobile `OverlayBackdrop.SCREENSHOT_ALPHA` (#64): the screenshot is shown
+/// dimmed behind the overlay.
+const SCREENSHOT_ALPHA: f32 = 0.7;
+/// Mobile `OverlayBackdrop.SCRIM_COLOR = 0x8C000000`, alpha channel only.
+const SCRIM_ALPHA: f32 = 140.0 / 255.0;
+/// iced's `draw_image` has no alpha, so the two mobile layers fold into one
+/// scrim over the opaque screenshot: `img · α_screenshot · (1 − α_scrim)`.
+/// Desktop has no status strip, so the scrim is flat everywhere (SOLID).
+const BACKDROP_SCRIM: f32 = 1.0 - SCREENSHOT_ALPHA * (1.0 - SCRIM_ALPHA);
 /// Font fill ratio for character buttons in the neighbor/alternatives panels.
 const BUTTON_CHAR_RATIO: f32 = 0.6;
 
@@ -894,6 +903,14 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                 frame.draw_image(
                     Rectangle::new(dest_pos, dest_size),
                     image,
+                );
+                // Mobile #64 backdrop: a dark scrim over the dimmed
+                // screenshot. Desktop has no status strip, so the scrim is
+                // flat over the whole overlay (SOLID).
+                frame.fill_rectangle(
+                    Point::ORIGIN,
+                    bounds.size(),
+                    Color::from_rgba(0.0, 0.0, 0.0, BACKDROP_SCRIM),
                 );
             }
             return vec![frame.into_geometry()];
@@ -2512,6 +2529,14 @@ mod tests {
         let gid = cache.borrow_mut().glyph_id('あ', false).expect("glyph id");
         let g = draw_glyph(&cache, gid, 54, false).expect("glyph");
         assert!(g.w > 0 && g.h > 0, "kana has ink");
+    }
+
+    /// The folded scrim equals mobile's two layers over black.
+    #[test]
+    fn backdrop_scrim_matches_mobile_layers() {
+        let expected = 1.0 - 0.7 * (1.0 - 140.0 / 255.0);
+        assert!((BACKDROP_SCRIM - expected).abs() < 1e-6, "{BACKDROP_SCRIM}");
+        assert!((BACKDROP_SCRIM - 0.68431).abs() < 1e-4, "{BACKDROP_SCRIM}");
     }
 
     /// Chips follow mobile's orientation gate for vertical forms.
