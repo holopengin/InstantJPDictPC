@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
+use image::{DynamicImage, Rgba, RgbaImage};
 use std::path::Path;
 
 use crate::models::*;
@@ -319,16 +319,18 @@ fn fit_components(
             };
             // DB unclip on the frame's own axes (mobile unclip); the cap is
             // a PC-only knob, off by default.
-            let (pw, ph) = (pre_quad.w, pre_quad.h);
-            let mut expand = if pw > 1e-6 && ph > 1e-6 {
-                pw * ph * det_unclip / (2.0 * (pw + ph))
+            let quad = if expand_cap.is_finite() {
+                let (pw, ph) = (pre_quad.w, pre_quad.h);
+                let expand = if pw > 1e-6 && ph > 1e-6 {
+                    pw * ph * det_unclip / (2.0 * (pw + ph))
+                } else {
+                    0.0
+                };
+                let expand = expand.min(expand_cap);
+                pre_quad.inset(-expand, -expand)
             } else {
-                0.0
+                pre_quad.unclip(det_unclip)
             };
-            if expand > expand_cap {
-                expand = expand_cap;
-            }
-            let quad = pre_quad.inset(-expand, -expand);
             if quad.w < 4.0 || quad.h < 4.0 {
                 continue;
             }
@@ -1033,6 +1035,10 @@ pub fn compute_char_boxes(
         return Vec::new();
     }
     let chars: Vec<char> = text.chars().collect();
+    // Android keeps charCols and text index-aligned; clamp defensively so a
+    // mismatched caller cannot panic a recognition worker.
+    let n = char_cols.len().min(chars.len());
+    let char_cols = &char_cols[..n];
     if !is_vertical {
         // ── HORIZONTAL: x-axis char boxes ──
         let char_w = (crop_h as f32).max(3.0);
@@ -1778,6 +1784,7 @@ pub fn recognize_boxes_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
 
     fn test_engine() -> OcrEngine {
         let dir = format!("{}/assets", env!("CARGO_MANIFEST_DIR"));
