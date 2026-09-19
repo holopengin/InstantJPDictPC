@@ -127,7 +127,8 @@ impl GlyphCache {
     }
 
     /// Ensure both tinted handles exist for (char, px_size) and return one
-    /// with the ink metrics.
+    /// with the ink metrics. The highlighted handle is fake-bolded, like
+    /// mobile (`paint.isFakeBoldText`): the bundled faces ship Regular only.
     fn get_handle(&mut self, gid: u16, px: u32, highlighted: bool) -> Option<(&ImageHandle, u32, u32, i32, i32)> {
         let entry = self.cache.entry((gid, px)).or_insert_with(|| {
             let (metrics, coverage) = self.font.rasterize_config(fontdue::layout::GlyphRasterConfig {
@@ -139,7 +140,8 @@ impl GlyphCache {
             let w = metrics.width as u32;
             let h = metrics.height as u32;
             let pink = Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2);
-            let yellow = Self::make_handle(w, h, &coverage, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2);
+            let bold = embolden(&coverage, w , h, fake_bold_radius(px));
+            let yellow = Self::make_handle(w, h, &bold, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2);
             CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
         });
         let idx = if highlighted { 1 } else { 0 };
@@ -175,7 +177,8 @@ impl GlyphCache {
             let w = metrics.width as u32;
             let h = metrics.height as u32;
             let pink = Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2);
-            let yellow = Self::make_handle(w, h, &coverage, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2);
+            let bold = embolden(&coverage, w, h, fake_bold_radius(px_size));
+            let yellow = Self::make_handle(w, h, &bold, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2);
             CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
         });
     }
@@ -261,6 +264,42 @@ impl GlyphCache {
         None
     }
 
+}
+
+/// Skia's fake-bold stroke is ~1/24 of the text size end to end, so the
+/// coverage grows by about 1/48 of the size per side.
+fn fake_bold_radius(px: u32) -> i32 {
+    ((px as f32 / 48.0).round() as i32).max(1)
+}
+
+/// Grow a glyph's coverage by `radius` pixels in every direction — the
+/// bitmap equivalent of `paint.isFakeBoldText`, used for highlighted glyphs
+/// because the bundled faces have Regular only.
+fn embolden(coverage: &[u8], w: u32, h: u32, radius: i32) -> Vec<u8> {
+    let (w, h) = (w as i32, h as i32);
+    if w <= 0 || h <= 0 || radius <= 0 {
+        return coverage.to_vec();
+    }
+    let src = |x: i32, y: i32| -> u8 {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            0
+        } else {
+            coverage[(y * w + x) as usize]
+        }
+    };
+    let mut out = vec![0u8; coverage.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut best = 0u8;
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    best = best.max(src(x + dx, y + dy));
+                }
+            }
+            out[(y * w + x) as usize] = best;
+        }
+    }
+    out
 }
 
 /// A rasterized glyph ready to draw: the ink bitmap plus the font metrics
@@ -922,8 +961,9 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         }
 
                         let Some(ch) = line.text.chars().nth(i) else { continue };
-                        let highlighted = self.highlighted_coords.contains(&(line_idx, i))
-                            || self.cursor_pos == Some((line_idx, i));
+                        // Mobile highlights the matched word only; the cursor
+                        // is drawn as chrome and keeps the glyph pink.
+                        let highlighted = self.highlighted_coords.contains(&(line_idx, i));
                         // GSUB `vert`/`vrt2` picks the vertical presentation
                         // glyph for vertical lines (Unicode form fallback for
                         // what the font does not cover).
@@ -2430,6 +2470,25 @@ mod tests {
         let gid = cache.borrow_mut().glyph_id('あ', false).expect("glyph id");
         let g = draw_glyph(&cache, gid, 54, false).expect("glyph");
         assert!(g.w > 0 && g.h > 0, "kana has ink");
+    }
+
+    /// Fake bold: a single lit pixel grows into a (2r+1)² block, and the
+    /// radius tracks the raster size (~1/24 em stroke).
+    #[test]
+    fn embolden_grows_coverage_symmetrically() {
+        let mut cov = vec![0u8; 25];
+        cov[12] = 255; // centre of 5×5
+        let bold = embolden(&cov, 5, 5, 1);
+        for y in 1..=3 {
+            for x in 1..=3 {
+                assert_eq!(bold[y * 5 + x], 255, "({x},{y}) should be bold");
+            }
+        }
+        assert_eq!(bold[0], 0, "corner stays clear");
+        // A zero radius returns the glyph untouched.
+        assert_eq!(embolden(&cov, 5, 5, 0), cov);
+        assert_eq!(fake_bold_radius(54), 1);
+        assert_eq!(fake_bold_radius(200), 4);
     }
 
     #[test]
