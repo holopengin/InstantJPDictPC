@@ -121,6 +121,32 @@ impl DictionaryDatabase {
         Ok(())
     }
 
+    /// Remove any existing dictionary with this declared title, so a re-import
+    /// replaces it instead of stacking a duplicate.
+    /// Mirrors Android's `DictionaryImporter.replaceExisting`.
+    pub fn delete_dictionary_by_name(&self, name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM dictionary_meta WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            conn.execute(
+                "DELETE FROM dictionary WHERE dictionary_id = ?1",
+                [&id],
+            )?;
+            conn.execute(
+                "DELETE FROM dictionary_tag WHERE dictionary_id = ?1",
+                [&id],
+            )?;
+            conn.execute("DELETE FROM dictionary_meta WHERE id = ?1", [&id])?;
+        }
+        Ok(())
+    }
+
     pub fn update_dictionary_name(&self, dictionary_id: i64, name: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
