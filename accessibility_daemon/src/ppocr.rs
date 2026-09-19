@@ -133,18 +133,91 @@ fn peak_offset(v0: f32, v1: f32, v2: f32) -> f32 {
     (0.5f32 * (v0 - v2) / denom).clamp(-0.5, 0.5)
 }
 
-/// Top-15 char alternatives for one timestep from full logits, descending.
-fn top15_alternatives(vocab: &[String], remap: &[i32], slice: &[f32]) -> Vec<(char, f32)> {
-    let mut scored: Vec<(usize, f32)> = slice.iter().copied().enumerate().collect();
-    scored.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1)
+/// Mobile `OcrEngine.top15Alternatives`' heap order: a Java `PriorityQueue`
+/// (binary min-heap by score, lowest index not privileged) fed every class id
+/// and polled whenever it exceeds TOP_K, then read in backing-array order.
+/// Reproduced here because the final stable sort's tie order depends on it.
+struct JavaMinHeap<'a> {
+    data: Vec<usize>,
+    score: &'a [f32],
+}
+
+impl JavaMinHeap<'_> {
+    fn add(&mut self, k: usize) {
+        self.data.push(k);
+        let mut child = self.data.len() - 1;
+        while child > 0 {
+            let parent = (child - 1) / 2;
+            // Java siftUp breaks on compare(key, parent) >= 0.
+            if self.score[self.data[child]] >= self.score[self.data[parent]] {
+                break;
+            }
+            self.data.swap(child, parent);
+            child = parent;
+        }
+    }
+
+    fn poll(&mut self) -> Option<usize> {
+        let n = self.data.len();
+        if n == 0 {
+            return None;
+        }
+        let result = self.data[0];
+        let last = self.data.pop().unwrap();
+        if n > 1 {
+            self.data[0] = last;
+            let mut parent = 0usize;
+            loop {
+                let left = 2 * parent + 1;
+                if left >= self.data.len() {
+                    break;
+                }
+                let mut child = left;
+                let right = left + 1;
+                if right < self.data.len()
+                    && self.score[self.data[right]] < self.score[self.data[left]]
+                {
+                    child = right;
+                }
+                // Java siftDown breaks on compare(key, child) <= 0.
+                if self.score[self.data[parent]] <= self.score[self.data[child]] {
+                    break;
+                }
+                self.data.swap(parent, child);
+                parent = child;
+            }
+        }
+        Some(result)
+    }
+}
+
+/// Mobile `top15Alternatives` index order: heap selection + stable
+/// descending sort (see `JavaMinHeap`).
+fn java_topk_order(slice: &[f32], k: usize) -> Vec<usize> {
+    let mut heap = JavaMinHeap { data: Vec::new(), score: slice };
+    for i in 0..slice.len() {
+        heap.add(i);
+        if heap.data.len() > k {
+            heap.poll();
+        }
+    }
+    let mut order = heap.data;
+    order.sort_by(|&a, &b| {
+        slice[b]
+            .partial_cmp(&slice[a])
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
     });
-    scored
+    order.truncate(k);
+    order
+}
+
+/// Top-15 char alternatives for one timestep from full logits, in mobile's
+/// exact order: heap selection, then a stable descending sort — so equal
+/// scores keep the Java heap's backing-array order (D6.1).
+fn top15_alternatives(vocab: &[String], remap: &[i32], slice: &[f32]) -> Vec<(char, f32)> {
+    java_topk_order(slice, top_k())
         .into_iter()
-        .take(top_k())
-        .map(|(idx, v)| (decode_char(vocab, remap_class(remap, idx as i32)), v))
+        .map(|idx| (decode_char(vocab, remap_class(remap, idx as i32)), slice[idx]))
         .collect()
 }
 
@@ -355,6 +428,19 @@ fn infer_resized(
     vocab: &[String],
     remap: &[i32],
 ) -> Result<PpocrResult> {
+    infer_resized_with_topk(rec, src, target_w, vocab, remap, None)
+}
+
+/// `topk_override` is a test seam for the native top-K call (D5.1: a top-K
+/// failure must degrade to full logits, not drop the line).
+fn infer_resized_with_topk(
+    rec: &RecNet,
+    src: &DynamicImage,
+    target_w: u32,
+    vocab: &[String],
+    remap: &[i32],
+    topk_override: Option<Result<Vec<f32>>>,
+) -> Result<PpocrResult> {
     let model_w = target_w.div_ceil(REC_STRIDE) * REC_STRIDE;
     let seq_len = (model_w / REC_STRIDE) as usize;
     // Exact source px per timestep: the resized content spans `target_w`
@@ -366,24 +452,41 @@ fn infer_resized(
     let input = build_rec_input(rgb.as_raw(), target_w, REC_TARGET_H, model_w);
 
     let k = top_k();
-    let packed = rec.infer_topk(&input, model_w as usize, REC_TARGET_H as usize)?;
-    let packed_ok = packed.len() == seq_len * k * 2
-        && !remap.is_empty()
-        && (0..seq_len * k).all(|i| {
-            let id = packed[i * 2] as i32;
-            id >= 0 && (id as usize) < remap.len()
-        });
+    // Mobile degrades to full logits when the native top-K entry fails
+    // (`UnsatisfiedLinkError` there); a top-K error must not drop the line.
+    let packed = match topk_override {
+        Some(result) => result,
+        None => rec.infer_topk(&input, model_w as usize, REC_TARGET_H as usize),
+    };
+    let packed = match packed {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("[PP-OCR] rec topK failed ({e}) — trying full logits");
+            None
+        }
+    };
+    let packed_ok = packed.as_ref().is_some_and(|packed| {
+        packed.len() == seq_len * k * 2
+            && !remap.is_empty()
+            && (0..seq_len * k).all(|i| {
+                let id = packed[i * 2] as i32;
+                id >= 0 && (id as usize) < remap.len()
+            })
+    });
 
     if !packed_ok {
         // Full-logits fallback: downloads seqLen×numClasses floats, then
-        // decodes identically (used when native top-K layout/ids disagree
-        // with the loaded remap, e.g. after a head re-prune).
-        if packed.len() != seq_len * k * 2 {
-            eprintln!(
-                "[PP-OCR] rec topK bad size {} (want {}) — trying full logits",
-                packed.len(),
-                seq_len * k * 2
-            );
+        // decodes identically (used when native top-K fails or its
+        // layout/ids disagree with the loaded remap, e.g. after a head
+        // re-prune).
+        if let Some(packed) = &packed {
+            if packed.len() != seq_len * k * 2 {
+                eprintln!(
+                    "[PP-OCR] rec topK bad size {} (want {}) — trying full logits",
+                    packed.len(),
+                    seq_len * k * 2
+                );
+            }
         }
         let flat = rec.infer(&input, model_w as usize, REC_TARGET_H as usize)?;
         let num_out = remap.len();
@@ -404,6 +507,7 @@ fn infer_resized(
         return Ok(decoded);
     }
 
+    let packed = packed.expect("packed_ok checked above");
     let mut top_pruned: Vec<Vec<i32>> = Vec::with_capacity(seq_len);
     let mut top_chars: Vec<Vec<(char, f32)>> = Vec::with_capacity(seq_len);
     for t in 0..seq_len {
@@ -1042,5 +1146,59 @@ mod tests {
             .collect();
         let from_full = ctc_decode_full(&f.vocab, &f.remap, &logits, num_out, seq_len);
         assert_eq!(via_decode.text, from_full.text);
+    }
+
+    /// D6.1: mobile's alternative tie order is the Java PriorityQueue's
+    /// backing-array order after a stable descending sort. Expected orders
+    /// were generated by running the exact Android code (PriorityQueue +
+    /// `sortedByDescending`) on the JDK.
+    #[test]
+    fn topk_order_matches_java_priority_queue() {
+        assert_eq!(java_topk_order(&[0.5, 0.5, 0.5], 2), vec![2, 1]);
+        assert_eq!(java_topk_order(&[0.1, 0.9, 0.5, 0.5], 3), vec![1, 3, 2]);
+        assert_eq!(
+            java_topk_order(
+                &[
+                    0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.0, 1.0, 0.9, 0.9,
+                    0.5, 0.5, 0.5, 0.2, 0.2, 0.1
+                ],
+                15
+            ),
+            vec![9, 10, 11, 8, 12, 13, 7, 6, 5, 14, 16, 4, 15, 3, 2]
+        );
+        assert_eq!(
+            java_topk_order(
+                &[
+                    0.7, 0.7, 0.3, 0.3, 0.9, 0.9, 0.1, 0.1, 0.5, 0.5, 0.5, 0.5, 0.2, 0.8,
+                    0.8, 0.4, 0.4, 0.6, 0.6, 0.6, 0.05, 0.95, 0.95, 0.35, 0.35, 0.75, 0.75,
+                    0.15, 0.15, 0.55, 0.55, 0.25, 0.65, 0.65, 0.45, 0.45, 0.85, 0.85, 0.0,
+                    1.0
+                ],
+                15
+            ),
+            vec![39, 21, 22, 4, 5, 36, 37, 13, 14, 26, 25, 1, 0, 33, 32]
+        );
+    }
+
+    /// D5.1: a failing native top-K entry degrades to full logits and still
+    /// decodes the line (mobile catches `UnsatisfiedLinkError` there).
+    #[test]
+    fn topk_failure_falls_back_to_full_logits() {
+        let f = fixture();
+        let img = image::open(repo_path("test_images/synth/line_03_h.png")).unwrap();
+        let (w, h) = img.dimensions();
+        let target_w = ((w as f32 * REC_TARGET_H as f32 / h as f32).round() as u32).max(4);
+        let normal = infer_resized(&f.rec, &img, target_w, &f.vocab, &f.remap).unwrap();
+        let fallback = infer_resized_with_topk(
+            &f.rec,
+            &img,
+            target_w,
+            &f.vocab,
+            &f.remap,
+            Some(Err(anyhow::anyhow!("simulated native top-K failure"))),
+        )
+        .unwrap();
+        assert!(!fallback.text.is_empty(), "fallback dropped the line");
+        assert_eq!(normal.text, fallback.text);
     }
 }
