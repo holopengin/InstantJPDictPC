@@ -272,6 +272,153 @@ pub fn estimate_em(text: &str, centers: &[f32]) -> f32 {
     norm[norm.len() / 2]
 }
 
+/// Split a space-separated KANJIDIC kana list into readings, stripping the
+/// leading `-` from suffix-only readings. Mirrors `JapaneseUtil.splitKanaList`.
+pub fn split_kana_list(raw: &str) -> Vec<String> {
+    raw.split([' ', '\u{3000}'])
+        .map(|s| s.trim_start_matches('-').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// One furigana run: `base` surface text with optional `ruby` above it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RubySegment {
+    pub base: String,
+    pub ruby: Option<String>,
+}
+
+/// True for CJK ideographs (and the iteration marks 々/〻).
+pub fn is_kanji_char(c: char) -> bool {
+    c == '々'
+        || c == '〻'
+        || ('\u{3400}'..='\u{4DBF}').contains(&c)
+        || ('\u{4E00}'..='\u{9FFF}').contains(&c)
+        || ('\u{F900}'..='\u{FAFF}').contains(&c)
+}
+
+/// Align a dictionary reading against its headword so ruby is shown only over
+/// kanji spans, with okurigana/kana rendered as plain base text (#55).
+/// Mirrors `FuriganaAligner.align`; None when the reading cannot be
+/// unambiguously aligned (callers fall back to full-reading ruby).
+pub fn align_furigana(term: &str, reading: &str) -> Option<Vec<RubySegment>> {
+    if term.is_empty() || reading.is_empty() {
+        return None;
+    }
+    if term == reading {
+        return Some(vec![RubySegment {
+            base: term.to_string(),
+            ruby: None,
+        }]);
+    }
+    // katakana_to_hiragana is 1:1 per char, so indices transfer to `reading`.
+    let norm_reading = katakana_to_hiragana(reading);
+    if norm_reading.chars().count() != reading.chars().count() {
+        return None;
+    }
+    let norm: Vec<char> = norm_reading.chars().collect();
+    let read: Vec<char> = reading.chars().collect();
+    let term_chars: Vec<char> = term.chars().collect();
+
+    let mut segments: Vec<RubySegment> = Vec::new();
+    let mut ti = 0usize;
+    let mut ri = 0usize;
+    while ti < term_chars.len() {
+        let c = term_chars[ti];
+        if !is_kanji_char(c) {
+            // Kana literal: must match the reading at the current position.
+            if ri >= norm.len() {
+                return None;
+            }
+            let c_hira = katakana_to_hiragana(&c.to_string());
+            if c_hira.chars().next() != Some(norm[ri]) {
+                return None;
+            }
+            match segments.last_mut() {
+                Some(last) if last.ruby.is_none() => last.base.push(c),
+                _ => segments.push(RubySegment {
+                    base: c.to_string(),
+                    ruby: None,
+                }),
+            }
+            ti += 1;
+            ri += 1;
+        } else {
+            // Kanji run: ruby is everything up to the next kana anchor.
+            let mut tj = ti;
+            while tj < term_chars.len() && is_kanji_char(term_chars[tj]) {
+                tj += 1;
+            }
+            if tj < term_chars.len() {
+                let anchor = katakana_to_hiragana(&term_chars[tj].to_string());
+                let anchor = anchor.chars().next()?;
+                let idx = norm[ri..].iter().position(|&x| x == anchor)? + ri;
+                let ruby: String = read[ri..idx].iter().collect();
+                if ruby.is_empty() {
+                    return None;
+                }
+                segments.push(RubySegment {
+                    base: term_chars[ti..tj].iter().collect(),
+                    ruby: Some(ruby),
+                });
+                ri = idx;
+            } else {
+                let ruby: String = read[ri..].iter().collect();
+                if ruby.is_empty() {
+                    return None;
+                }
+                segments.push(RubySegment {
+                    base: term_chars[ti..tj].iter().collect(),
+                    ruby: Some(ruby),
+                });
+                ri = read.len();
+            }
+            ti = tj;
+        }
+    }
+    if ri != norm.len() {
+        return None;
+    }
+    Some(segments)
+}
+
+/// Small kana (拗音) fuse with the preceding kana into one mora.
+const FUSING_KANA: &str = "ぁぃぅぇぉゃゅょゎゕゖァィゥェォャュョヮヵヶ";
+
+/// Split a reading into morae (きょう = 2; がっこう = 4; コーヒー = 4).
+pub fn morae_of(reading: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in reading.chars() {
+        if !out.is_empty() && FUSING_KANA.contains(c) {
+            out.last_mut().unwrap().push(c);
+        } else {
+            out.push(c.to_string());
+        }
+    }
+    out
+}
+
+/// High/low per mora for a Yomitan downstep position (0 = heiban).
+pub fn pitch_pattern(mora_count: usize, position: i32) -> Vec<bool> {
+    if mora_count == 0 {
+        return Vec::new();
+    }
+    let pos = position as usize;
+    if position <= 0 {
+        (0..mora_count).map(|i| i >= 1).collect()
+    } else if position == 1 {
+        (0..mora_count).map(|i| i == 0).collect()
+    } else {
+        (0..mora_count).map(|i| i >= 1 && i < pos).collect()
+    }
+}
+
+/// True when the downstep lands past the final mora (odaka): the following
+/// particle carries the fall, so the renderer draws a fall arrow.
+pub fn falls_beyond_word(mora_count: usize, position: i32) -> bool {
+    mora_count > 0 && position > 0 && position as usize >= mora_count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

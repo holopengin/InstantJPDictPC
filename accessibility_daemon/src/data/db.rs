@@ -161,6 +161,17 @@ impl DictionaryDatabase {
         Ok(val)
     }
 
+    /// id → display name for every dictionary, used for per-entry source
+    /// captions. Mirrors Android's `DictionaryProvider.dictionaryNames()`.
+    pub fn dictionary_names(&self) -> Result<std::collections::HashMap<i64, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, name FROM dictionary_meta")?;
+        let names = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+        Ok(names)
+    }
+
     // -------------------------------------------------------------------------
     // Entry CRUD
     // -------------------------------------------------------------------------
