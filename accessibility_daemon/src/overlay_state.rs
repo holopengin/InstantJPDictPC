@@ -2346,6 +2346,27 @@ mod tests {
     }
 
     #[test]
+    fn deinflected_matches_carry_their_chain() {
+        let deinflector = Deinflector::from_json_file("assets/deinflect.json").unwrap();
+        let state = OcrOverlayState::new(1024.0, 768.0);
+        let (terms, by_length) = state.prepare_search_candidates("食べた", &deinflector);
+        assert!(terms.contains("食べる"), "terms: {terms:?}");
+        let chain = by_length
+            .iter()
+            .flat_map(|(_, candidates)| candidates.iter())
+            .find_map(|(term, _, chain)| {
+                if term == "食べる" {
+                    chain.clone()
+                } else {
+                    None
+                }
+            })
+            .expect("a deinflected 食べる candidate");
+        assert_eq!(chain.surface, "食べた");
+        assert!(!chain.steps.is_empty());
+    }
+
+    #[test]
     fn matched_term_spans_line_boundaries() {
         let mut s = OcrOverlayState::new(1024.0, 768.0);
         s.active_all_chars = ["日", "本", "語", "を", "学", "ぶ"]
