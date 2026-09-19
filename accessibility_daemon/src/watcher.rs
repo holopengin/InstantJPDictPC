@@ -83,9 +83,11 @@ fn has_image_ext(p: &Path) -> bool {
 
 /// True if this filename is a watcher-owned temp/logged image that must
 /// never be re-OCR'd: dataset line samples (`ocr_line_*`) land in `/tmp`
-/// (and can also appear next to the input in batch mode).
+/// (and can also appear next to the input in batch mode), and `--capture`
+/// writes `instantjp_capture-*` images that are already being OCR'd by the
+/// process that took them.
 fn is_ignored_temp_output(name: &str) -> bool {
-    name.starts_with("ocr_line_")
+    name.starts_with("ocr_line_") || name.starts_with(crate::capture::CAPTURE_PREFIX)
 }
 
 /// Run the watcher loop until a stop is requested. Blocks forever.
