@@ -98,10 +98,9 @@ pub struct GlyphCache {
     cache: HashMap<(u16, u32), CachedGlyph>,
     /// GSUB `vert`/`vrt2` resolution results (source glyph -> vertical glyph).
     vert_cache: HashMap<u16, u16>,
-    /// Font-parser view of the same bytes, for the vertical metrics
-    /// (vmtx/vhea) fontdue does not expose.
+    /// Font-parser view of the same bytes, for cmap and GSUB `vert`/`vrt2`
+    /// resolution (fontdue exposes neither).
     vface: Option<ttf_parser::Face<'static>>,
-    units_per_em: f32,
 }
 
 impl GlyphCache {
@@ -113,16 +112,11 @@ impl GlyphCache {
                 let face_data: &'static [u8] = Box::leak(data.clone().into_boxed_slice());
                 let vface = ttf_parser::Face::parse(face_data, 0).ok();
                 if let Ok(font) = Font::from_bytes(data, fontdue::FontSettings::default()) {
-                    let units_per_em = vface
-                        .as_ref()
-                        .map(|f| f.units_per_em() as f32)
-                        .unwrap_or(1000.0);
                     return Some(Rc::new(RefCell::new(GlyphCache {
                         font,
                         cache: HashMap::new(),
                         vert_cache: HashMap::new(),
                         vface,
-                        units_per_em,
                     })));
                 }
             }
@@ -267,24 +261,6 @@ impl GlyphCache {
         None
     }
 
-    /// Vertical-layout metrics for a glyph at `px`: `(origin_x, origin_y,
-    /// advance)` in pixels, y-up font coordinates. The origin is the top of
-    /// the 1em vertical cell (vmtx: `yMax + topSideBearing`, no VORG in this
-    /// font); `advance` is the cell height. None when the font has no
-    /// vertical metrics for the glyph.
-    fn vertical_metrics(&self, gid: u16, px: u32) -> Option<(f32, f32, f32)> {
-        let face = self.vface.as_ref()?;
-        let gid = ttf_parser::GlyphId(gid);
-        let advance = face.glyph_ver_advance(gid)? as f32;
-        let tsb = face.glyph_ver_side_bearing(gid)? as f32;
-        let bbox = face.glyph_bounding_box(gid)?;
-        // Vertical origin: the em cell top. `glyph_y_origin` (VORG) is absent
-        // here, so derive it from the glyph bbox and the vmtx bearing.
-        let origin_y = bbox.y_max as f32 + tsb;
-        let origin_x = face.glyph_hor_advance(gid)? as f32 / 2.0;
-        let scale = px as f32 / self.units_per_em;
-        Some((origin_x * scale, origin_y * scale, advance * scale))
-    }
 }
 
 /// A rasterized glyph ready to draw: the ink bitmap plus the font metrics
@@ -2567,48 +2543,48 @@ mod tests {
         );
     }
 
-    /// Vertical forms must keep their place inside the font's 1em vertical
-    /// cell (vmtx): the ideographic comma sits top-right, a kanji centred, an
-    /// opening corner bracket low. This is the placement fontdue's
-    /// horizontal-only metrics cannot express.
+    /// Vertical glyphs centre their own ink on the cell (mobile
+    /// `LineOverlayView`), rather than keeping their vmtx place in the em
+    /// cell: the vertical comma sits mid-cell, not top-right.
     #[test]
-    fn vertical_metrics_place_punctuation_in_its_em_cell() {
+    fn vertical_glyphs_centre_their_own_ink() {
         let cache = GlyphCache::new().expect("bundled JP font");
         let px = 54u32;
         let (cx, cy) = (100.0f32, 100.0f32);
+        let ref_ink = {
+            let gid = cache.borrow_mut().glyph_id('あ', true).expect("glyph id");
+            let g = draw_glyph(&cache, gid, px, false).expect("glyph");
+            (g.w as f32, g.h as f32, g.xmin as f32, g.ymin as f32)
+        };
         let place = |ch: char| -> (f32, f32, f32, f32) {
             let gid = cache.borrow_mut().glyph_id(ch, true).expect("glyph id");
             let g = draw_glyph(&cache, gid, px, false).expect("glyph");
-            let (gw, gh) = (g.w as f32, g.h as f32);
-            let borrowed = cache.borrow();
-            let (ox, oy, adv) = borrowed
-                .vertical_metrics(gid, px)
-                .expect("vertical metrics");
-            let cell_center = oy - adv / 2.0;
-            (
-                cx - ox + g.xmin as f32,
-                cy + cell_center - (g.ymin as f32 + gh),
-                gw,
-                gh,
-            )
+            let glyph = (g.w as f32, g.h as f32, g.xmin as f32, g.ymin as f32);
+            let (dx, dy) = glyph_ink_origin(true, cx, cy, glyph, ref_ink);
+            (dx, dy, glyph.0, glyph.1)
         };
-        // U+FE11 VERTICAL IDEOGRAPHIC COMMA: right of centre, above centre.
-        let (dx, dy, gw, gh) = place('\u{FE11}');
-        assert!(dx + gw / 2.0 > cx, "comma should sit right of centre");
-        assert!(dy + gh / 2.0 < cy, "comma should sit above centre");
-        // Kanji: ink centre near the cell centre.
+        // U+FE11 VERTICAL IDEOGRAPHIC COMMA: its own ink is centred on the
+        // cell along the reading axis (vmtx would have put it above centre).
+        let (_, dy, _, gh) = place('\u{FE11}');
+        assert!(
+            ((dy + gh / 2.0) - cy).abs() < 0.5,
+            "comma ink centre {} should be the cell centre {cy}",
+            dy + gh / 2.0
+        );
+        // Across the axis the reference `あ` anchors the ink, so a bracket's
+        // x is its own bearing relative to the reference ink centre.
+        let (dx, _, gw, _) = place('\u{FE41}');
+        let gid = cache.borrow_mut().glyph_id('\u{FE41}', true).expect("glyph id");
+        let g = draw_glyph(&cache, gid, px, false).expect("glyph");
+        let ref_centre = ref_ink.2 + ref_ink.0 / 2.0;
+        let own_centre = g.xmin as f32 + gw / 2.0;
+        assert!(
+            (dx + gw / 2.0 - (cx + own_centre - ref_centre)).abs() < 0.5,
+            "vertical x must ride the reference ink centre"
+        );
+        // Kanji: ink centre on the cell centre in y.
         let (_, dy, _, gh) = place('漢');
-        assert!(
-            ((dy + gh / 2.0) - cy).abs() < px as f32 * 0.15,
-            "kanji ink centre off by {}",
-            (dy + gh / 2.0) - cy
-        );
-        // U+FE41 VERTICAL LEFT CORNER BRACKET: below centre.
-        let (_, dy, _, gh) = place('\u{FE41}');
-        assert!(
-            dy + gh / 2.0 > cy,
-            "vertical corner bracket should sit below centre"
-        );
+        assert!(((dy + gh / 2.0) - cy).abs() < px as f32 * 0.15);
     }
     /// Vertical glyph selection comes from the font's GSUB `vert`/`vrt2`
     /// feature, with the Unicode vertical form only filling the entries the
