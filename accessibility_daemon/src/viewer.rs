@@ -27,7 +27,7 @@ use crate::models::*;
 use crate::overlay_state::OcrOverlayState;
 use crate::util::deinflector::Deinflector;
 use crate::util::japanese;
-use crate::util::japanese::{estimate_em, is_half_width, to_vertical_glyph};
+use crate::util::japanese::{is_half_width, to_vertical_glyph};
 
 use fontdue::Font;
 use iced::widget::image::Handle as ImageHandle;
