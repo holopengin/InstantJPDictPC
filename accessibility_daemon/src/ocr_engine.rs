@@ -208,6 +208,185 @@ fn rect_of(q: &RotatedBox) -> BoundingBox {
     )
 }
 
+/// Mobile `detectRotated`'s component walk: 8-connected flood fill over
+/// `prob > thresh`, the component's boundary pixel corners in source space,
+/// `fitQuad`, then DB unclip on the frame's own axes. Returns index-aligned
+/// `(pre-unclip, unclipped)` frames. `expand_cap` is a PC-only cap in source
+/// pixels (default infinity = Android's uncapped unclip).
+#[allow(clippy::too_many_arguments)]
+fn fit_components(
+    prob_map: &[f32],
+    out_w: u32,
+    out_h: u32,
+    det_thresh: f32,
+    det_unclip: f32,
+    expand_cap: f32,
+    img_left: f32,
+    img_top: f32,
+    scale_w: f32,
+    scale_h: f32,
+) -> (Vec<RotatedBox>, Vec<RotatedBox>) {
+    let ow = out_w as usize;
+    let oh = out_h as usize;
+    let mut visited = vec![0u8; ow * oh];
+    let mut queue: Vec<u32> = Vec::with_capacity(ow * oh);
+    let mut points: Vec<(f32, f32)> = Vec::new();
+    let mut pre_quads: Vec<RotatedBox> = Vec::new();
+    let mut quads: Vec<RotatedBox> = Vec::new();
+    for y in 0..oh {
+        for x in 0..ow {
+            let idx = y * ow + x;
+            if visited[idx] != 0 || prob_map.get(idx).copied().unwrap_or(0.0) <= det_thresh {
+                continue;
+            }
+            // One 8-connected component (mobile floodFillComponent).
+            queue.clear();
+            queue.push(idx as u32);
+            visited[idx] = 1;
+            let mut head = 0usize;
+            while head < queue.len() {
+                let cur = queue[head] as usize;
+                head += 1;
+                let cx = cur % ow;
+                let cy = cur / ow;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+                        if nx < 0 || ny < 0 || nx >= out_w as i32 || ny >= out_h as i32 {
+                            continue;
+                        }
+                        let n_idx = ny as usize * ow + nx as usize;
+                        if visited[n_idx] == 0
+                            && prob_map.get(n_idx).copied().unwrap_or(0.0) > det_thresh
+                        {
+                            visited[n_idx] = 1;
+                            queue.push(n_idx as u32);
+                        }
+                    }
+                }
+            }
+            if queue.len() < 3 {
+                continue; // mobile noise filter counts ALL component pixels
+            }
+
+            // Boundary pixels: any 8-neighbour outside the mask. Their
+            // outer corners in source space enclose exactly the pixels the
+            // axis-aligned min/max box covers.
+            points.clear();
+            for &cur in &queue {
+                let cur = cur as usize;
+                let cx = cur % ow;
+                let cy = cur / ow;
+                let mut boundary = false;
+                'neighbours: for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+                        if nx < 0
+                            || ny < 0
+                            || nx >= out_w as i32
+                            || ny >= out_h as i32
+                            || prob_map
+                                .get(ny as usize * ow + nx as usize)
+                                .copied()
+                                .unwrap_or(0.0)
+                                <= det_thresh
+                        {
+                            boundary = true;
+                            break 'neighbours;
+                        }
+                    }
+                }
+                if !boundary {
+                    continue;
+                }
+                let mx = (cx as f32 - img_left) * scale_w;
+                let my = (cy as f32 - img_top) * scale_h;
+                points.push((mx - 0.5 * scale_w, my - 0.5 * scale_h));
+                points.push((mx + 0.5 * scale_w, my - 0.5 * scale_h));
+                points.push((mx + 0.5 * scale_w, my + 0.5 * scale_h));
+                points.push((mx - 0.5 * scale_w, my + 0.5 * scale_h));
+            }
+
+            // Mobile RotatedGeometry.fitQuad on the source-space corners.
+            let Some(pre_quad) = fit_quad(&points) else {
+                continue;
+            };
+            // DB unclip on the frame's own axes (mobile unclip); the cap is
+            // a PC-only knob, off by default.
+            let (pw, ph) = (pre_quad.w, pre_quad.h);
+            let mut expand = if pw > 1e-6 && ph > 1e-6 {
+                pw * ph * det_unclip / (2.0 * (pw + ph))
+            } else {
+                0.0
+            };
+            if expand > expand_cap {
+                expand = expand_cap;
+            }
+            let quad = pre_quad.inset(-expand, -expand);
+            if quad.w < 4.0 || quad.h < 4.0 {
+                continue;
+            }
+            pre_quads.push(pre_quad);
+            quads.push(quad);
+        }
+    }
+    (pre_quads, quads)
+}
+
+/// Mobile `detectRotated`'s post-fit stages: furigana rejection on AABB
+/// geometry (same rule and raw-vs-unclipped pair as the axis path), the
+/// local-size filter, the enclosing-blob filter (#53) and the vertical 5%
+/// cross-axis inset. Returns the surviving frames.
+fn filter_fitted_quads(
+    pre_quads: &[RotatedBox],
+    quads: &[RotatedBox],
+    orig_w: i32,
+    orig_h: i32,
+) -> Vec<RotatedBox> {
+    let pre_rects: Vec<BoundingBox> = pre_quads.iter().map(rect_of).collect();
+    let uncl_rects: Vec<BoundingBox> = quads.iter().map(rect_of).collect();
+    let keep = filter_furigana(&pre_rects, &uncl_rects, orig_w, orig_h);
+
+    // Min-size filter uses the frame's own local sizes (mobile).
+    let mut min_sized: Vec<RotatedBox> = Vec::new();
+    for (i, q) in quads.iter().enumerate() {
+        if !keep.get(i).copied().unwrap_or(true) {
+            eprintln!(
+                "[PP-OCR DET] furigana dropped {}x{}@({}, {})",
+                pre_rects[i].w, pre_rects[i].h, pre_rects[i].x, pre_rects[i].y
+            );
+            continue;
+        }
+        if q.w < 10.0 || q.h < 10.0 {
+            continue;
+        }
+        min_sized.push(*q);
+    }
+    // A DB blob that merged several Lines fits one frame covering them all
+    // while the Lines inside arrive as their own smaller fits; the blob is
+    // the false positive, so drop it before it can become a Line.
+    let kept = filter_enclosing_blobs(&min_sized);
+    let blobs = min_sized.len() - kept.len();
+    if blobs > 0 {
+        eprintln!("[PP-OCR DET] {blobs} enclosing blob(s) filtered");
+    }
+    kept.iter()
+        .map(|q| {
+            if q.is_vertical() {
+                q.inset(q.w * 0.05, 0.0)
+            } else {
+                *q
+            }
+        })
+        .collect()
+}
+
 /// Mobile shared orientation rule (#28): near-square boxes count as vertical
 /// for the ruby checks, so lone upright characters are tested against both
 /// rules.
@@ -1107,151 +1286,25 @@ impl OcrEngine {
             .and_then(|s| s.parse().ok())
             .unwrap_or(f32::INFINITY);
 
-        let ow = out_w as usize;
-        let oh = out_h as usize;
-        let mut visited = vec![0u8; ow * oh];
-        let mut queue: Vec<u32> = Vec::with_capacity(ow * oh);
-        let mut points: Vec<(f32, f32)> = Vec::new();
-        let mut pre_quads: Vec<RotatedBox> = Vec::new();
-        let mut quads: Vec<RotatedBox> = Vec::new();
-        for y in 0..oh {
-            for x in 0..ow {
-                let idx = y * ow + x;
-                if visited[idx] != 0 || prob_map.get(idx).copied().unwrap_or(0.0) <= det_thresh {
-                    continue;
-                }
-                // One 8-connected component (mobile floodFillComponent).
-                queue.clear();
-                queue.push(idx as u32);
-                visited[idx] = 1;
-                let mut head = 0usize;
-                while head < queue.len() {
-                    let cur = queue[head] as usize;
-                    head += 1;
-                    let cx = cur % ow;
-                    let cy = cur / ow;
-                    for dy in -1i32..=1 {
-                        for dx in -1i32..=1 {
-                            if dx == 0 && dy == 0 {
-                                continue;
-                            }
-                            let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
-                            if nx < 0 || ny < 0 || nx >= out_w as i32 || ny >= out_h as i32 {
-                                continue;
-                            }
-                            let n_idx = ny as usize * ow + nx as usize;
-                            if visited[n_idx] == 0
-                                && prob_map.get(n_idx).copied().unwrap_or(0.0) > det_thresh
-                            {
-                                visited[n_idx] = 1;
-                                queue.push(n_idx as u32);
-                            }
-                        }
-                    }
-                }
-                if queue.len() < 3 {
-                    continue; // mobile noise filter counts ALL component pixels
-                }
+        let (pre_quads, quads) = fit_components(
+            &prob_map,
+            out_w,
+            out_h,
+            det_thresh,
+            det_unclip,
+            expand_cap,
+            img_left,
+            img_top,
+            scale_w,
+            scale_h,
+        );
 
-                // Boundary pixels: any 8-neighbour outside the mask. Their
-                // outer corners in source space enclose exactly the pixels
-                // the axis-aligned min/max box covers.
-                points.clear();
-                for &cur in &queue {
-                    let cur = cur as usize;
-                    let cx = cur % ow;
-                    let cy = cur / ow;
-                    let mut boundary = false;
-                    'neighbours: for dy in -1i32..=1 {
-                        for dx in -1i32..=1 {
-                            if dx == 0 && dy == 0 {
-                                continue;
-                            }
-                            let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
-                            if nx < 0
-                                || ny < 0
-                                || nx >= out_w as i32
-                                || ny >= out_h as i32
-                                || prob_map
-                                    .get(ny as usize * ow + nx as usize)
-                                    .copied()
-                                    .unwrap_or(0.0)
-                                    <= det_thresh
-                            {
-                                boundary = true;
-                                break 'neighbours;
-                            }
-                        }
-                    }
-                    if !boundary {
-                        continue;
-                    }
-                    let mx = (cx as f32 - img_left) * scale_w;
-                    let my = (cy as f32 - img_top) * scale_h;
-                    points.push((mx - 0.5 * scale_w, my - 0.5 * scale_h));
-                    points.push((mx + 0.5 * scale_w, my - 0.5 * scale_h));
-                    points.push((mx + 0.5 * scale_w, my + 0.5 * scale_h));
-                    points.push((mx - 0.5 * scale_w, my + 0.5 * scale_h));
-                }
+        // 6-9. Mobile detectRotated's post-fit stages: furigana rejection on
+        // AABB geometry, the local-size filter, the enclosing-blob filter
+        // (#53) and the vertical 5% cross-axis inset.
+        let kept = filter_fitted_quads(&pre_quads, &quads, orig_w as i32, orig_h as i32);
 
-                // Mobile RotatedGeometry.fitQuad on the source-space corners.
-                let Some(pre_quad) = fit_quad(&points) else {
-                    continue;
-                };
-                // DB unclip on the frame's own axes (mobile unclip); the cap
-                // is a PC-only knob, off by default.
-                let (pw, ph) = (pre_quad.w, pre_quad.h);
-                let mut expand = if pw > 1e-6 && ph > 1e-6 {
-                    pw * ph * det_unclip / (2.0 * (pw + ph))
-                } else {
-                    0.0
-                };
-                if expand > expand_cap {
-                    expand = expand_cap;
-                }
-                let quad = pre_quad.inset(-expand, -expand);
-                if quad.w < 4.0 || quad.h < 4.0 {
-                    continue;
-                }
-                pre_quads.push(pre_quad);
-                quads.push(quad);
-            }
-        }
-
-        // 6. Furigana filter (#28) on AABB geometry: the same rule and the
-        // same raw-vs-unclipped pair as the axis path, so ruby is not
-        // promoted to a Line just because the fit rotated it.
-        let pre_rects: Vec<BoundingBox> = pre_quads.iter().map(rect_of).collect();
-        let uncl_rects: Vec<BoundingBox> = quads.iter().map(rect_of).collect();
-        let keep = filter_furigana(&pre_rects, &uncl_rects, orig_w as i32, orig_h as i32);
-
-        // 7-8. Min-size filter (mobile: the frame's own local sizes), then
-        // the enclosing-blob filter (#53): a DB blob that merged several
-        // Lines fits one frame covering them all while the Lines inside
-        // arrive as their own smaller fits; the blob is the false positive.
-        let mut min_sized: Vec<RotatedBox> = Vec::new();
-        for (i, q) in quads.iter().enumerate() {
-            if !keep.get(i).copied().unwrap_or(true) {
-                eprintln!(
-                    "[PP-OCR DET] furigana dropped {}x{}@({}, {})",
-                    pre_rects[i].w, pre_rects[i].h, pre_rects[i].x, pre_rects[i].y
-                );
-                continue;
-            }
-            if q.w < 10.0 || q.h < 10.0 {
-                continue;
-            }
-            min_sized.push(*q);
-        }
-        let kept = filter_enclosing_blobs(&min_sized);
-        let blobs = min_sized.len() - kept.len();
-        if blobs > 0 {
-            eprintln!("[PP-OCR DET] {blobs} enclosing blob(s) filtered");
-        }
-
-        // 9. Vertical frames shrink 5% per side on the cross axis (mobile
-        // detectRotated inset). The PC-only orientation knobs default to
-        // Android behaviour (off).
+        // The PC-only orientation knobs default to Android behaviour (off).
         let h_down: f32 = std::env::var("DET_H_DOWN")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1262,11 +1315,7 @@ impl OcrEngine {
             .unwrap_or(1.0);
         let mut pp_pairs: Vec<(BoundingBox, RotatedBox)> = Vec::with_capacity(kept.len());
         for quad_in in &kept {
-            let mut quad = if quad_in.is_vertical() {
-                quad_in.inset(quad_in.w * 0.05, 0.0)
-            } else {
-                *quad_in
-            };
+            let mut quad = *quad_in;
             if h_down != 0.0 && !quad.is_vertical() && quad.h >= 24.0 {
                 quad.h += h_down;
                 quad.cy += h_down / 2.0;
@@ -1733,6 +1782,101 @@ mod tests {
     fn test_engine() -> OcrEngine {
         let dir = format!("{}/assets", env!("CARGO_MANIFEST_DIR"));
         OcrEngine::new(&dir, RecognitionMode::Both, 4).expect("engine loads")
+    }
+
+    /// Prob map with `on` pixels set to 0.9 (above the 0.3 threshold).
+    fn prob_map(w: usize, h: usize, on: impl Fn(usize, usize) -> bool) -> Vec<f32> {
+        let mut map = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                if on(x, y) {
+                    map[y * w + x] = 0.9;
+                }
+            }
+        }
+        map
+    }
+
+    fn components(map: &[f32], w: usize, h: usize, cap: f32) -> (Vec<RotatedBox>, Vec<RotatedBox>) {
+        fit_components(map, w as u32, h as u32, 0.3, 1.5, cap, 0.0, 0.0, 1.0, 1.0)
+    }
+
+    /// D3.1: mobile flood-fills the component, so an interior hole is not a
+    /// second box (imageproc's Suzuki-Abe contours returned hole borders too).
+    #[test]
+    fn fit_components_ignores_interior_holes() {
+        // A 20x20 ring: border pixels on, interior off.
+        let map = prob_map(40, 40, |x, y| {
+            (5..25).contains(&x) && (5..25).contains(&y) && (x == 5 || x == 24 || y == 5 || y == 24)
+        });
+        let (pre, uncl) = components(&map, 40, 40, f32::INFINITY);
+        assert_eq!(pre.len(), 1, "the hole must not become a box");
+        let (x, y, w, h) = pre[0].aabb();
+        assert!(
+            (x - 4.5).abs() < 0.01 && (y - 4.5).abs() < 0.01,
+            "frame origin {x},{y}"
+        );
+        assert!((w - 20.0).abs() < 0.01 && (h - 20.0).abs() < 0.01, "{w}x{h}");
+        // Unclip grows both axes on the frame (no cap).
+        assert!(uncl[0].w > pre[0].w && uncl[0].h > pre[0].h);
+    }
+
+    /// D3.1/D3.7: specks are counted over all component pixels (mobile), and
+    /// anything whose frame is under 4px in either local axis is dropped, so
+    /// a 2-pixel speck and a 3-pixel L both go; a real block is kept at its
+    /// pixel extents.
+    #[test]
+    fn fit_components_drops_specks_and_sub_4px_frames() {
+        let two = prob_map(10, 10, |x, y| (x, y) == (5, 5) || (x, y) == (6, 5));
+        assert!(components(&two, 10, 10, f32::INFINITY).0.is_empty());
+        let three = prob_map(10, 10, |x, y| {
+            (x, y) == (5, 5) || (x, y) == (6, 5) || (x, y) == (5, 6)
+        });
+        assert!(
+            components(&three, 10, 10, f32::INFINITY).0.is_empty(),
+            "3-pixel L is under the 4px frame gate"
+        );
+        let block = prob_map(20, 20, |x, y| (5..11).contains(&x) && (5..11).contains(&y));
+        let (pre, _) = components(&block, 20, 20, f32::INFINITY);
+        assert_eq!(pre.len(), 1);
+        let (x, y, w, h) = pre[0].aabb();
+        assert!((x - 4.5).abs() < 0.01 && (y - 4.5).abs() < 0.01);
+        assert!((w - 6.0).abs() < 0.01 && (h - 6.0).abs() < 0.01);
+    }
+
+    /// D3.3: the expansion is Android's uncapped `area*ratio/perimeter` per
+    /// side by default; DET_EXPAND_CAP is an opt-in clamp in source pixels.
+    #[test]
+    fn fit_components_expansion_is_uncapped_by_default() {
+        // A 40x10 block: area 400, perimeter 100, expand 6 per side.
+        let map = prob_map(60, 30, |x, y| (10..50).contains(&x) && (10..20).contains(&y));
+        let (pre, uncl) = components(&map, 60, 30, f32::INFINITY);
+        assert_eq!(pre.len(), 1);
+        assert!((uncl[0].w - pre[0].w - 12.0).abs() < 0.01, "uncapped");
+        let (_, capped) = components(&map, 60, 30, 2.0);
+        assert!((capped[0].w - pre[0].w - 4.0).abs() < 0.01, "capped at 2/side");
+    }
+
+    /// D3.8: a DB blob that merged several lines — its frame encloses two
+    /// line-shaped frames — is dropped while the lines survive.
+    #[test]
+    fn detect_filters_enclosing_blobs() {
+        // A 200x200 ring (one component) around two horizontal bars.
+        let map = prob_map(240, 240, |x, y| {
+            let ring = (10..210).contains(&x)
+                && (10..210).contains(&y)
+                && (x == 10 || x == 209 || y == 10 || y == 209);
+            let line_a = (30..190).contains(&x) && (40..52).contains(&y);
+            let line_b = (30..190).contains(&x) && (120..132).contains(&y);
+            ring || line_a || line_b
+        });
+        let (pre, quads) = components(&map, 240, 240, f32::INFINITY);
+        assert_eq!(quads.len(), 3, "ring + two lines");
+        let kept = filter_fitted_quads(&pre, &quads, 240, 240);
+        assert_eq!(kept.len(), 2, "the enclosing ring must be dropped");
+        for q in &kept {
+            assert!(q.w > q.h, "line frames survive: {:?}", q);
+        }
     }
 
     /// Detection parity smoke on the mobile synth set: the ncnn det model +
