@@ -58,6 +58,8 @@ const OVERLAY_FG: (u8, u8, u8) = (255, 119, 119);
 const OVERLAY_HL: (u8, u8, u8) = (255, 255, 0);
 
 struct CachedGlyph {
+    /// Ink bitmap size in pixels. Zero means the glyph has no ink (a space,
+    /// or `.notdef` in a font without one) — mobile skips those outright.
     w: u32,
     h: u32,
     xmin: i32,
@@ -139,8 +141,9 @@ impl GlyphCache {
                 px: px as f32,
                 font_hash: 0,
             });
-            let w = metrics.width.max(1) as u32;
-            let h = metrics.height.max(1) as u32;
+            // Keep the true ink size: zero is how a blank glyph reports itself.
+            let w = metrics.width as u32;
+            let h = metrics.height as u32;
             let pink = Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2);
             let yellow = Self::make_handle(w, h, &coverage, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2);
             CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
@@ -150,6 +153,11 @@ impl GlyphCache {
     }
 
     fn make_handle(w: u32, h: u32, cov: &[u8], r: u8, g: u8, b: u8) -> ImageHandle {
+        if w == 0 || h == 0 {
+            // No ink: a 1×1 transparent pixel keeps the handle valid; the
+            // draw path never places it.
+            return ImageHandle::from_rgba(1, 1, vec![0, 0, 0, 0]);
+        }
         let mut rgba = Vec::with_capacity((w * h * 4) as usize);
         for &a in cov {
             rgba.push(r);
@@ -170,8 +178,8 @@ impl GlyphCache {
                 px: px_size as f32,
                 font_hash: 0,
             });
-            let w = metrics.width.max(1) as u32;
-            let h = metrics.height.max(1) as u32;
+            let w = metrics.width as u32;
+            let h = metrics.height as u32;
             let pink = Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2);
             let yellow = Self::make_handle(w, h, &coverage, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2);
             CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
@@ -2433,6 +2441,19 @@ mod tests {
         // top = cy + ref_centre - (ymin + h) = 50 + 12 - 4 = 58.
         assert!((dy - 58.0).abs() < 1e-3, "comma dy={dy}");
         assert!((dx - 95.0).abs() < 1e-3, "comma dx={dx}");
+    }
+
+    /// Mobile skips glyphs whose measured ink is degenerate (`glyphW <= 0 ||
+    /// glyphH <= 0`); a blank cell must not draw a placeholder pixel.
+    #[test]
+    fn blank_glyphs_report_no_ink() {
+        let cache = GlyphCache::new().expect("bundled JP font");
+        let gid = cache.borrow_mut().glyph_id(' ', false).expect("space glyph");
+        let g = draw_glyph(&cache, gid, 54, false).expect("glyph");
+        assert_eq!((g.w, g.h), (0, 0), "space must report no ink");
+        let gid = cache.borrow_mut().glyph_id('あ', false).expect("glyph id");
+        let g = draw_glyph(&cache, gid, 54, false).expect("glyph");
+        assert!(g.w > 0 && g.h > 0, "kana has ink");
     }
 
     #[test]
