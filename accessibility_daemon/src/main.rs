@@ -1,4 +1,5 @@
 mod nav_graph;
+mod capture;
 mod data;
 mod frontend;
 mod models;
@@ -202,6 +203,23 @@ fn main() -> Result<()> {
         watcher::run(&data_dir, &args[2..]);
         return Ok(());
     }
+    // One-time (idempotent) setup for capture mode: install the desktop file
+    // KWin requires before it will hand screenshots to this binary.
+    if args.len() >= 2 && args[1] == "--setup-capture" {
+        let desktop = capture::setup_capture_authorization()?;
+        println!(
+            "[Capture] Registered {} as an authorized screenshot client.",
+            desktop.display()
+        );
+        println!();
+        println!("{}", capture::shortcut_instructions());
+        return Ok(());
+    }
+    // Capture mode: screenshot the focused window, then OCR it. Meant to be
+    // bound to a global shortcut; viewer options are forwarded.
+    if args.len() >= 2 && args[1] == "--capture" {
+        return run_capture(&args[2..], &data_dir);
+    }
     if args.len() < 2 {
         println!("No image argument provided. Opening frontend window...");
         let db_path = data_dir.join("dictionary.sqlite");
@@ -210,6 +228,26 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    run_ocr_viewer(args)
+}
+
+fn run_capture(extra_args: &[String], data_dir: &std::path::Path) -> Result<()> {
+    let t_start = std::time::Instant::now();
+    let image = capture::capture_active_window()
+        .context("failed to take a screenshot of the focused window")?;
+    let path = capture::save_capture(&image, data_dir)?;
+    println!(
+        "[Capture] {}x{} → {} ({:.0} ms)",
+        image.width(),
+        image.height(),
+        path.display(),
+        t_start.elapsed().as_secs_f64() * 1000.0,
+    );
+    // Hand the capture to the normal OCR viewer. Appending the path last is
+    // safe: the viewer's option parser accepts positionals anywhere.
+    let mut args: Vec<String> = vec!["accessibility_daemon".to_string()];
+    args.extend(extra_args.iter().cloned());
+    args.push(path.to_string_lossy().into_owned());
     run_ocr_viewer(args)
 }
 
@@ -222,6 +260,8 @@ fn print_usage() {
     println!("  {name} [OPTIONS] --headless <IMAGE_PATH|DIRECTORY> [MORE_IMAGES...]");
     println!("  {name}                     Opens the frontend window (no arguments)");
     println!("  {name} --watcher [ARGS]    Run the file watcher (blocks until stopped)");
+    println!("  {name} --capture [OPTIONS] Screenshot the focused window and OCR it");
+    println!("  {name} --setup-capture     Authorize KWin screenshots for this binary");
     println!("  {name} --help              Show this help message");
     println!();
     println!("OPTIONS:");
@@ -232,6 +272,17 @@ fn print_usage() {
     println!("      --hybrid               Hybrid mode: both horizontal and vertical recognition");
     println!("  -b, --batch-size <N>       Recognition batch size (default: 10)");
     println!("      --batch-size=<N>       (alternative syntax)");
+    println!();
+    println!("CAPTURE MODE (for a global shortcut):");
+    println!("  --capture takes the screenshot itself — the focused window, no");
+    println!("  picker and no file in ~/Pictures/Screenshots — then opens the OCR");
+    println!("  viewer on it. Because nothing lands in a watched folder, the file");
+    println!("  watcher cannot open a second viewer for the same image.");
+    println!();
+    println!("  Run --setup-capture once first: KWin only hands screenshots to");
+    println!("  binaries whose .desktop file declares");
+    println!("  X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2");
+    println!("  (the same mechanism Spectacle uses).");
     println!();
     println!("FRONTEND WINDOW:");
     println!("  Launching with no arguments opens a window with two options:");
@@ -252,11 +303,14 @@ fn print_usage() {
     println!("  {name} --headless screenshots_dir/");
     println!("  {name} --headless shot1.png shot2.png shot3.png");
     println!("  {name} --watcher --vert");
+    println!("  {name} --setup-capture       (once; then bind a shortcut to --capture)");
+    println!("  {name} --capture --vert");
     println!("  {name}                     (opens the frontend window)");
     println!();
     println!("KEYBOARD SHORTCUTS (when GUI is shown):");
     println!("  D / Shift+J                Scroll dictionary down");
     println!("  F / Shift+K                Scroll dictionary up");
+    println!("  Esc / Q                    Close viewer / back out of a selection");
 }
 
 fn run_frontend(db: Arc<DictionaryDatabase>, data_dir: std::path::PathBuf) -> Result<()> {

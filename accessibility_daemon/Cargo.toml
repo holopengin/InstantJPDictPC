@@ -28,6 +28,9 @@ env_logger = "0.11"
 anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 
+# Screenshot capture (--capture): talk to KWin's ScreenShot2 D-Bus API
+zbus = { version = "5", features = ["blocking-api"] }
+
 # GUI: Iced for displaying the annotated image
 iced = { version= "0.14.0", features = ["image", "canvas", "advanced", "tokio", "x11", "wgpu"] }
 iced_futures = "0.14.0"
@@ -35,8 +38,11 @@ iced_futures = "0.14.0"
 # Database: SQLite for dictionary storage
 rusqlite = { version = "0.37", features = ["bundled"] }
 
-# Dictionary import from Yomitan ZIP files
-zip = "0.6"
+# Dictionary import from Yomitan ZIP files.
+# Default features would pull bzip2/zstd/aes; Yomitan archives are plain
+# deflate ZIPs, and linking the system libbz2 makes the binary depend on a
+# soname that differs across distros (libbz2.so.1.0 on Arch, .so.1 on Fedora).
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 # Lazy static initialization
 lazy_static = "1.4"
