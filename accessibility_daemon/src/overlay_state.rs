@@ -289,7 +289,7 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
     /// Default: left (Start) in landscape, top (Top) in portrait.
     /// Only switch to the other side if the character would be overlapped by the panel.
     /// The panel is on the left in landscape (dict + neighbors + alt = ~386px wide).
-    pub fn update_gravity(&mut self, tapped_box: &BoundingBox, panel_width: f32) {
+    pub fn update_gravity(&mut self, tapped_box: &BoundingBox, _panel_width: f32) {
         let root_width = self.window_width.get();
         let root_height = self.window_height.get();
         let is_landscape = root_width > root_height;
@@ -314,55 +314,32 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
         let char_center_y = tapped_box.top() as f32 * total_scale
             + total_offset_y
             + (tapped_box.h as f32 / 2.0) * total_scale;
-        // Character's left edge in screen space (for overlap check)
-        let char_top = tapped_box.top() as f32 * total_scale + total_offset_y;
 
         eprintln!(
             "[GRAVITY] img=({img_w_f},{img_h_f}) window=({root_width},{root_height}) \
-             base_scale={base_scale:.2} base_off=({base_offset_x:.0},{base_offset_y:.0}) \
-             cur_scale={sc:.2} cur_trans=({tx:.0},{ty:.0}) \
-             total_scale={ts:.2} total_off=({tox:.0},{toy:.0}) \
-             bbox=({bx},{bw}) char_center=({ccx:.0},{ccy:.0}) \
-             panel_w={pw:.0} rpl={rpl:.0} overlaps={ov} gravity={g:?}",
+             total_scale={total_scale:.2} total_off=({total_offset_x:.0},{total_offset_y:.0}) \
+             bbox=({bx},{bw}) char_center=({char_center_x:.0},{char_center_y:.0}) \
+             gravity={g:?}",
             img_w_f=img_w_f, img_h_f=img_h_f,
             root_width=root_width, root_height=root_height,
-            base_scale=base_scale,
-            base_offset_x=base_offset_x, base_offset_y=base_offset_y,
-            sc=self.current_scale,
-            tx=self.current_trans_x, ty=self.current_trans_y,
-            ts=total_scale,
-            tox=total_offset_x, toy=total_offset_y,
+            total_scale=total_scale,
+            total_offset_x=total_offset_x, total_offset_y=total_offset_y,
             bx=tapped_box.left(), bw=tapped_box.w,
-            ccx=char_center_x, ccy=char_center_y,
-            pw=panel_width,
-            rpl=root_width - panel_width,
-            ov=char_center_x > root_width - panel_width,
             g=self.last_landscape_gravity,
         );
 
-        // In portrait, panel takes roughly half the screen height
-        let panel_height = root_height * 0.5_f32;
-
+        // Android `updateGravity`: the panel takes the opposite half from the
+        // tapped character. Landscape → END when the character is in the left
+        // half, START otherwise; portrait → BOTTOM in the top half, TOP
+        // otherwise.
         if is_landscape {
-            // Default: panel on the right (End)
-            // Switch to left (Start) only if the character's center would be
-            // overlapped by the right panel (i.e. its center is past the
-            // panel's left edge). Using center rather than right edge avoids
-            // bouncing between similarly-positioned characters whose widths
-            // happen to tip one over the panel boundary.
-            let right_panel_left = root_width - panel_width;
-            let overlaps_panel = char_center_x > right_panel_left;
-            self.last_landscape_gravity = if overlaps_panel {
-                Gravity::Start
-            } else {
+            self.last_landscape_gravity = if char_center_x < root_width / 2.0 {
                 Gravity::End
+            } else {
+                Gravity::Start
             };
         } else {
-            // Default: panel at top (Top)
-            // Switch to bottom (Bottom) only if the character would be overlapped by the top panel.
-            let char_bottom = char_top + tapped_box.h as f32 * total_scale;
-            let overlaps_panel = char_bottom > 0.0 && char_top < panel_height;
-            self.last_portrait_gravity = if overlaps_panel {
+            self.last_portrait_gravity = if char_center_y < root_height / 2.0 {
                 Gravity::Bottom
             } else {
                 Gravity::Top
@@ -1985,6 +1962,54 @@ mod tests {
             ", ",
         );
         assert_eq!(nodes, vec![DefinitionNode::Text("not rows".to_string())]);
+    }
+
+    // ——— dictionary grouping and lookup plumbing ————————————————
+
+    #[test]
+    fn entries_are_split_per_dictionary_with_a_source_label() {
+        // "One entry per (term, dictionary): JMdict and KANJIDIC rows must
+        // never merge into a single block."
+        let defs = serde_json::json!(["gloss"]);
+        let mut jm = entry("分", "ぶん", &defs);
+        jm.dictionary_id = 1;
+        let mut kj = entry("分", "ぶん", &defs);
+        kj.dictionary_id = 2;
+        kj.onyomi = Some("ブン".to_string());
+        let matches = vec![TermMatch {
+            term: "分".to_string(),
+            entries: vec![jm, kj],
+            chain: None,
+        }];
+        let mut names = HashMap::new();
+        names.insert(1i64, "JMdict".to_string());
+        names.insert(2i64, "KANJIDIC".to_string());
+        let mut state = OcrOverlayState::new(1024.0, 768.0);
+        let out = state.format_dictionary_results(&matches, &names);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].dictionary_name.as_deref(), Some("JMdict"));
+        assert_eq!(out[1].dictionary_name.as_deref(), Some("KANJIDIC"));
+    }
+
+    #[test]
+    fn gravity_follows_the_android_halves() {
+        let mut s = OcrOverlayState::new(1000.0, 800.0);
+        s.img_w = 1000;
+        s.img_h = 800;
+        // Landscape: left half -> END, right half -> START.
+        s.update_gravity(&BoundingBox::new(100, 300, 100, 100, 1.0), 388.0);
+        assert_eq!(s.last_landscape_gravity, Gravity::End);
+        s.update_gravity(&BoundingBox::new(900, 300, 100, 100, 1.0), 388.0);
+        assert_eq!(s.last_landscape_gravity, Gravity::Start);
+
+        let mut p = OcrOverlayState::new(800.0, 1000.0);
+        p.img_w = 800;
+        p.img_h = 1000;
+        // Portrait: top half -> BOTTOM, bottom half -> TOP.
+        p.update_gravity(&BoundingBox::new(300, 100, 100, 100, 1.0), 388.0);
+        assert_eq!(p.last_portrait_gravity, Gravity::Bottom);
+        p.update_gravity(&BoundingBox::new(300, 900, 100, 100, 1.0), 388.0);
+        assert_eq!(p.last_portrait_gravity, Gravity::Top);
     }
 
     // ——— small helpers to keep the assertions above readable ————

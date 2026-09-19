@@ -446,4 +446,61 @@ mod tests {
         assert!(!is_half_width('漢'));
         assert!(!is_half_width('。'));
     }
+
+    /// Mirrors Android `FuriganaAligner` examples: ruby over kanji runs only,
+    /// okurigana as plain base text, fallback None when unalignable.
+    #[test]
+    fn furigana_aligner_covers_kanji_only() {
+        assert_eq!(
+            align_furigana("食べる", "たべる").unwrap(),
+            vec![
+                RubySegment { base: "食".into(), ruby: Some("た".into()) },
+                RubySegment { base: "べる".into(), ruby: None },
+            ]
+        );
+        assert_eq!(
+            align_furigana("大きい", "おおきい").unwrap(),
+            vec![
+                RubySegment { base: "大".into(), ruby: Some("おお".into()) },
+                RubySegment { base: "きい".into(), ruby: None },
+            ]
+        );
+        assert_eq!(
+            align_furigana("申し込む", "もうしこむ").unwrap(),
+            vec![
+                RubySegment { base: "申".into(), ruby: Some("もう".into()) },
+                RubySegment { base: "し".into(), ruby: None },
+                RubySegment { base: "込".into(), ruby: Some("こ".into()) },
+                RubySegment { base: "む".into(), ruby: None },
+            ]
+        );
+        // No kana anchor: whole ruby, as before.
+        assert_eq!(
+            align_furigana("今日", "きょう").unwrap(),
+            vec![RubySegment { base: "今日".into(), ruby: Some("きょう".into()) }]
+        );
+        // Unalignable (reading shorter than the term).
+        assert!(align_furigana("食べる", "たべ").is_none());
+    }
+
+    #[test]
+    fn kana_list_split_strips_suffix_dashes() {
+        assert_eq!(split_kana_list("しじぐい しじくい"), vec!["しじぐい", "しじくい"]);
+        assert_eq!(split_kana_list("ぶん -ぶん"), vec!["ぶん", "ぶん"]);
+        assert_eq!(split_kana_list("  "), Vec::<String>::new());
+    }
+
+    /// Mirrors `PitchAccent`: small kana fuse; っ/ー/ん keep their own mora.
+    #[test]
+    fn pitch_morae_and_contour() {
+        assert_eq!(morae_of("きょう"), vec!["きょ", "う"]);
+        assert_eq!(morae_of("がっこう").len(), 4);
+        assert_eq!(morae_of("コーヒー").len(), 4);
+        assert_eq!(pitch_pattern(4, 0), vec![false, true, true, true]);
+        assert_eq!(pitch_pattern(4, 1), vec![true, false, false, false]);
+        assert_eq!(pitch_pattern(4, 3), vec![false, true, true, false]);
+        assert!(falls_beyond_word(4, 4));
+        assert!(!falls_beyond_word(4, 3));
+        assert!(!falls_beyond_word(0, 0));
+    }
 }
