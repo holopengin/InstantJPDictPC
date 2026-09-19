@@ -404,6 +404,17 @@ fn line_text_px(line: &LineResult, quad: Option<&RotatedBox>, total_scale: f32) 
     line_glyph_px(line, quad) * TEXT_SIZE_RATIO * total_scale
 }
 
+/// Mobile chip rule (`OcrOverlayView` neighbour and alternatives panels):
+/// the chips take the vertical presentation forms only in landscape, where
+/// they run down the side of the screen; portrait chips stay horizontal.
+fn chip_text(text: &str, is_landscape: bool) -> String {
+    if is_landscape {
+        text.chars().map(to_vertical_glyph).collect()
+    } else {
+        text.to_string()
+    }
+}
+
 /// Mobile `updateCursor` geometry: the cursor box is the char box inflated
 /// by 2dp per side, in the same (content-transform) space as the boxes.
 fn cursor_rect(box_pt: Point, box_size: Size, total_scale: f32) -> (Point, Size) {
@@ -1526,6 +1537,12 @@ impl OcrViewer {
         }
     }
 
+    /// Landscape orientation, as mobile's `isLandscape = root.width > root.height`
+    /// — the gate for the chips' vertical forms (D28).
+    fn is_landscape(&self) -> bool {
+        self.window_width > self.window_height
+    }
+
     /// Total width of the panel (dict + neighbors + alt + spacing + padding).
     /// Must match the values used in view().
     fn panel_width(&self) -> f32 {
@@ -2088,7 +2105,7 @@ impl OcrViewer {
             for cs in line.chars {
                 let msg = Message::SelectNeighbor(line.line_idx, cs.char_idx);
                 let is_selected = cs.is_selected;
-                let text: String = cs.text.chars().map(to_vertical_glyph).collect();
+                let text = chip_text(&cs.text, self.is_landscape());
 
                 let btn: Element<'a, Message> = Container::new(
                     Text::new(text)
@@ -2169,7 +2186,7 @@ impl OcrViewer {
                 let is_selected = c.is_selected;
                 let ch = c.char;
 
-                let vertical_ch: String = ch.to_string().chars().map(to_vertical_glyph).collect();
+                let vertical_ch = chip_text(&ch.to_string(), self.is_landscape());
 
                 let btn: Element<'a, Message> = Container::new(
                     Text::new(vertical_ch)
@@ -2495,6 +2512,14 @@ mod tests {
         let gid = cache.borrow_mut().glyph_id('あ', false).expect("glyph id");
         let g = draw_glyph(&cache, gid, 54, false).expect("glyph");
         assert!(g.w > 0 && g.h > 0, "kana has ink");
+    }
+
+    /// Chips follow mobile's orientation gate for vertical forms.
+    #[test]
+    fn chip_vertical_forms_are_landscape_only() {
+        assert_eq!(chip_text("「", true), "\u{FE41}");
+        assert_eq!(chip_text("「", false), "「");
+        assert_eq!(chip_text("あ", true), "あ");
     }
 
     /// Mobile cursor: 2dp inflation per side, scaling with the transform.
