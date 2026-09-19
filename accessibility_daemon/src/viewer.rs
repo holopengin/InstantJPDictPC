@@ -513,6 +513,159 @@ fn glyph_fit_scale(is_vertical: bool, is_half: bool, cell: (f32, f32), ink: (f32
     }
 }
 
+// ---------------------------------------------------------------------------
+// Blank gaps — mobile `BlankGaps` / `GapDetector` (#44 Feature 2)
+// ---------------------------------------------------------------------------
+
+/// Mobile `OcrEngine.GAP_CHAR`: the placeholder a dropped character becomes.
+pub const GAP_CHAR: char = '\u{25CC}';
+/// Mobile `GapDetector.DEFAULT_VERTICAL_RATIO`: measured recall 1.00 and no
+/// false positives on the vertical bench; horizontal lines are never
+/// eligible (`BlankGaps.apply` returns early on them).
+const BLANK_GAP_RATIO: f32 = 1.6;
+
+/// Mobile `medianOf`: even counts average the two middles.
+fn median_of(values: &mut [f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(f32::total_cmp);
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        (values[mid - 1] + values[mid]) / 2.0
+    }
+}
+
+/// Mobile `GapDetector.detect` on the char-box geometry: character indices
+/// where the spacing to the next character is at least [BLANK_GAP_RATIO]×
+/// the median spacing of the line. Vertical lines only.
+fn blank_gap_positions(line: &LineResult) -> Vec<usize> {
+    if !line.is_vertical {
+        return Vec::new();
+    }
+    let n = line.text.chars().count();
+    if n < 2 || line.char_boxes.len() < n {
+        return Vec::new();
+    }
+    let centres: Vec<f32> = line
+        .char_boxes
+        .iter()
+        .take(n)
+        .map(|b| b.y as f32 + b.h as f32 / 2.0)
+        .collect();
+    let spacings: Vec<f32> = centres
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .collect();
+    let pitch = median_of(&mut spacings.clone());
+    if pitch <= 0.0 {
+        return Vec::new();
+    }
+    spacings
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| **s / pitch >= BLANK_GAP_RATIO)
+        .map(|(k, _)| k + 1)
+        .collect()
+}
+
+/// Mobile `interpolateGapBox`: a placeholder box centred between the two
+/// neighbours it was dropped from, sized as the mean of their extents along
+/// the reading axis.
+fn interpolate_gap_box(boxes: &[BoundingBox], index: usize, is_vertical: bool) -> BoundingBox {
+    let before = index.checked_sub(1).and_then(|i| boxes.get(i));
+    let after = boxes.get(index);
+    let (Some(before), Some(after)) = (before, after) else {
+        return before
+            .or(after)
+            .cloned()
+            .unwrap_or_else(|| BoundingBox::new(0, 0, 0, 0, 1.0));
+    };
+    // Integer maths, matching the mobile `JpDictRect` arithmetic exactly.
+    let (bl, bt, br, bb) = (before.left(), before.top(), before.right(), before.bottom());
+    let (al, at, ar, ab) = (after.left(), after.top(), after.right(), after.bottom());
+    if is_vertical {
+        let centre_y = ((bt + bb) / 2 + (at + ab) / 2) / 2;
+        let height = ((bb - bt + (ab - at)) / 2).max(1);
+        BoundingBox::new(
+            bl.min(al),
+            centre_y - height / 2,
+            br.max(ar) - bl.min(al),
+            height,
+            before.confidence,
+        )
+    } else {
+        let centre_x = ((bl + br) / 2 + (al + ar) / 2) / 2;
+        let width = ((br - bl + (ar - al)) / 2).max(1);
+        BoundingBox::new(
+            centre_x - width / 2,
+            bt.min(at),
+            width,
+            bb.max(ab) - bt.min(at),
+            before.confidence,
+        )
+    }
+}
+
+/// Mobile `LineResult.withGapCharAt`: insert the placeholder at `index`,
+/// growing text, char boxes and alternatives together so every parallel list
+/// still describes the same characters at the same indices. PC lines carry
+/// no CTC columns or overrides, so those mobile-list steps have no analogue.
+fn with_gap_char(line: &LineResult, index: usize) -> LineResult {
+    let chars: Vec<char> = line.text.chars().collect();
+    if index > chars.len() {
+        return line.clone();
+    }
+    let mut text: String = chars[..index].iter().collect();
+    text.push(GAP_CHAR);
+    text.extend(chars[index..].iter());
+
+    let char_boxes = if line.char_boxes.len() == chars.len() && !line.char_boxes.is_empty() {
+        let mut out = line.char_boxes.clone();
+        out.insert(
+            index,
+            interpolate_gap_box(&line.char_boxes, index, line.is_vertical),
+        );
+        out
+    } else {
+        line.char_boxes.clone()
+    };
+    let alternatives = if line.alternatives.len() == chars.len() && !line.alternatives.is_empty() {
+        let mut out = line.alternatives.clone();
+        out.insert(index, vec![(GAP_CHAR, 0.0)]);
+        out
+    } else {
+        line.alternatives.clone()
+    };
+    LineResult {
+        text,
+        char_boxes,
+        alternatives,
+        is_vertical: line.is_vertical,
+        ..line.clone()
+    }
+}
+
+/// Mobile `BlankGaps.apply`: materialise every measured gap as a placeholder.
+/// Vertical lines only, idempotent, insertions right-to-left so the
+/// detector's indices (computed against the original text) stay valid.
+fn apply_blank_gaps(line: &LineResult) -> LineResult {
+    if !line.is_vertical || line.text.contains(GAP_CHAR) {
+        return line.clone();
+    }
+    let gaps = blank_gap_positions(line);
+    if gaps.is_empty() {
+        return line.clone();
+    }
+    let mut out = line.clone();
+    for &index in gaps.iter().rev() {
+        out = with_gap_char(&out, index);
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PanState {
     pub is_panning: bool,
@@ -1575,6 +1728,14 @@ impl OcrViewer {
             self.selected_word = Some(SelectedWord { line_idx, char_idx });
             line.text.clone()
         };
+        // Mobile `OcrOverlayStateController.lookup` returns null for a blank
+        // placeholder: the position is selectable but has no definition.
+        if full_line_text.chars().nth(char_idx) == Some(GAP_CHAR) {
+            self.state.cached_entries = Rc::new(Vec::new());
+            self.state.current_word_length = 1;
+            self.state.update_highlight_coords(line_idx, char_idx, 1);
+            return;
+        }
         // Only look up if db/deinflector are loaded (bootstrap may not be done yet)
         if let (Some(db), Some(deinf)) = (self.db.as_ref(), self.deinflector.as_ref()) {
             if let Some(result) = self.state.lookup(line_idx, char_idx, db, deinf) {
@@ -1733,7 +1894,13 @@ impl OcrViewer {
     /// Called when a recognition result streams in from the background OCR thread.
     /// Replaces the detection-only annotation (bbox + line: None) at the given
     /// index with the full annotation (bbox + line with text and char_boxes).
-    pub fn handle_ocr_recognition_result(&mut self, index: usize, annotation: DetectedAnnotation) {
+    pub fn handle_ocr_recognition_result(&mut self, index: usize, mut annotation: DetectedAnnotation) {
+        // Mobile `addLineToResults` runs BlankGaps before layout (#44
+        // Feature 2), so the placeholder is part of the line from here on:
+        // text, char boxes and alternatives all grow together.
+        if let Some(line) = annotation.line.take() {
+            annotation.line = Some(apply_blank_gaps(&line));
+        }
         let line = annotation.line.clone();
         let quad = annotation.quad;
         if line.is_some() {
@@ -2591,6 +2758,51 @@ mod tests {
         // top = cy + ref_centre - (ymin + h) = 50 + 12 - 4 = 58.
         assert!((dy - 58.0).abs() < 1e-3, "comma dy={dy}");
         assert!((dx - 95.0).abs() < 1e-3, "comma dx={dx}");
+    }
+
+    /// Mobile `GapDetector`: a spacing ≥1.6× the median marks a dropped
+    /// character; vertical lines only, and never twice.
+    #[test]
+    fn blank_gaps_detect_wide_vertical_spacing() {
+        let boxes = vec![
+            BoundingBox::new(0, 0, 40, 20, 1.0),
+            BoundingBox::new(0, 20, 40, 20, 1.0),
+            BoundingBox::new(0, 120, 40, 20, 1.0),
+            BoundingBox::new(0, 140, 40, 20, 1.0),
+        ];
+        let mut line = line_with_boxes("あいうえ", boxes.clone(), true);
+        // Spacings 20/100/20 → pitch 20, the 100 gap triggers at index 2.
+        assert_eq!(blank_gap_positions(&line), vec![2]);
+        line.is_vertical = false;
+        assert!(blank_gap_positions(&line).is_empty(), "horizontal is not eligible");
+
+        // Idempotent, and the placeholder lands between its neighbours.
+        let gapped = apply_blank_gaps(&line_with_boxes("あいうえ", boxes, true));
+        assert_eq!(gapped.text.chars().collect::<Vec<_>>(), vec!['あ', 'い', GAP_CHAR, 'う', 'え']);
+        assert_eq!(gapped.char_boxes.len(), 5);
+        // Between box 1 (20..40) and box 2 (120..140): centre 80, height 20.
+        let gap_box = &gapped.char_boxes[2];
+        assert_eq!((gap_box.top(), gap_box.bottom()), (70, 90), "interpolated box");
+        assert_eq!(apply_blank_gaps(&gapped).text, gapped.text, "idempotent");
+
+        // Alternatives stay index-aligned.
+        let with_alts = LineResult {
+            alternatives: vec![vec![('あ', 1.0)], vec![('い', 1.0)], vec![('う', 1.0)], vec![('え', 1.0)]],
+            ..line_with_boxes(
+                "あいうえ",
+                vec![
+                    BoundingBox::new(0, 0, 40, 20, 1.0),
+                    BoundingBox::new(0, 20, 40, 20, 1.0),
+                    BoundingBox::new(0, 120, 40, 20, 1.0),
+                    BoundingBox::new(0, 140, 40, 20, 1.0),
+                ],
+                true,
+            )
+        };
+        let gapped = apply_blank_gaps(&with_alts);
+        assert_eq!(gapped.alternatives.len(), 5);
+        assert_eq!(gapped.alternatives[2][0].0, GAP_CHAR);
+        assert_eq!(gapped.alternatives[3][0].0, 'う');
     }
 
     /// Mobile degrades to a platform face and keeps rendering when the
