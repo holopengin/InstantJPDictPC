@@ -735,8 +735,13 @@ pub struct OverlayProgram {
     pub handle_pan_zoom: bool,
     /// Coordinates of characters to highlight in yellow (matched word).
     pub highlighted_coords: Vec<(usize, usize)>,
+    // Debug-overlay-only data (navigation graph arrows), read under
+    // `#[cfg(debug_assertions)]`.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub nav_edges_initial: Option<Vec<[usize; 4]>>,
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub nav_edges_final: Option<Vec<[usize; 4]>>,
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub nav_centers: Vec<(f32, f32)>,
 }
 
