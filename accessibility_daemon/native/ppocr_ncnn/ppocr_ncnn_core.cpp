@@ -140,7 +140,7 @@ bool rec_infer(RecNet* rec, const float* data, size_t dataFloats, int w, int h, 
     // graph, 204 pre-fusion; see rec_dyn.param tail). #25, fused #41.
     // Argmax/top-15 order is identical (softmax monotonic); scores become logits, which no
     // consumer reads absolutely (blankThreshold path is relative, default 0 = pure greedy).
-    // Lazy eval never runs softmax — saves ~4% (its exp/sum over 13193×seq post-prune). #25
+    // Lazy eval never runs softmax — saves ~4% (its exp/sum over 13353×seq post-prune). #25
     int ret = ex.extract(191, outMat);
     if (ret != 0) {
         PPOCR_LOGE("extract out0 failed %d", ret);

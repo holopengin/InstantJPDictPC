@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
-use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
-use imageproc::contours;
+use image::{DynamicImage, Rgba, RgbaImage};
 use std::path::Path;
 
 use crate::models::*;
@@ -25,7 +24,6 @@ const FURIGANA_HSHORT_RATIO: f32 = 0.85; // horizontal short-side ceiling
 const FURIGANA_WIDTH_RATIO: f32 = 0.65; // vertical small short-side ceiling
 const FURIGANA_GAP_RATIO: f32 = 0.5;
 const FURIGANA_OVERLAP_RATIO: f32 = 0.5;
-const VERTICAL_MIN_ASPECT: f32 = 1.25;
 // Absolute ceiling: real short columns dwarf ruby runs even when the ratio
 // matches — ruby longer than 12% of the image side is not ruby.
 const FURIGANA_MAX_FRAC: f32 = 0.12;
@@ -111,88 +109,284 @@ fn load_ppocr_models(
     Ok((ppocr_rec, ppocr_vocab, rec_remap))
 }
 
-/// Minimum-area rotated rectangle around a contour (cv2.minAreaRect
-/// equivalent): convex hull + exhaustive hull-edge orientations. Returns
-/// (cx, cy, w, h, angle_rad) with w = LONGER side and angle = angle of that
-/// side from +x (radians, y-down image coords).
-fn min_area_rect(points: &[imageproc::point::Point<i32>]) -> Option<(f32, f32, f32, f32, f32)> {
-    let hull = imageproc::geometry::convex_hull(points.to_vec());
-    if hull.len() < 3 {
+/// Bilinear sample of `src` at `(sx, sy)`; None when the point lies more than
+/// half a pixel outside (the caller keeps the background there), otherwise
+/// clamped to the source edges like Skia's CLAMP tile mode.
+fn sample_bilinear(src: &RgbaImage, sx: f32, sy: f32) -> Option<Rgba<u8>> {
+    let (sw, sh) = src.dimensions();
+    if sw == 0 || sh == 0 {
         return None;
     }
-    let n = hull.len();
-    let mut best: Option<(f32, f32, f32, f32)> = None; // (cx, cy, area, angle)
-    let mut best_w = 0.0f32;
-    let mut best_h = 0.0f32;
-    for i in 0..n {
-        let p1 = hull[i];
-        let p2 = hull[(i + 1) % n];
-        let dx = (p2.x - p1.x) as f32;
-        let dy = (p2.y - p1.y) as f32;
-        let len = (dx * dx + dy * dy).sqrt();
-        if len < 1e-6 {
-            continue;
-        }
-        let (ux, uy) = (dx / len, dy / len);
-        let (vx, vy) = (-uy, ux);
-        let mut min_u = f32::MAX;
-        let mut max_u = f32::MIN;
-        let mut min_v = f32::MAX;
-        let mut max_v = f32::MIN;
-        for p in &hull {
-            let u = p.x as f32 * ux + p.y as f32 * uy;
-            let v = p.x as f32 * vx + p.y as f32 * vy;
-            min_u = min_u.min(u);
-            max_u = max_u.max(u);
-            min_v = min_v.min(v);
-            max_v = max_v.max(v);
-        }
-        let w = max_u - min_u;
-        let h = max_v - min_v;
-        let area = w * h;
-        if best.map_or(true, |b| area < b.2) {
-            let uc = (min_u + max_u) / 2.0;
-            let vc = (min_v + max_v) / 2.0;
-            best = Some((
-                uc * ux + vc * vx,
-                uc * uy + vc * vy,
-                area,
-                uy.atan2(ux),
-            ));
-            best_w = w;
-            best_h = h;
-        }
+    let (sw_f, sh_f) = (sw as f32, sh as f32);
+    if sx < -0.5 || sy < -0.5 || sx > sw_f - 0.5 || sy > sh_f - 0.5 {
+        return None;
     }
-    let (cx, cy, _area, angle) = best?;
-    // Normalize: w = longer side, angle follows the long axis.
-    if best_w >= best_h {
-        Some((cx, cy, best_w, best_h, angle))
-    } else {
-        Some((cx, cy, best_h, best_w, angle + std::f32::consts::FRAC_PI_2))
+    let x0 = sx.floor().clamp(0.0, sw_f - 1.0);
+    let y0 = sy.floor().clamp(0.0, sh_f - 1.0);
+    let x1 = (x0 + 1.0).min(sw_f - 1.0);
+    let y1 = (y0 + 1.0).min(sh_f - 1.0);
+    let fx = (sx - x0).clamp(0.0, 1.0);
+    let fy = (sy - y0).clamp(0.0, 1.0);
+    let p00 = src.get_pixel(x0 as u32, y0 as u32).0;
+    let p10 = src.get_pixel(x1 as u32, y0 as u32).0;
+    let p01 = src.get_pixel(x0 as u32, y1 as u32).0;
+    let p11 = src.get_pixel(x1 as u32, y1 as u32).0;
+    let mut out = [0u8; 4];
+    for c in 0..4 {
+        let v0 = p00[c] as f32 * (1.0 - fx) + p10[c] as f32 * fx;
+        let v1 = p01[c] as f32 * (1.0 - fx) + p11[c] as f32 * fx;
+        out[c] = (v0 * (1.0 - fy) + v1 * fy).round().clamp(0.0, 255.0) as u8;
     }
+    Some(Rgba(out))
 }
 
-/// Rotate an image about its center by `angle` radians. Positive angle
-/// rotates the content toward +y (clockwise visually in y-down coords).
-/// Output keeps the input dimensions; out-of-bounds pixels are white.
-/// Nearest-neighbor sampling — fine for OCR crops, avoids interpolation blur.
-fn rotate_crop(img: &DynamicImage, angle: f32) -> DynamicImage {
-    let (w, h) = img.dimensions();
-    let (wc, hc) = (w as f32 / 2.0, h as f32 / 2.0);
-    let (s, c) = angle.sin_cos();
-    let mut out = RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]));
-    for y in 0..h {
-        for x in 0..w {
-            let dx = x as f32 - wc;
-            let dy = y as f32 - hc;
-            let sx = c * dx + s * dy + wc; // R(-angle) = [c, s; -s, c]
-            let sy = -s * dx + c * dy + hc;
-            if sx >= 0.0 && sy >= 0.0 && sx < w as f32 && sy < h as f32 {
-                out.put_pixel(x, y, img.get_pixel(sx as u32, sy as u32));
+/// Bilinear-blit `src` into `dst` with its top-left at the exact float offset
+/// `(left, top)` — mobile draws the resized det bitmap at the float centering
+/// offset with filtering, so a `.5` offset blends the content edge with the
+/// gray letterbox pad.
+fn blit_filtered(dst: &mut RgbaImage, src: &RgbaImage, left: f32, top: f32) {
+    let (dw, dh) = dst.dimensions();
+    let (sw, sh) = src.dimensions();
+    if sw == 0 || sh == 0 {
+        return;
+    }
+    let x_start = left.floor().max(0.0) as u32;
+    let y_start = top.floor().max(0.0) as u32;
+    let x_end = ((left + sw as f32).ceil() as u32).min(dw);
+    let y_end = ((top + sh as f32).ceil() as u32).min(dh);
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            // Source coordinate at this destination pixel's centre.
+            let sx = (x as f32 + 0.5) - left - 0.5;
+            let sy = (y as f32 + 0.5) - top - 0.5;
+            if let Some(px) = sample_bilinear(src, sx, sy) {
+                dst.put_pixel(x, y, px);
             }
         }
     }
-    DynamicImage::ImageRgba8(out)
+}
+
+/// Mobile `warpRotatedCrop` (#53): draw the source through the frame's
+/// inverse into an upright `localW × localH` bitmap. `setPolyToPoly` maps the
+/// frame's four corners to the upright rect, so the inverse samples
+/// `c0 + (dx/w)·localWidth·xAxis + (dy/h)·localHeight·yAxis`; bilinear, like
+/// the mobile FILTER_BITMAP_FLAG paint. Pixels outside the source stay
+/// transparent.
+fn warp_quad_crop(image: &DynamicImage, quad: &RotatedBox) -> Option<DynamicImage> {
+    let w = quad.w.round().max(4.0) as u32;
+    let h = quad.h.round().max(4.0) as u32;
+    let (xa, ya) = (quad.x_axis(), quad.y_axis());
+    let (ox, oy) = quad.origin();
+    let src = image.to_rgba8();
+    let mut out = RgbaImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 + 0.5;
+            let dy = y as f32 + 0.5;
+            let lx = dx / w as f32 * quad.w;
+            let ly = dy / h as f32 * quad.h;
+            let sx = ox + lx * xa.0 + ly * ya.0;
+            let sy = oy + lx * xa.1 + ly * ya.1;
+            if let Some(px) = sample_bilinear(&src, sx, sy) {
+                out.put_pixel(x, y, px);
+            }
+        }
+    }
+    Some(DynamicImage::ImageRgba8(out))
+}
+
+/// A frame's enclosing AABB as the shared `BoundingBox` (rounded like every
+/// other box in the pipeline).
+fn rect_of(q: &RotatedBox) -> BoundingBox {
+    let (x, y, w, h) = q.aabb();
+    BoundingBox::new(
+        x.round() as i32,
+        y.round() as i32,
+        w.round() as i32,
+        h.round() as i32,
+        q.confidence,
+    )
+}
+
+/// Mobile `detectRotated`'s component walk: 8-connected flood fill over
+/// `prob > thresh`, the component's boundary pixel corners in source space,
+/// `fitQuad`, then DB unclip on the frame's own axes. Returns index-aligned
+/// `(pre-unclip, unclipped)` frames. `expand_cap` is a PC-only cap in source
+/// pixels (default infinity = Android's uncapped unclip).
+#[allow(clippy::too_many_arguments)]
+fn fit_components(
+    prob_map: &[f32],
+    out_w: u32,
+    out_h: u32,
+    det_thresh: f32,
+    det_unclip: f32,
+    expand_cap: f32,
+    img_left: f32,
+    img_top: f32,
+    scale_w: f32,
+    scale_h: f32,
+) -> (Vec<RotatedBox>, Vec<RotatedBox>) {
+    let ow = out_w as usize;
+    let oh = out_h as usize;
+    let mut visited = vec![0u8; ow * oh];
+    let mut queue: Vec<u32> = Vec::with_capacity(ow * oh);
+    let mut points: Vec<(f32, f32)> = Vec::new();
+    let mut pre_quads: Vec<RotatedBox> = Vec::new();
+    let mut quads: Vec<RotatedBox> = Vec::new();
+    for y in 0..oh {
+        for x in 0..ow {
+            let idx = y * ow + x;
+            if visited[idx] != 0 || prob_map.get(idx).copied().unwrap_or(0.0) <= det_thresh {
+                continue;
+            }
+            // One 8-connected component (mobile floodFillComponent).
+            queue.clear();
+            queue.push(idx as u32);
+            visited[idx] = 1;
+            let mut head = 0usize;
+            while head < queue.len() {
+                let cur = queue[head] as usize;
+                head += 1;
+                let cx = cur % ow;
+                let cy = cur / ow;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+                        if nx < 0 || ny < 0 || nx >= out_w as i32 || ny >= out_h as i32 {
+                            continue;
+                        }
+                        let n_idx = ny as usize * ow + nx as usize;
+                        if visited[n_idx] == 0
+                            && prob_map.get(n_idx).copied().unwrap_or(0.0) > det_thresh
+                        {
+                            visited[n_idx] = 1;
+                            queue.push(n_idx as u32);
+                        }
+                    }
+                }
+            }
+            if queue.len() < 3 {
+                continue; // mobile noise filter counts ALL component pixels
+            }
+
+            // Boundary pixels: any 8-neighbour outside the mask. Their
+            // outer corners in source space enclose exactly the pixels the
+            // axis-aligned min/max box covers.
+            points.clear();
+            for &cur in &queue {
+                let cur = cur as usize;
+                let cx = cur % ow;
+                let cy = cur / ow;
+                let mut boundary = false;
+                'neighbours: for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+                        if nx < 0
+                            || ny < 0
+                            || nx >= out_w as i32
+                            || ny >= out_h as i32
+                            || prob_map
+                                .get(ny as usize * ow + nx as usize)
+                                .copied()
+                                .unwrap_or(0.0)
+                                <= det_thresh
+                        {
+                            boundary = true;
+                            break 'neighbours;
+                        }
+                    }
+                }
+                if !boundary {
+                    continue;
+                }
+                let mx = (cx as f32 - img_left) * scale_w;
+                let my = (cy as f32 - img_top) * scale_h;
+                points.push((mx - 0.5 * scale_w, my - 0.5 * scale_h));
+                points.push((mx + 0.5 * scale_w, my - 0.5 * scale_h));
+                points.push((mx + 0.5 * scale_w, my + 0.5 * scale_h));
+                points.push((mx - 0.5 * scale_w, my + 0.5 * scale_h));
+            }
+
+            // Mobile RotatedGeometry.fitQuad on the source-space corners.
+            let Some(pre_quad) = fit_quad(&points) else {
+                continue;
+            };
+            // DB unclip on the frame's own axes (mobile unclip); the cap is
+            // a PC-only knob, off by default.
+            let quad = if expand_cap.is_finite() {
+                let (pw, ph) = (pre_quad.w, pre_quad.h);
+                let expand = if pw > 1e-6 && ph > 1e-6 {
+                    pw * ph * det_unclip / (2.0 * (pw + ph))
+                } else {
+                    0.0
+                };
+                let expand = expand.min(expand_cap);
+                pre_quad.inset(-expand, -expand)
+            } else {
+                pre_quad.unclip(det_unclip)
+            };
+            if quad.w < 4.0 || quad.h < 4.0 {
+                continue;
+            }
+            pre_quads.push(pre_quad);
+            quads.push(quad);
+        }
+    }
+    (pre_quads, quads)
+}
+
+/// Mobile `detectRotated`'s post-fit stages: furigana rejection on AABB
+/// geometry (same rule and raw-vs-unclipped pair as the axis path), the
+/// local-size filter, the enclosing-blob filter (#53) and the vertical 5%
+/// cross-axis inset. Returns the surviving frames.
+fn filter_fitted_quads(
+    pre_quads: &[RotatedBox],
+    quads: &[RotatedBox],
+    orig_w: i32,
+    orig_h: i32,
+) -> Vec<RotatedBox> {
+    let pre_rects: Vec<BoundingBox> = pre_quads.iter().map(rect_of).collect();
+    let uncl_rects: Vec<BoundingBox> = quads.iter().map(rect_of).collect();
+    let keep = filter_furigana(&pre_rects, &uncl_rects, orig_w, orig_h);
+
+    // Min-size filter uses the frame's own local sizes (mobile).
+    let mut min_sized: Vec<RotatedBox> = Vec::new();
+    for (i, q) in quads.iter().enumerate() {
+        if !keep.get(i).copied().unwrap_or(true) {
+            eprintln!(
+                "[PP-OCR DET] furigana dropped {}x{}@({}, {})",
+                pre_rects[i].w, pre_rects[i].h, pre_rects[i].x, pre_rects[i].y
+            );
+            continue;
+        }
+        if q.w < 10.0 || q.h < 10.0 {
+            continue;
+        }
+        min_sized.push(*q);
+    }
+    // A DB blob that merged several Lines fits one frame covering them all
+    // while the Lines inside arrive as their own smaller fits; the blob is
+    // the false positive, so drop it before it can become a Line.
+    let kept = filter_enclosing_blobs(&min_sized);
+    let blobs = min_sized.len() - kept.len();
+    if blobs > 0 {
+        eprintln!("[PP-OCR DET] {blobs} enclosing blob(s) filtered");
+    }
+    kept.iter()
+        .map(|q| {
+            if q.is_vertical() {
+                q.inset(q.w * 0.05, 0.0)
+            } else {
+                *q
+            }
+        })
+        .collect()
 }
 
 /// Mobile shared orientation rule (#28): near-square boxes count as vertical
@@ -461,42 +655,486 @@ fn trim_ruby_gutter_vertical(
         );
         let delta = (b.x + b.w - cut) as f32;
         b.w = cut - b.x;
-        // Non-rotated vertical: the short side is the width; keep the quad
-        // in sync so crops/char boxes follow the trim.
-        r.h -= delta;
+        // Non-rotated vertical: the cross axis is the frame's local x; keep
+        // the quad in sync so crops/char boxes follow the trim.
+        r.w -= delta;
         r.cx -= delta / 2.0;
         trimmed += 1;
     }
     trimmed
 }
 
-/// Cross-axis size of a character cell: fullwidth JP occupies the line's
-/// cross size, halfwidth latin/katakana half of it.
-fn char_cell_width(ch: Option<char>, cross: f32) -> f32 {
-    match ch {
-        Some(c) if crate::util::japanese::is_half_width(c) => cross * 0.5,
-        _ => cross,
+/// Mobile `BOX_LAYOUT_MODE` (0 = legacy uniform columns, 1 = legacy + ink
+/// snapping; default 1). `BOX_LAYOUT_MODE=0` disables snapping.
+fn box_layout_snap() -> bool {
+    std::env::var("BOX_LAYOUT_MODE")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(1)
+        == 1
+}
+
+/// Mobile `BOX_UNIFORM_SIZE` (default true): uniform em widths around the
+/// resolved centres.
+fn box_uniform_size() -> bool {
+    std::env::var("BOX_UNIFORM_SIZE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// Mobile `legacyCells` (#49): centre ± cross/2 at `(t + 0.5) · L/seqLen`,
+/// clamped to `[0, L]`, sorted by start.
+fn legacy_cells(cols: &[f32], seq_len: usize, l: f32, cross: f32) -> Vec<(f32, f32)> {
+    let avg_col_w = l / seq_len as f32;
+    let half = cross / 2.0;
+    let mut cells: Vec<(f32, f32)> = cols
+        .iter()
+        .map(|&t| {
+            let c = (t + 0.5) * avg_col_w;
+            ((c - half).max(0.0), (c + half).min(l))
+        })
+        .collect();
+    cells.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    cells
+}
+
+/// Mobile `isSnapSkipped`: punctuation whose ink centroid is not the em
+/// centre, small kana and midline marks keep their legacy boxes.
+fn is_snap_skipped(ch: char) -> bool {
+    if "ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ".contains(ch) {
+        return true;
     }
+    "、。．，,．「」『』（）〔〕［］｛｝〈〉《》【】〘〙〚〛'\"\"‘’“”()[]{}-+*/<>＜＞＝…‥︙︰：；"
+        .contains(ch)
 }
 
-/// Max length of a character cell along the reading axis: 1.1x its own width
-/// (so 1.1x the line cross size for JP, 0.55x for halfwidth latin).
-fn char_cell_max_len(ch: Option<char>, cross: f32) -> f32 {
-    char_cell_width(ch, cross) * 1.1
+/// Mobile `snapCells` (idea 4): snap legacy box centres to image-ink evidence
+/// along the line axis. Profiled over the central 60% cross-band (dodges ruby
+/// at the edges); each centre moves to its window ink centroid, clamped to its
+/// Voronoi cell with a 0.4-pitch leash. Polarity auto-detects from border
+/// pixels. `pixels` are RGB8 in the (possibly clamped) crop frame; `l` is the
+/// full frame length the cells live in, so the profile scales defensively at
+/// image edges.
+fn snap_cells(
+    cells: &[(f32, f32)],
+    text: &[char],
+    pixels: &[u8],
+    pix_w: u32,
+    pix_h: u32,
+    vertical: bool,
+    l: f32,
+) -> Vec<(f32, f32)> {
+    if cells.is_empty() || pix_w < 8 || pix_h < 8 {
+        return cells.to_vec();
+    }
+    let (pw, ph) = (pix_w as usize, pix_h as usize);
+    if pixels.len() < pw * ph * 3 {
+        return cells.to_vec();
+    }
+    let lum: Vec<f32> = (0..pw * ph)
+        .map(|i| {
+            let p = i * 3;
+            (pixels[p] as f32 + pixels[p + 1] as f32 + pixels[p + 2] as f32) / 3.0
+        })
+        .collect();
+    // Background polarity from border samples.
+    let mut border: Vec<f32> = Vec::new();
+    let mut bi = 0usize;
+    while bi < pw {
+        border.push(lum[bi]);
+        border.push(lum[(ph - 1) * pw + bi]);
+        bi += 7;
+    }
+    bi = 0;
+    while bi < ph {
+        border.push(lum[bi * pw]);
+        border.push(lum[bi * pw + pw - 1]);
+        bi += 7;
+    }
+    if border.is_empty() {
+        return cells.to_vec();
+    }
+    border.sort_by(f32::total_cmp);
+    let bg_light = border[border.len() / 2] > 128.0;
+    let is_ink = |v: f32| if bg_light { v < 110.0 } else { v > 145.0 };
+    // Axis profile over the central cross-band.
+    let prof_len = if vertical { ph } else { pw };
+    let mut prof = vec![0.0f32; prof_len];
+    if vertical {
+        let x0 = (pw as f32 * 0.2) as usize;
+        let x1 = (pw as f32 * 0.8) as usize;
+        for y in 0..ph {
+            let mut m = 0.0f32;
+            for x in x0..x1 {
+                if is_ink(lum[y * pw + x]) {
+                    m += 1.0;
+                }
+            }
+            prof[y] = m;
+        }
+    } else {
+        let y0 = (ph as f32 * 0.2) as usize;
+        let y1 = (ph as f32 * 0.8) as usize;
+        for x in 0..pw {
+            let mut m = 0.0f32;
+            for y in y0..y1 {
+                if is_ink(lum[y * pw + x]) {
+                    m += 1.0;
+                }
+            }
+            prof[x] = m;
+        }
+    }
+    // Box blur radius 2.
+    let sm: Vec<f32> = (0..prof_len)
+        .map(|i| {
+            let mut a = 0.0f32;
+            let mut c = 0usize;
+            for k in -2i32..=2 {
+                let j = (i as i32 + k).clamp(0, prof_len as i32 - 1) as usize;
+                a += prof[j];
+                c += 1;
+            }
+            a / c as f32
+        })
+        .collect();
+    let centers: Vec<f32> = cells.iter().map(|(a, b)| (a + b) / 2.0).collect();
+    // Ink peaks along the axis (local maxima with prominence): each box snaps
+    // to the NEAREST peak, and each peak carries ARGMAX + CENTROID.
+    let mut peaks: Vec<(f32, f32, f32)> = Vec::new(); // (argmax, centroid, mass)
+    let mut p = 1usize;
+    while p + 1 < prof_len {
+        if sm[p] > sm[p - 1] && sm[p] >= sm[p + 1] {
+            let mut lft = p;
+            while lft > 0 && sm[lft - 1] >= sm[lft] * 0.5 {
+                lft -= 1;
+            }
+            let mut rgt = p;
+            while rgt < prof_len - 1 && sm[rgt + 1] >= sm[rgt] * 0.5 {
+                rgt += 1;
+            }
+            let (mut m2, mut mo, mut am, mut ap) = (0.0f32, 0.0f32, -1.0f32, p);
+            for q in lft..=rgt {
+                m2 += sm[q];
+                mo += sm[q] * q as f32;
+                if sm[q] > am {
+                    am = sm[q];
+                    ap = q;
+                }
+            }
+            if m2 > 0.0 {
+                peaks.push((ap as f32, mo / m2, m2));
+            }
+            p = rgt + 1;
+        } else {
+            p += 1;
+        }
+    }
+    let mut masses: Vec<f32> = peaks.iter().map(|pk| pk.2).collect();
+    masses.sort_by(f32::total_cmp);
+    let med_mass = if masses.is_empty() {
+        0.0
+    } else {
+        masses[masses.len() / 2]
+    };
+    cells
+        .iter()
+        .enumerate()
+        .map(|(i, &(a, b))| {
+            if i >= text.len() || is_snap_skipped(text[i]) {
+                return (a, b);
+            }
+            let c = centers[i];
+            let pitch = (b - a).max(4.0);
+            let scale = prof_len as f32 / l.max(1.0);
+            let cp = (c * scale).clamp(0.0, prof_len as f32 - 1.0);
+            let mut best: Option<(f32, f32, f32)> = None;
+            let mut best_d = 0.5 * pitch * scale + 1.0;
+            for &pk in &peaks {
+                if pk.2 < 6.0f32.max(0.35 * med_mass) {
+                    continue;
+                }
+                let d = (pk.1 - cp).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = Some(pk);
+                }
+            }
+            let Some(best) = best else { return (a, b) };
+            // Agreement veto: centroid far from argmax = merged neighbours.
+            if (best.1 - best.0).abs() > 0.3 * pitch * scale {
+                return (a, b);
+            }
+            // Min-move gate: sub-visible moves (< 3px) carry measurement risk.
+            if (best.1 / scale - c).abs() < 3.0 {
+                return (a, b);
+            }
+            let mut nc = best.1 / scale;
+            // Voronoi clamp between neighbour centres (ends: line bounds).
+            let lo_b = if i > 0 {
+                (centers[i - 1] + c) / 2.0
+            } else {
+                0.0
+            };
+            let hi_b = if i < centers.len() - 1 {
+                (c + centers[i + 1]) / 2.0
+            } else {
+                l
+            };
+            nc = nc.clamp(lo_b, hi_b);
+            nc = nc.clamp(c - 0.4 * pitch, c + 0.4 * pitch);
+            let len = b - a;
+            let s0 = (nc - len / 2.0).clamp(0.0, (l - len).max(0.0));
+            (s0, (s0 + len).min(l))
+        })
+        .collect()
 }
 
-/// Resolve one overlapping pair of character cells: move the shared boundary
-/// to where both boxes reach the same aspect ratio (length / width), clamped
-/// into the overlap so at worst the edges align and the boxes just touch.
-/// Cells are `(start, end)` along the reading axis.
-fn split_overlap_same_aspect(a: &mut (f32, f32), b: &mut (f32, f32), wa: f32, wb: f32) {
-    if a.1 <= b.0 {
+/// Load the PC overlay's JP font for ink measurement (mobile measures with the
+/// device DEFAULT typeface; the PC equivalent is the bundled NotoSansJP the
+/// viewer draws with). Cached after the first successful read.
+fn ink_font_data() -> Option<&'static Vec<u8>> {
+    static FONT: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    FONT.get_or_init(|| {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(p) = std::env::var("JPDICT_FONT") {
+            candidates.push(std::path::PathBuf::from(p));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("fonts/NotoSansJP-Regular.ttf"));
+                candidates.push(dir.join("usr/bin/fonts/NotoSansJP-Regular.ttf"));
+            }
+        }
+        candidates.push(std::path::PathBuf::from("fonts/NotoSansJP-Regular.ttf"));
+        candidates.push(std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fonts/NotoSansJP-Regular.ttf"
+        )));
+        candidates.push(std::path::PathBuf::from(
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        ));
+        candidates.push(std::path::PathBuf::from(
+            "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
+        ));
+        candidates.iter().find_map(|p| std::fs::read(p).ok())
+    })
+    .as_ref()
+}
+
+/// Ink half-widths (px) per char at `render_size`, from the font's glyph
+/// bounding boxes — mobile's `Paint.getTextBounds(...).width() / 2`.
+fn ink_half_widths(chars: &[char], render_size: f32) -> Vec<f32> {
+    let Some(data) = ink_font_data() else {
+        return vec![0.0; chars.len()];
+    };
+    let Ok(face) = ttf_parser::Face::parse(data, 0) else {
+        return vec![0.0; chars.len()];
+    };
+    let upem = face.units_per_em().max(1) as f32;
+    chars
+        .iter()
+        .map(|&c| {
+            let gid = face.glyph_index(c).unwrap_or(ttf_parser::GlyphId(0));
+            match face.glyph_bounding_box(gid) {
+                Some(bb) => {
+                    ((bb.x_max - bb.x_min) as f32 / upem * render_size).max(0.0) / 2.0
+                }
+                None => 0.0,
+            }
+        })
+        .collect()
+}
+
+/// Mobile `resolveInkCollisions` (#49): move centres only where glyph ink
+/// actually collides at render size, splitting just the collision. Widths are
+/// preserved; only centres move.
+fn resolve_ink_collisions(cells: &mut [(f32, f32)], chars: &[char], render_text_size: f32) {
+    let n = cells.len();
+    if n < 2 {
         return;
     }
-    let m = (wa * b.1 + wb * a.0) / (wa + wb);
-    let m = m.clamp(b.0, a.1);
-    a.1 = m;
-    b.0 = m;
+    let ink_half = ink_half_widths(chars, render_text_size.max(1.0));
+    let mut centers: Vec<f32> = cells.iter().map(|(a, b)| (a + b) / 2.0).collect();
+    for ci in 0..n - 1 {
+        let ink_r = centers[ci] + ink_half.get(ci).copied().unwrap_or(0.0);
+        let ink_l = centers[ci + 1] - ink_half.get(ci + 1).copied().unwrap_or(0.0);
+        if ink_r <= ink_l {
+            continue;
+        }
+        let shift = (ink_r - ink_l) / 2.0;
+        centers[ci] -= shift;
+        centers[ci + 1] += shift;
+    }
+    for i in 0..n {
+        let half = (cells[i].1 - cells[i].0) / 2.0;
+        let c = centers[i];
+        cells[i] = (c - half, c + half);
+    }
+}
+
+/// Mobile `uniformCells` (#49): uniform WIDTHS around existing centres
+/// (centres bit-identical to the resolve path). em = median width-normalized
+/// pitch (`estimate_em`); fullwidth = em, halfwidth = 0.5em; edges clamped,
+/// centres never moved.
+fn uniform_cells(cells: &[(f32, f32)], chars: &[char], l: f32) -> Vec<(f32, f32)> {
+    if cells.len() < 2 || chars.len() != cells.len() {
+        return cells.to_vec();
+    }
+    let centers: Vec<f32> = cells.iter().map(|(a, b)| (a + b) / 2.0).collect();
+    let text: String = chars.iter().collect();
+    let em = crate::util::japanese::estimate_em(&text, &centers);
+    if em <= 0.0 {
+        return cells.to_vec();
+    }
+    cells
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let w = (if crate::util::japanese::is_half_width(chars[i]) {
+                0.5
+            } else {
+                1.0
+            }) * em;
+            let half = w / 2.0;
+            let c = centers[i];
+            ((c - half).max(0.0), (c + half).min(l))
+        })
+        .collect()
+}
+
+/// Mobile vertical punctuation sets (`OcrEngine.computeCharBoxes`): closing
+/// marks shrink onto the next box's start, opening marks onto the previous
+/// box's end. Kept byte-for-byte with Android (D7.3/D46).
+pub fn is_vertical_closing_punct(ch: char) -> bool {
+    "。.．、,，)）〕》」』】〙〗〟’”］".contains(ch)
+}
+
+pub fn is_vertical_opening_punct(ch: char) -> bool {
+    "(（〔《「『【〘〖〝‘“［".contains(ch)
+}
+
+/// Mobile `computeCharBoxes` (#49): per-character boxes from CTC timestep
+/// columns. Horizontal: centre each char at `(t+0.5)·cropW/seqLenTotal` with
+/// height `cropH`, then snap / ink-resolve / uniform-size. Vertical: same on
+/// the y axis with width `cropW`, with the punctuation rules. `pixels` (RGB8
+/// crop + dims) enables the snap stage; pass None to force legacy columns.
+pub fn compute_char_boxes(
+    text: &str,
+    char_cols: &[f32],
+    seq_len_total: usize,
+    crop_x: i32,
+    crop_y: i32,
+    crop_w: u32,
+    crop_h: u32,
+    is_vertical: bool,
+    pixels: Option<(&[u8], u32, u32)>,
+) -> Vec<BoundingBox> {
+    let n = char_cols.len();
+    if n == 0 || seq_len_total == 0 {
+        return Vec::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // Android keeps charCols and text index-aligned; clamp defensively so a
+    // mismatched caller cannot panic a recognition worker.
+    let n = char_cols.len().min(chars.len());
+    let char_cols = &char_cols[..n];
+    if !is_vertical {
+        // ── HORIZONTAL: x-axis char boxes ──
+        let char_w = (crop_h as f32).max(3.0);
+        let l = crop_w as f32;
+        let base = legacy_cells(char_cols, seq_len_total, l, char_w);
+        let cells = match (box_layout_snap(), pixels) {
+            (true, Some((px, pw, ph))) => snap_cells(&base, &chars, px, pw, ph, false, l),
+            _ => base,
+        };
+        let mut resolved = cells;
+        resolve_ink_collisions(&mut resolved, &chars, crop_h as f32 * 0.90);
+        let sized = if box_uniform_size() {
+            uniform_cells(&resolved, &chars, l)
+        } else {
+            resolved
+        };
+        sized
+            .iter()
+            .map(|&(xl, xr)| {
+                let left = (crop_x as f32 + xl).round() as i32;
+                let right = (crop_x as f32 + xr).round() as i32;
+                BoundingBox::new(left, crop_y, (right - left).max(1), crop_h as i32, 1.0)
+            })
+            .collect()
+    } else {
+        // ── VERTICAL: y-axis char boxes with punctuation handling ──
+        let avg_ch_h = (crop_w as f32).max(3.0);
+        let l = crop_h as f32;
+        let base = legacy_cells(char_cols, seq_len_total, l, avg_ch_h);
+        let cells = match (box_layout_snap(), pixels) {
+            (true, Some((px, pw, ph))) => snap_cells(&base, &chars, px, pw, ph, true, l),
+            _ => base,
+        };
+        let is_cp: Vec<bool> = chars.iter().map(|&c| is_vertical_closing_punct(c)).collect();
+        let is_op: Vec<bool> = chars.iter().map(|&c| is_vertical_opening_punct(c)).collect();
+
+        // Resolve overlaps with punctuation rules (always; positions).
+        let mut resolved = cells;
+        for ci in 0..n.saturating_sub(1) {
+            if resolved[ci].1 <= resolved[ci + 1].0 {
+                continue;
+            }
+            if is_cp[ci] {
+                resolved[ci].1 = resolved[ci + 1].0;
+            } else if is_op[ci + 1] {
+                resolved[ci + 1].0 = resolved[ci].1;
+            } else if is_cp[ci + 1] {
+                resolved[ci + 1].0 = resolved[ci].1;
+            } else if is_op[ci] {
+                resolved[ci].1 = resolved[ci + 1].0;
+            } else {
+                let h = (resolved[ci].1 - resolved[ci + 1].0) / 2.0;
+                resolved[ci].1 -= h;
+                resolved[ci + 1].0 += h;
+            }
+        }
+        // Expand punctuation cells to the average non-punctuation height.
+        let mut sized = if box_uniform_size() {
+            uniform_cells(&resolved, &chars, l)
+        } else {
+            resolved
+        };
+        let hs: Vec<f32> = sized
+            .iter()
+            .enumerate()
+            .filter(|(ci, _)| !is_cp[*ci] && !is_op[*ci])
+            .map(|(_, c)| c.1 - c.0)
+            .collect();
+        let avg_np_h = if hs.is_empty() {
+            crop_w as f32
+        } else {
+            hs.iter().sum::<f32>() / hs.len() as f32
+        };
+        for ci in 0..n {
+            if is_cp[ci] {
+                let nx = ((ci + 1)..n)
+                    .find(|&j| !is_cp[j] && !is_op[j])
+                    .map(|j| sized[j].0)
+                    .unwrap_or(f32::INFINITY);
+                sized[ci].1 = (sized[ci].0 + avg_np_h).min(nx).max(sized[ci].1);
+            } else if is_op[ci] {
+                let pb = (0..ci).rev().find(|&j| !is_cp[j] && !is_op[j]);
+                let pl = pb.map(|j| sized[j].1).unwrap_or(f32::NEG_INFINITY);
+                sized[ci].0 = (sized[ci].1 - avg_np_h).max(pl).min(sized[ci].0);
+            }
+        }
+        sized
+            .iter()
+            .map(|&(yt, yb)| {
+                let ch = (yb - yt).max(1.0);
+                let top = (crop_y as f32 + yt).round() as i32;
+                let bottom = (crop_y as f32 + yt + ch).round() as i32;
+                BoundingBox::new(crop_x, top, crop_w as i32, (bottom - top).max(1), 1.0)
+            })
+            .collect()
+    }
 }
 
 impl OcrEngine {
@@ -551,13 +1189,18 @@ impl OcrEngine {
         let scale = target_long as f32 / orig_w.max(orig_h);
         let resize_w = ((orig_w * scale).round() as u32).max(32);
         let resize_h = ((orig_h * scale).round() as u32).max(32);
-        let img_left = (model_size - resize_w) / 2;
-        let img_top = (model_size - resize_h) / 2;
+        // Mobile draws the resized bitmap at the exact float centering offset
+        // (`(modelSize - resizeW) / 2f`, e.g. 261.5) with a filtered blit, so
+        // a half-pixel offset shifts/blends the content edge with the gray
+        // pad. Keep the same float offset and bilinear-blit instead of the
+        // old integer `replace`.
+        let img_left = (model_size - resize_w) as f32 / 2.0;
+        let img_top = (model_size - resize_h) as f32 / 2.0;
 
         let resized = image.resize_exact(resize_w, resize_h, image::imageops::FilterType::Triangle);
         let mut letterbox =
             RgbaImage::from_pixel(model_size, model_size, Rgba([128u8, 128u8, 128u8, 255u8]));
-        image::imageops::replace(&mut letterbox, &resized.to_rgba8(), img_left as i64, img_top as i64);
+        blit_filtered(&mut letterbox, &resized.to_rgba8(), img_left, img_top);
 
         // 2. Convert to NCHW float with ImageNet normalization, same per-pixel
         // math as the mobile DET_NORM_LUT ((v/255 - mean) / std per channel).
@@ -586,30 +1229,34 @@ impl OcrEngine {
 
         // The net should emit model_size²; a smaller square (stride) gets
         // nearest-upsampled like mobile, so downstream coords are always in
-        // letterbox space.
-        let prob_map: Vec<f32> = if raw_map.len() == h * w {
-            raw_map
+        // letterbox space. Any other shape is treated as flat (mobile's
+        // fallback: derive side = sqrt(total) and carry on with a warning)
+        // rather than hard-failing the whole detection.
+        let (prob_map, out_w, out_h): (Vec<f32>, u32, u32) = if raw_map.len() == h * w {
+            (raw_map, model_size, model_size)
         } else {
             let dim = (raw_map.len() as f64).sqrt() as u32;
-            if dim == 0 || (dim * dim) as usize != raw_map.len() || dim > model_size {
-                anyhow::bail!(
-                    "unexpected det output size {} for {}x{} input",
-                    raw_map.len(),
-                    model_size,
-                    model_size
-                );
-            }
-            let mut up = vec![0.0f32; h * w];
-            let step = dim as f32 / model_size as f32;
-            for y in 0..h {
-                for x in 0..w {
-                    let sx = ((x as f32 * step) as u32).min(dim - 1) as usize;
-                    let sy = ((y as f32 * step) as u32).min(dim - 1) as usize;
-                    up[y * w + x] = raw_map[sy * dim as usize + sx];
+            if dim > 0 && (dim * dim) as usize == raw_map.len() && dim <= model_size {
+                let mut up = vec![0.0f32; h * w];
+                let step = dim as f32 / model_size as f32;
+                for y in 0..h {
+                    for x in 0..w {
+                        let sx = ((x as f32 * step) as u32).min(dim - 1) as usize;
+                        let sy = ((y as f32 * step) as u32).min(dim - 1) as usize;
+                        up[y * w + x] = raw_map[sy * dim as usize + sx];
+                    }
                 }
+                eprintln!("[PP-OCR DET] upsampled det output {dim}x{dim} -> {model_size}x{model_size}");
+                (up, model_size, model_size)
+            } else {
+                let side = (raw_map.len() as f64).sqrt() as u32;
+                anyhow::ensure!(side > 0, "unexpected det output size {}", raw_map.len());
+                eprintln!(
+                    "[PP-OCR DET] unexpected prob size {}, using {side}x{side}",
+                    raw_map.len()
+                );
+                (raw_map, side, side)
             }
-            eprintln!("[PP-OCR DET] upsampled det output {dim}x{dim} -> {model_size}x{model_size}");
-            up
         };
         // Debug: print prob_map statistics to understand value range
         if !prob_map.is_empty() {
@@ -619,17 +1266,17 @@ impl OcrEngine {
             let mean = sum / prob_map.len() as f32;
             eprintln!("[PP-OCR DET] prob_map: min={min_val:.4} max={max_val:.4} mean={mean:.4}");
         }
-        let out_w = model_size;
-        let out_h = model_size;
 
         // Scale factors from letterbox space to the original image; content
         // sits at (img_left, img_top) after centering.
         let scale_w = orig_w / resize_w as f32;
         let scale_h = orig_h / resize_h as f32;
 
-        // 5. Threshold → find contours → bounding boxes
-        // DET_THRESH / DET_UNCLIP env overrides let us sweep parameters
-        // without rebuilding (defaults = the consts above).
+        // 5. Threshold → flood-fill components → min-area fits (mobile
+        // detectRotated, the default path): an 8-connected fill over
+        // `prob > thresh`, the component's boundary pixel corners in source
+        // space, then RotatedGeometry.fitQuad. DET_THRESH / DET_UNCLIP env
+        // overrides let us sweep parameters without rebuilding.
         let det_thresh: f32 = std::env::var("DET_THRESH")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -638,194 +1285,87 @@ impl OcrEngine {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(PPOCR_DET_UNCLIP_RATIO);
-        let mut binary = vec![0u8; (out_w * out_h) as usize];
-        for y in 0..out_h {
-            for x in 0..out_w {
-                let idx = (y * out_w + x) as usize;
-                if idx < prob_map.len() && prob_map[idx] > det_thresh {
-                    binary[idx] = 255;
-                }
+        // PC-only expansion cap in source pixels; the default is Android's
+        // uncapped DB unclip.
+        let expand_cap: f32 = std::env::var("DET_EXPAND_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(f32::INFINITY);
+
+        let (pre_quads, quads) = fit_components(
+            &prob_map,
+            out_w,
+            out_h,
+            det_thresh,
+            det_unclip,
+            expand_cap,
+            img_left,
+            img_top,
+            scale_w,
+            scale_h,
+        );
+
+        // 6-9. Mobile detectRotated's post-fit stages: furigana rejection on
+        // AABB geometry, the local-size filter, the enclosing-blob filter
+        // (#53) and the vertical 5% cross-axis inset.
+        let kept = filter_fitted_quads(&pre_quads, &quads, orig_w as i32, orig_h as i32);
+
+        // The PC-only orientation knobs default to Android behaviour (off).
+        let h_down: f32 = std::env::var("DET_H_DOWN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let v_trim: f32 = std::env::var("DET_V_SHRINK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
+        let mut pp_pairs: Vec<(BoundingBox, RotatedBox)> = Vec::with_capacity(kept.len());
+        for quad_in in &kept {
+            let mut quad = *quad_in;
+            if h_down != 0.0 && !quad.is_vertical() && quad.h >= 24.0 {
+                quad.h += h_down;
+                quad.cy += h_down / 2.0;
             }
-        }
-
-        let binary_img = image::GrayImage::from_raw(out_w, out_h, binary.clone())
-            .context("Failed to create binary image")?;
-        let contours = contours::find_contours_with_threshold::<i32>(&binary_img, 128);
-        let mut raw_pairs: Vec<(BoundingBox, RotatedBox)> = Vec::new();
-        // Index-aligned with raw_pairs: pre-unclip raw contour AABBs (mobile
-        // rawPreBoxes) and unclipped AABBs (rawBoxes) for the furigana filter.
-        let mut pre_boxes: Vec<BoundingBox> = Vec::new();
-        let mut uncl_boxes: Vec<BoundingBox> = Vec::new();
-
-        for contour in &contours {
-            if contour.points.len() < 3 { continue; } // noise filter
-
-            // Minimum-area ROTATED rectangle around the contour (PP-OCR's
-            // cv2.minAreaRect equivalent). Angled text lines get a tight
-            // quad instead of one big orthogonal box covering the span.
-            let Some((cx, cy, rw, rh, angle)) = min_area_rect(&contour.points) else {
-                continue;
-            };
-
-            // Unclip: expand box using proper PP-OCR formula:
-            // distance = area * ratio / perimeter (applied in rect space)
-            let area = rw * rh;
-            let perimeter = 2.0 * (rw + rh);
-            let expand = if perimeter > 0.0 { area * det_unclip / perimeter } else { 0.0 };
-            // Cap the expansion in ORIGINAL pixels. The det model's prob
-            // blob covers only ~85% of large text (model property), so the
-            // proportional unclip alone leaves large boxes tight (≈1.0×ink);
-            // a fixed-px cap adds real margin there without inflating the
-            // already-bloated small-text boxes.
-            let cap: f32 = std::env::var("DET_EXPAND_CAP")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(48.0);
-            let contour_w_det = rw;
-            let contour_h_det = rh;
-            // Raw contour box mapped to original image coords, BEFORE the
-            // unclip expansion — the furigana filter's geometry (#28).
-            let raw_cx = (cx - img_left as f32) * scale_w;
-            let raw_cy = (cy - img_top as f32) * scale_h;
-            let raw_w = rw * scale_w;
-            let raw_h = rh * scale_h;
-            // Expansion in ORIGINAL pixels, capped in ORIGINAL pixels.
-            let expand_orig = (expand * scale_w).min(cap);
-            let rw = rw * scale_w + 2.0 * expand_orig;
-            let mut rh = rh * scale_h + 2.0 * expand_orig;
-
-            // Orientation-specific post-adjustments (env-tunable):
-            // - horizontal lines: nudge the box DOWN a bit — glyphs sit
-            //   slightly above the contour center on most fonts.
-            // - vertical lines: optional width trim (DET_V_SHRINK; 1.0 =
-            //   off). Disabled by default — trims risk cutting glyphs.
-            let h_angle = angle.to_degrees().abs();
-            let mut down_shift: f32 = 0.0;
-            if h_angle <= 45.0 {
-                let h_down: f32 = std::env::var("DET_H_DOWN")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(4.0);
-                if rh >= 24.0 {
-                    rh += h_down;
-                    down_shift = h_down / 2.0;
-                }
-            } else {
-                let v_trim: f32 = std::env::var("DET_V_SHRINK")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1.0);
-                rh *= v_trim;
+            if v_trim != 1.0 && quad.is_vertical() {
+                quad.h *= v_trim;
             }
-
-            // Scale centers back to original image coords: undo the centered
-            // letterbox offset first, then the uniform resize scale.
-            let cx = (cx - img_left as f32) * scale_w;
-            let cy = (cy - img_top as f32) * scale_h + down_shift;
-
-            if rw < 4.0 || rh < 4.0 { continue; }
-
-            eprintln!(
-                "[contour] det {:.1}x{:.1} expand {:.1} -> orig {:.0}x{:.0}",
-                contour_w_det, contour_h_det, expand, rw, rh
-            );
-
-            let rot = RotatedBox::new(cx, cy, rw, rh, angle, PPOCR_DET_BOX_THRESH);
-            let (bx, by, bw, bh) = rot.aabb();
-            let bbox = BoundingBox::new(
-                bx.round() as i32,
-                by.round() as i32,
-                bw.round() as i32,
-                bh.round() as i32,
-                PPOCR_DET_BOX_THRESH,
-            );
-            let raw_rot = RotatedBox::new(raw_cx, raw_cy, raw_w, raw_h, angle, PPOCR_DET_BOX_THRESH);
-            let (rx, ry, rww, rhh) = raw_rot.aabb();
-            pre_boxes.push(BoundingBox::new(
-                rx.round() as i32,
-                ry.round() as i32,
-                rww.round() as i32,
-                rhh.round() as i32,
-                PPOCR_DET_BOX_THRESH,
+            let (bx, by, bw, bh) = quad.aabb();
+            pp_pairs.push((
+                BoundingBox::new(
+                    bx.round() as i32,
+                    by.round() as i32,
+                    bw.round() as i32,
+                    bh.round() as i32,
+                    PPOCR_DET_BOX_THRESH,
+                ),
+                quad,
             ));
-            uncl_boxes.push(bbox.clone());
-            raw_pairs.push((bbox, rot));
         }
 
-        // Furigana line rejection (#28): drop boxes that are ruby to a nearby
-        // larger box. Mobile matches on raw contour geometry (pre-unclip, so
-        // stacked column fragments are not welded together by unclip padding)
-        // and uses the unclipped boxes only for the gap test.
-        let keep = filter_furigana(&pre_boxes, &uncl_boxes, orig_w as i32, orig_h as i32);
-        let dropped: usize = keep.iter().filter(|k| !**k).count();
-        if dropped > 0 {
-            for (pre, k) in pre_boxes.iter().zip(keep.iter()) {
-                if !k {
-                    eprintln!(
-                        "[PP-OCR DET] furigana dropped {}x{}@({}, {})",
-                        pre.w, pre.h, pre.x, pre.y
-                    );
-                }
-            }
-            let mut idx = 0usize;
-            raw_pairs.retain(|_| {
-                let k = keep[idx];
-                idx += 1;
-                k
-            });
-            eprintln!("[PP-OCR DET] furigana {} -> {} boxes", pre_boxes.len(), raw_pairs.len());
-        }
-
-        // Debug: print the contour boxes (after furigana rejection)
-        eprintln!("[PP-OCR DET] {} boxes:", raw_pairs.len());
-        for (i, (b, r)) in raw_pairs.iter().enumerate() {
+        // Debug: print the fitted boxes (after the filters)
+        eprintln!("[PP-OCR DET] {} boxes:", pp_pairs.len());
+        for (i, (b, r)) in pp_pairs.iter().enumerate() {
             eprintln!(
                 "  [{i}] x={} y={} w={} h={} angle={:.1}° c={:.3}",
                 b.x, b.y, b.w, b.h, r.angle.to_degrees(), b.confidence
             );
         }
 
-        // MERGE DISABLED for diagnosis
-        let sorted = self.sort_detected_boxes(raw_pairs);
-        // Post-processing
-        let mut pp_pairs = sorted;
-        // Filter out degenerate tiny boxes (noise specks)
-        pp_pairs.retain(|(b, _)| b.w >= 10 && b.h >= 10);
-        // 1. Shrink vertical box widths by 10% (centered; mobile shrink).
-        // The old one-sided x offset never shrank the width, which both
-        // skewed the box and inflated the ruby-trim reference width.
-        for (b, r) in pp_pairs.iter_mut().filter(|(b, _)| b.h > b.w) {
-            let shrink = (b.w as f32 * 0.05).round();
-            if r.h > 2.0 * shrink {
-                r.h -= 2.0 * shrink;
-                let (nx, ny, nw, nh) = r.aabb();
-                *b = BoundingBox::new(
-                    nx.round() as i32,
-                    ny.round() as i32,
-                    nw.round() as i32,
-                    nh.round() as i32,
-                    b.confidence,
-                );
+        // PC-only ruby-gutter trim (#48) behind RUBY_TRIM_VERTICAL: Android's
+        // default rotated path does not trim, so the default is off (D7.2).
+        if std::env::var("RUBY_TRIM_VERTICAL").map(|v| v != "0").unwrap_or(false) {
+            let trimmed = trim_ruby_gutter_vertical(&mut pp_pairs, image);
+            if trimmed > 0 {
+                eprintln!("[PP-OCR DET] rubyTrim applied to {trimmed} box(es)");
             }
         }
-        // 1b. Ruby-gutter trim (#48): detector boxes that swallowed the
-        // furigana strip (~2x normal column width) are cut back to the main
-        // column here, before cropping, so the ruby width never enters
-        // recognition.
-        let trimmed = trim_ruby_gutter_vertical(&mut pp_pairs, image);
-        if trimmed > 0 {
-            eprintln!("[PP-OCR DET] rubyTrim applied to {trimmed} box(es)");
-        }
-        // 2. Stacked-overlap split — DISABLED: with merging off, detection
-        // already produces per-line boxes; splitting stacked lines at the
-        // overlap midpoint shaves real text (boxes end up smaller than the
-        // glyphs, most visibly on large close-spaced text). Kept behind an
-        // env flag in case it's ever needed again.
+        // PC-only stacked-overlap split (DET_SPLIT_OVERLAP, off by default):
+        // Android's default rotated path does not split.
         if std::env::var("DET_SPLIT_OVERLAP").is_ok() {
             let h_indices: Vec<usize> = pp_pairs
                 .iter()
                 .enumerate()
-                .filter(|(_, (b, _))| b.w >= b.h)
+                .filter(|(_, (_, r))| !r.is_vertical())
                 .map(|(i, _)| i)
                 .collect();
             for i in 0..h_indices.len() {
@@ -856,6 +1396,10 @@ impl OcrEngine {
                 }
             }
         }
+
+        // 10. Sort: horizontal top-bottom/left-right, vertical right-left/
+        // top-bottom (the frame's own sizes decide the group).
+        let pp_pairs = self.sort_detected_boxes(pp_pairs);
         eprintln!("[PP-OCR DET] final {} boxes:", pp_pairs.len());
         for (i, (b, r)) in pp_pairs.iter().enumerate() {
             eprintln!(
@@ -885,7 +1429,11 @@ impl OcrEngine {
                 if let Some(img) = image::GrayImage::from_raw(out_w, out_h, pm) {
                     let _ = img.save(dir.join(format!("prob_{ts}.png")));
                 }
-                if let Some(img) = image::GrayImage::from_raw(out_w, out_h, binary.clone()) {
+                let binary: Vec<u8> = prob_map
+                    .iter()
+                    .map(|&v| if v > det_thresh { 255 } else { 0 })
+                    .collect();
+                if let Some(img) = image::GrayImage::from_raw(out_w, out_h, binary) {
                     let _ = img.save(dir.join(format!("binary_{ts}.png")));
                 }
             }
@@ -931,23 +1479,28 @@ impl OcrEngine {
 
 
     pub fn sort_detected_boxes(&self, mut boxes: Vec<(BoundingBox, RotatedBox)>) -> Vec<(BoundingBox, RotatedBox)> {
-        // Separate by orientation
+        // Separate by orientation — the frame's own sizes decide, like mobile
+        // isVerticalLineBox (near-square counts as horizontal).
         let mut horizontal: Vec<(BoundingBox, RotatedBox)> = Vec::new();
         let mut vertical: Vec<(BoundingBox, RotatedBox)> = Vec::new();
         for pair in boxes.drain(..) {
-            if pair.0.w >= pair.0.h {
-                horizontal.push(pair);
-            } else {
+            if pair.1.is_vertical() {
                 vertical.push(pair);
+            } else {
+                horizontal.push(pair);
             }
         }
 
         // Horizontal: top-to-bottom, left-to-right
         horizontal.sort_by(|a, b| a.0.y.cmp(&b.0.y).then(a.0.x.cmp(&b.0.x)));
 
-        // Vertical: right-to-left, top-to-bottom
-        // Japanese vertical text is read right-to-left across columns.
-        vertical.sort_by(|a, b| b.0.x.cmp(&a.0.x).then(a.0.y.cmp(&b.0.y)));
+        // Vertical: right-to-left, top-to-bottom (mobile sorts on the AABB's
+        // RIGHT edge, not the left).
+        vertical.sort_by(|a, b| {
+            (b.0.x + b.0.w)
+                .cmp(&(a.0.x + a.0.w))
+                .then(a.0.y.cmp(&b.0.y))
+        });
 
         // Concatenate: horizontal lines first, then vertical
         boxes = horizontal;
@@ -1044,24 +1597,18 @@ pub fn recognize_boxes_streaming(
         let rot = rotated.get(i).copied();
         let (crop, crop_x, crop_y, crop_w, crop_h, is_vertical, job_rot) = match rot {
             Some(r) if r.is_rotated() => {
-                // Angled line: crop the quad's axis-aligned bounds, then
-                // un-rotate so the text axis is axis-aligned (the recogniser sees a
-                // clean horizontal or vertical line instead of one huge
-                // orthogonal crop covering the whole span).
-                let (rx, ry, rw, rh) = r.aabb();
-                let crop = image.crop_imm(
-                    rx.max(0.0) as u32,
-                    ry.max(0.0) as u32,
-                    rw.max(1.0) as u32,
-                    rh.max(1.0) as u32,
-                );
-                let crop = rotate_crop(&crop, r.unrotate_angle());
+                // Angled line: mobile warpRotatedCrop — the frame's corners
+                // map to an upright localW × localH crop, so the recogniser
+                // sees the line's own tight frame instead of an AABB canvas.
+                let Some(crop) = warp_quad_crop(image, &r) else {
+                    continue;
+                };
                 (
                     crop,
-                    rx.max(0.0) as u32,
-                    ry.max(0.0) as u32,
-                    rw.max(1.0) as u32,
-                    rh.max(1.0) as u32,
+                    0,
+                    0,
+                    r.w.round().max(4.0) as u32,
+                    r.h.round().max(4.0) as u32,
                     r.is_vertical(),
                     Some(r),
                 )
@@ -1079,7 +1626,7 @@ pub fn recognize_boxes_streaming(
                     bbox.y.max(0) as u32,
                     bbox.w.max(0) as u32,
                     bbox.h.max(0) as u32,
-                    bbox.h > bbox.w,
+                    is_vertical_box(bbox),
                     None,
                 )
             }
@@ -1136,113 +1683,70 @@ pub fn recognize_boxes_streaming(
 
                 if let Ok(mut results) = result {
                     if let Some(res) = results.pop() {
-                        let text = res.text;
-                        let alternatives = res.alternatives;
+                        let mut text = res.text;
+                        let mut alternatives = res.alternatives;
                         let char_cols = res.char_cols;
                         let seq_len_total = res.seq_len_total;
-                        let step_px = res.step_px;
                         if text.is_empty() { continue; }
+
+                        // Vertical punctuation normalisation at emit (#56/#63):
+                        // ASCII `?` and horizontal `…`/`‥` become their vertical
+                        // presentation forms in the text and the alternatives
+                        // BEFORE char boxes, so the substitutes get full-em
+                        // metrics (dictionary lookup folds them back).
+                        if job.is_vertical {
+                            text = crate::util::japanese::vertical_punctuation(&text);
+                            for alts in alternatives.iter_mut() {
+                                for (c, _) in alts.iter_mut() {
+                                    *c = crate::util::japanese::vertical_punctuation_char(*c);
+                                }
+                            }
+                        }
 
                         // Dataset collection: save the line crop + detected text
                         let sample_txt = save_line_sample(&job.crop, &text);
 
-                        let n = char_cols.len();
-                        let mut char_boxes = Vec::with_capacity(n);
-                        // Char cells are built in the (possibly un-rotated)
-                        // crop frame; a rotated line maps each box back to
-                        // image coordinates through the inverse rotation.
-                        let map_box = |x: f32, y: f32, w: f32, h: f32| -> BoundingBox {
-                            let w = w.max(1.0);
-                            let h = h.max(1.0);
-                            match job.rot.filter(|r| r.is_rotated()) {
-                                Some(r) => r.map_char_box(
-                                    job.crop_w, job.crop_h, job.crop_x, job.crop_y,
-                                    x.round() as i32, y.round() as i32,
-                                    w.round() as i32, h.round() as i32,
-                                ),
-                                None => BoundingBox::new(
-                                    (job.crop_x as f32 + x).round() as i32,
-                                    (job.crop_y as f32 + y).round() as i32,
-                                    w.round() as i32, h.round() as i32, 1.0,
-                                ),
-                            }
+                        // Char boxes: mobile computeCharBoxes (#49). Rotated
+                        // lines compute in the upright local crop
+                        // (0,0,localW,localH) and map back through the frame;
+                        // axis lines use the UNCLAMPED rect frame (the crop
+                        // itself stays clamped, D6).
+                        let snap_pixels = if box_layout_snap()
+                            && job.crop.width() >= 8
+                            && job.crop.height() >= 8
+                        {
+                            let rgb = job.crop.to_rgb8();
+                            Some((rgb.into_raw(), job.crop.width(), job.crop.height()))
+                        } else {
+                            None
                         };
-                        if n > 0 && seq_len_total > 0 && !job.is_vertical {
-                            // ---- HORIZONTAL: x-axis char boxes ----
-                            // The decoded timestep is the character's centre;
-                            // the cell is centred on it with length capped at
-                            // 1.1x its width (0.55x for halfwidth latin), then
-                            // overlapping neighbours split to a common aspect
-                            // ratio. Horizontal punctuation has no special
-                            // rules (as before).
-                            let step = if step_px > 0.0 { step_px } else { job.crop_w as f32 / seq_len_total as f32 };
-                            let cross = (job.crop_h as f32).max(3.0);
-                            let text_chars: Vec<char> = text.chars().collect();
-                            let mut cells: Vec<(f32, f32)> = char_cols.iter().enumerate().map(|(idx, &t)| {
-                                let anchor = (t as f32 + 0.5) * step;
-                                let half = char_cell_max_len(text_chars.get(idx).copied(), cross) / 2.0;
-                                ((anchor - half).max(0.0), (anchor + half).min(job.crop_w as f32))
-                            }).collect();
-                            for ci in 0..n.saturating_sub(1) {
-                                let wa = char_cell_width(text_chars.get(ci).copied(), cross);
-                                let wb = char_cell_width(text_chars.get(ci + 1).copied(), cross);
-                                let (left, right) = cells.split_at_mut(ci + 1);
-                                split_overlap_same_aspect(&mut left[ci], &mut right[0], wa, wb);
-                            }
-                            for &(xl, xr) in &cells {
-                                char_boxes.push(map_box(xl, 0.0, xr - xl, job.crop_h as f32));
-                            }
-                        } else if n > 0 && seq_len_total > 0 {
-                            // ---- VERTICAL: y-axis char boxes with punct handling ----
-                            // Same centred geometry with the column width as
-                            // 1: max cell height 1.1x (0.55x halfwidth).
-                            // Punctuation keeps its own rules.
-                            let step = if step_px > 0.0 { step_px } else { job.crop_h as f32 / seq_len_total as f32 };
-                            let cross = (job.crop_w as f32).max(3.0);
-                            let text_chars: Vec<char> = text.chars().collect();
-                            let mut cells: Vec<(f32, f32)> = char_cols.iter().enumerate().map(|(idx, &t)| {
-                                let anchor = (t as f32 + 0.5) * step;
-                                let half = char_cell_max_len(text_chars.get(idx).copied(), cross) / 2.0;
-                                ((anchor - half).max(0.0), (anchor + half).min(job.crop_h as f32))
-                            }).collect();
-                            let is_cp: Vec<bool> = text.chars().map(|ch| matches!(ch, '\u{3002}'|'\u{002E}'|'\u{FF0E}'|'\u{3001}'|'\u{002C}'|'\u{FF0C}'|')'|'\u{FF09}'|'\u{3017}'|'\u{300D}'|'\u{300F}'|'\u{3015}'|'\u{3011}'|'\u{3009}'|']'|'\u{FF3D}')).collect();
-                            let is_op: Vec<bool> = text.chars().map(|ch| matches!(ch, '('|'\u{FF08}'|'\u{300C}'|'\u{300E}'|'\u{3014}'|'\u{3010}'|'\u{300A}'|'\u{3008}'|'\u{3016}'|'['|'\u{FF3B}')).collect();
-                            for ci in 0..n.saturating_sub(1) {
-                                if cells[ci].1 <= cells[ci + 1].0 { continue; }
-                                if is_cp[ci] { cells[ci].1 = cells[ci + 1].0; }
-                                else if is_op[ci + 1] { cells[ci + 1].0 = cells[ci].1; }
-                                else if is_cp[ci + 1] { cells[ci + 1].0 = cells[ci].1; }
-                                else if is_op[ci] { cells[ci].1 = cells[ci + 1].0; }
-                                else {
-                                    let wa = char_cell_width(text_chars.get(ci).copied(), cross);
-                                    let wb = char_cell_width(text_chars.get(ci + 1).copied(), cross);
-                                    let (left, right) = cells.split_at_mut(ci + 1);
-                                    split_overlap_same_aspect(&mut left[ci], &mut right[0], wa, wb);
-                                }
-                            }
-                            let avg_np_h: f32 = {
-                                let hs: Vec<f32> = cells.iter().enumerate().filter(|(ci,_)| !is_cp[*ci] && !is_op[*ci]).map(|(_,c)| c.1 - c.0).collect();
-                                if hs.is_empty() { job.crop_w as f32 } else { hs.iter().sum::<f32>() / hs.len() as f32 }
-                            };
-                            for ci in 0..n {
-                                if is_cp[ci] {
-                                    let nx = ((ci + 1)..n).filter(|&j| !is_cp[j] && !is_op[j]).next().map(|j| cells[j].0).unwrap_or(f32::INFINITY);
-                                    cells[ci].1 = (cells[ci].0 + avg_np_h).min(nx).max(cells[ci].1);
-                                } else if is_op[ci] {
-                                    let pb: Option<usize> = (0..ci).rev().filter(|&j| !is_cp[j] && !is_op[j]).next();
-                                    let pl = pb.map(|j| cells[j].1).unwrap_or(f32::NEG_INFINITY);
-                                    cells[ci].0 = (cells[ci].1 - avg_np_h).max(pl).min(cells[ci].0);
-                                }
-                            }
-                            for &(yt, yb) in &cells {
-                                let ch = (yb - yt).max(1.0);
-                                char_boxes.push(map_box(0.0, yt, job.crop_w as f32, ch));
-                            }
-                        }
+                        let pixels = snap_pixels
+                            .as_ref()
+                            .map(|(p, w, h)| (p.as_slice(), *w, *h));
+                        let char_boxes = if let Some(r) = job.rot.filter(|r| r.is_rotated()) {
+                            let lw = r.w.round().max(4.0) as u32;
+                            let lh = r.h.round().max(4.0) as u32;
+                            let local = compute_char_boxes(
+                                &text, &char_cols, seq_len_total,
+                                0, 0, lw, lh, job.is_vertical, pixels,
+                            );
+                            local
+                                .iter()
+                                .map(|b| {
+                                    r.map_local_rect(
+                                        b.x as f32, b.y as f32, b.w as f32, b.h as f32,
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            compute_char_boxes(
+                                &text, &char_cols, seq_len_total,
+                                job.bbox.x, job.bbox.y,
+                                job.bbox.w.max(0) as u32, job.bbox.h.max(0) as u32,
+                                job.is_vertical, pixels,
+                            )
+                        };
 
-                        // Text stays as recognised: the overlay picks the
-                        // vertical presentation glyphs from the font's GSUB
-                        // `vert`/`vrt2` at draw time.
                         let (final_text, final_alts) = (text, alternatives);
 
                         let annotation = DetectedAnnotation {
@@ -1280,10 +1784,106 @@ pub fn recognize_boxes_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
 
     fn test_engine() -> OcrEngine {
         let dir = format!("{}/assets", env!("CARGO_MANIFEST_DIR"));
         OcrEngine::new(&dir, RecognitionMode::Both, 4).expect("engine loads")
+    }
+
+    /// Prob map with `on` pixels set to 0.9 (above the 0.3 threshold).
+    fn prob_map(w: usize, h: usize, on: impl Fn(usize, usize) -> bool) -> Vec<f32> {
+        let mut map = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                if on(x, y) {
+                    map[y * w + x] = 0.9;
+                }
+            }
+        }
+        map
+    }
+
+    fn components(map: &[f32], w: usize, h: usize, cap: f32) -> (Vec<RotatedBox>, Vec<RotatedBox>) {
+        fit_components(map, w as u32, h as u32, 0.3, 1.5, cap, 0.0, 0.0, 1.0, 1.0)
+    }
+
+    /// D3.1: mobile flood-fills the component, so an interior hole is not a
+    /// second box (imageproc's Suzuki-Abe contours returned hole borders too).
+    #[test]
+    fn fit_components_ignores_interior_holes() {
+        // A 20x20 ring: border pixels on, interior off.
+        let map = prob_map(40, 40, |x, y| {
+            (5..25).contains(&x) && (5..25).contains(&y) && (x == 5 || x == 24 || y == 5 || y == 24)
+        });
+        let (pre, uncl) = components(&map, 40, 40, f32::INFINITY);
+        assert_eq!(pre.len(), 1, "the hole must not become a box");
+        let (x, y, w, h) = pre[0].aabb();
+        assert!(
+            (x - 4.5).abs() < 0.01 && (y - 4.5).abs() < 0.01,
+            "frame origin {x},{y}"
+        );
+        assert!((w - 20.0).abs() < 0.01 && (h - 20.0).abs() < 0.01, "{w}x{h}");
+        // Unclip grows both axes on the frame (no cap).
+        assert!(uncl[0].w > pre[0].w && uncl[0].h > pre[0].h);
+    }
+
+    /// D3.1/D3.7: specks are counted over all component pixels (mobile), and
+    /// anything whose frame is under 4px in either local axis is dropped, so
+    /// a 2-pixel speck and a 3-pixel L both go; a real block is kept at its
+    /// pixel extents.
+    #[test]
+    fn fit_components_drops_specks_and_sub_4px_frames() {
+        let two = prob_map(10, 10, |x, y| (x, y) == (5, 5) || (x, y) == (6, 5));
+        assert!(components(&two, 10, 10, f32::INFINITY).0.is_empty());
+        let three = prob_map(10, 10, |x, y| {
+            (x, y) == (5, 5) || (x, y) == (6, 5) || (x, y) == (5, 6)
+        });
+        assert!(
+            components(&three, 10, 10, f32::INFINITY).0.is_empty(),
+            "3-pixel L is under the 4px frame gate"
+        );
+        let block = prob_map(20, 20, |x, y| (5..11).contains(&x) && (5..11).contains(&y));
+        let (pre, _) = components(&block, 20, 20, f32::INFINITY);
+        assert_eq!(pre.len(), 1);
+        let (x, y, w, h) = pre[0].aabb();
+        assert!((x - 4.5).abs() < 0.01 && (y - 4.5).abs() < 0.01);
+        assert!((w - 6.0).abs() < 0.01 && (h - 6.0).abs() < 0.01);
+    }
+
+    /// D3.3: the expansion is Android's uncapped `area*ratio/perimeter` per
+    /// side by default; DET_EXPAND_CAP is an opt-in clamp in source pixels.
+    #[test]
+    fn fit_components_expansion_is_uncapped_by_default() {
+        // A 40x10 block: area 400, perimeter 100, expand 6 per side.
+        let map = prob_map(60, 30, |x, y| (10..50).contains(&x) && (10..20).contains(&y));
+        let (pre, uncl) = components(&map, 60, 30, f32::INFINITY);
+        assert_eq!(pre.len(), 1);
+        assert!((uncl[0].w - pre[0].w - 12.0).abs() < 0.01, "uncapped");
+        let (_, capped) = components(&map, 60, 30, 2.0);
+        assert!((capped[0].w - pre[0].w - 4.0).abs() < 0.01, "capped at 2/side");
+    }
+
+    /// D3.8: a DB blob that merged several lines — its frame encloses two
+    /// line-shaped frames — is dropped while the lines survive.
+    #[test]
+    fn detect_filters_enclosing_blobs() {
+        // A 200x200 ring (one component) around two horizontal bars.
+        let map = prob_map(240, 240, |x, y| {
+            let ring = (10..210).contains(&x)
+                && (10..210).contains(&y)
+                && (x == 10 || x == 209 || y == 10 || y == 209);
+            let line_a = (30..190).contains(&x) && (40..52).contains(&y);
+            let line_b = (30..190).contains(&x) && (120..132).contains(&y);
+            ring || line_a || line_b
+        });
+        let (pre, quads) = components(&map, 240, 240, f32::INFINITY);
+        assert_eq!(quads.len(), 3, "ring + two lines");
+        let kept = filter_fitted_quads(&pre, &quads, 240, 240);
+        assert_eq!(kept.len(), 2, "the enclosing ring must be dropped");
+        for q in &kept {
+            assert!(q.w > q.h, "line frames survive: {:?}", q);
+        }
     }
 
     /// Detection parity smoke on the mobile synth set: the ncnn det model +
@@ -1423,70 +2023,146 @@ mod tests {
         }
         let image = DynamicImage::ImageRgba8(img);
         // Three vertical boxes so the median width is the normal 60, and one
-        // wide (120) swallowed the ruby.
+        // wide (120) swallowed the ruby. Frames are vertical (angle 0, local
+        // x = cross width, local y = reading extent).
         let mut pairs = vec![
             (
                 BoundingBox::new(0, 0, 120, 240, 1.0),
-                RotatedBox::new(60.0, 120.0, 240.0, 120.0, std::f32::consts::FRAC_PI_2, 1.0),
+                RotatedBox::new(60.0, 120.0, 120.0, 240.0, 0.0, 1.0),
             ),
             (
                 BoundingBox::new(200, 0, 60, 240, 1.0),
-                RotatedBox::new(230.0, 120.0, 240.0, 60.0, std::f32::consts::FRAC_PI_2, 1.0),
+                RotatedBox::new(230.0, 120.0, 60.0, 240.0, 0.0, 1.0),
             ),
             (
                 BoundingBox::new(300, 0, 60, 240, 1.0),
-                RotatedBox::new(330.0, 120.0, 240.0, 60.0, std::f32::consts::FRAC_PI_2, 1.0),
+                RotatedBox::new(330.0, 120.0, 60.0, 240.0, 0.0, 1.0),
             ),
         ];
         assert_eq!(trim_ruby_gutter_vertical(&mut pairs, &image), 1);
-        // Gutter starts at x=56; the quad is a +90° vertical (h = width).
+        // Gutter starts at x=56; the frame's local x is the cross width.
         assert_eq!(pairs[0].0.w, 56);
-        assert!((pairs[0].1.h - 56.0).abs() < 0.01, "quad h {}", pairs[0].1.h);
+        assert!((pairs[0].1.w - 56.0).abs() < 0.01, "quad w {}", pairs[0].1.w);
         assert!((pairs[0].1.cx - 28.0).abs() < 0.01, "quad cx {}", pairs[0].1.cx);
         assert_eq!(pairs[1].0.w, 60);
         assert_eq!(pairs[2].0.w, 60);
     }
-    /// The new char-cell geometry: 1.1x max length for JP, 0.55x for
-    /// halfwidth, and overlaps resolve to a common aspect ratio (or just
-    /// touching edges when the equal-aspect point lies outside the overlap).
+
+    /// Mobile #49's legacy columns: `(t+0.5)·L/seqLenTotal`, centred with
+    /// half the cross size, clamped to the frame.
     #[test]
-    fn char_cell_geometry_and_aspect_split() {
-        assert_eq!(char_cell_width(Some('あ'), 50.0), 50.0);
-        assert_eq!(char_cell_width(Some('漢'), 50.0), 50.0);
-        assert_eq!(char_cell_width(Some('A'), 50.0), 25.0);
-        assert_eq!(char_cell_width(Some('ｶ'), 50.0), 25.0);
-        assert_eq!(char_cell_width(None, 50.0), 50.0);
-        assert!((char_cell_max_len(Some('あ'), 50.0) - 55.0).abs() < 1e-3);
-        assert!((char_cell_max_len(Some('A'), 50.0) - 27.5).abs() < 1e-3);
-
-        // Equal widths: the shared boundary lands midway.
-        let (mut a, mut b) = ((0.0f32, 110.0f32), (30.0f32, 140.0f32));
-        split_overlap_same_aspect(&mut a, &mut b, 100.0, 100.0);
-        assert!((a.1 - 70.0).abs() < 1e-3 && (b.0 - 70.0).abs() < 1e-3);
-
-        // Different widths: both boxes end at the same aspect ratio.
-        let (mut a, mut b) = ((0.0f32, 110.0f32), (50.0f32, 160.0f32));
-        split_overlap_same_aspect(&mut a, &mut b, 50.0, 100.0);
-        let (la, lb) = ((a.1 - a.0) / 50.0, (b.1 - b.0) / 100.0);
-        assert!((la - lb).abs() < 1e-3, "aspects {la} {lb}");
-
-        // Equal-aspect point beyond the overlap: clamp, edges just touch.
-        let (mut a, mut b) = ((0.0f32, 110.0f32), (60.0f32, 170.0f32));
-        split_overlap_same_aspect(&mut a, &mut b, 100.0, 50.0);
-        assert!((a.1 - 110.0).abs() < 1e-3 && (b.0 - 110.0).abs() < 1e-3);
-
-        // Gapped pair is untouched.
-        let (mut a, mut b) = ((0.0f32, 10.0f32), (30.0f32, 40.0f32));
-        split_overlap_same_aspect(&mut a, &mut b, 100.0, 100.0);
-        assert_eq!((a, b), ((0.0, 10.0), (30.0, 40.0)));
+    fn legacy_cells_use_frame_length_over_seq_len() {
+        // L=100, seqLen=4 -> avgColW 25; cross 10 -> half 5.
+        let cells = legacy_cells(&[0.0, 1.0, 2.0, 3.0], 4, 100.0, 10.0);
+        assert_eq!(cells, vec![(7.5, 17.5), (32.5, 42.5), (57.5, 67.5), (82.5, 92.5)]);
+        // A fractional column keeps its fraction (peak interpolation).
+        let cells = legacy_cells(&[0.5], 4, 100.0, 10.0);
+        assert_eq!(cells, vec![(20.0, 30.0)]);
+        // Clamped to [0, L].
+        let cells = legacy_cells(&[0.0, 3.0], 4, 100.0, 60.0);
+        assert_eq!(cells, vec![(0.0, 42.5), (57.5, 100.0)]);
     }
 
-    /// End-to-end: every char box the streaming path emits must respect the
-    /// per-class caps (1.1x line cross for JP, 0.55x for halfwidth), the
-    /// neighbours must not overlap beyond rounding, and plain-glyph lines
-    /// must land on the synth truth centres along the reading axis.
+    /// Mobile #49 uniform sizing: fullwidth cells become one em wide,
+    /// halfwidth 0.5 em, around unchanged centres.
     #[test]
-    fn synth_char_boxes_aspect_and_position() {
+    fn uniform_cells_size_to_the_estimated_em() {
+        // Centres 20 apart with fullwidth chars -> em 20; widths 20.
+        let chars: Vec<char> = "日本語".chars().collect();
+        let cells = vec![(0.0f32, 40.0f32), (20.0, 60.0), (40.0, 80.0)];
+        let sized = uniform_cells(&cells, &chars, 100.0);
+        assert!((sized[0].1 - sized[0].0 - 20.0).abs() < 1e-3, "{sized:?}");
+        assert!((sized[1].1 - sized[1].0 - 20.0).abs() < 1e-3, "{sized:?}");
+        // Halfwidth ASCII: 10px apart = 0.5 em each -> em 20, width 10.
+        let chars: Vec<char> = "ABC".chars().collect();
+        let cells = vec![(0.0f32, 20.0f32), (10.0, 30.0), (20.0, 40.0)];
+        let sized = uniform_cells(&cells, &chars, 100.0);
+        assert!((sized[0].1 - sized[0].0 - 10.0).abs() < 1e-3, "{sized:?}");
+        // Single cell: unchanged (needs 2+).
+        let chars: Vec<char> = "日".chars().collect();
+        assert_eq!(uniform_cells(&[(0.0, 40.0)], &chars, 100.0), vec![(0.0, 40.0)]);
+    }
+
+    /// Mobile #49 vertical punctuation sets (D7.3/D46): the full Android
+    /// closing/opening sets, including the marks the PC list used to miss.
+    #[test]
+    fn vertical_punctuation_sets_match_android() {
+        for ch in "。.．、,，)）〕》」』】〙〗〟’”］".chars() {
+            assert!(is_vertical_closing_punct(ch), "closing {ch:?}");
+        }
+        for ch in "(（〔《「『【〘〖〝‘“［".chars() {
+            assert!(is_vertical_opening_punct(ch), "opening {ch:?}");
+        }
+        // PC-only strays from the old list must no longer be treated as marks.
+        assert!(!is_vertical_closing_punct('〉'));
+        assert!(!is_vertical_opening_punct('〈'));
+        assert!(!is_vertical_closing_punct('a'));
+    }
+
+    /// Mobile `computeCharBoxes` horizontal path end to end: legacy columns,
+    /// no pixels (legacy), uniform widths — the cell centres stay on the CTC
+    /// columns and the widths follow the estimated em.
+    #[test]
+    fn compute_char_boxes_horizontal_uniform_em() {
+        // crop 200 wide, seqLen 4 -> avgColW 50, cross (cropH) 40.
+        let text = "あいうえ";
+        let cols = [0.0f32, 1.0, 2.0, 3.0];
+        let boxes = compute_char_boxes(text, &cols, 4, 10, 20, 200, 40, false, None);
+        assert_eq!(boxes.len(), 4);
+        for b in &boxes {
+            assert_eq!(b.y, 20);
+            assert_eq!(b.h, 40);
+        }
+        // Centres at (t+0.5)*50 + 10 -> 35, 85, 135, 185; em 50, width 50.
+        let centers: Vec<f32> = boxes
+            .iter()
+            .map(|b| b.x as f32 + b.w as f32 / 2.0)
+            .collect();
+        assert_eq!(centers, vec![35.0, 85.0, 135.0, 185.0]);
+        for b in &boxes {
+            assert!((b.w as f32 - 50.0).abs() <= 1.0, "w={}", b.w);
+        }
+        // Halfwidth chars: 50px apart = 0.5 em -> em 100, width 50.
+        let boxes = compute_char_boxes("ABCD", &cols, 4, 0, 0, 200, 40, false, None);
+        for b in &boxes {
+            assert!((b.w as f32 - 50.0).abs() <= 1.0, "w={}", b.w);
+        }
+    }
+
+    /// Mobile `computeCharBoxes` vertical path: punctuation shrinks onto the
+    /// neighbour and expands back to the average non-punct cell height.
+    #[test]
+    fn compute_char_boxes_vertical_punctuation_rules() {
+        // crop 100 tall, seqLen 4 -> avgColW 25, cross (cropW) 40.
+        let cols = [0.0f32, 1.0, 2.0, 3.0];
+        let boxes = compute_char_boxes("あ。いあ", &cols, 4, 0, 0, 40, 100, true, None);
+        assert_eq!(boxes.len(), 4);
+        // Closing 。 shrinks onto the next box's start then expands back to
+        // the mean non-punct height (its height matches the plain cells).
+        let cp = &boxes[1];
+        assert!(cp.y + cp.h <= boxes[2].y + 1, "closing mark {:?}", cp);
+        assert!(
+            (cp.h - boxes[2].h).abs() <= 2,
+            "closing h={} vs plain h={}",
+            cp.h,
+            boxes[2].h
+        );
+        // Opening 「 expands downward from its end to the mean height.
+        let cols3 = [0.0f32, 1.0, 2.0];
+        let boxes = compute_char_boxes("「あい", &cols3, 4, 0, 0, 40, 100, true, None);
+        assert!(
+            (boxes[0].h - boxes[1].h).abs() <= 2,
+            "opening h={} vs plain h={}",
+            boxes[0].h,
+            boxes[1].h
+        );
+    }
+
+    /// End-to-end: every char box the streaming path emits must follow the
+    /// mobile #49 uniform-em sizing, and plain-glyph lines must land on the
+    /// synth truth centres along the reading axis.
+    #[test]
+    fn synth_char_boxes_uniform_em_and_position() {
         let mut eng = test_engine();
         let truth: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(format!(
@@ -1518,8 +2194,9 @@ mod tests {
             }).collect();
             let truth_text = line["text"].as_str().unwrap();
             for (_i, ann) in rx.into_iter() {
+                let quad_present = ann.quad.is_some();
                 let Some(line) = ann.line else { continue };
-                if ann.quad.is_some() {
+                if quad_present {
                     continue; // rotated lines carry AABBs by design
                 }
                 // Position regression: on synth the truth boxes are the drawn
@@ -1556,32 +2233,49 @@ mod tests {
                 }
                 let chars: Vec<char> = line.text.chars().collect();
                 let vertical = line.is_vertical;
-                let mut prev_end: Option<i32> = None;
+                // Uniform-em regression (mobile #49): every emitted cell's
+                // along length is the line's estimated em (halfwidth: 0.5em),
+                // clamped at the frame edges.
+                let centers: Vec<f32> = line
+                    .char_boxes
+                    .iter()
+                    .map(|b| {
+                        if vertical {
+                            b.y as f32 + b.h as f32 / 2.0
+                        } else {
+                            b.x as f32 + b.w as f32 / 2.0
+                        }
+                    })
+                    .collect();
+                let em = crate::util::japanese::estimate_em(&line.text, &centers);
                 for (ci, b) in line.char_boxes.iter().enumerate() {
-                    let cross = if vertical { b.w } else { b.h } as f32;
                     let along = if vertical { b.h } else { b.w } as f32;
-                    let max_len = char_cell_max_len(chars.get(ci).copied(), cross);
-                    assert!(
-                        along <= max_len * 1.02 + 2.0,
-                        "{file} char {ci} ({:?}): along {along} > max {max_len}",
-                        chars.get(ci)
-                    );
-                    if let Some(prev) = prev_end {
-                        let start = if vertical { b.y } else { b.x };
+                    assert!(along >= 1.0, "{file} char {ci}: empty box");
+                    if em > 0.0 {
+                        let expected = if chars
+                            .get(ci)
+                            .copied()
+                            .map(crate::util::japanese::is_half_width)
+                            .unwrap_or(false)
+                        {
+                            0.5 * em
+                        } else {
+                            em
+                        };
                         assert!(
-                            start >= prev - 2,
-                            "{file} char {ci}: boxes overlap beyond rounding"
+                            (along - expected).abs() <= expected * 0.3 + 3.0,
+                            "{file} char {ci} ({:?}): along {along} vs uniform {expected} (em {em})",
+                            chars.get(ci)
                         );
                     }
-                    prev_end = Some(if vertical { b.y + b.h } else { b.x + b.w });
                     checked += 1;
                 }
             }
         }
         assert!(checked >= 80, "expected the full synth set, checked {checked}");
         assert!(
-            position_checked >= 6,
-            "expected at least 6 plain-glyph lines for the position check, got {position_checked}"
+            position_checked >= 5,
+            "expected at least 5 plain-glyph lines for the position check, got {position_checked}"
         );
     }
 }
