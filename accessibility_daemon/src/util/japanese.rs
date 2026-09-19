@@ -190,6 +190,25 @@ lazy_static::lazy_static! {
     };
 }
 
+/// Mobile `JapaneseUtil.verticalPunctuation` (#56, #63): PP-OCR emits ASCII
+/// `?` where JP wants fullwidth `？`, and horizontal `…`/`‥` where vertical
+/// text wants the vertical presentation forms `︙`/`︰`. Applied at emit time
+/// for vertical lines only, before char boxes. Lookup-safe: `normalize` folds
+/// them back, so dictionary search is unaffected.
+pub fn vertical_punctuation(text: &str) -> String {
+    text.chars().map(vertical_punctuation_char).collect()
+}
+
+/// Mobile `JapaneseUtil.verticalPunctuationChar`.
+pub fn vertical_punctuation_char(c: char) -> char {
+    match c {
+        '?' => '？',
+        '…' => '︙', // U+2026 → U+FE19 vertical ellipsis
+        '‥' => '︰', // U+2035 → U+FE30 vertical two-dot leader
+        _ => c,
+    }
+}
+
 /// Convert a CJK character to its vertical-mode presentation form.
 /// Unicode vertical presentation form (U+FE10–U+FE48), used by the overlay
 /// only as a fallback for characters the font's GSUB `vert`/`vrt2` feature
