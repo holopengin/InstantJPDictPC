@@ -26,6 +26,7 @@ use crate::data::models::DictionaryEntry;
 use crate::models::*;
 use crate::overlay_state::OcrOverlayState;
 use crate::util::deinflector::Deinflector;
+use crate::util::japanese;
 use crate::util::japanese::{estimate_em, is_half_width, to_vertical_glyph};
 
 use fontdue::Font;
@@ -1525,8 +1526,14 @@ impl OcrViewer {
                             Vec::new()
                         };
                     if !kanji_only.is_empty() {
+                        let dict_names = db.dictionary_names().unwrap_or_default();
                         let formatted = self.state.format_dictionary_results(
-                            &[(kanji_str.clone(), kanji_only)],
+                            &[TermMatch {
+                                term: kanji_str.clone(),
+                                entries: kanji_only,
+                                chain: None,
+                            }],
+                            &dict_names,
                         );
                         append_kanji.extend(formatted);
                     }
@@ -1956,18 +1963,52 @@ impl OcrViewer {
     }
 
     fn dictionary_panel<'a>(&'a self, entries: Rc<Vec<FormattedEntry>>) -> Container<'a, Message> {
+        let gray = Color::from_rgb(0.75, 0.75, 0.75); // Android LTGRAY (#BEBEBE)
         let mut content = Column::new().padding(4).spacing(4).width(Length::Fill);
         if entries.is_empty() {
             content = content.push(Text::new("No dictionary entries found.").size(14));
         }
         for entry in entries.iter() {
             let mut entry_col = Column::new().spacing(4).width(Length::Fill);
+            // #62: deinflection chain row directly below the headwords.
+            if let Some(chain) = &entry.deinflection {
+                entry_col = entry_col.push(Self::deinflection_row(chain, &entry.term));
+            }
+            entry_col = entry_col.push(Self::headword_block(entry));
             for group in &entry.reading_groups {
-                entry_col = entry_col.push(Self::headword_section(group.clone()));
+                // A reading that repeats an already-rendered glossary shows its
+                // headword but not a second copy of the senses (and examples).
+                if !group.render_senses {
+                    continue;
+                }
                 for sg in &group.sense_groups {
                     entry_col = entry_col.push(Self::sense_group(sg.clone()));
                 }
-                entry_col = entry_col.push(iced::widget::Space::new().height(Pixels(4.0)));
+                // 1px divider per reading group (Android: DKGRAY, alpha 0.3).
+                entry_col = entry_col.push(
+                    Container::new(
+                        iced::widget::Space::new().height(Pixels(1.0)).width(Length::Fill),
+                    )
+                    .padding([10.0, 0.0])
+                    .style(|_t: &Theme| container::Style {
+                        background: Some(iced::Background::Color(Color::from_rgba(
+                            169.0 / 255.0,
+                            169.0 / 255.0,
+                            169.0 / 255.0,
+                            0.3,
+                        ))),
+                        ..Default::default()
+                    }),
+                );
+            }
+            // Dictionary source, bottom of the entry (one caption per section).
+            if let Some(name) = &entry.dictionary_name {
+                entry_col = entry_col.push(
+                    Container::new(Text::new(name.clone()).size(12).color(gray))
+                        .width(Length::Fill)
+                        .align_x(alignment::Horizontal::Right)
+                        .padding(iced::Padding { top: 4.0, ..Default::default() }),
+                );
             }
             content = content.push(entry_col);
         }
@@ -1991,109 +2032,504 @@ impl OcrViewer {
         })
     }
 
-    fn headword_section(group: FormattedReadingGroup) -> Container<'static, Message> {
-        let cyan = Color::from_rgb(0.0, 1.0, 1.0);      // Android CYAN
-        let gray = Color::from_rgb(0.75, 0.75, 0.75);   // Android LTGRAY (#BEBEBE)
+    fn bold_font() -> IcedFont {
+        IcedFont {
+            weight: iced::font::Weight::Bold,
+            ..IcedFont::default()
+        }
+    }
+
+    /// `JapaneseUtil.splitKanaList`: space-split, strip leading "-", join with 、.
+    fn kana_list_text(raw: &str) -> String {
+        japanese::split_kana_list(raw).join("、")
+    }
+
+    /// #62: compact deinflection chain row, e.g. "食べた → 食べる" + past chip.
+    fn deinflection_row(chain: &DeinflectionChain, term: &str) -> Row<'static, Message> {
+        let gray = Color::from_rgb(0.75, 0.75, 0.75);
+        let mut row = Row::new().spacing(4).align_y(alignment::Vertical::Center);
+        row = row.push(
+            Text::new(format!("{} → {}", chain.surface, term))
+                .size(12)
+                .color(gray),
+        );
+        for step in &chain.steps {
+            row = row.push(Self::tag_chip(step));
+        }
+        row
+    }
+
+    /// Headword block for one entry. Kanji (KANJIDIC) entries render their big
+    /// glyph with 訓/音 rows; ordinary term entries render every headword with
+    /// its reading in one comma-separated row.
+    fn headword_block(entry: &FormattedEntry) -> Container<'static, Message> {
+        let cyan = Color::from_rgb(0.0, 1.0, 1.0); // Android CYAN
+        let gray = Color::from_rgb(0.75, 0.75, 0.75);
         let mut content = Column::new().spacing(2);
 
-        if group.is_kanji_entry {
+        let kanji_groups: Vec<&FormattedReadingGroup> = entry
+            .reading_groups
+            .iter()
+            .filter(|g| g.is_kanji_entry)
+            .collect();
+        for group in kanji_groups {
             for hw in &group.headwords {
-                let mut row = Row::new().spacing(6).align_y(alignment::Vertical::Center);
-                row = row.push(Text::new(hw.kanji.clone()).size(36).color(cyan)
-                    .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }));
-                if let Some(o) = &hw.onyomi { row = row.push(Text::new(format!("音: {o}")).size(14).color(gray)); }
-                if let Some(k) = &hw.kunyomi { row = row.push(Text::new(format!("訓: {k}")).size(14).color(gray)); }
+                let mut row = Row::new().spacing(10).align_y(alignment::Vertical::Center);
+                row = row.push(
+                    Text::new(hw.kanji.clone())
+                        .size(48)
+                        .color(cyan)
+                        .font(Self::bold_font()),
+                );
+                let mut reading_stack = Column::new().spacing(0);
+                // 訓 (kun) above 音 (on).
+                if let Some(k) = &hw.kunyomi {
+                    if !k.is_empty() {
+                        reading_stack =
+                            reading_stack.push(Self::kun_on_row("訓", &Self::kana_list_text(k)));
+                    }
+                }
+                if let Some(o) = &hw.onyomi {
+                    if !o.is_empty() {
+                        reading_stack =
+                            reading_stack.push(Self::kun_on_row("音", &Self::kana_list_text(o)));
+                    }
+                }
+                row = row.push(reading_stack);
                 content = content.push(row);
             }
-        } else {
-            let mut row = Row::new().spacing(4).align_y(alignment::Vertical::Center);
-            for (i, hw) in group.headwords.iter().enumerate() {
-                if hw.kanji == group.reading {
-                    row = row.push(Text::new(hw.kanji.clone()).size(24).color(cyan)
-                        .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }));
-                } else {
-                    let mut rc = Column::new().align_x(alignment::Horizontal::Center).spacing(1);
-                    rc = rc.push(Text::new(group.reading.clone()).size(14).color(gray));
-                    rc = rc.push(Text::new(hw.kanji.clone()).size(24).color(cyan)
-                        .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }));
-                    row = row.push(rc);
-                }
-                if i + 1 < group.headwords.len() {
-                    row = row.push(Text::new("、").size(20).color(gray));
+        }
+
+        // Every (kanji, reading) pair across the remaining reading groups, one
+        // row, comma separated.
+        let term_groups: Vec<&FormattedReadingGroup> = entry
+            .reading_groups
+            .iter()
+            .filter(|g| !g.is_kanji_entry)
+            .collect();
+        if !term_groups.is_empty() {
+            let pairs: Vec<(String, String)> = term_groups
+                .iter()
+                .flat_map(|g| {
+                    g.headwords
+                        .iter()
+                        .map(|h| (h.kanji.clone(), g.reading.clone()))
+                })
+                .collect();
+            let reserve_ruby = pairs.iter().any(|(kanji, reading)| kanji != reading);
+            let mut row = Row::new()
+                .spacing(2)
+                .align_y(alignment::Vertical::Bottom);
+            for (i, (kanji, reading)) in pairs.iter().enumerate() {
+                row = row.push(Self::ruby_view(kanji, reading, false, reserve_ruby));
+                if i + 1 < pairs.len() {
+                    row = row.push(Text::new("、").size(24).color(gray));
                 }
             }
             content = content.push(row);
+
+            // #43: pitch accents for every reading of this entry, one line.
+            let items: Vec<(String, Vec<i32>)> = term_groups
+                .iter()
+                .filter(|g| !g.pitch_positions.is_empty())
+                .map(|g| (g.reading.clone(), g.pitch_positions.clone()))
+                .collect();
+            if !items.is_empty() {
+                content = content.push(Self::pitch_line(&items));
+            }
         }
         Container::new(content)
     }
 
+    /// One 訓 / 音 row — label (12, GRAY) beside its readings (13, LTGRAY).
+    fn kun_on_row(label: &str, readings: &str) -> Row<'static, Message> {
+        let gray = Color::from_rgb(0.75, 0.75, 0.75);
+        let light_gray = Color::from_rgb(0.75, 0.75, 0.75);
+        Row::new()
+            .spacing(6)
+            .align_y(alignment::Vertical::Center)
+            .push(Text::new(label.to_string()).size(12).color(gray))
+            .push(Text::new(readings.to_string()).size(13).color(light_gray))
+    }
+
+    /// #43: one comma-separated pitch line; high morae white, low gray, with a
+    /// fall arrow where the downstep leaves the word.
+    fn pitch_line(items: &[(String, Vec<i32>)]) -> Row<'static, Message> {
+        let accent = Color::WHITE;
+        let plain = Color::from_rgb(0.67, 0.67, 0.67);
+        let mut row = Row::new().spacing(1).align_y(alignment::Vertical::Top);
+        for (i, (reading, positions)) in items.iter().enumerate() {
+            let morae = japanese::morae_of(reading);
+            if morae.is_empty() {
+                continue;
+            }
+            if i > 0 {
+                row = row.push(Text::new("、").size(13).color(plain));
+            }
+            let position = positions.first().copied().unwrap_or(0);
+            let contour = japanese::pitch_pattern(morae.len(), position);
+            for (mora_index, mora) in morae.iter().enumerate() {
+                let color = if contour.get(mora_index).copied().unwrap_or(false) {
+                    accent
+                } else {
+                    plain
+                };
+                row = row.push(Text::new(mora.clone()).size(13).color(color));
+            }
+            if japanese::falls_beyond_word(morae.len(), position) {
+                row = row.push(Text::new("↓").size(9).color(plain));
+            }
+        }
+        row
+    }
+
+    /// Android `createTagView` palette: POS/verb/adjective blue, common noun
+    /// classes green, jlpt/grade/favourite red, everything else gray.
     fn tag_color(tag: &str) -> Color {
-        match tag {
-            t if t == "pos" || t == "v" || t == "adj" || t == "adj-i" || t == "adj-na" => Color::from_rgb(0.23, 0.35, 0.48),
-            t if t == "n" || t == "adv" || t == "pn" => Color::from_rgb(0.23, 0.48, 0.35),
-            t if t.starts_with("jlpt") || t.starts_with("grade") || t == "★" => Color::from_rgb(0.48, 0.23, 0.23),
-            _ => Color::from_rgb(0.27, 0.27, 0.27),
+        if tag == "pos"
+            || tag.starts_with('v')
+            || tag == "adj-i"
+            || tag == "adj-na"
+        {
+            Color::from_rgb(0.23, 0.35, 0.48) // #3a5a7a
+        } else if tag == "n" || tag == "adv" || tag == "pn" {
+            Color::from_rgb(0.23, 0.48, 0.35) // #3a7a5a
+        } else if tag.starts_with("jlpt")
+            || tag.starts_with("grade")
+            || tag == "★"
+            || tag == "meta"
+        {
+            Color::from_rgb(0.48, 0.23, 0.23) // #7a3a3a
+        } else {
+            Color::from_rgb(0.27, 0.27, 0.27) // #444444
         }
     }
 
+    fn tag_chip(tag: &str) -> Container<'static, Message> {
+        let bg = Self::tag_color(tag);
+        Container::new(
+            Text::new(tag.to_string())
+                .size(10)
+                .color(Color::WHITE)
+                .font(Self::bold_font()),
+        )
+        .padding([1.0, 4.0])
+        .style(move |_t: &Theme| container::Style {
+            background: Some(iced::Background::Color(bg)),
+            border: iced::Border {
+                radius: 5.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    /// Minimal furigana (#55): ruby only over kanji spans, okurigana as plain
+    /// base text. Falls back to full-reading ruby when unalignable.
+    fn ruby_view(
+        term: &str,
+        reading: &str,
+        is_mini: bool,
+        reserve_ruby_space: bool,
+    ) -> Element<'static, Message> {
+        let cyan = Color::from_rgb(0.0, 1.0, 1.0);
+        let gray = Color::from_rgb(0.75, 0.75, 0.75);
+        let base_size = if is_mini { 15.0 } else { 32.0 };
+        let ruby_size = if is_mini { 9.0 } else { 13.0 };
+        let base = |text: String| -> Element<'static, Message> {
+            Text::new(text)
+                .size(base_size)
+                .color(cyan)
+                .font(Self::bold_font())
+                .into()
+        };
+        if term == reading {
+            if !reserve_ruby_space {
+                return base(term.to_string());
+            }
+            // Mixed group: reserve the same ruby row a furigana-bearing
+            // sibling has, so baselines align.
+            let mut stack = Column::new()
+                .align_x(alignment::Horizontal::Center)
+                .spacing(0);
+            stack = stack.push(Text::new(" ").size(ruby_size).color(gray));
+            stack = stack.push(base(term.to_string()));
+            return stack.into();
+        }
+        let segments = japanese::align_furigana(term, reading);
+        let Some(segments) = segments else {
+            return Self::full_ruby_view(term, reading, is_mini);
+        };
+        if !segments.iter().any(|s| s.ruby.is_some()) {
+            return Self::full_ruby_view(term, reading, is_mini);
+        }
+        let mut row = Row::new().align_y(alignment::Vertical::Bottom);
+        for seg in segments {
+            match seg.ruby {
+                None => row = row.push(base(seg.base)),
+                Some(ruby) => {
+                    let mut stack = Column::new()
+                        .align_x(alignment::Horizontal::Center)
+                        .spacing(0);
+                    stack = stack.push(Text::new(ruby).size(ruby_size).color(gray));
+                    stack = stack.push(base(seg.base));
+                    row = row.push(stack);
+                }
+            }
+        }
+        row.into()
+    }
+
+    fn full_ruby_view(term: &str, reading: &str, is_mini: bool) -> Element<'static, Message> {
+        let cyan = Color::from_rgb(0.0, 1.0, 1.0);
+        let gray = Color::from_rgb(0.75, 0.75, 0.75);
+        let base_size = if is_mini { 15.0 } else { 32.0 };
+        let ruby_size = if is_mini { 9.0 } else { 13.0 };
+        let mut stack = Column::new()
+            .align_x(alignment::Horizontal::Center)
+            .spacing(0);
+        stack = stack.push(Text::new(reading.to_string()).size(ruby_size).color(gray));
+        stack = stack.push(
+            Text::new(term.to_string())
+                .size(base_size)
+                .color(cyan)
+                .font(Self::bold_font()),
+        );
+        stack.into()
+    }
+
     fn sense_group(sg: FormattedSenseGroup) -> Column<'static, Message> {
-        let cyan = Color::from_rgb(0.0, 1.0, 1.0); // Android CYAN
-        let gray = Color::from_rgb(0.75, 0.75, 0.75); // Android LTGRAY (#BEBEBE)
         let white = Color::WHITE;
-        let mut content = Column::new().spacing(3);
+        let mut content = Column::new().spacing(3).width(Length::Fill);
 
         if !sg.tags.is_empty() {
-            let mut tag_row = Row::new().spacing(3).align_y(alignment::Vertical::Center);
+            let mut tag_row = Row::new()
+                .spacing(3)
+                .align_y(alignment::Vertical::Center)
+                .padding(iced::Padding { top: 4.0, ..Default::default() });
             for tag in &sg.tags {
-                let bg = Self::tag_color(tag);
-                tag_row = tag_row.push(
-                    Container::new(Text::new(tag.clone()).size(13).color(white)
-                        .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }))
-                    .padding([1.0, 3.0])
-                    .style(move |_t: &Theme| container::Style {
-                        background: Some(iced::Background::Color(bg)),
-                        border: iced::Border { radius: 3.0.into(), ..Default::default() },
-                        ..Default::default()
-                    }),
-                );
+                tag_row = tag_row.push(Self::tag_chip(tag));
             }
             content = content.push(tag_row);
         }
 
-        for sense in &sg.senses {
-            let mut sense_row = Row::new().spacing(3).align_y(alignment::Vertical::Top);
-            sense_row = sense_row.push(Text::new(format!("{}. ", sense.index)).size(16).color(white));
-            let mut nodes_col = Column::new().spacing(1).width(Length::Fill);
-            for node in &sense.nodes {
-                match node {
-                    DefinitionNode::Text(t) => {
-                        nodes_col = nodes_col.push(
-                            Text::new(t.clone()).size(14).color(white).width(Length::Fill)
-                                .wrapping(iced::widget::text::Wrapping::Word),
-                        );
-                    }
-                    DefinitionNode::Ruby { term, reading } => {
-                        if term == reading {
-                            nodes_col = nodes_col.push(Text::new(term.clone()).size(16).color(cyan)
-                                .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }));
-                        } else {
-                            let mut rc = Column::new().align_x(alignment::Horizontal::Center).spacing(0);
-                            rc = rc.push(Text::new(reading.clone()).size(12).color(gray));
-                            rc = rc.push(Text::new(term.clone()).size(16).color(cyan)
-                                .font(IcedFont { weight: iced::font::Weight::Bold, ..IcedFont::default() }));
-                            nodes_col = nodes_col.push(rc);
-                        }
-                    }
-                    DefinitionNode::Tag { text } => {
-                        nodes_col = nodes_col.push(Text::new(format!("[{text}]")).size(14).color(gray));
-                    }
-                    _ => {}
-                }
+        // #88: Jitendex group metadata (POS/field info) is structured content
+        // rendered once as the header.
+        if !sg.header.is_empty() {
+            content = content.push(
+                Self::render_definition(&sg.header)
+                    .padding(iced::Padding { top: 2.0, ..Default::default() }),
+            );
+        }
+
+        if sg.is_forms {
+            // JMdict "Forms" groups render as unnumbered rows.
+            for sense in &sg.senses {
+                content = content.push(Self::render_definition(&sense.nodes));
             }
-            sense_row = sense_row.push(nodes_col);
-            content = content.push(sense_row);
+        } else {
+            for sense in &sg.senses {
+                let mut sense_row = Row::new().spacing(3).align_y(alignment::Vertical::Top);
+                sense_row = sense_row.push(Text::new(format!("{}. ", sense.index)).size(15).color(white));
+                sense_row = sense_row.push(Self::render_definition(&sense.nodes).width(Length::Fill));
+                content = content.push(sense_row);
+            }
+        }
+
+        // #88: the forms table and attribution trail the senses, unnumbered.
+        if !sg.trailing.is_empty() {
+            content = content.push(
+                Self::render_definition(&sg.trailing)
+                    .padding(iced::Padding { bottom: 2.0, ..Default::default() }),
+            );
         }
         content
+    }
+
+    /// Render a definition node list. Consecutive text runs are coalesced into
+    /// one widget, like Android's `renderDefinition`.
+    fn render_definition(nodes: &[DefinitionNode]) -> Column<'static, Message> {
+        let white = Color::WHITE;
+        let mut col = Column::new().spacing(2).width(Length::Fill);
+        let mut i = 0;
+        while i < nodes.len() {
+            match &nodes[i] {
+                DefinitionNode::Text(_) => {
+                    let mut run = String::new();
+                    let mut j = i;
+                    while j < nodes.len() {
+                        if let DefinitionNode::Text(t) = &nodes[j] {
+                            run.push_str(t);
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    col = col.push(
+                        Text::new(run)
+                            .size(15)
+                            .color(white)
+                            .width(Length::Fill)
+                            .wrapping(iced::widget::text::Wrapping::Word),
+                    );
+                    i = j;
+                }
+                DefinitionNode::Ruby { term, reading } => {
+                    col = col.push(Self::ruby_view(term, reading, true, false));
+                    i += 1;
+                }
+                DefinitionNode::Tag { text } => {
+                    col = col.push(Self::tag_chip(text));
+                    i += 1;
+                }
+                DefinitionNode::Citation(text) => {
+                    col = col.push(
+                        Text::new(text.clone())
+                            .size(11)
+                            .color(Color::from_rgba(1.0, 1.0, 1.0, 120.0 / 255.0)),
+                    );
+                    i += 1;
+                }
+                DefinitionNode::Example(example) => {
+                    col = col.push(Self::example_box(example));
+                    i += 1;
+                }
+                DefinitionNode::ListBlock { items, .. } => {
+                    let mut block = Column::new().spacing(3).padding([4.0, 2.0]);
+                    for item in items {
+                        block = block.push(Self::render_definition(item));
+                    }
+                    col = col.push(block);
+                    i += 1;
+                }
+                DefinitionNode::Table { rows } => {
+                    if !rows.is_empty() {
+                        col = col.push(Self::definition_table(rows));
+                    }
+                    i += 1;
+                }
+                DefinitionNode::Group { nodes, .. } => {
+                    // A non-inline group gets its own line; an inline group
+                    // flows with its neighbours.
+                    col = col.push(Self::render_definition(nodes));
+                    i += 1;
+                }
+            }
+        }
+        col
+    }
+
+    /// #88: an example box — Japanese sentence (ruby intact) over its
+    /// translation, on the example palette.
+    fn example_box(example: &ExampleNode) -> Container<'static, Message> {
+        let white = Color::WHITE;
+        let light_gray = Color::from_rgb(0.75, 0.75, 0.75);
+        let mut inner = Column::new().spacing(3).width(Length::Fill);
+        if let Some(jp) = &example.japanese {
+            inner = inner.push(
+                Text::new(jp.clone())
+                    .size(16)
+                    .color(white)
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::Word),
+            );
+            if let Some(en) = &example.english {
+                inner = inner.push(
+                    Text::new(en.clone())
+                        .size(14)
+                        .color(light_gray)
+                        .width(Length::Fill)
+                        .wrapping(iced::widget::text::Wrapping::Word),
+                );
+            }
+        } else if !example.parts.is_empty() {
+            for part in &example.parts {
+                inner = inner.push(Self::render_definition(part));
+            }
+        } else if !example.content.is_empty() {
+            inner = inner.push(Self::render_definition(&example.content));
+        }
+        Container::new(inner)
+            .width(Length::Fill)
+            .padding([8.0, 8.0])
+            .style(|_t: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgba(
+                    1.0,
+                    1.0,
+                    1.0,
+                    10.0 / 255.0,
+                ))),
+                border: iced::Border {
+                    color: Color::from_rgba(1.0, 1.0, 1.0, 80.0 / 255.0),
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            })
+    }
+
+    /// #88: render a structured-content table as a real grid: equal-weight
+    /// columns, a shared 1px rule between neighbours, and the example box's
+    /// card palette around the outside.
+    fn definition_table(rows: &[Vec<Vec<DefinitionNode>>]) -> Container<'static, Message> {
+        let border = Color::from_rgba(1.0, 1.0, 1.0, 80.0 / 255.0);
+        let columns = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut table = Column::new().width(Length::Fill).spacing(0);
+        for (row_index, cells) in rows.iter().enumerate() {
+            let mut row = Row::new().width(Length::Fill);
+            for column in 0..columns {
+                if column > 0 {
+                    row = row.push(
+                        Container::new(
+                            iced::widget::Space::new()
+                                .width(Pixels(1.0))
+                                .height(Length::Fill),
+                        )
+                        .height(Length::Fill)
+                        .style(move |_t: &Theme| container::Style {
+                            background: Some(iced::Background::Color(border)),
+                            ..Default::default()
+                        }),
+                    );
+                }
+                let mut cell = Column::new().padding([4.0, 6.0]).width(Length::FillPortion(1));
+                if let Some(nodes) = cells.get(column) {
+                    cell = cell.push(Self::render_definition(nodes));
+                }
+                row = row.push(cell);
+            }
+            table = table.push(row);
+            if row_index + 1 < rows.len() {
+                table = table.push(
+                    Container::new(
+                        iced::widget::Space::new()
+                            .width(Length::Fill)
+                            .height(Pixels(1.0)),
+                    )
+                    .width(Length::Fill)
+                    .style(move |_t: &Theme| container::Style {
+                        background: Some(iced::Background::Color(border)),
+                        ..Default::default()
+                    }),
+                );
+            }
+        }
+        Container::new(table)
+            .width(Length::Fill)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgba(
+                    1.0,
+                    1.0,
+                    1.0,
+                    10.0 / 255.0,
+                ))),
+                border: iced::Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            })
     }
 
     fn neighbor_panel<'a>(&'a self) -> Container<'a, Message> {

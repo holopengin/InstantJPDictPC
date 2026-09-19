@@ -249,16 +249,30 @@ pub enum GamepadAction {
 // Dictionary formatting
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+/// A Jitendex/Yomitan example box: either a JMdict-shaped
+/// `{japanese, english}` pair, a set of `example-sentence-a/-b` parts
+/// (Japanese then English), or generic structured content.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExampleNode {
+    pub japanese: Option<String>,
+    pub english: Option<String>,
+    pub content: Vec<DefinitionNode>,
+    pub parts: Vec<Vec<DefinitionNode>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum DefinitionNode {
     Text(String),
     Ruby { term: String, reading: String },
     Tag { text: String },
-    /// Block-level container: rendered as nothing today, but it keeps its
-    /// content out of the inline flow (see `parse_definition_item`).
-    Example,
-    ListBlock,
-    Table,
+    /// The closing `attribution` source line (`JMdict | Tatoeba`).
+    Citation(String),
+    Example(ExampleNode),
+    ListBlock { items: Vec<Vec<DefinitionNode>>, list_type: Option<String> },
+    Table { rows: Vec<Vec<Vec<DefinitionNode>>> },
+    /// A boxed extra-info block (`xref`, `antonym`, `related`, `sense-note`,
+    /// `info-gloss`, `lang-source`): `is_inline = false` gives it its own line.
+    Group { nodes: Vec<DefinitionNode>, is_inline: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +285,12 @@ pub struct FormattedSense {
 pub struct FormattedSenseGroup {
     pub tags: Vec<String>,
     pub senses: Vec<FormattedSense>,
+    /// JMdict "Forms"/"Other forms" groups render unnumbered.
+    pub is_forms: bool,
+    /// Jitendex group metadata (POS/field info) rendered before the senses.
+    pub header: Vec<DefinitionNode>,
+    /// Forms/attribution blocks rendered after the senses, unnumbered.
+    pub trailing: Vec<DefinitionNode>,
 }
 
 #[derive(Debug, Clone)]
@@ -286,12 +306,35 @@ pub struct FormattedReadingGroup {
     pub headwords: Vec<FormattedHeadword>,
     pub sense_groups: Vec<FormattedSenseGroup>,
     pub is_kanji_entry: bool,
+    /// Downstep positions from a pitch dictionary, empty when none.
+    pub pitch_positions: Vec<i32>,
+    /// False when this reading repeats a glossary already rendered for an
+    /// earlier reading: the headword still shows, the senses do not.
+    pub render_senses: bool,
+}
+
+/// A deinflection (or redirect) hop shown above the senses: `食べた → 食べる`.
+#[derive(Debug, Clone)]
+pub struct DeinflectionChain {
+    pub surface: String,
+    /// Rule-type tags for the hop (`past`, `redirect`, …).
+    pub steps: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FormattedEntry {
     pub term: String,
     pub reading_groups: Vec<FormattedReadingGroup>,
+    pub deinflection: Option<DeinflectionChain>,
+    pub dictionary_name: Option<String>,
+}
+
+/// One matched term with its database rows and the chain that reached it.
+#[derive(Debug, Clone)]
+pub struct TermMatch {
+    pub term: String,
+    pub entries: Vec<crate::data::models::DictionaryEntry>,
+    pub chain: Option<DeinflectionChain>,
 }
 
 // ---------------------------------------------------------------------------
