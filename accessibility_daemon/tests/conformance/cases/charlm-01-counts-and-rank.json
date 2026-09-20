@@ -1,0 +1,21 @@
+{
+  "id": "charlm-01-counts-and-rank",
+  "kind": "char_lm",
+  "description": "The character n-gram prior: packed-table binary search finds entries of every order and misses cleanly; the back-off chain ranks by the longest known context, else the unigram prior, else last. Toy table with the shipped CLM1 semantics.",
+  "mobile_mirror": "GapCandidatesTest.theModelBinarySearchesThePackedTable + CharLmAssetTest (shape)",
+  "case": {
+    "mass": 500,
+    "entries": [["私", 100], ["の", 200], ["を", 50], ["は", 30], ["私の", 40], ["私を", 5], ["のは", 60], ["私は", 20]],
+    "counts": [
+      { "ngram": ["私"], "expect": 100 },
+      { "ngram": ["私", "の"], "expect": 40 },
+      { "ngram": ["私", "の", "は"], "expect": 0 },
+      { "ngram": [], "expect": 0 },
+      { "ngram": ["私", "の", "は", "を", "に"], "expect": 0 }
+    ],
+    "ranks": [
+      { "context": ["私"], "pool": ["を", "の"], "expect": ["の", "を"] },
+      { "context": [], "pool": ["の", "は"], "expect": ["の", "は"] }
+    ]
+  }
+}
