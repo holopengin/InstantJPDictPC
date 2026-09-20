@@ -100,6 +100,7 @@ mod tests {
             name: name.to_string(),
             priority: 0,
             enabled: true,
+            built_in: false,
             catalog_id: catalog_id.map(str::to_string),
         };
         assert!(!is_installed(&[], jitendex));

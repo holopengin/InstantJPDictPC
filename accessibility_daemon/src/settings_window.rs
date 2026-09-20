@@ -259,6 +259,12 @@ impl SettingsWindow {
                 if self.busy {
                     return Task::none();
                 }
+                // The bundled pitch dictionary is app state: never deletable,
+                // even if a stale button ever reaches this handler.
+                if self.dictionaries.iter().any(|d| d.id == id && d.built_in) {
+                    self.status_text = "Bundled dictionaries cannot be deleted".to_string();
+                    return Task::none();
+                }
                 if let Err(e) = self.db.delete_dictionary(id) {
                     self.status_text = format!("Delete failed: {}", e);
                 } else {
@@ -353,6 +359,7 @@ impl SettingsWindow {
                                 &dest,
                                 Some(cb),
                                 ImportOptions {
+                                    built_in: false,
                                     catalog_id: Some(entry.id.clone()),
                                 },
                             )
@@ -668,7 +675,9 @@ impl SettingsWindow {
         dict: &'a DictionaryMeta,
         disabled: bool,
     ) -> Container<'a, SettingsMessage> {
-        let name_text = if dict.enabled {
+        let name_text = if dict.built_in {
+            Text::new(format!("{} (bundled)", dict.name)).size(15)
+        } else if dict.enabled {
             Text::new(&dict.name).size(15)
         } else {
             Text::new(format!("{} (disabled)", dict.name))
@@ -687,17 +696,24 @@ impl SettingsWindow {
             .on_press(SettingsMessage::MoveDown(dict.id))
             .style(button::secondary);
 
-        let delete_btn = if disabled {
-            Button::new(Text::new("Delete").size(13)).style(button::danger)
+        // The bundled dictionary has no Delete: it is app state, not a
+        // user import (mobile hides built-ins from the manager entirely).
+        let delete_btn = if dict.built_in {
+            None
+        } else if disabled {
+            Some(Button::new(Text::new("Delete").size(13)).style(button::danger))
         } else {
-            Button::new(Text::new("Delete").size(13))
-                .on_press(SettingsMessage::DeleteDictionary(dict.id))
-                .style(button::danger)
+            Some(
+                Button::new(Text::new("Delete").size(13))
+                    .on_press(SettingsMessage::DeleteDictionary(dict.id))
+                    .style(button::danger),
+            )
         };
 
-        let controls = row![up_btn, down_btn, delete_btn]
-            .spacing(6)
-            .align_y(Vertical::Center);
+        let mut controls = row![up_btn, down_btn].spacing(6).align_y(Vertical::Center);
+        if let Some(btn) = delete_btn {
+            controls = controls.push(btn);
+        }
 
         let row_content = row![
             enabled_checkbox,
