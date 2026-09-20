@@ -15,6 +15,7 @@ use crate::data::catalog::{self, CatalogEntry};
 use crate::data::db::DictionaryDatabase;
 use crate::data::models::DictionaryMeta;
 use crate::data::importer::{DictionaryImporter, ImportOptions, ImportProgress};
+use crate::overlay_font::FontFace;
 use futures_timer::Delay;
 use std::time::Duration;
 
@@ -36,6 +37,9 @@ pub enum SettingsMessage {
     /// #100: the furigana (ruby) rule switch. The frontend owns the settings
     /// file; this window renders the checkbox and reports the change.
     SetFuriganaFilter(bool),
+    /// Font face switch, rendered here so all behaviour lives in one place.
+    /// Like the furigana switch, the frontend owns the file and saves.
+    SetFontFace(FontFace),
     CloseWindow,
 }
 
@@ -311,6 +315,12 @@ impl SettingsWindow {
                 Task::none()
             }
 
+            SettingsMessage::SetFontFace(face) => {
+                // Same ownership as the furigana switch: the frontend saves.
+                self.app_settings.overlay_font = face;
+                Task::none()
+            }
+
             SettingsMessage::InstallCatalog(id) => {
                 if self.busy {
                     return Task::none();
@@ -554,21 +564,8 @@ impl SettingsWindow {
 
         content = content.push(Space::new().height(Pixels(8.0)));
 
-        // --- Action buttons (disabled while busy) ---
+        // --- Behaviour: toggles that apply to the next capture / launch. ---
 
-        let disabled = self.busy;
-        content = content.push(action_button(
-            "Import Yomitan Dictionary (.zip)",
-            SettingsMessage::ImportDictionary,
-            disabled,
-        ));
-        content = content.push(action_button(
-            "Refresh Status",
-            SettingsMessage::RefreshStatus,
-            disabled,
-        ));
-
-        content = content.push(Space::new().height(Pixels(16.0)));
         content = content.push(Text::new("Behaviour").size(18).style(text::primary));
         content = content.push(Space::new().height(Pixels(4.0)));
 
@@ -594,8 +591,49 @@ impl SettingsWindow {
             .style(text::secondary),
         );
 
+        // Font face, moved here from the frontend menu so all behaviour lives
+        // in one place. Applies to the overlay and the dictionary panel alike
+        // (both register the same face at viewer startup).
+        let serif_check = checkbox(self.app_settings.overlay_font == FontFace::Serif)
+            .on_toggle(|serif| {
+                SettingsMessage::SetFontFace(if serif {
+                    FontFace::Serif
+                } else {
+                    FontFace::Sans
+                })
+            });
+        content = content.push(
+            row![
+                serif_check,
+                Text::new("Serif font (Noto Serif JP)").size(14),
+            ]
+            .spacing(6)
+            .align_y(Vertical::Center),
+        );
+        content = content.push(
+            Text::new("Overlay & dictionary panel — takes effect next launch.")
+                .size(12)
+                .style(text::secondary),
+        );
+
         content = content.push(Space::new().height(Pixels(16.0)));
-        content = content.push(Text::new("Dictionaries").size(18).style(text::primary));
+
+        // --- Action buttons (disabled while busy) ---
+
+        let disabled = self.busy;
+        content = content.push(action_button(
+            "Import Yomitan Dictionary (.zip)",
+            SettingsMessage::ImportDictionary,
+            disabled,
+        ));
+        content = content.push(action_button(
+            "Refresh Status",
+            SettingsMessage::RefreshStatus,
+            disabled,
+        ));
+
+        content = content.push(Space::new().height(Pixels(16.0)));
+        content = content.push(Text::new("Dictionary Catalog").size(18).style(text::primary));
         content = content.push(Space::new().height(Pixels(4.0)));
 
         // --- One-click installs (#71): the dictionaries that used to be
@@ -607,7 +645,11 @@ impl SettingsWindow {
             content = content.push(self.catalog_row(entry, installed, disabled));
         }
 
-        // --- Dictionary list (disabled while busy) ---
+        content = content.push(Space::new().height(Pixels(16.0)));
+        content = content.push(Text::new("Dictionary Manager").size(18).style(text::primary));
+        content = content.push(Space::new().height(Pixels(4.0)));
+
+        // --- Installed dictionaries (disabled while busy) ---
 
         if self.dictionaries.is_empty() {
             content = content.push(
