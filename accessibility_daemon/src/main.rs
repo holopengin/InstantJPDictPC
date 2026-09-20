@@ -51,6 +51,8 @@ enum BootstrapMsg {
     ImageReady(iced::widget::image::Handle, Vec<u8>, u32, u32),
     DictReady(Arc<DictionaryDatabase>),
     DeinflectReady(Arc<Deinflector>),
+    /// Complete replacement detection+recognition result after a live retune.
+    Retuned(Vec<DetectedAnnotation>),
 }
 
 use iced::window::settings::PlatformSpecific;
@@ -272,6 +274,10 @@ fn print_usage() {
     println!("      --hybrid               Hybrid mode: both horizontal and vertical recognition");
     println!("  -b, --batch-size <N>       Recognition batch size (default: 10)");
     println!("      --batch-size=<N>       (alternative syntax)");
+    println!("      --det-thresh <F>       Detection threshold 0.01-0.99 (default 0.3)");
+    println!("      --det-thresh=<F>       (alternative syntax)");
+    println!("      --det-unclip <F>       DB unclip ratio 0.0-5.0 (default 1.5)");
+    println!("      --det-unclip=<F>       (alternative syntax)");
     println!();
     println!("CAPTURE MODE (for a global shortcut):");
     println!("  --capture takes the screenshot itself — the focused window, no");
@@ -311,6 +317,10 @@ fn print_usage() {
     println!("  D / Shift+J                Scroll dictionary down");
     println!("  F / Shift+K                Scroll dictionary up");
     println!("  Esc / Q                    Close viewer / back out of a selection");
+    println!("  [ / ]                      Lower / raise DET_UNCLIP by 0.05 (live)");
+    println!("  - / =                      Lower / raise DET_THRESH by 0.01 (live)");
+    println!("  R                          Reset detection tuning to startup values");
+    println!("  F1                         Show/hide the detection tuning HUD");
 }
 
 fn run_frontend(db: Arc<DictionaryDatabase>, data_dir: std::path::PathBuf) -> Result<()> {
@@ -330,6 +340,52 @@ fn run_frontend(db: Arc<DictionaryDatabase>, data_dir: std::path::PathBuf) -> Re
     });
     app.run().context("Failed to run frontend window")?;
     Ok(())
+}
+
+/// Detection tunables supplied on the command line.
+#[derive(Clone, Copy, Default)]
+struct DetTuning {
+    thresh: Option<f32>,
+    unclip: Option<f32>,
+}
+
+/// A live retune request sent from the viewer to the OCR worker.
+#[derive(Clone, Copy)]
+struct TuneCmd {
+    thresh: f32,
+    unclip: f32,
+}
+
+/// `--det-thresh[=F]` / `--det-unclip[=F]`, both clamped to plausible ranges.
+/// Unknown arguments are ignored here; the main parser handles the rest.
+fn parse_det_tuning(args: &[String]) -> DetTuning {
+    let mut tuning = DetTuning::default();
+    let clamp_thresh = |v: f32| v.clamp(0.01, 0.99);
+    let clamp_unclip = |v: f32| v.clamp(0.0, 5.0);
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if let Some(v) = arg.strip_prefix("--det-thresh=") {
+            tuning.thresh = v.parse::<f32>().ok().map(clamp_thresh);
+            i += 1;
+        } else if arg == "--det-thresh" {
+            if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                tuning.thresh = Some(clamp_thresh(v));
+            }
+            i += 2;
+        } else if let Some(v) = arg.strip_prefix("--det-unclip=") {
+            tuning.unclip = v.parse::<f32>().ok().map(clamp_unclip);
+            i += 1;
+        } else if arg == "--det-unclip" {
+            if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                tuning.unclip = Some(clamp_unclip(v));
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    tuning
 }
 
 fn run_ocr_viewer(
@@ -363,11 +419,12 @@ fn run_ocr_viewer(
         else { image_paths.push(args[i].clone()); i += 1; }
     }
     let _ = font_path;
+    let tuning = parse_det_tuning(&args);
 
     // Headless batch mode: OCR a directory or a list of images, saving line
     // crops + sidecar text files next to each source image.
     if headless {
-        return run_headless_batch(image_paths, recognition_mode, batch_size);
+        return run_headless_batch(image_paths, recognition_mode, batch_size, tuning);
     }
 
     let image_path = image_paths.first().cloned().context("No image path provided")?;
@@ -376,6 +433,9 @@ fn run_ocr_viewer(
     let (bootstrap_tx, bootstrap_rx) = std::sync::mpsc::channel::<BootstrapMsg>();
     // OCR channel — streamed detection boxes and recognition results
     let (ocr_tx, ocr_rx) = std::sync::mpsc::channel::<(usize, DetectedAnnotation)>();
+    // Live tuning channel — the viewer's tune keys send the latest
+    // DET_THRESH / DET_UNCLIP values to the OCR worker.
+    let (tune_tx, tune_rx) = std::sync::mpsc::channel::<TuneCmd>();
 
     let ocr_tx2 = ocr_tx.clone();
     let image_path2 = image_path.clone();
@@ -431,6 +491,10 @@ fn run_ocr_viewer(
                     Ok(e) => e,
                     Err(err) => { eprintln!("[Bootstrap] OCR engine error: {err}"); return; }
                 };
+                // CLI tuning flags apply to the very first detection; the
+                // viewer's tune keys adjust the same overrides live.
+                engine.det_thresh_override = tuning.thresh;
+                engine.det_unclip_override = tuning.unclip;
                 println!("[Bootstrap] OCR engine created ({} chars) in {:.0} ms",
                     engine.ppocr_vocab.len(), t_engine.elapsed().as_secs_f64() * 1000.0);
 
@@ -473,6 +537,60 @@ fn run_ocr_viewer(
                 }
                 let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;
                 println!("[OCR timing] Character recognition: {:>8.2} ms", recognize_ms);
+
+                // ── Live detection tuning ────────────────────────────────
+                // Keep the engine + image alive so the viewer can sweep
+                // DET_THRESH / DET_UNCLIP without restarting. Commands that
+                // pile up while a sweep is running are coalesced to the latest.
+                while let Ok(first) = tune_rx.recv() {
+                    let mut cmd = first;
+                    while let Ok(next) = tune_rx.try_recv() {
+                        cmd = next;
+                    }
+                    engine.det_thresh_override = Some(cmd.thresh);
+                    engine.det_unclip_override = Some(cmd.unclip);
+                    let t_tune = std::time::Instant::now();
+                    let det = match engine.detect_lines(&image) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!("[Tune] detection error: {e}");
+                            continue;
+                        }
+                    };
+                    let boxes = det.boxes;
+                    let rotated = det.rotated;
+                    let mut anns: Vec<DetectedAnnotation> = boxes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| {
+                            let quad = rotated.get(i).copied().filter(|r| r.is_rotated());
+                            DetectedAnnotation { bbox: b.clone(), quad, line: None }
+                        })
+                        .collect();
+                    let (tx, rx) = std::sync::mpsc::channel::<(usize, DetectedAnnotation)>();
+                    if let Err(e) = ocr_engine::recognize_boxes_streaming(
+                        &image, &boxes, &rotated,
+                        engine.ppocr_rec.clone(),
+                        &ppocr_vocab, &rec_remap, batch_sz, rec_mode,
+                        tx,
+                        std::path::Path::new("/tmp"),
+                    ) {
+                        eprintln!("[Tune] recognition error: {e}");
+                    }
+                    for (idx, ann) in rx {
+                        if idx < anns.len() {
+                            anns[idx] = ann;
+                        }
+                    }
+                    println!(
+                        "[Tune] DET_THRESH={:.2} DET_UNCLIP={:.2} → {} boxes in {:.0} ms",
+                        cmd.thresh, cmd.unclip, anns.len(),
+                        t_tune.elapsed().as_secs_f64() * 1000.0
+                    );
+                    if bootstrap_tx.send(BootstrapMsg::Retuned(anns)).is_err() {
+                        break;
+                    }
+                }
             }
         })?;
 
@@ -516,10 +634,28 @@ fn run_ocr_viewer(
         screen_h / ui_scale,
     );
 
-    let boot = move || OcrViewer::new_empty(screen_w, screen_h);
+    // The UI keeps the sending end; the worker owns the receiver so it can
+    // re-run detection when the viewer's tuning keys change the values.
+    let tune_tx = std::sync::Mutex::new(tune_tx);
+
+    let boot = move || {
+        let mut viewer = OcrViewer::new_empty(screen_w, screen_h);
+        if let Some(t) = tuning.thresh {
+            viewer.det_thresh = t;
+            viewer.det_thresh_default = t;
+        }
+        if let Some(u) = tuning.unclip {
+            viewer.det_unclip = u;
+            viewer.det_unclip_default = u;
+        }
+        viewer
+    };
 
     let update = move |state: &mut OcrViewer, msg: Message| -> iced::Task<Message> {
-        // Drain bootstrap channel (image, dict, deinflector)
+        // Track whether any channel drained anything — if so, schedule the
+        // next frame immediately so we keep draining until they are empty.
+        let mut had_ocr_work = false;
+        // Drain bootstrap channel (image, dict, deinflector, retunes)
         if let Ok(mut guard) = rx_for_update.lock() {
             if let Some(rx) = guard.as_mut() {
                 while let Ok(event) = rx.try_recv() {
@@ -533,13 +669,15 @@ fn run_ocr_viewer(
                         BootstrapMsg::DeinflectReady(d) => {
                             state.deinflector = Some(d);
                         }
+                        BootstrapMsg::Retuned(annotations) => {
+                            state.apply_retune(annotations);
+                            state.det_busy = false;
+                            had_ocr_work = true;
+                        }
                     }
                 }
             }
         }
-        // Track whether we drained anything — if so, schedule the next frame
-        // immediately so we keep draining until the channel is empty.
-        let mut had_ocr_work = false;
         if let Ok(mut guard) = ocr_rx_update.lock() {
             if let Some(rx) = guard.as_mut() {
                 while let Ok((idx, ann)) = rx.try_recv() {
@@ -751,6 +889,29 @@ fn run_ocr_viewer(
                     }
                 }
             }
+            Message::TuneDet { param, delta } => {
+                state.adjust_det_tuning(param, delta);
+                state.det_busy = true;
+                if let Ok(tx) = tune_tx.lock() {
+                    let _ = tx.send(TuneCmd {
+                        thresh: state.det_thresh,
+                        unclip: state.det_unclip,
+                    });
+                }
+            }
+            Message::TuneReset => {
+                state.reset_det_tuning();
+                state.det_busy = true;
+                if let Ok(tx) = tune_tx.lock() {
+                    let _ = tx.send(TuneCmd {
+                        thresh: state.det_thresh,
+                        unclip: state.det_unclip,
+                    });
+                }
+            }
+            Message::ToggleDetHud => {
+                state.det_hud_visible = !state.det_hud_visible;
+            }
             Message::Tick => {
                 // Nav graph rebuild is deferred to navigate() — no need
                 // to rebuild here every frame during streaming.
@@ -863,6 +1024,18 @@ fn run_ocr_viewer(
                                     || *k == iced::keyboard::Key::Character("k".into()) => GamepadAction::NavigateUp,
                                 k if *k == iced::keyboard::Key::Character("d".into()) => GamepadAction::ScrollDown,
                                 k if *k == iced::keyboard::Key::Character("f".into()) => GamepadAction::ScrollUp,
+                                k if *k == iced::keyboard::Key::Character("[".into()) =>
+                                    return Some(Message::TuneDet { param: DetParam::Unclip, delta: -0.05 }),
+                                k if *k == iced::keyboard::Key::Character("]".into()) =>
+                                    return Some(Message::TuneDet { param: DetParam::Unclip, delta: 0.05 }),
+                                k if *k == iced::keyboard::Key::Character("-".into()) =>
+                                    return Some(Message::TuneDet { param: DetParam::Threshold, delta: -0.01 }),
+                                k if *k == iced::keyboard::Key::Character("=".into()) =>
+                                    return Some(Message::TuneDet { param: DetParam::Threshold, delta: 0.01 }),
+                                k if *k == iced::keyboard::Key::Character("r".into()) =>
+                                    return Some(Message::TuneReset),
+                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::F1) =>
+                                    return Some(Message::ToggleDetHud),
                                 _ => return None,
                             };
                             // Set keyboard repeat tracking so ZoomTick can fire repeats.
@@ -922,6 +1095,7 @@ fn run_headless_batch(
     image_paths: Vec<String>,
     recognition_mode: RecognitionMode,
     batch_size: usize,
+    tuning: DetTuning,
 ) -> Result<()> {
     use std::path::{Path, PathBuf};
 
@@ -966,6 +1140,8 @@ fn run_headless_batch(
 
     let t_engine = std::time::Instant::now();
     let mut engine = ocr_engine::OcrEngine::new(&resolve_asset_dir(), recognition_mode, batch_size)?;
+    engine.det_thresh_override = tuning.thresh;
+    engine.det_unclip_override = tuning.unclip;
     println!("[Batch] OCR engine created in {:.0} ms", t_engine.elapsed().as_secs_f64() * 1000.0);
 
     let ppocr_vocab = engine.ppocr_vocab.clone();
@@ -1003,5 +1179,46 @@ fn run_headless_batch(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        std::iter::once("accessibility_daemon".to_string())
+            .chain(v.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn det_tuning_parses_both_syntaxes() {
+        let t = parse_det_tuning(&args(&[
+            "--det-thresh=0.42",
+            "--det-unclip",
+            "1.25",
+            "img.png",
+        ]));
+        assert_eq!(t.thresh, Some(0.42));
+        assert_eq!(t.unclip, Some(1.25));
+    }
+
+    #[test]
+    fn det_tuning_clamps_out_of_range_values() {
+        let t = parse_det_tuning(&args(&["--det-thresh", "9.0", "--det-unclip=99"]));
+        assert_eq!(t.thresh, Some(0.99));
+        assert_eq!(t.unclip, Some(5.0));
+        let t = parse_det_tuning(&args(&["--det-thresh=-1"]));
+        assert_eq!(t.thresh, Some(0.01));
+    }
+
+    #[test]
+    fn det_tuning_ignores_missing_and_unparsable_values() {
+        let t = parse_det_tuning(&args(&["--det-thresh", "--vert", "img.png"]));
+        assert_eq!(t.thresh, None);
+        assert!(t.unclip.is_none());
+        let t = parse_det_tuning(&args(&["--det-unclip=abc"]));
+        assert_eq!(t.unclip, None);
+    }
 }
 

@@ -47,6 +47,27 @@ pub struct OcrEngine {
     pub rec_remap: Vec<i32>,
     pub recognition_mode: RecognitionMode,
     pub batch_size: usize,
+    /// Live detection tuning from the viewer (`Message::TuneDet`). `None`
+    /// falls back to the `DET_THRESH` / `DET_UNCLIP` environment, then to the
+    /// mobile defaults.
+    pub det_thresh_override: Option<f32>,
+    pub det_unclip_override: Option<f32>,
+}
+
+/// Effective `DET_THRESH`: environment override, else the mobile 0.3.
+pub fn default_det_thresh() -> f32 {
+    std::env::var("DET_THRESH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(PPOCR_DET_THRESH)
+}
+
+/// Effective `DET_UNCLIP`: environment override, else the mobile 1.5.
+pub fn default_det_unclip() -> f32 {
+    std::env::var("DET_UNCLIP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(PPOCR_DET_UNCLIP_RATIO)
 }
 
 /// Load the PP-OCRv6 ncnn models + vocab/remap from `model_dir`.
@@ -1162,7 +1183,21 @@ impl OcrEngine {
             rec_remap,
             recognition_mode,
             batch_size,
+            det_thresh_override: None,
+            det_unclip_override: None,
         })
+    }
+
+    /// Effective detection threshold: viewer override → `DET_THRESH` env →
+    /// mobile default. The viewer's tuning keys set the override live.
+    pub fn det_thresh(&self) -> f32 {
+        self.det_thresh_override.unwrap_or_else(default_det_thresh)
+    }
+
+    /// Effective DB unclip ratio: viewer override → `DET_UNCLIP` env →
+    /// mobile default.
+    pub fn det_unclip(&self) -> f32 {
+        self.det_unclip_override.unwrap_or_else(default_det_unclip)
     }
 
 
@@ -1275,16 +1310,11 @@ impl OcrEngine {
         // 5. Threshold → flood-fill components → min-area fits (mobile
         // detectRotated, the default path): an 8-connected fill over
         // `prob > thresh`, the component's boundary pixel corners in source
-        // space, then RotatedGeometry.fitQuad. DET_THRESH / DET_UNCLIP env
-        // overrides let us sweep parameters without rebuilding.
-        let det_thresh: f32 = std::env::var("DET_THRESH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(PPOCR_DET_THRESH);
-        let det_unclip: f32 = std::env::var("DET_UNCLIP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(PPOCR_DET_UNCLIP_RATIO);
+        // space, then RotatedGeometry.fitQuad. The viewer's tuning keys write
+        // the overrides; DET_THRESH / DET_UNCLIP env vars still work when no
+        // override is set.
+        let det_thresh = self.det_thresh();
+        let det_unclip = self.det_unclip();
         // PC-only expansion cap in source pixels; the default is Android's
         // uncapped DB unclip.
         let expand_cap: f32 = std::env::var("DET_EXPAND_CAP")
@@ -1791,6 +1821,23 @@ mod tests {
         OcrEngine::new(&dir, RecognitionMode::Both, 4).expect("engine loads")
     }
 
+    /// Live tuning overrides win over the environment defaults, and clearing
+    /// them falls back to the default resolution path.
+    #[test]
+    fn det_tuning_overrides_beat_the_defaults() {
+        let mut engine = test_engine();
+        engine.det_thresh_override = Some(0.42);
+        engine.det_unclip_override = Some(1.1);
+        assert_eq!(engine.det_thresh(), 0.42);
+        assert_eq!(engine.det_unclip(), 1.1);
+
+        engine.det_thresh_override = None;
+        engine.det_unclip_override = None;
+        // No override: resolves via env-or-mobile-default (env unset in tests).
+        assert_eq!(engine.det_thresh(), default_det_thresh());
+        assert_eq!(engine.det_unclip(), default_det_unclip());
+    }
+
     /// Prob map with `on` pixels set to 0.9 (above the 0.3 threshold).
     fn prob_map(w: usize, h: usize, on: impl Fn(usize, usize) -> bool) -> Vec<f32> {
         let mut map = vec![0.0f32; w * h];
@@ -1963,6 +2010,49 @@ mod tests {
             worst.0
         );
     }
+    /// Live tuning reaches detection: a near-1.0 threshold drops the line,
+    /// and a zero unclip ratio tightens the fitted boxes.
+    #[test]
+    fn det_tuning_overrides_change_detection_output() {
+        let mut eng = test_engine();
+        let truth: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/test_images/synth/truth.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let file = truth["lines"][0]["file"].as_str().unwrap();
+        let img =
+            image::open(format!("{}/test_images/synth/{file}", env!("CARGO_MANIFEST_DIR")))
+                .unwrap();
+        let area = |b: &BoundingBox| (b.w as i64) * (b.h as i64);
+
+        let base = eng.detect(&img).unwrap();
+        let base_max = base
+            .boxes
+            .iter()
+            .max_by_key(|b| area(b))
+            .expect("baseline detects a line");
+
+        eng.det_thresh_override = Some(1.0);
+        let high = eng.detect(&img).unwrap();
+        assert!(high.boxes.is_empty(), "a 1.0 threshold should drop every box");
+
+        eng.det_thresh_override = None;
+        eng.det_unclip_override = Some(0.0);
+        let tight = eng.detect(&img).unwrap();
+        match tight.boxes.iter().max_by_key(|b| area(b)) {
+            Some(t) => assert!(
+                area(t) < area(base_max),
+                "unclip 0.0 should be tighter than 1.5: {t:?} vs {base_max:?}"
+            ),
+            // Everything fell under the min-size filter: also tighter.
+            None => {}
+        }
+    }
+
     /// Mobile #28's filter: small ruby beside/above a large line is dropped,
     /// but a stacked column fragment (center inside the big box's x-range)
     /// and a merely-short real line survive.
