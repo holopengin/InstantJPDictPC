@@ -2324,6 +2324,7 @@ mod tests {
                 .map(|i| BoundingBox::new(i * 20, 0, 20, 20, 1.0))
                 .collect(),
             alternatives: vec![],
+            raw_alternatives: vec![],
             sample_txt: None,
             is_vertical: false,
             chunk_boxes: vec![],

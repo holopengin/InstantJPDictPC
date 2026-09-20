@@ -1161,6 +1161,72 @@ pub fn compute_char_boxes(
     }
 }
 
+#[allow(dead_code)] // no live caller yet: mobile's consumer is the gap-detector fallback
+impl DetectedAnnotation {
+    /// Mobile `OcrEngine.reDecodeLineResult`: rebuild a line's text, char
+    /// boxes and per-character alternatives from its cached
+    /// [`LineResult::raw_alternatives`], without re-running the model. The
+    /// walk (blank handling, CTC collapse, fractional columns, vertical
+    /// punctuation) lives in [`crate::ppocr::re_decode_raw_alternatives`].
+    ///
+    /// Mobile reads the crop geometry off its `LineResult`; the PC annotation
+    /// owns it instead, so the boxes are recomputed in the same frame the emit
+    /// path used — the unclamped `bbox` rect for axis lines, the upright local
+    /// crop mapped back through `quad` for rotated ones — whenever
+    /// `seq_len_total` is known (the one crop fact the PC line does not
+    /// cache). `seq_len_total == 0` keeps the existing boxes, mobile's
+    /// `cropW == 0` fallback. Lines with nothing cached come back unchanged,
+    /// as do annotation slots that never got a line.
+    pub fn re_decode_line(&self, seq_len_total: usize) -> DetectedAnnotation {
+        let Some(line) = self.line.as_ref() else {
+            return self.clone();
+        };
+        let Some(re) =
+            crate::ppocr::re_decode_raw_alternatives(&line.raw_alternatives, line.is_vertical)
+        else {
+            return self.clone();
+        };
+
+        let char_boxes = if seq_len_total > 0 {
+            match self.quad.filter(|r| r.is_rotated()) {
+                Some(r) => {
+                    let lw = r.w.round().max(4.0) as u32;
+                    let lh = r.h.round().max(4.0) as u32;
+                    compute_char_boxes(
+                        &re.text, &re.char_cols, seq_len_total,
+                        0, 0, lw, lh, line.is_vertical, None,
+                    )
+                    .iter()
+                    .map(|b| r.map_local_rect(b.x as f32, b.y as f32, b.w as f32, b.h as f32))
+                    .collect()
+                }
+                None => compute_char_boxes(
+                    &re.text, &re.char_cols, seq_len_total,
+                    self.bbox.x, self.bbox.y,
+                    self.bbox.w.max(0) as u32, self.bbox.h.max(0) as u32,
+                    line.is_vertical, None,
+                ),
+            }
+        } else {
+            line.char_boxes.clone()
+        };
+
+        DetectedAnnotation {
+            bbox: self.bbox.clone(),
+            quad: self.quad,
+            line: Some(LineResult {
+                text: re.text,
+                char_boxes,
+                alternatives: re.alternatives,
+                raw_alternatives: line.raw_alternatives.clone(),
+                sample_txt: line.sample_txt.clone(),
+                is_vertical: line.is_vertical,
+                chunk_boxes: line.chunk_boxes.clone(),
+            }),
+        }
+    }
+}
+
 impl OcrEngine {
     pub fn new(model_dir: &str, recognition_mode: RecognitionMode, batch_size: usize) -> Result<Self> {
         let model_path = Path::new(model_dir);
@@ -1803,6 +1869,7 @@ pub fn recognize_boxes_streaming(
                         let mut alternatives = res.alternatives;
                         let char_cols = res.char_cols;
                         let seq_len_total = res.seq_len_total;
+                        let mut raw_alternatives = res.raw_alternatives;
                         if text.is_empty() { continue; }
 
                         // Vertical punctuation normalisation at emit (#56/#63):
@@ -1813,6 +1880,14 @@ pub fn recognize_boxes_streaming(
                         if job.is_vertical {
                             text = crate::util::japanese::vertical_punctuation(&text);
                             for alts in alternatives.iter_mut() {
+                                for (c, _) in alts.iter_mut() {
+                                    *c = crate::util::japanese::vertical_punctuation_char(*c);
+                                }
+                            }
+                            // Cached raw lists get the same treatment (mobile
+                            // `recRaw`), so a later re-decode cannot reintroduce
+                            // the horizontal forms.
+                            for alts in raw_alternatives.iter_mut() {
                                 for (c, _) in alts.iter_mut() {
                                     *c = crate::util::japanese::vertical_punctuation_char(*c);
                                 }
@@ -1872,6 +1947,7 @@ pub fn recognize_boxes_streaming(
                                 text: final_text,
                                 char_boxes,
                                 alternatives: final_alts,
+                                raw_alternatives,
                                 sample_txt,
                                 is_vertical: job.is_vertical,
                                 chunk_boxes: vec![BoundingBox::new(
@@ -2492,5 +2568,74 @@ mod tests {
             position_checked >= 5,
             "expected at least 5 plain-glyph lines for the position check, got {position_checked}"
         );
+    }
+
+    /// Mobile `OcrEngine.reDecodeLineResult`: a line rebuilt from its cached
+    /// raw alternatives without the model. Text and alternatives are
+    /// rewritten, char boxes recomputed in the annotation's own frame, and the
+    /// raw cache / sidecar / orientation carry over. `seq_len_total == 0`
+    /// keeps the existing boxes (mobile's `cropW == 0` fallback), and a line
+    /// with nothing cached comes back unchanged.
+    #[test]
+    fn annotation_re_decodes_from_raw_alternatives() {
+        let step = |entries: &[(char, f32)]| entries.to_vec();
+        let raw = vec![
+            step(&[('あ', 0.9), ('い', 0.1)]),
+            step(&[('あ', 0.8), ('い', 0.2)]),
+            step(&[('\u{3000}', 0.95), ('あ', 0.4)]),
+            step(&[('い', 0.7), ('あ', 0.3)]),
+        ];
+        let line = LineResult {
+            text: "あ".into(),
+            char_boxes: vec![BoundingBox::new(0, 0, 40, 40, 1.0)],
+            alternatives: vec![vec![('あ', 0.9)]],
+            raw_alternatives: raw.clone(),
+            sample_txt: Some("/tmp/sample.txt".into()),
+            is_vertical: false,
+            chunk_boxes: vec![BoundingBox::new(0, 0, 160, 40, 1.0)],
+        };
+        let ann = DetectedAnnotation {
+            bbox: BoundingBox::new(10, 20, 120, 40, 1.0),
+            quad: None,
+            line: Some(line),
+        };
+
+        // Geometry unknown: the walk still rewrites text/alternatives, but the
+        // old boxes stay (there is nothing to recompute them from).
+        let kept = ann.re_decode_line(0).line.unwrap();
+        assert_eq!(kept.text, "あい");
+        assert_eq!(kept.alternatives.len(), 2);
+        assert_eq!(kept.char_boxes.len(), 1, "boxes kept without geometry");
+        assert_eq!(kept.raw_alternatives, raw);
+        assert_eq!(
+            kept.sample_txt.as_deref(),
+            Some(std::path::Path::new("/tmp/sample.txt"))
+        );
+
+        // Geometry known: one box per emitted character, in the bbox frame.
+        let rebuilt = ann.re_decode_line(4);
+        assert_eq!(rebuilt.bbox.x, 10);
+        assert!(rebuilt.quad.is_none());
+        let line = rebuilt.line.unwrap();
+        assert_eq!(line.text, "あい");
+        assert_eq!(line.alternatives.len(), 2);
+        assert_eq!(line.alternatives[1][0], ('い', 0.7));
+        assert_eq!(line.char_boxes.len(), 2, "one box per emitted character");
+        for b in &line.char_boxes {
+            assert!(b.x >= 10 && b.right() <= 130, "boxes stay in the crop frame: {b:?}");
+        }
+        assert_eq!(line.raw_alternatives, raw, "the cache is carried, not dropped");
+
+        // Nothing cached: unchanged (mobile returns `oldLine`).
+        let bare = DetectedAnnotation {
+            line: Some(LineResult {
+                raw_alternatives: vec![],
+                ..ann.line.clone().unwrap()
+            }),
+            ..ann.clone()
+        };
+        let same = bare.re_decode_line(4).line.unwrap();
+        assert_eq!(same.text, "あ");
+        assert_eq!(same.char_boxes.len(), 1);
     }
 }
