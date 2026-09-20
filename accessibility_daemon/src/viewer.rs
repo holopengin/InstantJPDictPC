@@ -805,8 +805,6 @@ fn glyph_fit_scale(is_vertical: bool, is_half: bool, cell: (f32, f32), ink: (f32
 // Blank gaps — mobile `BlankGaps` / `GapDetector` (#44 Feature 2)
 // ---------------------------------------------------------------------------
 
-/// Mobile `OcrEngine.GAP_CHAR`: the placeholder a dropped character becomes.
-pub const GAP_CHAR: char = '\u{25CC}';
 /// Mobile `GapDetector.DEFAULT_VERTICAL_RATIO`: measured recall 1.00 and no
 /// false positives on the vertical bench; horizontal lines are never
 /// eligible (`BlankGaps.apply` returns early on them).

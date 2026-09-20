@@ -378,6 +378,12 @@ pub struct DetectionResult {
 // OCR results
 // ---------------------------------------------------------------------------
 
+/// Mobile `OcrEngine.GAP_CHAR`: the placeholder a dropped character becomes
+/// (`BlankGaps`, #44). Tapping it opens the alternatives panel — the
+/// dictionary lookup deliberately returns null for a placeholder — and the
+/// panel offers the line's own per-timestep evidence for what went there.
+pub const GAP_CHAR: char = '\u{25CC}';
+
 #[derive(Debug, Clone)]
 pub struct LineResult {
     pub text: String,

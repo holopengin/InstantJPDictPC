@@ -7,6 +7,7 @@ use crate::nav_graph;
 use crate::data::models::DictionaryEntry;
 use crate::models::*;
 use crate::util::deinflector::Deinflector;
+use crate::util::gap_candidates;
 use crate::util::japanese;
 
 /// Result of a dictionary lookup.
@@ -270,8 +271,34 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
             .active_line_results
             .get(line_idx)
             .and_then(|line| line.as_ref())?;
-        let alts = line.alternatives.get(char_idx)?;
         let current_char = line.text.chars().nth(char_idx)?;
+
+        // A blank is not a character to expand from its own table entry (#44):
+        // the placeholder's list is the placeholder itself plus the
+        // evidence-ranked candidates from the line's per-timestep top-K. This
+        // is checked *before* the alternatives table because `with_gap_char`
+        // writes a placeholder entry into that table — reading it (as an
+        // earlier version did) made the ranked path unreachable and the list
+        // came back as the dotted circle alone.
+        if current_char == GAP_CHAR {
+            let mut ranked = gap_candidates::generate(&line.raw_alternatives, gap_candidates::MAX);
+            if ranked.is_empty() {
+                // A blank with nothing to choose from is worse than a guess.
+                ranked = gap_candidates::fallback(gap_candidates::MAX);
+            }
+            let mut candidates = Vec::with_capacity(ranked.len() + 1);
+            candidates.push(AlternativeChar {
+                char: GAP_CHAR,
+                is_selected: true,
+            });
+            candidates.extend(ranked.into_iter().map(|ch| AlternativeChar {
+                char: ch,
+                is_selected: false,
+            }));
+            return Some(AlternativesUiState { candidates });
+        }
+
+        let alts = line.alternatives.get(char_idx)?;
 
         Some(AlternativesUiState {
             candidates: alts
@@ -2447,6 +2474,97 @@ mod tests {
             assert_eq!(self.len(), 1, "expected exactly one element");
             &self[0]
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Blank alternatives (mobile `BlankAlternativesTest`, #44).
+    // ---------------------------------------------------------------------
+
+    /// A line with a placeholder in the middle and the parallel lists a real
+    /// detection would carry.
+    fn blank_line(
+        alternatives: Vec<Vec<(char, f32)>>,
+        raw: Vec<Vec<(char, f32)>>,
+    ) -> LineResult {
+        LineResult {
+            text: format!("私{GAP_CHAR}う"),
+            char_boxes: vec![],
+            alternatives,
+            raw_alternatives: raw,
+            sample_txt: None,
+            is_vertical: true,
+            chunk_boxes: vec![],
+        }
+    }
+
+    fn state_at(line: LineResult, char_idx: isize) -> OcrOverlayState {
+        let mut state = OcrOverlayState::new(1024.0, 768.0);
+        state.active_line_results = vec![Some(line)];
+        state.current_tapped_line_idx = 0;
+        state.current_tapped_char_idx_in_line = char_idx;
+        state
+    }
+
+    /// Mobile `BlankAlternativesTest.a_blank_offers_more_than_the_placeholder_even_when_the_table_holds_it`:
+    /// the alternatives table *does* carry a placeholder entry
+    /// (`with_gap_char` writes one), so the ranked path must be taken before
+    /// reading that table — the old order made it unreachable and the list
+    /// came back as the dotted circle alone.
+    #[test]
+    fn a_blank_offers_more_than_the_placeholder() {
+        let state = state_at(
+            blank_line(
+                vec![vec![('私', 1.0)], vec![(GAP_CHAR, 0.0)], vec![('う', 1.0)]],
+                vec![vec![('、', 0.7), ('。', 0.5)]],
+            ),
+            1,
+        );
+        let ui = state.get_alternatives_ui_state().expect("blank panel");
+        let chars: Vec<char> = ui.candidates.iter().map(|c| c.char).collect();
+        assert_eq!(chars[0], GAP_CHAR, "the placeholder leads");
+        assert!(ui.candidates[0].is_selected);
+        assert!(chars.len() > 1, "blank list was {chars:?}");
+        assert!(
+            chars.contains(&'、'),
+            "the timestep evidence is offered: {chars:?}"
+        );
+    }
+
+    /// The older shape: the table never grew (short `alternatives`), which
+    /// used to return no panel at all.
+    #[test]
+    fn a_blank_offers_more_when_the_table_never_grew() {
+        let state = state_at(blank_line(vec![vec![('私', 1.0)]], vec![]), 1);
+        let ui = state.get_alternatives_ui_state().expect("blank panel");
+        assert!(ui.candidates.len() > 1, "fallback must not be empty");
+    }
+
+    /// With no recogniser evidence the fallback still offers punctuation
+    /// first, then kana.
+    #[test]
+    fn a_blank_without_evidence_falls_back_to_punctuation_then_kana() {
+        let state = state_at(blank_line(vec![], vec![]), 1);
+        let ui = state.get_alternatives_ui_state().expect("blank panel");
+        let chars: Vec<char> = ui.candidates.iter().map(|c| c.char).collect();
+        assert_eq!(chars[0], GAP_CHAR);
+        assert_eq!(chars[1], '、', "punctuation first: {chars:?}");
+        assert!(chars.contains(&'は'), "then kana: {chars:?}");
+    }
+
+    /// An ordinary character still reads its own table entry.
+    #[test]
+    fn an_ordinary_character_still_gets_its_own_head_list() {
+        let state = state_at(
+            blank_line(
+                vec![vec![('私', 1.0)], vec![(GAP_CHAR, 0.0)], vec![('う', 1.0)]],
+                vec![],
+            ),
+            0,
+        );
+        let ui = state.get_alternatives_ui_state().expect("char panel");
+        assert_eq!(ui.candidates.len(), 1);
+        assert_eq!(ui.candidates[0].char, '私');
+        assert!(ui.candidates[0].is_selected);
     }
 }
 
