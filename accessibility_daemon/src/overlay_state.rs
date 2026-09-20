@@ -11,6 +11,9 @@ use crate::util::char_lm::CharLm;
 use crate::util::deinflector::Deinflector;
 use crate::util::gap_candidates;
 use crate::util::japanese;
+use crate::util::kanji_variants::KanjiVariantTable;
+use crate::util::oov_candidates::OovCandidates;
+use crate::util::oov_suggestions;
 
 /// Result of a dictionary lookup.
 pub struct LookupResult {
@@ -54,6 +57,13 @@ pub struct OcrOverlayState {
     /// Mobile `CharLm` (#44): ranks blank candidates by the line context.
     /// `None` when the asset is missing; the list then keeps discovery order.
     pub char_lm: Option<Arc<CharLm>>,
+    /// Mobile `OovCandidates` (#44): component neighbours for a tapped
+    /// character the dictionary misses. `None` when the component-table asset
+    /// is missing; the list is then the head list unchanged.
+    pub oov_candidates: Option<Arc<OovCandidates>>,
+    /// Mobile `KanjiVariants` (#44): obsolete variant forms offered last in a
+    /// tapped character's list. `None` when the variants asset is missing.
+    pub kanji_variants: Option<Arc<KanjiVariantTable>>,
 }
 
 impl OcrOverlayState {
@@ -84,6 +94,8 @@ impl OcrOverlayState {
             nav_graph: None,
             nav_positions: Vec::new(),
             char_lm: None,
+            oov_candidates: None,
+            kanji_variants: None,
         }
     }
 
@@ -91,6 +103,17 @@ impl OcrOverlayState {
     /// candidates (#44). `None` keeps the discovery order.
     pub fn install_char_lm(&mut self, lm: Option<Arc<CharLm>>) {
         self.char_lm = lm;
+    }
+
+    /// Mobile `OovCandidates` + `KanjiVariants` (#44): the component table and
+    /// variant forms behind a tapped character's extra candidates. `None`
+    /// keeps the head-only list.
+    pub fn install_oov_candidates(&mut self, oov: Option<Arc<OovCandidates>>) {
+        self.oov_candidates = oov;
+    }
+
+    pub fn install_kanji_variants(&mut self, variants: Option<Arc<KanjiVariantTable>>) {
+        self.kanji_variants = variants;
     }
 
 
@@ -339,13 +362,31 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
 
         let alts = line.alternatives.get(char_idx)?;
 
+        // Mobile `OovSuggestions.assemble` (#44): the head's own ranking first
+        // and unchanged, then component neighbours by descending IDF mass,
+        // then the obsolete variant forms of the current character. The blank
+        // path above keeps its own rules (no component expansion).
+        let head: Vec<char> = alts.iter().take(15).map(|(ch, _)| *ch).collect();
+        let oov = self.oov_candidates.clone();
+        let variants = self.kanji_variants.clone();
+        let assembled = oov_suggestions::assemble(
+            current_char,
+            &head,
+            oov.as_deref(),
+            &|ch| {
+                variants
+                    .as_deref()
+                    .map(|t| t.obsolete_forms_of(ch))
+                    .unwrap_or_default()
+            },
+        );
+
         Some(AlternativesUiState {
-            candidates: alts
-                .iter()
-                .take(15)
-                .map(|(ch, _)| AlternativeChar {
-                    char: *ch,
-                    is_selected: *ch == current_char,
+            candidates: assembled
+                .into_iter()
+                .map(|s| AlternativeChar {
+                    char: s.ch,
+                    is_selected: s.ch == current_char,
                 })
                 .collect(),
         })
@@ -1798,6 +1839,7 @@ struct ParsedSenseGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::component_table::ComponentTable;
 
     // ---------------------------------------------------------------------
     // Pinned Jitendex fixture (the executable spec from Android's
@@ -2678,6 +2720,86 @@ mod tests {
         assert_eq!(chars[0], GAP_CHAR);
         assert_eq!(chars[1], 'は', "the context prior leads: {chars:?}");
         assert_eq!(chars[2], 'を');
+    }
+
+    // ---------------------------------------------------------------------
+    // OOV suggestions (mobile `OovSuggestionsTest`, #44).
+    // ---------------------------------------------------------------------
+
+    /// The `OovSuggestionsTest` fixture: 50 kanji, `化` carried by two of
+    /// them and `中` by twenty, so a candidate sharing only `化` clears the
+    /// 0.7 tier (≈ 0.78) while one sharing only `中` does not (≈ 0.22).
+    fn fixture_oov() -> OovCandidates {
+        let mut text = String::from("仲:化 中\n伜:化 九 十\n");
+        for i in 0..19 {
+            text.push(char::from_u32(0x4E00 + i).expect("BMP"));
+            text.push_str(":中\n");
+        }
+        for i in 0..29 {
+            text.push(char::from_u32(0x5E00 + i).expect("BMP"));
+            text.push_str(":水\n");
+        }
+        OovCandidates::new(ComponentTable::parse(&text))
+    }
+
+    fn panel_chars(ui: &AlternativesUiState) -> Vec<char> {
+        ui.candidates.iter().map(|c| c.char).collect()
+    }
+
+    /// Mobile `OovSuggestionsTest.component_neighbour_is_appended_after_the_head_list`,
+    /// through the panel: a tapped 仲 lists 伜 after the head entry.
+    #[test]
+    fn a_tapped_character_appends_component_neighbours_after_the_head_list() {
+        let mut state = state_at(blank_line("仲", vec![vec![('仲', 1.0)]], vec![]), 0);
+        state.install_oov_candidates(Some(Arc::new(fixture_oov())));
+        let ui = state.get_alternatives_ui_state().expect("char panel");
+        assert_eq!(panel_chars(&ui), vec!['仲', '伜']);
+        let selected: Vec<char> =
+            ui.candidates.iter().filter(|c| c.is_selected).map(|c| c.char).collect();
+        assert_eq!(selected, vec!['仲']);
+    }
+
+    /// The variant group is offered last, from the current character:
+    /// tapping the canonical 掴 offers its obsolete form 摑, even with no
+    /// component table installed.
+    #[test]
+    fn a_tapped_character_appends_variant_forms_last() {
+        let mut state = state_at(blank_line("掴", vec![vec![('掴', 1.0)]], vec![]), 0);
+        state.install_kanji_variants(Some(Arc::new(KanjiVariantTable::parse("摑\t掴\n"))));
+        let ui = state.get_alternatives_ui_state().expect("char panel");
+        assert_eq!(panel_chars(&ui), vec!['掴', '摑']);
+    }
+
+    /// An ordinary character with no table entry is unchanged, even with both
+    /// tables installed: あ has no components and no variant forms.
+    #[test]
+    fn a_character_with_no_table_entry_is_unchanged() {
+        let mut state = state_at(
+            blank_line("あい", vec![vec![('あ', 1.0), ('い', 0.5)]], vec![]),
+            0,
+        );
+        state.install_oov_candidates(Some(Arc::new(fixture_oov())));
+        state.install_kanji_variants(Some(Arc::new(KanjiVariantTable::parse("摑\t掴\n"))));
+        let ui = state.get_alternatives_ui_state().expect("char panel");
+        assert_eq!(panel_chars(&ui), vec!['あ', 'い']);
+    }
+
+    /// A blank placeholder still gets the evidence list with no component
+    /// expansion, even with both tables installed.
+    #[test]
+    fn a_blank_gets_no_component_expansion() {
+        let mut state = state_at(
+            blank_line(
+                "私\u{25CC}う",
+                vec![vec![('私', 1.0)], vec![(GAP_CHAR, 0.0)], vec![('う', 1.0)]],
+                vec![vec![('、', 0.7), ('。', 0.5)]],
+            ),
+            1,
+        );
+        state.install_oov_candidates(Some(Arc::new(fixture_oov())));
+        state.install_kanji_variants(Some(Arc::new(KanjiVariantTable::parse("摑\t掴\n"))));
+        let ui = state.get_alternatives_ui_state().expect("blank panel");
+        assert_eq!(panel_chars(&ui), vec![GAP_CHAR, '、', '。']);
     }
 }
 
