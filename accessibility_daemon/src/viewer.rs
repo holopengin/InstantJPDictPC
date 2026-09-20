@@ -425,6 +425,17 @@ fn line_glyph_px(line: &LineResult, quad: Option<&RotatedBox>) -> f32 {
     line.char_boxes.iter().map(|b| b.h as f32).fold(0.0, f32::max)
 }
 
+/// Content scale for sizing overlay work: `None` until the image size is
+/// known (`img_w`/`img_h` start at 1). A scale computed from the default 1
+/// is `min(window_w, window_h)` — ~960 instead of ~1 — which sized pre-warm
+/// glyphs at thousands of px and made `embolden` take seconds per line.
+fn content_scale(window_w: f32, window_h: f32, img_w: u32, img_h: u32, zoom: f32) -> Option<f32> {
+    if img_w <= 1 || img_h <= 1 {
+        return None;
+    }
+    Some(f32::min(window_w / img_w as f32, window_h / img_h as f32) * zoom)
+}
+
 /// The font pixel size a line's glyphs are rasterized at: mobile's
 /// `fixedSize * 0.90`, in source pixels, scaled to screen pixels by the
 /// content transform. Zero (no measurable box) means the line draws nothing.
@@ -1978,19 +1989,29 @@ impl OcrViewer {
         // stutter on the first frame new characters appear).
         if let Some(ref line) = line {
             if let Some(ref gc) = self.glyph_cache {
-                // Use cached total_scale from last view() frame — avoids
-                // computing from potentially-not-yet-loaded img_w/img_h (1 vs real).
-                let total_scale = self.last_total_scale.get();
-                // Exactly the draw pass's per-line text size.
-                let px = line_text_px(line, quad.as_ref(), total_scale).round().clamp(1.0, 1024.0) as u32;
-                let mut cache = gc.borrow_mut();
-                let vertical = line.is_vertical;
-                if let Some(gid) = cache.glyph_id('あ', false) {
-                    cache.ensure_glyph(gid, px);
-                }
-                for ch in line.text.chars() {
-                    if let Some(gid) = cache.glyph_id(ch, vertical) {
+                // The scale needs the real image size: before ImageReady
+                // arrives the content scale is unknown, and pre-warming
+                // against a bogus one costs seconds per line in `embolden`.
+                if let Some(total_scale) = content_scale(
+                    self.window_width,
+                    self.window_height,
+                    self.img_w,
+                    self.img_h,
+                    self.state.current_scale,
+                ) {
+                    // Exactly the draw pass's per-line text size.
+                    let px = line_text_px(line, quad.as_ref(), total_scale)
+                        .round()
+                        .clamp(1.0, 1024.0) as u32;
+                    let mut cache = gc.borrow_mut();
+                    let vertical = line.is_vertical;
+                    if let Some(gid) = cache.glyph_id('あ', false) {
                         cache.ensure_glyph(gid, px);
+                    }
+                    for ch in line.text.chars() {
+                        if let Some(gid) = cache.glyph_id(ch, vertical) {
+                            cache.ensure_glyph(gid, px);
+                        }
                     }
                 }
             }
@@ -2096,11 +2117,18 @@ impl OcrViewer {
 
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
         // Cache total_scale for glyph pre-warming in handle_ocr_recognition_result
-        let base_scale = f32::min(
-            self.window_width / self.img_w.max(1) as f32,
-            self.window_height / self.img_h.max(1) as f32,
-        );
-        self.last_total_scale.set(base_scale * self.state.current_scale);
+        // Only once the image size is known: before ImageReady, img_w/img_h
+        // are 1 and min(window_w, window_h) would be mistaken for the content
+        // scale (~960 instead of ~1).
+        if let Some(scale) = content_scale(
+            self.window_width,
+            self.window_height,
+            self.img_w,
+            self.img_h,
+            self.state.current_scale,
+        ) {
+            self.last_total_scale.set(scale);
+        }
         let has_panel = self.selected_word.is_some();
 
         // Gravity is computed in select_character/update_gravity with the full
@@ -3509,6 +3537,21 @@ mod tests {
         assert_eq!(line_text_px(&empty, None, 1.0), 0.0);
         // The zoom transform scales the source size.
         assert!((line_text_px(&line, None, 2.0) - 108.0).abs() < 1e-3);
+    }
+
+    /// The pre-warm freeze: before ImageReady, img_w/img_h are 1, so a scale
+    /// computed then is min(window_w, window_h) (~960) instead of ~1. That
+    /// scaled glyphs to thousands of px and `embolden` took seconds per line.
+    #[test]
+    fn content_scale_needs_a_real_image_size() {
+        assert_eq!(content_scale(960.0, 1018.0, 1, 1, 1.0), None);
+        assert_eq!(content_scale(960.0, 1018.0, 0, 0, 1.0), None);
+
+        let normal = content_scale(960.0, 1018.0, 960, 1018, 1.0).expect("image known");
+        assert!((normal - 1.0).abs() < 1e-3, "expected ~1.0, got {normal}");
+
+        let zoomed = content_scale(1280.0, 1357.0, 960, 1018, 2.0).expect("image known");
+        assert!((zoomed - 2.6667).abs() < 1e-3, "expected ~2.667, got {zoomed}");
     }
 
     /// Mobile per-glyph fit: only the overflowing glyph shrinks, along the
