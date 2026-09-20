@@ -22,7 +22,8 @@ use crate::models::{
     BoundingBox, FormattedEntry, LineResult, RotatedBox, TermMatch, GAP_CHAR,
 };
 use crate::ocr_engine::{
-    filter_fitted_quads, fit_components, merge_straight_boxes, rect_of, OcrEngine,
+    filter_fitted_quads, fit_components, merge_straight_boxes,
+    recognize_boxes_collect, rect_of, OcrEngine,
 };
 use crate::overlay_state::OcrOverlayState;
 use crate::util::char_lm::CharLm;
@@ -216,6 +217,7 @@ fn every_case_has_a_runner() {
         "char_lm",
         "kana",
         "dictionary",
+        "recognition",
     ];
     for (name, v) in all_cases() {
         let id = case_id(&name, &v);
@@ -585,6 +587,162 @@ fn kana_cases() {
                 exp["to"].as_str().expect("to").chars().next().expect("char")
             );
         }
+        }
+    }
+}
+
+/// Full pixel→text run over a vendored photo/screenshot, in detection
+/// (reading) order: `detect_lines` → `recognize_boxes_collect`. Returns one
+/// entry per annotation the recognizer emitted, each with its detection box
+/// index — boxes the crop stage skips (un-croppable quads) have no entry,
+/// and the pinned `i` fails loudly if that set ever changes.
+///
+/// Deterministic: `recognize_boxes_collect` sorts by box index, normalizing
+/// the worker completion order; per-line box/text/conf are byte-identical
+/// across runs on the same host (see `TOLERANCES.md`).
+fn run_recognition(
+    engine: &mut OcrEngine,
+    image: &str,
+    det_thresh: f32,
+    det_unclip: f32,
+    furigana: bool,
+) -> Vec<(usize, BoundingBox, Option<(bool, String, Vec<BoundingBox>)>)> {
+    engine.det_thresh_override = Some(det_thresh);
+    engine.det_unclip_override = Some(det_unclip);
+    engine.det_furigana = furigana;
+    let path = corpus_dir().join(image);
+    let img = image::open(&path).expect("input image loads");
+    let det = engine.detect_lines(&img).expect("detection runs");
+    let vocab = engine.ppocr_vocab.clone();
+    let remap = engine.rec_remap.clone();
+    // Dataset sidecars go to /tmp (the pipeline's `save_line_sample` always
+    // writes there), never next to the vendored fixture.
+    let out = recognize_boxes_collect(
+        &img,
+        &det.boxes,
+        &det.rotated,
+        engine.ppocr_rec.clone(),
+        engine.kana_size.clone(),
+        &vocab,
+        &remap,
+        4,
+        RecognitionMode::Both,
+        &std::env::temp_dir(),
+    )
+    .expect("recognition runs");
+    out.into_iter()
+        .map(|(idx, ann)| {
+            let line = ann
+                .line
+                .map(|l| (l.is_vertical, l.text, l.char_boxes));
+            (idx, ann.bbox, line)
+        })
+        .collect()
+}
+
+#[test]
+fn recognition_cases() {
+    let mut engine = test_engine();
+    for (name, v) in kind_cases("recognition") {
+        let id = case_id(&name, &v);
+        let c = &v["case"];
+        let got = run_recognition(
+            &mut engine,
+            c["image"].as_str().expect("image"),
+            c["det_thresh"].as_f64().expect("det_thresh") as f32,
+            c["det_unclip"].as_f64().expect("det_unclip") as f32,
+            c["furigana_filter"].as_bool().expect("furigana_filter"),
+        );
+        if dump() {
+            for (idx, bbox, line) in &got {
+                let (vertical, text, chars) = match line {
+                    Some((vert, t, cb)) => (
+                        *vert,
+                        serde_json::Value::String(t.clone()),
+                        cb.iter()
+                            .map(|b| serde_json::json!([b.x, b.y, b.w, b.h]))
+                            .collect::<Vec<_>>(),
+                    ),
+                    None => (false, serde_json::Value::Null, Vec::new()),
+                };
+                let j = serde_json::json!({
+                    "i": idx,
+                    "box": [bbox.x, bbox.y, bbox.w, bbox.h],
+                    "vertical": vertical,
+                    "text": text,
+                    "char_boxes": chars,
+                });
+                println!("DUMP-JSON {id} {j}");
+            }
+            // Regenerate mode: print actuals for every case without failing,
+            // so one run refreshes the whole kind. Plain `cargo test`
+            // (below) enforces the pins.
+            continue;
+        }
+        let expect = c["expect_lines"].as_array().expect("expect_lines");
+        assert_eq!(
+            got.len(),
+            expect.len(),
+            "{id}: recognized line count drifted: got {}, expected {}",
+            got.len(),
+            expect.len()
+        );
+        let tol = box_tol(&v);
+        for ((idx, bbox, line), exp) in got.iter().zip(expect.iter()) {
+            assert_eq!(
+                *idx,
+                exp["i"].as_i64().expect("i") as usize,
+                "{id}: detection-index mapping drifted"
+            );
+            let ebox: Vec<i64> = exp["box"]
+                .as_array()
+                .expect("box")
+                .iter()
+                .map(|x| x.as_i64().expect("int"))
+                .collect();
+            assert_box_close(&id, &format!("line i={idx}"), bbox, &ebox, tol);
+            match (line, exp.get("text")) {
+                (Some((vert, text, chars)), Some(t)) if !t.is_null() => {
+                    assert_eq!(
+                        *vert,
+                        exp["vertical"].as_bool().expect("vertical"),
+                        "{id} line i={idx}: vertical flag drifted"
+                    );
+                    assert_eq!(
+                        text,
+                        t.as_str().expect("text"),
+                        "{id} line i={idx}: recognized text drifted"
+                    );
+                    let expect_chars =
+                        exp["char_boxes"].as_array().expect("char_boxes");
+                    assert_eq!(
+                        chars.len(),
+                        expect_chars.len(),
+                        "{id} line i={idx}: char box count drifted"
+                    );
+                    for (j, (cb, ec)) in
+                        chars.iter().zip(expect_chars.iter()).enumerate()
+                    {
+                        let e: Vec<i64> = ec
+                            .as_array()
+                            .expect("char box")
+                            .iter()
+                            .map(|x| x.as_i64().expect("int"))
+                            .collect();
+                        assert_box_close(
+                            &id,
+                            &format!("line i={idx} char {j}"),
+                            cb,
+                            &e,
+                            tol,
+                        );
+                    }
+                }
+                (None, t) if t.is_none_or(|x| x.is_null()) => {}
+                (l, t) => panic!(
+                    "{id} line i={idx}: recognized/unrecognized flipped: {l:?} vs {t:?}"
+                ),
+            }
         }
     }
 }
