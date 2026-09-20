@@ -566,6 +566,19 @@ pub enum Message {
     WindowResized { width: f32, height: f32 },
     /// Frame tick — drains bootstrap/OCR channels so results stream smoothly.
     Tick,
+    /// Live detection tuning: nudge DET_THRESH / DET_UNCLIP from the viewer.
+    TuneDet { param: DetParam, delta: f32 },
+    /// Restore both detection tunables to their startup values.
+    TuneReset,
+    /// Show/hide the detection tuning HUD.
+    ToggleDetHud,
+}
+
+/// Which detection tunable the viewer's +/- keys adjust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetParam {
+    Threshold,
+    Unclip,
 }
 
 #[cfg(test)]
