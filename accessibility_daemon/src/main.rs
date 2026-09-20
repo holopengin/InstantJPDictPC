@@ -286,9 +286,9 @@ fn print_usage() {
     println!("      --hybrid               Hybrid mode: both horizontal and vertical recognition");
     println!("  -b, --batch-size <N>       Recognition batch size (default: 10)");
     println!("      --batch-size=<N>       (alternative syntax)");
-    println!("      --det-thresh <F>       Detection threshold 0.01-0.99 (default 0.3)");
+    println!("      --det-thresh <F>       Detection threshold 0.01-0.99 (default 0.65)");
     println!("      --det-thresh=<F>       (alternative syntax)");
-    println!("      --det-unclip <F>       DB unclip ratio 0.0-5.0 (default 1.5)");
+    println!("      --det-unclip <F>       DB unclip ratio 0.0-5.0 (default 1.2)");
     println!("      --det-unclip=<F>       (alternative syntax)");
     println!();
     println!("CAPTURE MODE (for a global shortcut):");

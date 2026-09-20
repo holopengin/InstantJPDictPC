@@ -10,9 +10,11 @@ use crate::ppocr_ncnn::{DetNet, RecNet};
 // and turned into rotated boxes by the PC pipeline below.
 const PPOCR_DET_MODEL_SIZE: u32 = 896;
 const PPOCR_DET_LONG_SIDE: u32 = 960;
-const PPOCR_DET_THRESH: f32 = 0.3;
+/// PC-tuned detection defaults (mobile ships 0.3 / 1.5). The viewer's live
+/// keys, the CLI flags and the `DET_*` environment overrides still win.
+const PPOCR_DET_THRESH: f32 = 0.65;
 const PPOCR_DET_BOX_THRESH: f32 = 0.8;
-const PPOCR_DET_UNCLIP_RATIO: f32 = 1.5;
+const PPOCR_DET_UNCLIP_RATIO: f32 = 1.2;
 /// Mobile `xOverlapThresh` pref default: union two straight boxes when their
 /// intersection covers at least this fraction of the smaller box.
 const X_OVERLAP_THRESHOLD: f32 = 0.40;
@@ -60,7 +62,8 @@ pub struct OcrEngine {
     pub det_unclip_override: Option<f32>,
 }
 
-/// Effective `DET_THRESH`: environment override, else the mobile 0.3.
+/// Effective `DET_THRESH`: environment override, else the PC default 0.65
+/// (mobile ships 0.3).
 pub fn default_det_thresh() -> f32 {
     std::env::var("DET_THRESH")
         .ok()
@@ -68,7 +71,8 @@ pub fn default_det_thresh() -> f32 {
         .unwrap_or(PPOCR_DET_THRESH)
 }
 
-/// Effective `DET_UNCLIP`: environment override, else the mobile 1.5.
+/// Effective `DET_UNCLIP`: environment override, else the PC default 1.2
+/// (mobile ships 1.5).
 pub fn default_det_unclip() -> f32 {
     std::env::var("DET_UNCLIP")
         .ok()
