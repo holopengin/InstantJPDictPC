@@ -1,11 +1,13 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::data::db::DictionaryDatabase;
 use crate::nav_graph;
 use crate::data::models::DictionaryEntry;
 use crate::models::*;
+use crate::util::char_lm::CharLm;
 use crate::util::deinflector::Deinflector;
 use crate::util::gap_candidates;
 use crate::util::japanese;
@@ -49,6 +51,9 @@ pub struct OcrOverlayState {
     pub nav_graph: Option<crate::nav_graph::NavGraph>,
     /// Normalized (x, y) positions for each node in [0,1)².
     pub nav_positions: Vec<(f32, f32)>,
+    /// Mobile `CharLm` (#44): ranks blank candidates by the line context.
+    /// `None` when the asset is missing; the list then keeps discovery order.
+    pub char_lm: Option<Arc<CharLm>>,
 }
 
 impl OcrOverlayState {
@@ -78,7 +83,14 @@ impl OcrOverlayState {
             window_height: Cell::new(window_height),
             nav_graph: None,
             nav_positions: Vec::new(),
+            char_lm: None,
         }
+    }
+
+    /// Mobile `installCharLm`: the character n-gram model that ranks blank
+    /// candidates (#44). `None` keeps the discovery order.
+    pub fn install_char_lm(&mut self, lm: Option<Arc<CharLm>>) {
+        self.char_lm = lm;
     }
 
 
@@ -155,6 +167,7 @@ impl OcrOverlayState {
     }
 
     pub fn update_character(&mut self, line_idx: usize, char_idx: usize, new_char: char) {
+        let char_lm = self.char_lm.clone();
         let Some(line) = self
             .active_line_results
             .get_mut(line_idx)
@@ -163,12 +176,35 @@ impl OcrOverlayState {
             return;
         };
         let mut chars: Vec<char> = line.text.chars().collect();
-        if let Some(slot) = chars.get_mut(char_idx) {
-            *slot = new_char;
-            line.text = chars.into_iter().collect();
-            self.update_global_data();
-self.build_nav_graph();
+        let Some(slot) = chars.get_mut(char_idx) else {
+            return;
+        };
+        let was_gap = *slot == GAP_CHAR;
+        *slot = new_char;
+        line.text = chars.into_iter().collect();
+
+        // A filled blank keeps its list (#44): the position's alternatives
+        // become the placeholder plus the evidence candidates, so re-opening
+        // the panel shows the same list with the new character selected
+        // instead of collapsing to the placeholder alone.
+        if was_gap {
+            let context = gap_candidates::context_before(&line.text, char_idx);
+            let lm = char_lm.as_deref();
+            let mut ranked =
+                gap_candidates::generate(&line.raw_alternatives, gap_candidates::MAX, lm, &context);
+            if ranked.is_empty() {
+                ranked = gap_candidates::fallback(gap_candidates::MAX, lm, &context);
+            }
+            if let Some(entry) = line.alternatives.get_mut(char_idx) {
+                let mut out = Vec::with_capacity(ranked.len() + 1);
+                out.push((GAP_CHAR, 0.0));
+                out.extend(ranked.into_iter().map(|c| (c, 0.0)));
+                *entry = out;
+            }
         }
+
+        self.update_global_data();
+        self.build_nav_graph();
     }
 
 
@@ -281,10 +317,13 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
         // earlier version did) made the ranked path unreachable and the list
         // came back as the dotted circle alone.
         if current_char == GAP_CHAR {
-            let mut ranked = gap_candidates::generate(&line.raw_alternatives, gap_candidates::MAX);
+            let context = gap_candidates::context_before(&line.text, char_idx);
+            let lm = self.char_lm.as_deref();
+            let mut ranked =
+                gap_candidates::generate(&line.raw_alternatives, gap_candidates::MAX, lm, &context);
             if ranked.is_empty() {
                 // A blank with nothing to choose from is worse than a guess.
-                ranked = gap_candidates::fallback(gap_candidates::MAX);
+                ranked = gap_candidates::fallback(gap_candidates::MAX, lm, &context);
             }
             let mut candidates = Vec::with_capacity(ranked.len() + 1);
             candidates.push(AlternativeChar {
@@ -2480,14 +2519,15 @@ mod tests {
     // Blank alternatives (mobile `BlankAlternativesTest`, #44).
     // ---------------------------------------------------------------------
 
-    /// A line with a placeholder in the middle and the parallel lists a real
-    /// detection would carry.
+    /// A line with a placeholder and the parallel lists a real detection
+    /// would carry.
     fn blank_line(
+        text: &str,
         alternatives: Vec<Vec<(char, f32)>>,
         raw: Vec<Vec<(char, f32)>>,
     ) -> LineResult {
         LineResult {
-            text: format!("私{GAP_CHAR}う"),
+            text: text.into(),
             char_boxes: vec![],
             alternatives,
             raw_alternatives: raw,
@@ -2514,6 +2554,7 @@ mod tests {
     fn a_blank_offers_more_than_the_placeholder() {
         let state = state_at(
             blank_line(
+                "私\u{25CC}う",
                 vec![vec![('私', 1.0)], vec![(GAP_CHAR, 0.0)], vec![('う', 1.0)]],
                 vec![vec![('、', 0.7), ('。', 0.5)]],
             ),
@@ -2534,7 +2575,7 @@ mod tests {
     /// used to return no panel at all.
     #[test]
     fn a_blank_offers_more_when_the_table_never_grew() {
-        let state = state_at(blank_line(vec![vec![('私', 1.0)]], vec![]), 1);
+        let state = state_at(blank_line("私\u{25CC}う", vec![vec![('私', 1.0)]], vec![]), 1);
         let ui = state.get_alternatives_ui_state().expect("blank panel");
         assert!(ui.candidates.len() > 1, "fallback must not be empty");
     }
@@ -2543,7 +2584,7 @@ mod tests {
     /// first, then kana.
     #[test]
     fn a_blank_without_evidence_falls_back_to_punctuation_then_kana() {
-        let state = state_at(blank_line(vec![], vec![]), 1);
+        let state = state_at(blank_line("私\u{25CC}う", vec![], vec![]), 1);
         let ui = state.get_alternatives_ui_state().expect("blank panel");
         let chars: Vec<char> = ui.candidates.iter().map(|c| c.char).collect();
         assert_eq!(chars[0], GAP_CHAR);
@@ -2556,6 +2597,7 @@ mod tests {
     fn an_ordinary_character_still_gets_its_own_head_list() {
         let state = state_at(
             blank_line(
+                "私\u{25CC}う",
                 vec![vec![('私', 1.0)], vec![(GAP_CHAR, 0.0)], vec![('う', 1.0)]],
                 vec![],
             ),
@@ -2565,6 +2607,77 @@ mod tests {
         assert_eq!(ui.candidates.len(), 1);
         assert_eq!(ui.candidates[0].char, '私');
         assert!(ui.candidates[0].is_selected);
+    }
+
+    /// Filling a blank must not collapse its list: the position keeps the
+    /// placeholder plus the evidence candidates, with the chosen character
+    /// selected (#44).
+    #[test]
+    fn filling_a_blank_keeps_its_candidate_list() {
+        let mut state = state_at(
+            blank_line(
+                "私\u{25CC}う",
+                vec![vec![('私', 1.0)], vec![(GAP_CHAR, 0.0)], vec![('う', 1.0)]],
+                vec![vec![('、', 0.7), ('の', 0.6)]],
+            ),
+            1,
+        );
+        state.update_character(0, 1, 'の');
+        assert_eq!(
+            state.active_line_results[0]
+                .as_ref()
+                .unwrap()
+                .text
+                .chars()
+                .nth(1),
+            Some('の'),
+            "the fill lands in the text"
+        );
+        let ui = state.get_alternatives_ui_state().expect("panel after filling");
+        let chars: Vec<char> = ui.candidates.iter().map(|c| c.char).collect();
+        assert_eq!(chars[0], GAP_CHAR, "the placeholder stays in the list");
+        assert!(
+            chars.contains(&'の') && chars.contains(&'、'),
+            "the list is kept: {chars:?}"
+        );
+        let selected: Vec<char> = ui
+            .candidates
+            .iter()
+            .filter(|c| c.is_selected)
+            .map(|c| c.char)
+            .collect();
+        assert_eq!(selected, vec!['の'], "only the filled character is selected");
+    }
+
+    /// With a model installed the blank's list is ranked by the line context,
+    /// not by the recogniser's own order (the shipped Aozora model; skipped
+    /// when the asset is absent).
+    #[test]
+    fn an_installed_model_ranks_the_blank_list_by_context() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/lm/char_lm.bin");
+        let Some(lm) = CharLm::load(&path) else {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        };
+        // The recogniser offered を first; after 今日 the model prefers は.
+        let mut state = state_at(
+            blank_line(
+                "今日\u{25CC}",
+                vec![
+                    vec![('今', 1.0)],
+                    vec![('日', 1.0)],
+                    vec![(GAP_CHAR, 0.0)],
+                ],
+                vec![vec![('を', 0.9)], vec![('は', 0.8)]],
+            ),
+            2,
+        );
+        state.install_char_lm(Some(Arc::new(lm)));
+        let ui = state.get_alternatives_ui_state().expect("blank panel");
+        let chars: Vec<char> = ui.candidates.iter().map(|c| c.char).collect();
+        assert_eq!(chars[0], GAP_CHAR);
+        assert_eq!(chars[1], 'は', "the context prior leads: {chars:?}");
+        assert_eq!(chars[2], 'を');
     }
 }
 
