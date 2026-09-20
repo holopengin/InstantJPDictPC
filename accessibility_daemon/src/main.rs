@@ -388,6 +388,32 @@ fn parse_det_tuning(args: &[String]) -> DetTuning {
     tuning
 }
 
+/// Viewer tuning keys, matched on the **modified** key so layouts that put
+/// tuning characters behind Shift still work: on JIS (`jp106`) `=` is
+/// Shift+`-` on the same physical key as `-`, and matching the unmodified key
+/// made both decrease the threshold.
+fn tune_key_message(modified_key: &iced::keyboard::Key) -> Option<Message> {
+    use iced::keyboard::Key;
+
+    match modified_key {
+        Key::Character(c) if c.as_ref() == "[" => {
+            Some(Message::TuneDet { param: DetParam::Unclip, delta: -0.05 })
+        }
+        Key::Character(c) if c.as_ref() == "]" => {
+            Some(Message::TuneDet { param: DetParam::Unclip, delta: 0.05 })
+        }
+        Key::Character(c) if c.as_ref() == "-" || c.as_ref() == "_" => {
+            Some(Message::TuneDet { param: DetParam::Threshold, delta: -0.01 })
+        }
+        Key::Character(c) if c.as_ref() == "=" || c.as_ref() == "+" => {
+            Some(Message::TuneDet { param: DetParam::Threshold, delta: 0.01 })
+        }
+        Key::Character(c) if c.as_ref() == "r" || c.as_ref() == "R" => Some(Message::TuneReset),
+        Key::Named(iced::keyboard::key::Named::F1) => Some(Message::ToggleDetHud),
+        _ => None,
+    }
+}
+
 fn run_ocr_viewer(
     args: Vec<String>,
 ) -> Result<()> {
@@ -999,7 +1025,7 @@ fn run_ocr_viewer(
                 |event: iced_futures::subscription::Event| {
                     match &event {
                         iced_futures::subscription::Event::Interaction {
-                            event: iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }),
+                            event: iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modified_key, .. }),
                             ..
                         } => {
                             // If we already have a held keyboard action, this is an
@@ -1024,19 +1050,11 @@ fn run_ocr_viewer(
                                     || *k == iced::keyboard::Key::Character("k".into()) => GamepadAction::NavigateUp,
                                 k if *k == iced::keyboard::Key::Character("d".into()) => GamepadAction::ScrollDown,
                                 k if *k == iced::keyboard::Key::Character("f".into()) => GamepadAction::ScrollUp,
-                                k if *k == iced::keyboard::Key::Character("[".into()) =>
-                                    return Some(Message::TuneDet { param: DetParam::Unclip, delta: -0.05 }),
-                                k if *k == iced::keyboard::Key::Character("]".into()) =>
-                                    return Some(Message::TuneDet { param: DetParam::Unclip, delta: 0.05 }),
-                                k if *k == iced::keyboard::Key::Character("-".into()) =>
-                                    return Some(Message::TuneDet { param: DetParam::Threshold, delta: -0.01 }),
-                                k if *k == iced::keyboard::Key::Character("=".into()) =>
-                                    return Some(Message::TuneDet { param: DetParam::Threshold, delta: 0.01 }),
-                                k if *k == iced::keyboard::Key::Character("r".into()) =>
-                                    return Some(Message::TuneReset),
-                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::F1) =>
-                                    return Some(Message::ToggleDetHud),
-                                _ => return None,
+                                // Tuning keys match the MODIFIED key (see
+                                // `tune_key_message`): on JIS layouts `=` is
+                                // Shift+`-`, so the unmodified key `-` would
+                                // otherwise collide with decrease.
+                                _ => return tune_key_message(modified_key),
                             };
                             // Set keyboard repeat tracking so ZoomTick can fire repeats.
                             *KB_ACTION_HELD.lock().unwrap() = Some((nav_action, Instant::now()));
@@ -1219,6 +1237,47 @@ mod tests {
         assert!(t.unclip.is_none());
         let t = parse_det_tuning(&args(&["--det-unclip=abc"]));
         assert_eq!(t.unclip, None);
+    }
+
+    /// Regression for the JIS layout: `=` is Shift+`-`, so the modified key
+    /// must map to increase while the unmodified `-` decreases.
+    #[test]
+    fn tune_keys_use_the_modified_character() {
+        use iced::keyboard::Key;
+
+        assert!(matches!(
+            tune_key_message(&Key::Character("=".into())),
+            Some(Message::TuneDet { param: DetParam::Threshold, delta }) if delta > 0.0
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Character("+".into())),
+            Some(Message::TuneDet { param: DetParam::Threshold, delta }) if delta > 0.0
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Character("-".into())),
+            Some(Message::TuneDet { param: DetParam::Threshold, delta }) if delta < 0.0
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Character("_".into())),
+            Some(Message::TuneDet { param: DetParam::Threshold, delta }) if delta < 0.0
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Character("[".into())),
+            Some(Message::TuneDet { param: DetParam::Unclip, delta }) if delta < 0.0
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Character("]".into())),
+            Some(Message::TuneDet { param: DetParam::Unclip, delta }) if delta > 0.0
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Character("R".into())),
+            Some(Message::TuneReset)
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Named(iced::keyboard::key::Named::F1)),
+            Some(Message::ToggleDetHud)
+        ));
+        assert!(tune_key_message(&Key::Character("x".into())).is_none());
     }
 }
 
