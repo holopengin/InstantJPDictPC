@@ -1500,6 +1500,19 @@ pub struct OcrViewer {
     /// Recalculated from the physical window width after each resize:
     /// debounced_ui_scale = physical_width / 1280.0
     pub debounced_ui_scale: f32,
+    /// Live detection tuning values, adjusted with the viewer's tune keys and
+    /// sent to the OCR worker (`TuneCmd`). Shown in the HUD.
+    pub det_thresh: f32,
+    pub det_unclip: f32,
+    /// Startup values, restored by the `R` reset key.
+    pub det_thresh_default: f32,
+    pub det_unclip_default: f32,
+    /// Boxes in the last detection, shown in the HUD.
+    pub det_box_count: usize,
+    /// True while a live retune round-trip is in flight.
+    pub det_busy: bool,
+    /// HUD visibility (F1).
+    pub det_hud_visible: bool,
 }
 
 impl OcrViewer {
@@ -1536,6 +1549,13 @@ impl OcrViewer {
             screen_physical_width: window_w,
             native_scale: 0.0,
             debounced_ui_scale: window_w / 1280.0,
+            det_thresh: crate::ocr_engine::default_det_thresh(),
+            det_unclip: crate::ocr_engine::default_det_unclip(),
+            det_thresh_default: crate::ocr_engine::default_det_thresh(),
+            det_unclip_default: crate::ocr_engine::default_det_unclip(),
+            det_box_count: 0,
+            det_busy: false,
+            det_hud_visible: true,
         }
     }
 
@@ -1992,6 +2012,88 @@ impl OcrViewer {
         *self.synced_annotations.borrow_mut() = Rc::new((*self.annotations).clone());
     }
 
+    /// Nudge a detection tunable (viewer tune keys). Clamped to plausible
+    /// search ranges: threshold [0.01, 0.99], unclip [0.0, 5.0].
+    pub fn adjust_det_tuning(&mut self, param: DetParam, delta: f32) {
+        match param {
+            DetParam::Threshold => self.det_thresh = (self.det_thresh + delta).clamp(0.01, 0.99),
+            DetParam::Unclip => self.det_unclip = (self.det_unclip + delta).clamp(0.0, 5.0),
+        }
+    }
+
+    /// Restore the startup tuning values (`R` key).
+    pub fn reset_det_tuning(&mut self) {
+        self.det_thresh = self.det_thresh_default;
+        self.det_unclip = self.det_unclip_default;
+    }
+
+    /// Replace the whole detection result after a live retune. The box set
+    /// and its indices change, so selection/edit state is dropped first.
+    pub fn apply_retune(&mut self, annotations: Vec<DetectedAnnotation>) {
+        self.edited_lines.clear();
+        self.selected_word = None;
+        self.alternatives_visible = false;
+        self.scroll_neighbor_to = None;
+        self.scroll_alt_to = None;
+        self.state.active_line_results.clear();
+        self.state.cached_entries = Rc::new(Vec::new());
+        self.state.cached_lookup_term.clear();
+        self.state.current_word_length = 0;
+        self.state.is_dictionary_visible = false;
+        self.state.current_tapped_idx = -1;
+        self.state.current_tapped_line_idx = -1;
+        self.state.current_tapped_char_idx_in_line = -1;
+        self.state.last_highlighted_coords.clear();
+        self.annotations = Rc::new(Vec::new());
+        self.det_box_count = annotations.len();
+        for (i, ann) in annotations.into_iter().enumerate() {
+            self.handle_ocr_recognition_result(i, ann);
+        }
+        self.annotations_sync_dirty.set(true);
+    }
+
+    /// One-line HUD: current tunables, box count, and the tuning keys.
+    fn det_hud_text(&self) -> String {
+        format!(
+            "DET {:.2}  UNCLIP {:.2}  boxes {}{}   [/] unclip  -/= thresh  R reset  F1 hide",
+            self.det_thresh,
+            self.det_unclip,
+            self.det_box_count,
+            if self.det_busy { "  (re-running…)" } else { "" },
+        )
+    }
+
+    /// Overlay the tuning HUD on the top-left of the viewer.
+    fn with_det_hud<'a>(&'a self, base: Element<'a, Message>) -> Element<'a, Message> {
+        if !self.det_hud_visible {
+            return base;
+        }
+        let hud = Container::new(
+            Text::new(self.det_hud_text())
+                .size(13)
+                .color(Color::from_rgb(0.95, 0.95, 0.95)),
+        )
+        .padding(6)
+        .style(|_t: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.65))),
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        Stack::new()
+            .push(base)
+            .push(
+                Container::new(hud)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(alignment::Horizontal::Left)
+                    .align_y(alignment::Vertical::Top),
+            )
+            .into()
+    }
+
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
         // Cache total_scale for glyph pre-warming in handle_ocr_recognition_result
         let base_scale = f32::min(
@@ -2080,10 +2182,12 @@ impl OcrViewer {
         .height(Length::Fill);
 
         if !has_panel {
-            return Container::new(Stack::new().push(image_canvas).push(annotation_canvas))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
+            return self.with_det_hud(
+                Container::new(Stack::new().push(image_canvas).push(annotation_canvas))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+            );
         }
 
         // Build panel components
@@ -2218,15 +2322,17 @@ impl OcrViewer {
 
         // Root Stack: image (bottom) → annotations (middle) → panel content (top).
         // Two separate canvases because tiny_skia composites images after primitives.
-        Container::new(
-            Stack::new()
-                .push(image_canvas)
-                .push(annotation_canvas)
-                .push(content_stack),
+        self.with_det_hud(
+            Container::new(
+                Stack::new()
+                    .push(image_canvas)
+                    .push(annotation_canvas)
+                    .push(content_stack),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
         )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
     }
 
     fn dictionary_panel<'a>(&'a self, entries: Rc<Vec<FormattedEntry>>) -> Container<'a, Message> {
