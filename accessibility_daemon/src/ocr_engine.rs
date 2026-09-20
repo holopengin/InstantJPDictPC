@@ -1673,6 +1673,12 @@ fn save_line_sample(crop: &image::DynamicImage, text: &str) -> Option<std::path:
     Some(txt)
 }
 
+/// Result sink shared by the recognition entry points: called once per
+/// recognized line with the line's original box index. Returning `false`
+/// stops the worker (used by the streaming wrapper when its receiver is
+/// gone).
+type ResultEmitter = dyn Fn(usize, DetectedAnnotation) -> bool + Send + Sync;
+
 /// Run character recognition on pre-detected boxes and stream each result
 /// over the channel as soon as it's ready. Designed to be called from a
 /// background thread: all sessions are `Arc`-wrapped and `Send`.
@@ -1688,6 +1694,58 @@ pub fn recognize_boxes_streaming(
     _recognition_mode: RecognitionMode,
     sender: std::sync::mpsc::Sender<(usize, DetectedAnnotation)>,
     _out_dir: &std::path::Path,
+) -> Result<()> {
+    recognize_boxes_core(
+        image, sorted, rotated, rec, ppocr_vocab, rec_remap,
+        std::sync::Arc::new(move |idx, ann| sender.send((idx, ann)).is_ok()),
+    )
+}
+
+/// Run character recognition on pre-detected boxes and return the complete
+/// result set once every worker has finished, keyed by the original box
+/// index and ordered by it. Same recognition path as
+/// [`recognize_boxes_streaming`]; callers that apply results in one update
+/// use this so the whole set arrives as a batch.
+pub fn recognize_boxes_collect(
+    image: &DynamicImage,
+    sorted: &[BoundingBox],
+    rotated: &[RotatedBox],
+    rec: Option<std::sync::Arc<RecNet>>,
+    ppocr_vocab: &[String],
+    rec_remap: &[i32],
+    _batch_size: usize,
+    _recognition_mode: RecognitionMode,
+    _out_dir: &std::path::Path,
+) -> Result<Vec<(usize, DetectedAnnotation)>> {
+    let collected: std::sync::Arc<std::sync::Mutex<Vec<(usize, DetectedAnnotation)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&collected);
+    recognize_boxes_core(
+        image, sorted, rotated, rec, ppocr_vocab, rec_remap,
+        std::sync::Arc::new(move |idx, ann| {
+            sink.lock().unwrap().push((idx, ann));
+            true
+        }),
+    )?;
+    let mut results = std::sync::Arc::try_unwrap(collected)
+        .map(|m| m.into_inner().unwrap())
+        .unwrap_or_else(|shared| shared.lock().unwrap().clone());
+    // Workers finish out of order; the batch is index-ordered so applying it
+    // is independent of worker scheduling.
+    results.sort_by_key(|(idx, _)| *idx);
+    Ok(results)
+}
+
+/// Shared fan-out: build one job per box, recognize with `PPOCR_REC_WORKERS`
+/// workers and hand each finished annotation to `emit`.
+fn recognize_boxes_core(
+    image: &DynamicImage,
+    sorted: &[BoundingBox],
+    rotated: &[RotatedBox],
+    rec: Option<std::sync::Arc<RecNet>>,
+    ppocr_vocab: &[String],
+    rec_remap: &[i32],
+    emit: std::sync::Arc<ResultEmitter>,
 ) -> Result<()> {
     use std::time::Instant;
     let t_recognize = Instant::now();
@@ -1787,7 +1845,7 @@ pub fn recognize_boxes_streaming(
             let rec = std::sync::Arc::clone(&rec);
             let voc = ppocr_vocab.to_vec();
             let remap = rec_remap.to_vec();
-            let snd = sender.clone();
+            let emit = std::sync::Arc::clone(&emit);
 
             handles.push(std::thread::spawn(move || loop {
                 let job = { let mut ql = q.lock().unwrap(); ql.pop_front() };
@@ -1880,7 +1938,7 @@ pub fn recognize_boxes_streaming(
                                 )],
                             }),
                         };
-                        if snd.send((job.idx, annotation)).is_err() { return; }
+                        if !emit(job.idx, annotation) { return; }
                         std::thread::yield_now();
                     }
                 }
@@ -2492,5 +2550,68 @@ mod tests {
             position_checked >= 5,
             "expected at least 5 plain-glyph lines for the position check, got {position_checked}"
         );
+    }
+
+    /// The batch collector must agree with the streaming channel: for the
+    /// same detection result both deliver the same index-keyed annotations.
+    /// Workers finish out of order, so the streaming side is sorted by index
+    /// before comparing (the collector sorts internally).
+    #[test]
+    fn batch_and_streaming_recognition_agree_by_index() {
+        let mut eng = test_engine();
+        for file in ["line_00_h.png", "line_00_v.png"] {
+            let img = image::open(format!(
+                "{}/test_images/synth/{file}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            let det = eng.detect_lines(&img).unwrap();
+            assert!(!det.boxes.is_empty(), "{file}: no boxes detected");
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            recognize_boxes_streaming(
+                &img, &det.boxes, &det.rotated,
+                eng.ppocr_rec.clone(), &eng.ppocr_vocab, &eng.rec_remap,
+                4, RecognitionMode::Both, tx, std::path::Path::new("/tmp"),
+            )
+            .unwrap();
+            let mut streamed: Vec<(usize, DetectedAnnotation)> = rx.into_iter().collect();
+            streamed.sort_by_key(|(idx, _)| *idx);
+
+            let collected = recognize_boxes_collect(
+                &img, &det.boxes, &det.rotated,
+                eng.ppocr_rec.clone(), &eng.ppocr_vocab, &eng.rec_remap,
+                4, RecognitionMode::Both, std::path::Path::new("/tmp"),
+            )
+            .unwrap();
+
+            assert!(!streamed.is_empty(), "{file}: nothing recognized");
+            assert_eq!(streamed.len(), collected.len(), "{file}: result count");
+            for ((s_idx, s_ann), (c_idx, c_ann)) in streamed.iter().zip(collected.iter()) {
+                assert_eq!(s_idx, c_idx, "{file}: index order");
+                assert_eq!(
+                    (s_ann.bbox.x, s_ann.bbox.y, s_ann.bbox.w, s_ann.bbox.h),
+                    (c_ann.bbox.x, c_ann.bbox.y, c_ann.bbox.w, c_ann.bbox.h),
+                    "{file}: bbox at index {s_idx}"
+                );
+                assert_eq!(s_ann.quad, c_ann.quad, "{file}: quad at index {s_idx}");
+                let s_line = s_ann.line.as_ref().expect("streamed line");
+                let c_line = c_ann.line.as_ref().expect("collected line");
+                assert_eq!(s_line.text, c_line.text, "{file}: text at index {s_idx}");
+                assert_eq!(s_line.is_vertical, c_line.is_vertical);
+                assert_eq!(
+                    s_line.char_boxes.len(),
+                    c_line.char_boxes.len(),
+                    "{file}: char box count at index {s_idx}"
+                );
+                assert_eq!(s_line.alternatives, c_line.alternatives);
+                assert_eq!(
+                    s_line.chunk_boxes.len(),
+                    c_line.chunk_boxes.len(),
+                    "{file}: chunk box count at index {s_idx}"
+                );
+                // `sample_txt` carries a per-run dataset id — not compared.
+            }
+        }
     }
 }
