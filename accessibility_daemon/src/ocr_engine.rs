@@ -10,11 +10,16 @@ use crate::ppocr_ncnn::{DetNet, RecNet};
 // and turned into rotated boxes by the PC pipeline below.
 const PPOCR_DET_MODEL_SIZE: u32 = 896;
 const PPOCR_DET_LONG_SIDE: u32 = 960;
-/// PC-tuned detection defaults (mobile ships 0.3 / 1.5). The viewer's live
-/// keys, the CLI flags and the `DET_*` environment overrides still win.
-const PPOCR_DET_THRESH: f32 = 0.65;
+/// PC-tuned detection defaults, from a sweep over the desktop test set (game
+/// UIs with dark overlays, tategaki ebook pages, a camera photo, a ruby-dense
+/// newspaper). Mobile #97 ships 0.65 / 1.2, but at those values the hard game
+/// screen splits three memo lines into fragments that recognize as junk, and
+/// the set loses ~6-9 real lines overall; 0.25 / 0.7 keeps every memo line
+/// whole with the same junk count. The viewer's live keys, the CLI flags and
+/// the `DET_*` environment overrides still win.
+const PPOCR_DET_THRESH: f32 = 0.25;
 const PPOCR_DET_BOX_THRESH: f32 = 0.8;
-const PPOCR_DET_UNCLIP_RATIO: f32 = 1.2;
+const PPOCR_DET_UNCLIP_RATIO: f32 = 0.7;
 /// Mobile `xOverlapThresh` pref default: union two straight boxes when their
 /// intersection covers at least this fraction of the smaller box.
 const X_OVERLAP_THRESHOLD: f32 = 0.40;
@@ -52,8 +57,8 @@ pub struct OcrEngine {
     pub det_furigana: bool,
 }
 
-/// Effective `DET_THRESH`: environment override, else the PC default 0.65
-/// (mobile ships 0.3).
+/// Effective `DET_THRESH`: environment override, else the PC default 0.25
+/// (mobile #97 ships 0.65).
 pub fn default_det_thresh() -> f32 {
     std::env::var("DET_THRESH")
         .ok()
@@ -61,8 +66,8 @@ pub fn default_det_thresh() -> f32 {
         .unwrap_or(PPOCR_DET_THRESH)
 }
 
-/// Effective `DET_UNCLIP`: environment override, else the PC default 1.2
-/// (mobile ships 1.5).
+/// Effective `DET_UNCLIP`: environment override, else the PC default 0.7
+/// (mobile #97 ships 1.2).
 pub fn default_det_unclip() -> f32 {
     std::env::var("DET_UNCLIP")
         .ok()
@@ -2210,10 +2215,15 @@ mod tests {
 
     /// Detection parity smoke on the mobile synth set: the ncnn det model +
     /// PC post-processing must find each line's box (IoU against the mobile
-    /// truth boxes), and every returned box must stay in image bounds.
+    /// truth boxes), and every returned box must stay in image bounds. The
+    /// truth boxes were captured with mobile's #97 tuning (0.65 / 1.2), so the
+    /// comparison pins those values instead of following the PC-tuned defaults
+    /// (a tighter unclip legitimately shrinks boxes below the truth padding).
     #[test]
     fn synth_det_finds_truth_line() {
         let mut eng = test_engine();
+        eng.det_thresh_override = Some(0.65);
+        eng.det_unclip_override = Some(1.2);
         let truth: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(format!(
                 "{}/test_images/synth/truth.json",
