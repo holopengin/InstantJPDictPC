@@ -1,0 +1,30 @@
+Jitendex — CC BY-SA 4.0 attribution
+====================================
+
+Bundled as : accessibility_daemon/assets/dictionaries/jitendex-yomitan.zip
+             installed at first start as the dictionary titled
+             "Jitendex.org [2026-08-11]" (stable title family "Jitendex.org").
+Source     : Jitendex — https://jitendex.org
+Repository : https://github.com/stephenmk/stephenmk.github.io
+Release    : 2026.08.11.0 (revision "2026.08.11.0")
+URL        : https://github.com/stephenmk/stephenmk.github.io/releases/download/2026.08.11.0/jitendex-yomitan.zip
+SHA-256    : 8364e69e7bd0881c42011e96af921a7399d7fe06e2bf4fff4da6d18affff74fc
+Author     : Stephen Kraus and contributors
+Licence    : Creative Commons Attribution-ShareAlike 4.0 International
+             (CC BY-SA 4.0) — licence text: ../texts/cc-by-sa-4.0.txt
+Attribution: "© CC BY-SA 4.0 Stephen Kraus 2023-2026 — You are free to use,
+             modify, and redistribute Jitendex files under the terms of the
+             Creative Commons Attribution-ShareAlike License (V4.0)."
+
+Upstream's own attribution note (index.json) also records that Jitendex
+includes material from other projects:
+
+  * JMdict (EDICT, etc.) dictionary data is provided by the Electronic
+    Dictionaries Research Group (EDRDG, https://www.edrdg.org). That data is
+    distributed under CC BY-SA 4.0; see ../texts/edrdg-licence.txt.
+  * Example sentences (Japanese and English) are provided by Tatoeba
+    (https://tatoeba.org/) under CC BY 2.0 FR.
+
+Share-alike: Jitendex is redistributed here unmodified as CC BY-SA 4.0
+material; the bundled copy is byte-identical to the pinned release (SHA-256
+above). The app's importer does not alter the file.

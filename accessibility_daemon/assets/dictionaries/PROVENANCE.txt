@@ -1,0 +1,51 @@
+Bundled dictionaries — vendored, do not edit by hand.
+=====================================================
+
+These three Yomitan zips ship next to the binary (build.rs copies this
+directory to target/{profile}/assets/dictionaries/, and build_appimage.sh
+bundles assets/* into the AppImage). On first start the app imports each one
+into dictionary.sqlite, once, and marks it built-in; see
+src/data/bundled.rs. Nothing is downloaded at runtime.
+
+Every pin below was verified with sha256sum against the downloaded artifact.
+
+Jitendex
+--------
+File       : jitendex-yomitan.zip
+Size       : 38698313 bytes
+SHA-256    : 8364e69e7bd0881c42011e96af921a7399d7fe06e2bf4fff4da6d18affff74fc
+Title      : Jitendex.org [2026-08-11]  (stable family: Jitendex.org)
+Source     : https://github.com/stephenmk/stephenmk.github.io
+Release    : 2026.08.11.0
+URL        : https://github.com/stephenmk/stephenmk.github.io/releases/download/2026.08.11.0/jitendex-yomitan.zip
+License    : CC BY-SA 4.0 (© Stephen Kraus 2023-2026)
+             Upstream attribution also credits JMdict/EDRDG and Tatoeba
+             (CC BY 2.0 FR) material; see licenses/notices/jitendex.txt.
+
+KANJIDIC (English)
+------------------
+File       : KANJIDIC_english.zip
+Size       : 721032 bytes
+SHA-256    : 51a7a1aa3f996e60742b9e5f62144422926060d48208d9bdb9f51ecfe9dd4f74
+Title      : KANJIDIC [2026-258]  (stable family: KANJIDIC)
+Source     : https://github.com/yomidevs/jmdict-yomitan
+Release    : 2026-09-15
+URL        : https://github.com/yomidevs/jmdict-yomitan/releases/download/2026-09-15/KANJIDIC_english.zip
+License    : CC BY-SA 4.0 (EDRDG)
+             See licenses/notices/kanjidic.txt and licenses/texts/edrdg-licence.txt.
+
+Kanjium pitch accents
+---------------------
+File       : kanjium_pitch_accents.zip
+Size       : 1207703 bytes
+SHA-256    : c1cdb4f4d930ff569490fe0b7d93b58eef23880c75f54660fd5fbca05b71740f
+Title      : Kanjium Pitch Accents  (stable family: Kanjium Pitch Accents)
+Entries    : 124134
+Source     : https://github.com/mifunetoshiro/kanjium (data/source_files/raw/accents.txt)
+Source ref : 685d4d723d6d20bf9beb169103aeac188eb067ad
+Retrieved  : accents.txt as published by the Kanjium project
+License    : CC BY-SA 4.0
+             See licenses/notices/kanjium-pitch-accents.txt.
+
+The zips are redistributed under their own licences (CC BY-SA 4.0); the licence
+texts and upstream attribution notices are in ../licenses/.

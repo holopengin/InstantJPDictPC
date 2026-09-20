@@ -27,6 +27,17 @@ pub struct DictionaryMeta {
     pub name: String,
     pub priority: i32,
     pub enabled: bool,
+    /// True for dictionaries bundled with the app (the vendored zips in
+    /// `assets/dictionaries/`). Mirrors Android's `builtIn`: it is written
+    /// only after every bank of a bundled import has landed, so it doubles as
+    /// the completion marker, and the settings manager uses it to tell
+    /// app-owned dictionaries from user ones.
+    pub built_in: bool,
+    /// Catalog entry this dictionary was installed from, when it came through
+    /// the catalog — else `None` (file picker, bundled install). Mirrors
+    /// Android's `catalogId`. Bundled installs record their own stable id so a
+    /// half-finished install can be told apart from a user-imported copy.
+    pub catalog_id: Option<String>,
 }
 
 /// A tag from a dictionary tag bank.
