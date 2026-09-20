@@ -674,35 +674,29 @@ fn glyph_ink_origin(
 
 /// Clockwise radians to rotate a line's glyphs by, about their char-box
 /// centres (mobile `LineOverlayView.tiltDeg`). `RotatedBox.angle` is the
-/// *long axis* angle normalised to [-90°, 90°), so for a vertical line it
-/// reads as `φ - 90°` where `φ` is the column's clockwise tilt from
-/// straight down — the glyph tilt itself is `φ`, i.e. `angle + 90°`
-/// re-normalised. Horizontal lines already measure `φ`. Unrotated lines
-/// (either orientation) draw exactly as before.
-fn glyph_tilt(quad: Option<&RotatedBox>, is_vertical: bool) -> f32 {
+/// frame's x-axis angle from +x, and that already equals mobile's `tiltDeg`
+/// in both orientations: for a horizontal frame the x axis is the reading
+/// axis, and for a vertical frame `atan2(-y.x, y.y)` on the rotated y axis
+/// reduces to the same x-axis angle. Adding 90° for vertical frames (as if
+/// the angle were the long axis) turned a −1.1° column into ~89° sideways
+/// glyphs. Unrotated lines draw exactly as before.
+fn glyph_tilt(quad: Option<&RotatedBox>) -> f32 {
     let Some(q) = quad.filter(|q| q.is_rotated()) else {
         return 0.0;
     };
-    let mut tilt = if is_vertical { q.angle + std::f32::consts::FRAC_PI_2 } else { q.angle };
-    while tilt >= std::f32::consts::FRAC_PI_2 {
-        tilt -= std::f32::consts::PI;
-    }
-    while tilt < -std::f32::consts::FRAC_PI_2 {
-        tilt += std::f32::consts::PI;
-    }
-    tilt
+    q.angle
 }
 
 /// Mobile `LineResult.glyphSizePx()`: the source-pixel size the overlay
 /// measures a line's glyphs against. The default path is the tallest char
 /// box — the detector box height for a horizontal line, the 1em cell for a
-/// vertical one. A rotated line measures its upright frame's cross axis
-/// instead (`RotatedBox.h`, the short side of the fitted rect), because its
-/// char boxes are AABBs of rotated cells and would oversize the glyphs.
+/// vertical one. A rotated line measures its upright frame's **cross axis**
+/// instead (`isVertical ? w : h`, matching mobile's `cropW`/`cropH`), because
+/// its char boxes are AABBs of rotated cells and would oversize the glyphs.
 /// Zero means the line has no measurable box: mobile skips it.
 fn line_glyph_px(line: &LineResult, quad: Option<&RotatedBox>) -> f32 {
     if let Some(q) = quad.filter(|q| q.is_rotated()) {
-        return q.h.max(1.0);
+        return if q.is_vertical() { q.w } else { q.h }.max(1.0);
     }
     line.char_boxes.iter().map(|b| b.h as f32).fold(0.0, f32::max)
 }
@@ -1587,7 +1581,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         let off_y = (dy - cy) * draw_scale;
                         let draw_size = Size::new(gw * draw_scale, gh * draw_scale);
 
-                        let tilt = glyph_tilt(annotation.quad.as_ref(), line.is_vertical);
+                        let tilt = glyph_tilt(annotation.quad.as_ref());
                         if tilt != 0.0 {
                             // Rotated line: draw the glyph at the line's tilt
                             // around the char box centre so it matches the
@@ -3967,9 +3961,15 @@ mod tests {
         );
         assert!((line_text_px(&vertical, None, 1.0) - 72.0).abs() < 1e-3);
         // Rotated line: the upright frame's cross axis (the fitted rect's
-        // short side), not the AABB-inflated char box height.
+        // short side), not the AABB-inflated char box height. Horizontal
+        // frames measure their local height…
         let quad = RotatedBox::new(50.0, 50.0, 120.0, 30.0, 10.0f32.to_radians(), 1.0);
         assert!((line_glyph_px(&vertical, Some(&quad)) - 30.0).abs() < 1e-3);
+        // …and vertical ones their local width (mobile `cropW`); using the
+        // height would size tategaki glyphs to the whole column length.
+        let column = RotatedBox::new(50.0, 50.0, 30.0, 120.0, 10.0f32.to_radians(), 1.0);
+        assert!(column.is_vertical());
+        assert!((line_glyph_px(&vertical, Some(&column)) - 30.0).abs() < 1e-3);
         // No measurable box: mobile returns before drawing.
         let empty = line_with_boxes("あ", vec![], false);
         assert_eq!(line_text_px(&empty, None, 1.0), 0.0);
@@ -4011,27 +4011,31 @@ mod tests {
             .abs() < 1e-4);
     }
 
-    /// Mobile `tiltDeg`: a vertical column's long-axis angle reads 90° off
-    /// the glyph tilt; axis-aligned lines and tiny tolerances draw upright.
+    /// Mobile `RotatedGeometry.tiltDeg` on our axes reduces to the stored
+    /// x-axis angle for both orientations — horizontal: `atan2(x.y, x.x)`
+    /// with x the reading axis; vertical: `atan2(-y.x, y.y)` with y the
+    /// reading axis, which is the same value, not 90° away from it.
     #[test]
     fn glyph_tilt_follows_the_reading_axis() {
         let q = |deg: f32| RotatedBox::new(0.0, 0.0, 40.0, 20.0, deg.to_radians(), 1.0);
-        // Axis-aligned: no rotation on either orientation.
-        assert_eq!(glyph_tilt(Some(&q(0.0)), false), 0.0);
-        assert_eq!(glyph_tilt(Some(&q(-90.0)), true), 0.0);
-        // Sub-tolerance tilt is not "rotated" (mobile AXIS_ALIGNED_TOL).
-        assert_eq!(glyph_tilt(Some(&q(1.0)), false), 0.0);
-        // Horizontal line tilted clockwise by 5°.
-        assert!((glyph_tilt(Some(&q(5.0)), false) - 5.0f32.to_radians()).abs() < 1e-5);
-        // Vertical column tilted clockwise by 10°: long-axis angle -80°.
+        // Axis-aligned: no rotation on either orientation. A straight
+        // vertical frame's x axis is horizontal, so its angle is 0.
+        assert_eq!(glyph_tilt(Some(&q(0.0))), 0.0);
+        assert_eq!(glyph_tilt(None), 0.0);
+        // Sub-tolerance tilt is not "rotated" (mobile AXIS_ALIGNED_TOL
+        // widened by the fit quantization: a 40px side allows ~2.1°).
+        assert_eq!(glyph_tilt(Some(&q(1.0))), 0.0);
+        // Above the band the glyphs turn by the frame angle exactly.
+        assert!((glyph_tilt(Some(&q(5.0))) - 5.0f32.to_radians()).abs() < 1e-5);
+        // Regression: the reported tategaki column (fitted 32×188, −1.1°
+        // past vertical) must draw essentially upright at −1.1°, not roll
+        // ~89° sideways as when the angle was read as a long axis.
+        let column = RotatedBox::new(100.0, 100.0, 32.0, 188.0, -1.1f32.to_radians(), 1.0);
+        assert!(column.is_vertical() && column.is_rotated());
+        let tilt = glyph_tilt(Some(&column));
         assert!(
-            (glyph_tilt(Some(&q(-80.0)), true) - 10.0f32.to_radians()).abs() < 1e-5,
-            "clockwise tategaki"
-        );
-        // Vertical column tilted counter-clockwise by 10°: long-axis 80°.
-        assert!(
-            (glyph_tilt(Some(&q(80.0)), true) + 10.0f32.to_radians()).abs() < 1e-5,
-            "counter-clockwise tategaki"
+            (tilt + 1.1f32.to_radians()).abs() < 1e-4,
+            "tategaki column drew at {tilt} rad"
         );
     }
 
