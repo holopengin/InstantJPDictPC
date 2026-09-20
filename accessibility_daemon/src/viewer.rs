@@ -33,6 +33,46 @@ use crate::util::japanese::{is_half_width, to_vertical_glyph};
 use fontdue::Font;
 use iced::widget::image::Handle as ImageHandle;
 
+/// Text width available inside the fixed 300px dictionary column: panel and
+/// scroll padding removed, with slack so estimated line breaks cannot
+/// overflow the column.
+const DICT_TEXT_WIDTH: f32 = 278.0;
+
+/// Body text size in definitions and examples (mobile: 15sp) and the ruby
+/// size that sits above it (mobile: 9sp).
+const DEF_TEXT_SIZE: f32 = 15.0;
+const DEF_RUBY_SIZE: f32 = 9.0;
+
+/// Atomic inline cell for the definition flow layout.
+enum InlineCell {
+    Char(char),
+    Ruby { term: String, reading: String, width: f32 },
+    Tag { text: String, width: f32 },
+}
+
+/// Advance estimate for one character at `size`: the app's halfwidth rule
+/// (ASCII and halfwidth kana) is half an em; everything else is one em.
+fn inline_char_width(ch: char, size: f32) -> f32 {
+    if ch == '\u{3000}' {
+        size
+    } else if is_half_width(ch) {
+        size * 0.5
+    } else {
+        size
+    }
+}
+
+fn inline_text_width(text: &str, size: f32) -> f32 {
+    text.chars().map(|c| inline_char_width(c, size)).sum()
+}
+
+fn inline_cell_width(cell: &InlineCell) -> f32 {
+    match cell {
+        InlineCell::Char(c) => inline_char_width(*c, DEF_TEXT_SIZE),
+        InlineCell::Ruby { width, .. } | InlineCell::Tag { width, .. } => *width,
+    }
+}
+
 /// Mobile `LineOverlayView.textSize = fixedSize * 0.90f`: the one glyph size
 /// per line, taken from the line's own box (never a measured pitch).
 const TEXT_SIZE_RATIO: f32 = 0.9;
@@ -2517,7 +2557,7 @@ impl OcrViewer {
                     continue;
                 }
                 for sg in &group.sense_groups {
-                    entry_col = entry_col.push(Self::sense_group(sg.clone()));
+                    entry_col = entry_col.push(Self::sense_group(sg.clone(), DICT_TEXT_WIDTH));
                 }
                 // 1px divider per reading group (Android: DKGRAY, alpha 0.3).
                 // The background must wrap only the line: padding on the
@@ -2838,7 +2878,9 @@ impl OcrViewer {
         stack.into()
     }
 
-    fn sense_group(sg: FormattedSenseGroup) -> Column<'static, Message> {
+    /// Render a sense group. `width` is the text width available inside the
+    /// dictionary column (see [`DICT_TEXT_WIDTH`]).
+    fn sense_group(sg: FormattedSenseGroup, width: f32) -> Column<'static, Message> {
         let white = Color::WHITE;
         let mut content = Column::new().spacing(3).width(Length::Fill);
 
@@ -2857,7 +2899,7 @@ impl OcrViewer {
         // rendered once as the header.
         if !sg.header.is_empty() {
             content = content.push(
-                Self::render_definition(&sg.header)
+                Self::render_definition(&sg.header, width)
                     .padding(iced::Padding { top: 2.0, ..Default::default() }),
             );
         }
@@ -2865,13 +2907,14 @@ impl OcrViewer {
         if sg.is_forms {
             // JMdict "Forms" groups render as unnumbered rows.
             for sense in &sg.senses {
-                content = content.push(Self::render_definition(&sense.nodes));
+                content = content.push(Self::render_definition(&sense.nodes, width));
             }
         } else {
             for sense in &sg.senses {
                 let mut sense_row = Row::new().spacing(3).align_y(alignment::Vertical::Top);
                 sense_row = sense_row.push(Text::new(format!("{}. ", sense.index)).size(15).color(white));
-                sense_row = sense_row.push(Self::render_definition(&sense.nodes).width(Length::Fill));
+                sense_row = sense_row
+                    .push(Self::render_definition(&sense.nodes, width - 20.0).width(Length::Fill));
                 content = content.push(sense_row);
             }
         }
@@ -2879,89 +2922,175 @@ impl OcrViewer {
         // #88: the forms table and attribution trail the senses, unnumbered.
         if !sg.trailing.is_empty() {
             content = content.push(
-                Self::render_definition(&sg.trailing)
+                Self::render_definition(&sg.trailing, width)
                     .padding(iced::Padding { bottom: 2.0, ..Default::default() }),
             );
         }
         content
     }
 
-    /// Render a definition node list. Consecutive text runs are coalesced into
-    /// one widget, like Android's `renderDefinition`.
-    fn render_definition(nodes: &[DefinitionNode]) -> Column<'static, Message> {
-        let white = Color::WHITE;
+    /// Render a definition node list. Inline runs (text, ruby, tags) flow in
+    /// a wrapping layout like mobile's `FlowLayout`; block nodes (examples,
+    /// tables, lists, non-inline groups, citations) start their own row.
+    fn render_definition(nodes: &[DefinitionNode], width: f32) -> Column<'static, Message> {
         let mut col = Column::new().spacing(2).width(Length::Fill);
-        let mut i = 0;
-        while i < nodes.len() {
-            match &nodes[i] {
-                DefinitionNode::Text(_) => {
-                    let mut run = String::new();
-                    let mut j = i;
-                    while j < nodes.len() {
-                        if let DefinitionNode::Text(t) = &nodes[j] {
-                            run.push_str(t);
-                            j += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    col = col.push(
-                        Text::new(run)
-                            .size(15)
-                            .color(white)
-                            .width(Length::Fill)
-                            .wrapping(iced::widget::text::Wrapping::Word),
-                    );
-                    i = j;
-                }
-                DefinitionNode::Ruby { term, reading } => {
-                    col = col.push(Self::ruby_view(term, reading, true, false));
-                    i += 1;
-                }
-                DefinitionNode::Tag { text } => {
-                    col = col.push(Self::tag_chip(text));
-                    i += 1;
+        let mut inline: Vec<DefinitionNode> = Vec::new();
+        for node in nodes {
+            match node {
+                DefinitionNode::Text(_) | DefinitionNode::Ruby { .. } | DefinitionNode::Tag { .. } => {
+                    inline.push(node.clone());
                 }
                 DefinitionNode::Citation(text) => {
+                    col = Self::flush_inline(col, &mut inline, width);
                     col = col.push(
                         Text::new(text.clone())
                             .size(11)
                             .color(Color::from_rgba(1.0, 1.0, 1.0, 120.0 / 255.0)),
                     );
-                    i += 1;
                 }
                 DefinitionNode::Example(example) => {
-                    col = col.push(Self::example_box(example));
-                    i += 1;
+                    col = Self::flush_inline(col, &mut inline, width);
+                    col = col.push(Self::example_box(example, width));
                 }
                 DefinitionNode::ListBlock { items, .. } => {
+                    col = Self::flush_inline(col, &mut inline, width);
                     let mut block = Column::new().spacing(3).padding([4.0, 2.0]);
                     for item in items {
-                        block = block.push(Self::render_definition(item));
+                        block = block.push(Self::render_definition(item, width - 8.0));
                     }
                     col = col.push(block);
-                    i += 1;
                 }
                 DefinitionNode::Table { rows } => {
                     if !rows.is_empty() {
-                        col = col.push(Self::definition_table(rows));
+                        col = Self::flush_inline(col, &mut inline, width);
+                        col = col.push(Self::definition_table(rows, width));
                     }
-                    i += 1;
                 }
-                DefinitionNode::Group { nodes, .. } => {
-                    // A non-inline group gets its own line; an inline group
-                    // flows with its neighbours.
-                    col = col.push(Self::render_definition(nodes));
-                    i += 1;
+                DefinitionNode::Group { nodes, is_inline } => {
+                    if *is_inline {
+                        inline.extend(nodes.iter().cloned());
+                    } else {
+                        col = Self::flush_inline(col, &mut inline, width);
+                        col = col.push(Self::render_definition(nodes, width));
+                    }
                 }
             }
         }
-        col
+        Self::flush_inline(col, &mut inline, width)
+    }
+
+    /// Push the pending inline nodes as one wrapping flow block.
+    fn flush_inline<'a>(
+        col: Column<'a, Message>,
+        inline: &mut Vec<DefinitionNode>,
+        width: f32,
+    ) -> Column<'a, Message> {
+        if inline.is_empty() {
+            return col;
+        }
+        let cells = Self::inline_cells(inline);
+        inline.clear();
+        let mut flow = Column::new().spacing(2).width(Length::Fill);
+        for line in Self::wrap_inline_cells(cells, width) {
+            flow = flow.push(Self::inline_line(line));
+        }
+        col.push(flow)
+    }
+
+    /// Atomic inline cells: characters, ruby stacks and tag chips.
+    fn inline_cells(nodes: &[DefinitionNode]) -> Vec<InlineCell> {
+        let mut cells = Vec::new();
+        for node in nodes {
+            match node {
+                DefinitionNode::Text(text) => cells.extend(text.chars().map(InlineCell::Char)),
+                DefinitionNode::Ruby { term, reading } => cells.push(InlineCell::Ruby {
+                    term: term.clone(),
+                    reading: reading.clone(),
+                    width: inline_text_width(term, DEF_TEXT_SIZE)
+                        .max(inline_text_width(reading, DEF_RUBY_SIZE)),
+                }),
+                DefinitionNode::Tag { text } => cells.push(InlineCell::Tag {
+                    text: text.clone(),
+                    width: inline_text_width(text, 10.0) + 12.0,
+                }),
+                _ => {}
+            }
+        }
+        cells
+    }
+
+    /// Greedy line packing at `width`, mobile `FlowLayout` style: cells fill a
+    /// row until the next one would overflow. A trailing ASCII word moves to
+    /// the next line whole when it fits there; an oversized cell still gets
+    /// its own line rather than being dropped.
+    fn wrap_inline_cells(cells: Vec<InlineCell>, width: f32) -> Vec<Vec<InlineCell>> {
+        let avail = width.max(1.0);
+        let mut lines: Vec<Vec<InlineCell>> = Vec::new();
+        let mut line: Vec<InlineCell> = Vec::new();
+        let mut used = 0.0f32;
+        for cell in cells {
+            let w = inline_cell_width(&cell);
+            if !line.is_empty() && used + w > avail {
+                // Keep a trailing ASCII word together if it can move down.
+                let mut split = line.len();
+                while split > 0 {
+                    match &line[split - 1] {
+                        InlineCell::Char(c) if c.is_ascii_alphanumeric() => split -= 1,
+                        _ => break,
+                    }
+                }
+                if split > 0 && split < line.len() {
+                    let tail = line.split_off(split);
+                    used = line.iter().map(inline_cell_width).sum();
+                    lines.push(std::mem::take(&mut line));
+                    line = tail;
+                } else {
+                    lines.push(std::mem::take(&mut line));
+                    used = 0.0;
+                }
+            }
+            line.push(cell);
+            used += w;
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+        lines
+    }
+
+    /// One flow line: merged text runs with ruby stacks and chips between them,
+    /// bottom-aligned so plain text sits on the ruby bases' baseline.
+    fn inline_line(line: Vec<InlineCell>) -> Row<'static, Message> {
+        let white = Color::WHITE;
+        let mut row = Row::new().align_y(alignment::Vertical::Bottom);
+        let mut run = String::new();
+        let flush_run = |row: Row<'static, Message>, run: &mut String| {
+            if run.is_empty() {
+                row
+            } else {
+                row.push(Text::new(std::mem::take(run)).size(DEF_TEXT_SIZE).color(white))
+            }
+        };
+        for cell in line {
+            match cell {
+                InlineCell::Char(c) => run.push(c),
+                InlineCell::Ruby { term, reading, .. } => {
+                    row = flush_run(row, &mut run);
+                    row = row.push(Self::ruby_view(&term, &reading, true, false));
+                }
+                InlineCell::Tag { text, .. } => {
+                    row = flush_run(row, &mut run);
+                    row = row.push(Self::tag_chip(&text));
+                }
+            }
+        }
+        flush_run(row, &mut run)
     }
 
     /// #88: an example box — Japanese sentence (ruby intact) over its
-    /// translation, on the example palette.
-    fn example_box(example: &ExampleNode) -> Container<'static, Message> {
+    /// translation, on the example palette. `width` is the outer text width;
+    /// the box's own 8px padding is subtracted before laying out parts.
+    fn example_box(example: &ExampleNode, width: f32) -> Container<'static, Message> {
         let white = Color::WHITE;
         let light_gray = Color::from_rgb(0.75, 0.75, 0.75);
         let mut inner = Column::new().spacing(3).width(Length::Fill);
@@ -2984,10 +3113,10 @@ impl OcrViewer {
             }
         } else if !example.parts.is_empty() {
             for part in &example.parts {
-                inner = inner.push(Self::render_definition(part));
+                inner = inner.push(Self::render_definition(part, width - 16.0));
             }
         } else if !example.content.is_empty() {
-            inner = inner.push(Self::render_definition(&example.content));
+            inner = inner.push(Self::render_definition(&example.content, width - 16.0));
         }
         Container::new(inner)
             .width(Length::Fill)
@@ -3011,9 +3140,16 @@ impl OcrViewer {
     /// #88: render a structured-content table as a real grid: equal-weight
     /// columns, a shared 1px rule between neighbours, and the example box's
     /// card palette around the outside.
-    fn definition_table(rows: &[Vec<Vec<DefinitionNode>>]) -> Container<'static, Message> {
+    fn definition_table(rows: &[Vec<Vec<DefinitionNode>>], width: f32) -> Container<'static, Message> {
         let border = Color::from_rgba(1.0, 1.0, 1.0, 80.0 / 255.0);
         let columns = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        // 1px dividers between the equal-width cells; each cell pays its own
+        // 6px horizontal padding.
+        let cell_width = if columns > 0 {
+            (width - columns.saturating_sub(1) as f32) / columns as f32
+        } else {
+            width
+        };
         let mut table = Column::new().width(Length::Fill).spacing(0);
         for (row_index, cells) in rows.iter().enumerate() {
             let mut row = Row::new().width(Length::Fill);
@@ -3034,7 +3170,7 @@ impl OcrViewer {
                 }
                 let mut cell = Column::new().padding([4.0, 6.0]).width(Length::FillPortion(1));
                 if let Some(nodes) = cells.get(column) {
-                    cell = cell.push(Self::render_definition(nodes));
+                    cell = cell.push(Self::render_definition(nodes, cell_width - 12.0));
                 }
                 row = row.push(cell);
             }
@@ -3943,5 +4079,50 @@ mod tests {
         );
         assert_eq!(v.state.current_tapped_line_idx, -1);
         assert_eq!(v.state.current_tapped_char_idx_in_line, -1);
+    }
+
+    /// The definition flow packs inline cells at the available width: two
+    /// 15px characters per 40px line, ruby cells move down whole, ASCII words
+    /// stay together when they fit on the next line, and an oversized cell
+    /// still renders on its own line.
+    #[test]
+    fn inline_flow_wraps_at_the_available_width() {
+        assert_eq!(inline_char_width('あ', 15.0), 15.0);
+        assert_eq!(inline_char_width('a', 15.0), 7.5);
+
+        let chars: Vec<InlineCell> = "あああ".chars().map(InlineCell::Char).collect();
+        let lines = OcrViewer::wrap_inline_cells(chars, 40.0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].len(), 2);
+        assert_eq!(lines[1].len(), 1);
+
+        let cells = vec![
+            InlineCell::Char('あ'),
+            InlineCell::Ruby { term: "漢".into(), reading: "かん".into(), width: 30.0 },
+        ];
+        assert_eq!(OcrViewer::wrap_inline_cells(cells, 40.0).len(), 2, "ruby moves down whole");
+
+        let cells = vec![InlineCell::Ruby {
+            term: "漢字".into(),
+            reading: "かんじ".into(),
+            width: 99.0,
+        }];
+        assert_eq!(
+            OcrViewer::wrap_inline_cells(cells, 40.0).len(),
+            1,
+            "an oversized cell still renders on its own line"
+        );
+
+        let text: Vec<InlineCell> = "abc de".chars().map(InlineCell::Char).collect();
+        let lines = OcrViewer::wrap_inline_cells(text, 33.0);
+        assert_eq!(lines.len(), 2);
+        let second: String = lines[1]
+            .iter()
+            .map(|c| match c {
+                InlineCell::Char(ch) => *ch,
+                _ => '?',
+            })
+            .collect();
+        assert_eq!(second, "de", "the ASCII word moves down together");
     }
 }
