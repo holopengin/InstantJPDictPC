@@ -64,7 +64,10 @@ impl FrontendWindow {
         match msg {
             FrontMsg::OpenSettings => {
                 if self.settings.is_none() {
-                    self.settings = Some(SettingsWindow::new(Arc::clone(&self.db)));
+                    self.settings = Some(SettingsWindow::new(
+                        Arc::clone(&self.db),
+                        self.app_settings.clone(),
+                    ));
                 }
                 Task::none()
             }
@@ -106,6 +109,18 @@ impl FrontendWindow {
                 Task::none()
             }
             FrontMsg::Settings(m) => {
+                // The furigana switch is app state, not dictionary state: the
+                // settings window only renders it, the frontend owns the file.
+                // Keep our copy in step so a later font-face save cannot write
+                // a stale value back.
+                if let SettingsMessage::SetFuriganaFilter(enabled) = &m {
+                    if self.app_settings.furigana_filter != *enabled {
+                        self.app_settings.furigana_filter = *enabled;
+                        if let Err(e) = self.app_settings.save(&self.data_dir) {
+                            eprintln!("[Frontend] Failed to save settings: {e}");
+                        }
+                    }
+                }
                 if let Some(sw) = self.settings.as_mut() {
                     sw.update(m).map(FrontMsg::Settings)
                 } else {

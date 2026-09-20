@@ -3,6 +3,7 @@ mod nav_graph;
 mod capture;
 mod data;
 mod frontend;
+mod furigana;
 mod kana_size;
 mod models;
 mod ocr_engine;
@@ -478,16 +479,27 @@ fn run_ocr_viewer(
     let _ = font_path;
     let tuning = parse_det_tuning(&args);
 
+    // Persisted app settings, read once per run: every capture/watcher child
+    // is a fresh process, so a change applies to the next run (mobile reads
+    // its preferences per detection run).
+    let app_settings = crate::app_settings::AppSettings::load(data_dir);
+
     // Headless batch mode: OCR a directory or a list of images, saving line
     // crops + sidecar text files next to each source image.
     if headless {
-        return run_headless_batch(image_paths, recognition_mode, batch_size, tuning);
+        return run_headless_batch(
+            image_paths,
+            recognition_mode,
+            batch_size,
+            tuning,
+            app_settings.furigana_filter,
+        );
     }
 
     // The face the overlay (and, below, the iced dictionary panel) paints in.
     // Persisted by the frontend's Sans/Serif checkbox; loaded once per run, so
     // a change applies to the next launch.
-    let face = crate::app_settings::AppSettings::load(data_dir).overlay_font;
+    let face = app_settings.overlay_font;
 
     let image_path = image_paths.first().cloned().context("No image path provided")?;
 
@@ -499,6 +511,7 @@ fn run_ocr_viewer(
     let (tune_tx, tune_rx) = std::sync::mpsc::channel::<TuneCmd>();
 
     let image_path2 = image_path.clone();
+    let furigana_filter = app_settings.furigana_filter;
     std::thread::Builder::new()
         .name("bootstrap".into())
         .spawn(move || {
@@ -563,6 +576,8 @@ fn run_ocr_viewer(
                 // viewer's tune keys adjust the same overrides live.
                 engine.det_thresh_override = tuning.thresh;
                 engine.det_unclip_override = tuning.unclip;
+                // #100: the furigana (ruby) rule switch, off by default.
+                engine.det_furigana = furigana_filter;
                 println!("[Bootstrap] OCR engine created ({} chars) in {:.0} ms",
                     engine.ppocr_vocab.len(), t_engine.elapsed().as_secs_f64() * 1000.0);
 
@@ -1168,6 +1183,7 @@ fn run_headless_batch(
     recognition_mode: RecognitionMode,
     batch_size: usize,
     tuning: DetTuning,
+    furigana_filter: bool,
 ) -> Result<()> {
     use std::path::{Path, PathBuf};
 
@@ -1214,6 +1230,7 @@ fn run_headless_batch(
     let mut engine = ocr_engine::OcrEngine::new(&resolve_asset_dir(), recognition_mode, batch_size)?;
     engine.det_thresh_override = tuning.thresh;
     engine.det_unclip_override = tuning.unclip;
+    engine.det_furigana = furigana_filter;
     println!("[Batch] OCR engine created in {:.0} ms", t_engine.elapsed().as_secs_f64() * 1000.0);
 
     let ppocr_vocab = engine.ppocr_vocab.clone();

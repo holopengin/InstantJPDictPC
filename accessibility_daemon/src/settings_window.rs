@@ -10,6 +10,7 @@ use iced::{
 };
 use std::sync::{Arc, Mutex};
 
+use crate::app_settings::AppSettings;
 use crate::data::db::DictionaryDatabase;
 use crate::data::models::DictionaryMeta;
 use crate::data::importer::{DictionaryImporter, ImportProgress};
@@ -27,6 +28,9 @@ pub enum SettingsMessage {
     ToggleEnabled(i64, bool),
     MoveUp(i64),
     MoveDown(i64),
+    /// #100: the furigana (ruby) rule switch. The frontend owns the settings
+    /// file; this window renders the checkbox and reports the change.
+    SetFuriganaFilter(bool),
     OpenDownloadPage,
     CloseWindow,
 }
@@ -44,6 +48,10 @@ fn user_dictionaries(db: &DictionaryDatabase) -> Vec<DictionaryMeta> {
 
 pub struct SettingsWindow {
     db: Arc<DictionaryDatabase>,
+    /// Snapshot of the persisted app settings (rendered by the Behaviour
+    /// section). The frontend owns the file and saves changes; this copy is
+    /// refreshed by [`SettingsMessage::SetFuriganaFilter`].
+    app_settings: AppSettings,
     entry_count: usize,
     dictionaries: Vec<DictionaryMeta>,
     status_text: String,
@@ -57,9 +65,10 @@ pub struct SettingsWindow {
 }
 
 impl SettingsWindow {
-    pub fn new(db: Arc<DictionaryDatabase>) -> Self {
+    pub fn new(db: Arc<DictionaryDatabase>, app_settings: AppSettings) -> Self {
         let mut window = Self {
             db: Arc::clone(&db),
+            app_settings,
             entry_count: 0,
             dictionaries: Vec::new(),
             status_text: String::new(),
@@ -267,6 +276,13 @@ impl SettingsWindow {
                 Task::none()
             }
 
+            SettingsMessage::SetFuriganaFilter(enabled) => {
+                // The frontend owns settings.json and saves the change; keep
+                // this window's rendered copy in step.
+                self.app_settings.furigana_filter = enabled;
+                Task::none()
+            }
+
             SettingsMessage::OpenDownloadPage => {
                 let _ = open::that("https://github.com/yomidevs/jmdict-yomitan");
                 Task::none()
@@ -409,6 +425,32 @@ impl SettingsWindow {
             SettingsMessage::RefreshStatus,
             disabled,
         ));
+
+        content = content.push(Space::new().height(Pixels(16.0)));
+        content = content.push(Text::new("Behaviour").size(18).style(text::primary));
+        content = content.push(Space::new().height(Pixels(4.0)));
+
+        // #100: the furigana (ruby) rule, off by default — it is flaky on
+        // camera photos and a wrong drop costs a whole line. Off keeps the
+        // small ruby contours as their own lines.
+        let furigana_check = checkbox(self.app_settings.furigana_filter)
+            .on_toggle(SettingsMessage::SetFuriganaFilter);
+        content = content.push(
+            row![
+                furigana_check,
+                Text::new("Filter furigana (ruby)").size(14),
+            ]
+            .spacing(6)
+            .align_y(Vertical::Center),
+        );
+        content = content.push(
+            Text::new(
+                "Drops small ruby text beside kanji so it does not become its own \
+                 result. Applies to the next capture.",
+            )
+            .size(12)
+            .style(text::secondary),
+        );
 
         content = content.push(Space::new().height(Pixels(16.0)));
         content = content.push(Text::new("Dictionaries").size(18).style(text::primary));
