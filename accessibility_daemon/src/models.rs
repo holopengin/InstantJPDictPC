@@ -383,6 +383,12 @@ pub struct LineResult {
     pub text: String,
     pub char_boxes: Vec<BoundingBox>,
     pub alternatives: Vec<Vec<(char, f32)>>,
+    /// Top-K alternatives for EVERY CTC timestep, blanks included, descending
+    /// by score — mobile `LineResult.rawAlternatives`, the cache a re-decode
+    /// walks without re-running the model (see
+    /// [`DetectedAnnotation::re_decode_line`]).
+    #[allow(dead_code)] // populated at emit; the mobile consumer (gap fallback) is not ported yet
+    pub raw_alternatives: Vec<Vec<(char, f32)>>,
     /// Path to the crop's `.txt` sidecar in /tmp (dataset collection).
     /// The viewer rewrites it when the user picks an alternative, so the
     /// saved label follows the corrected text.
