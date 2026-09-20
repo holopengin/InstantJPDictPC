@@ -1,0 +1,16 @@
+{
+  "id": "detection-03-ruby-strip",
+  "kind": "detection",
+  "description": "One horizontal line with a ruby strip above it (synthetic analogue of the ruby-dense newspaper capture): with the furigana filter on, the strip is dropped and only the main line survives. Pins the #28/#99 geometry rules end to end from image bytes.",
+  "mobile_mirror": "FuriganaRuleTest.thinRubyStripAboveItsLineIsRuby",
+  "tolerances": { "box_px": 3 },
+  "case": {
+    "image": "images/ruby-h.png",
+    "det_thresh": 0.25,
+    "det_unclip": 0.7,
+    "furigana_filter": true,
+    "expect_lines": [
+      { "box": [50, 110, 540, 50], "vertical": false }
+    ]
+  }
+}

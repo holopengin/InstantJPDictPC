@@ -1,0 +1,15 @@
+{
+  "id": "kana-03-policy-declines",
+  "kind": "kana",
+  "description": "The middle band is deliberately left untouched: logit 0 (p = 0.5) flips nothing, the recogniser's form stands.",
+  "mobile_mirror": "KanaSizeFixTest (middle band declined)",
+  "case": {
+    "policy": {
+      "lines": ["かっき"],
+      "logits": [0.0],
+      "epsilon": 0.01,
+      "expect_text": ["かっき"],
+      "expect_flips": []
+    }
+  }
+}

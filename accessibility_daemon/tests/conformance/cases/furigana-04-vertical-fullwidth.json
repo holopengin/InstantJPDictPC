@@ -1,0 +1,15 @@
+{
+  "id": "furigana-04-vertical-fullwidth",
+  "kind": "furigana",
+  "description": "Same glyph width as the body column, just shorter: a real short column, not ruby. The vertical-panel page class.",
+  "mobile_mirror": "FuriganaRuleTest.fullWidthShortColumnIsNotRuby",
+  "case": {
+    "img": [1000, 1000],
+    "pairs": [
+      { "name": "full-width short column",
+        "small_raw": [300, 200, 360, 300], "big_raw": [300, 50, 360, 850],
+        "small_un": [290, 190, 370, 310], "big_un": [290, 40, 370, 860],
+        "orientation": "vertical", "expect_ruby": false }
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "furigana-05-overlap-boundary",
+  "kind": "furigana",
+  "description": "Boundary pair for the 50% overlap fraction: two thin strips above the same line, identical except width, straddling its left edge. Overlap exactly 50% of the small long side still counts (>=); 44% does not. Added after a perturbation probe (OVERLAP_RATIO 0.5 -> 0.99) showed the fully-contained seed pairs could not feel the overlap rule at all.",
+  "mobile_mirror": null,
+  "case": {
+    "img": [1000, 1000],
+    "pairs": [
+      { "name": "strip overlapping exactly half its width",
+        "small_raw": [0, 276, 200, 300], "big_raw": [100, 300, 600, 360],
+        "small_un": [-10, 266, 210, 308], "big_un": [90, 290, 610, 370],
+        "orientation": "horizontal", "expect_ruby": true },
+      { "name": "strip overlapping 44% of its width",
+        "small_raw": [0, 276, 180, 300], "big_raw": [100, 300, 600, 360],
+        "small_un": [-10, 266, 190, 308], "big_un": [90, 290, 610, 370],
+        "orientation": "horizontal", "expect_ruby": false }
+    ]
+  }
+}

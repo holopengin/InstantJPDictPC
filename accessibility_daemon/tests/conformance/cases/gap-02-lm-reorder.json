@@ -1,0 +1,17 @@
+{
+  "id": "gap-02-lm-reorder",
+  "kind": "gap",
+  "description": "With the character LM, the same pool reorders by line context: after 私 the model prefers 思 over 阿 even though 阿 came first from the recogniser. Shape proposes, the text prior disposes.",
+  "mobile_mirror": "GapCandidatesTest.theModelReordersThePoolByTheLineContext",
+  "case": {
+    "text": "私◌う",
+    "gap_index": 1,
+    "expect_context": ["私"],
+    "alternatives": [
+      [["阿", 0.9], ["思", 0.2]]
+    ],
+    "limit": 15,
+    "lm": { "mass": 500, "entries": [["私", 100], ["思", 50], ["阿", 1]] },
+    "expect": ["思", "阿"]
+  }
+}

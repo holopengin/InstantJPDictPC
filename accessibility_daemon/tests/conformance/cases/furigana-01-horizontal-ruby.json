@@ -1,0 +1,15 @@
+{
+  "id": "furigana-01-horizontal-ruby",
+  "kind": "furigana",
+  "description": "Thin ruby strip above its line is ruby: thin AND much shorter, small unclipped height, inside the gap band, overlapping. Ported from the PC furigana unit test (mobile FuriganaRuleTest).",
+  "mobile_mirror": "FuriganaRuleTest.thinRubyStripAboveItsLineIsRuby",
+  "case": {
+    "img": [1000, 1000],
+    "pairs": [
+      { "name": "thin strip above line",
+        "small_raw": [200, 276, 320, 300], "big_raw": [100, 300, 600, 360],
+        "small_un": [188, 266, 332, 308], "big_un": [90, 290, 610, 370],
+        "orientation": "horizontal", "expect_ruby": true }
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "id": "reading-order-01-mixed",
+  "kind": "reading_order",
+  "description": "Mixed page: horizontals sort top-to-bottom first, then verticals right-to-left on their RIGHT edge; a near-square box counts as horizontal (never fed sideways).",
+  "mobile_mirror": "OcrEngineTest.readingOrder",
+  "case": {
+    "boxes": [
+      { "box": [10, 10, 200, 30], "w_local": 200, "h_local": 30 },
+      { "box": [10, 100, 200, 30], "w_local": 200, "h_local": 30 },
+      { "box": [100, 10, 30, 200], "w_local": 30, "h_local": 200 },
+      { "box": [300, 10, 30, 200], "w_local": 30, "h_local": 200 },
+      { "box": [10, 200, 40, 40], "w_local": 40, "h_local": 40 }
+    ],
+    "expect_order": [0, 1, 4, 3, 2]
+  }
+}

@@ -246,7 +246,10 @@ fn warp_quad_crop(image: &DynamicImage, quad: &RotatedBox) -> Option<DynamicImag
 
 /// A frame's enclosing AABB as the shared `BoundingBox` (rounded like every
 /// other box in the pipeline).
-fn rect_of(q: &RotatedBox) -> BoundingBox {
+/// Visible to the conformance corpus runner (`crate::conformance`): these are
+/// pipeline stages both sides share, pinned by cases in
+/// `tests/conformance/cases/`.
+pub(crate) fn rect_of(q: &RotatedBox) -> BoundingBox {
     let (x, y, w, h) = q.aabb();
     BoundingBox::new(
         x.round() as i32,
@@ -263,7 +266,10 @@ fn rect_of(q: &RotatedBox) -> BoundingBox {
 /// `(pre-unclip, unclipped)` frames. `expand_cap` is a PC-only cap in source
 /// pixels (default infinity = Android's uncapped unclip).
 #[allow(clippy::too_many_arguments)]
-fn fit_components(
+/// Visible to the conformance corpus runner (`crate::conformance`): these are
+/// pipeline stages both sides share, pinned by cases in
+/// `tests/conformance/cases/`.
+pub(crate) fn fit_components(
     prob_map: &[f32],
     out_w: u32,
     out_h: u32,
@@ -395,7 +401,10 @@ fn fit_components(
 /// when `furigana` is off, #100), the local-size filter, the enclosing-blob
 /// filter (#53) and the vertical 5% cross-axis inset. Returns the surviving
 /// frames.
-fn filter_fitted_quads(
+/// Visible to the conformance corpus runner (`crate::conformance`): these are
+/// pipeline stages both sides share, pinned by cases in
+/// `tests/conformance/cases/`.
+pub(crate) fn filter_fitted_quads(
     pre_quads: &[RotatedBox],
     quads: &[RotatedBox],
     orig_w: i32,
@@ -1619,7 +1628,10 @@ fn union_boxes(a: &BoundingBox, b: &BoundingBox) -> BoundingBox {
 /// (no quad): the rotated path has no merge on mobile, so only boxes that
 /// would have been axis-aligned there take part. A merged box becomes a
 /// plain axis-aligned frame (angle 0).
-fn merge_straight_boxes(pairs: Vec<(BoundingBox, RotatedBox)>) -> Vec<(BoundingBox, RotatedBox)> {
+/// Visible to the conformance corpus runner (`crate::conformance`): these are
+/// pipeline stages both sides share, pinned by cases in
+/// `tests/conformance/cases/`.
+pub(crate) fn merge_straight_boxes(pairs: Vec<(BoundingBox, RotatedBox)>) -> Vec<(BoundingBox, RotatedBox)> {
     if pairs.len() < 2 {
         return pairs;
     }

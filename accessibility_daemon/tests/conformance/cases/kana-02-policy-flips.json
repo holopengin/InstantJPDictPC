@@ -1,0 +1,18 @@
+{
+  "id": "kana-02-policy-flips",
+  "kind": "kana",
+  "description": "The epsilon policy with injected logits (no native net): a confident small member flips to big, a confident big member flips to small. か/き are not size pairs, so each line presents exactly the っ/つ candidate.",
+  "mobile_mirror": "KanaSizeFixTest (epsilon policy)",
+  "case": {
+    "policy": {
+      "lines": ["かっき", "かつき"],
+      "logits": [8.0, -8.0],
+      "epsilon": 0.01,
+      "expect_text": ["かつき", "かっき"],
+      "expect_flips": [
+        { "line": 0, "index": 1, "from": "っ", "to": "つ" },
+        { "line": 1, "index": 1, "from": "つ", "to": "っ" }
+      ]
+    }
+  }
+}
