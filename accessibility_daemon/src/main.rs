@@ -1016,6 +1016,9 @@ fn run_ocr_viewer(
         .as_ref()
         .and_then(|path| std::fs::read(path).ok())
         .unwrap_or_default();
+    // The dictionary panel's flow layout packs lines against the real face;
+    // give it the same bytes iced renders with.
+    crate::viewer::init_panel_metrics(&font_bytes);
 
     let app = iced::application(boot, update, OcrViewer::view)
         // One selected face for the overlay glyph cache AND the iced text
