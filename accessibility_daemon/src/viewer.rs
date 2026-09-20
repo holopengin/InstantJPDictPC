@@ -50,9 +50,45 @@ enum InlineCell {
     Tag { text: String, width: f32 },
 }
 
+/// Fontdue metrics for the same face iced renders the panel with, given once
+/// by the app at startup (`init_panel_metrics`). Without it — unit tests —
+/// the flow falls back to em-category estimates.
+static PANEL_METRICS: std::sync::OnceLock<fontdue::Font> = std::sync::OnceLock::new();
+
+/// Hand the flow layout the panel font's real advances. Call once with the
+/// same bytes that are registered with iced.
+pub fn init_panel_metrics(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    if let Ok(font) = fontdue::Font::from_bytes(bytes.to_vec(), fontdue::FontSettings::default()) {
+        let _ = PANEL_METRICS.set(font);
+    }
+}
+
+/// Real advance of `text` at `size` in the panel face, kerning included.
+fn measured_advance(font: &fontdue::Font, text: &str, size: f32) -> f32 {
+    let mut width = 0.0;
+    let mut prev: Option<u16> = None;
+    for ch in text.chars() {
+        let gid = font.lookup_glyph_index(ch);
+        if let Some(p) = prev {
+            if let Some(kern) = font.horizontal_kern_indexed(p, gid, size) {
+                width += kern;
+            }
+        }
+        width += font.metrics(ch, size).advance_width;
+        prev = Some(gid);
+    }
+    width
+}
+
 /// Advance estimate for one character at `size`: the app's halfwidth rule
 /// (ASCII and halfwidth kana) is half an em; everything else is one em.
 fn inline_char_width(ch: char, size: f32) -> f32 {
+    if let Some(font) = PANEL_METRICS.get() {
+        return font.metrics(ch, size).advance_width;
+    }
     if ch == '\u{3000}' {
         size
     } else if is_half_width(ch) {
@@ -63,7 +99,62 @@ fn inline_char_width(ch: char, size: f32) -> f32 {
 }
 
 fn inline_text_width(text: &str, size: f32) -> f32 {
+    if let Some(font) = PANEL_METRICS.get() {
+        return measured_advance(font, text, size);
+    }
     text.chars().map(|c| inline_char_width(c, size)).sum()
+}
+
+/// Japanese line-start prohibition (kinsoku): these may not begin a line.
+fn must_not_start_line(ch: char) -> bool {
+    matches!(
+        ch,
+        '、' | '。'
+            | '，'
+            | '．'
+            | '！'
+            | '？'
+            | '：'
+            | '；'
+            | '）'
+            | ')'
+            | '］'
+            | ']'
+            | '｝'
+            | '}'
+            | '」'
+            | '』'
+            | '〕'
+            | '】'
+            | '〉'
+            | '》'
+            | 'ー'
+            | '々'
+            | 'ぁ'
+            | 'ぃ'
+            | 'ぅ'
+            | 'ぇ'
+            | 'ぉ'
+            | 'っ'
+            | 'ゃ'
+            | 'ゅ'
+            | 'ょ'
+            | 'ゎ'
+            | 'ァ'
+            | 'ィ'
+            | 'ゥ'
+            | 'ェ'
+            | 'ォ'
+            | 'ッ'
+            | 'ャ'
+            | 'ュ'
+            | 'ョ'
+            | 'ヮ'
+            | 'ヽ'
+            | 'ヾ'
+            | 'ゝ'
+            | 'ゞ'
+    )
 }
 
 fn inline_cell_width(cell: &InlineCell) -> f32 {
@@ -3028,27 +3119,44 @@ impl OcrViewer {
         let mut lines: Vec<Vec<InlineCell>> = Vec::new();
         let mut line: Vec<InlineCell> = Vec::new();
         let mut used = 0.0f32;
+        let line_width = |l: &[InlineCell]| l.iter().map(inline_cell_width).sum::<f32>();
         for cell in cells {
             let w = inline_cell_width(&cell);
-            if !line.is_empty() && used + w > avail {
-                // Keep a trailing ASCII word together if it can move down.
-                let mut split = line.len();
-                while split > 0 {
-                    match &line[split - 1] {
-                        InlineCell::Char(c) if c.is_ascii_alphanumeric() => split -= 1,
-                        _ => break,
-                    }
-                }
-                if split > 0 && split < line.len() {
-                    let tail = line.split_off(split);
-                    used = line.iter().map(inline_cell_width).sum();
-                    lines.push(std::mem::take(&mut line));
-                    line = tail;
-                } else {
-                    lines.push(std::mem::take(&mut line));
-                    used = 0.0;
+            if line.is_empty() || used + w <= avail {
+                line.push(cell);
+                used += w;
+                continue;
+            }
+            // Wrap. Keep a trailing ASCII word together when it can move down.
+            let mut split = line.len();
+            while split > 0 {
+                match &line[split - 1] {
+                    InlineCell::Char(c) if c.is_ascii_alphanumeric() => split -= 1,
+                    _ => break,
                 }
             }
+            let tail = if split > 0 && split < line.len() {
+                line.split_off(split)
+            } else {
+                Vec::new()
+            };
+            // Kinsoku: a character that may not start a line (、。 etc.) takes
+            // the character before it down too, unless that would orphan the
+            // previous line's only cell.
+            let mut carry = None;
+            if tail.is_empty() && line.len() >= 2 {
+                if let InlineCell::Char(c) = &cell {
+                    if must_not_start_line(*c) {
+                        carry = line.pop();
+                    }
+                }
+            }
+            lines.push(std::mem::take(&mut line));
+            line = tail;
+            if let Some(c) = carry {
+                line.push(c);
+            }
+            used = line_width(&line);
             line.push(cell);
             used += w;
         }
@@ -4124,5 +4232,38 @@ mod tests {
             })
             .collect();
         assert_eq!(second, "de", "the ASCII word moves down together");
+    }
+
+    /// With real font metrics the flow measures true advances (CJK ≈ 1 em,
+    /// ASCII narrower) instead of the em-category estimates.
+    #[test]
+    fn measured_advances_follow_the_font() {
+        let bytes = std::fs::read(format!(
+            "{}/fonts/NotoSansJP-Regular.ttf",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).unwrap();
+        let em = measured_advance(&font, "あ", DEF_TEXT_SIZE);
+        let ascii = measured_advance(&font, "a", DEF_TEXT_SIZE);
+        assert!((em - DEF_TEXT_SIZE).abs() < 1.0, "CJK advance ~1em, got {em}");
+        assert!(ascii < em * 0.8, "ASCII narrower than CJK, got {ascii}");
+    }
+
+    /// Kinsoku: a character that may not start a line (。、) takes the
+    /// character before it down rather than sitting alone.
+    #[test]
+    fn inline_flow_keeps_punctuation_off_the_line_start() {
+        let cells: Vec<InlineCell> = "ああ。".chars().map(InlineCell::Char).collect();
+        let lines = OcrViewer::wrap_inline_cells(cells, 30.0);
+        assert_eq!(lines.len(), 2);
+        let second: String = lines[1]
+            .iter()
+            .map(|c| match c {
+                InlineCell::Char(ch) => *ch,
+                _ => '?',
+            })
+            .collect();
+        assert_eq!(second, "あ。", "。 rides with the previous character");
     }
 }
