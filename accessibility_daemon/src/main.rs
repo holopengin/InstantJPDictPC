@@ -54,6 +54,9 @@ enum BootstrapMsg {
     ImageReady(iced::widget::image::Handle, Vec<u8>, u32, u32),
     DictReady(Arc<DictionaryDatabase>),
     DeinflectReady(Arc<Deinflector>),
+    /// Complete initial result set: `annotations[i]` is detection box `i`,
+    /// detection-only (`line: None`) where recognition produced no text.
+    Results(Vec<DetectedAnnotation>),
     /// Complete replacement detection+recognition result after a live retune.
     Retuned(Vec<DetectedAnnotation>),
 }
@@ -427,6 +430,20 @@ fn tune_key_message(modified_key: &iced::keyboard::Key) -> Option<Message> {
     }
 }
 
+/// Detection-only annotations for every box, indexed by the box's original
+/// index. The recognition pass replaces the entries that produced text, so
+/// boxes that recognise nothing still reach the viewer as placeholders.
+fn detection_annotations(boxes: &[BoundingBox], rotated: &[RotatedBox]) -> Vec<DetectedAnnotation> {
+    boxes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let quad = rotated.get(i).copied().filter(|r| r.is_rotated());
+            DetectedAnnotation { bbox: b.clone(), quad, line: None }
+        })
+        .collect()
+}
+
 fn run_ocr_viewer(
     args: Vec<String>,
     data_dir: &std::path::Path,
@@ -474,15 +491,13 @@ fn run_ocr_viewer(
 
     let image_path = image_paths.first().cloned().context("No image path provided")?;
 
-    // Bootstrap channel — one-shot events (image, dict, deinflector)
+    // Bootstrap channel — one-shot events (image, dict, deinflector,
+    // initial results, retunes)
     let (bootstrap_tx, bootstrap_rx) = std::sync::mpsc::channel::<BootstrapMsg>();
-    // OCR channel — streamed detection boxes and recognition results
-    let (ocr_tx, ocr_rx) = std::sync::mpsc::channel::<(usize, DetectedAnnotation)>();
     // Live tuning channel — the viewer's tune keys send the latest
     // DET_THRESH / DET_UNCLIP values to the OCR worker.
     let (tune_tx, tune_rx) = std::sync::mpsc::channel::<TuneCmd>();
 
-    let ocr_tx2 = ocr_tx.clone();
     let image_path2 = image_path.clone();
     std::thread::Builder::new()
         .name("bootstrap".into())
@@ -564,14 +579,10 @@ fn run_ocr_viewer(
                 let detect_ms = t_detect.elapsed().as_secs_f64() * 1000.0;
                 println!("[OCR timing] Line detection:       {:>8.2} ms ({} boxes)", detect_ms, boxes.len());
 
-                // Send boxes with their original indices
-                for (i, b) in boxes.iter().enumerate() {
-                    let quad = rotated.get(i).copied().filter(|r| r.is_rotated());
-                    if ocr_tx2.send((
-                        i,
-                        DetectedAnnotation { bbox: b.clone(), quad, line: None }
-                    )).is_err() { return; }
-                }
+                // Detection-only annotations for every box, indexed by the
+                // box's original index. Recognition below replaces the
+                // entries that produced text; the rest stay as placeholders.
+                let mut results = detection_annotations(&boxes, &rotated);
 
                 // Recognition
                 let ppocr_vocab = engine.ppocr_vocab.clone();
@@ -579,18 +590,25 @@ fn run_ocr_viewer(
                 let batch_sz = engine.batch_size;
                 let rec_mode = engine.recognition_mode;
                 let t_recognize = std::time::Instant::now();
-                if let Err(e) = ocr_engine::recognize_boxes_streaming(
+                match ocr_engine::recognize_boxes_collect(
                     &image, &boxes, &rotated,
                     engine.ppocr_rec.clone(),
                     engine.kana_size.clone(),
                     &ppocr_vocab, &rec_remap, batch_sz, rec_mode,
-                    ocr_tx2,
                     std::path::Path::new("/tmp"),
                 ) {
-                    eprintln!("[OCR] Recognition error: {e}");
+                    Ok(recognized) => {
+                        for (idx, ann) in recognized {
+                            if let Some(slot) = results.get_mut(idx) {
+                                *slot = ann;
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("[OCR] Recognition error: {e}"),
                 }
                 let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;
                 println!("[OCR timing] Character recognition: {:>8.2} ms", recognize_ms);
+                if bootstrap_tx.send(BootstrapMsg::Results(results)).is_err() { return; }
 
                 // ── Live detection tuning ────────────────────────────────
                 // Keep the engine + image alive so the viewer can sweep
@@ -613,29 +631,22 @@ fn run_ocr_viewer(
                     };
                     let boxes = det.boxes;
                     let rotated = det.rotated;
-                    let mut anns: Vec<DetectedAnnotation> = boxes
-                        .iter()
-                        .enumerate()
-                        .map(|(i, b)| {
-                            let quad = rotated.get(i).copied().filter(|r| r.is_rotated());
-                            DetectedAnnotation { bbox: b.clone(), quad, line: None }
-                        })
-                        .collect();
-                    let (tx, rx) = std::sync::mpsc::channel::<(usize, DetectedAnnotation)>();
-                    if let Err(e) = ocr_engine::recognize_boxes_streaming(
+                    let mut anns = detection_annotations(&boxes, &rotated);
+                    match ocr_engine::recognize_boxes_collect(
                         &image, &boxes, &rotated,
                         engine.ppocr_rec.clone(),
                         engine.kana_size.clone(),
                         &ppocr_vocab, &rec_remap, batch_sz, rec_mode,
-                        tx,
                         std::path::Path::new("/tmp"),
                     ) {
-                        eprintln!("[Tune] recognition error: {e}");
-                    }
-                    for (idx, ann) in rx {
-                        if idx < anns.len() {
-                            anns[idx] = ann;
+                        Ok(recognized) => {
+                            for (idx, ann) in recognized {
+                                if idx < anns.len() {
+                                    anns[idx] = ann;
+                                }
+                            }
                         }
+                        Err(e) => eprintln!("[Tune] recognition error: {e}"),
                     }
                     println!(
                         "[Tune] DET_THRESH={:.2} DET_UNCLIP={:.2} → {} boxes in {:.0} ms",
@@ -658,8 +669,6 @@ fn run_ocr_viewer(
 
     let bootstrap_rx = Arc::new(std::sync::Mutex::new(Some(bootstrap_rx)));
     let rx_for_update = Arc::clone(&bootstrap_rx);
-    let ocr_rx = Arc::new(std::sync::Mutex::new(Some(ocr_rx)));
-    let ocr_rx_update = Arc::clone(&ocr_rx);
 
     // Detect native screen resolution for UI scaling.
     // Scale factor = screen_w / 1280 so that the logical viewport is always
@@ -710,7 +719,7 @@ fn run_ocr_viewer(
         // Track whether any channel drained anything — if so, schedule the
         // next frame immediately so we keep draining until they are empty.
         let mut had_ocr_work = false;
-        // Drain bootstrap channel (image, dict, deinflector, retunes)
+        // Drain bootstrap channel (image, dict, deinflector, results, retunes)
         if let Ok(mut guard) = rx_for_update.lock() {
             if let Some(rx) = guard.as_mut() {
                 while let Ok(event) = rx.try_recv() {
@@ -724,20 +733,16 @@ fn run_ocr_viewer(
                         BootstrapMsg::DeinflectReady(d) => {
                             state.deinflector = Some(d);
                         }
+                        BootstrapMsg::Results(annotations) => {
+                            state.apply_ocr_batch(annotations);
+                            had_ocr_work = true;
+                        }
                         BootstrapMsg::Retuned(annotations) => {
                             state.apply_retune(annotations);
                             state.det_busy = false;
                             had_ocr_work = true;
                         }
                     }
-                }
-            }
-        }
-        if let Ok(mut guard) = ocr_rx_update.lock() {
-            if let Some(rx) = guard.as_mut() {
-                while let Ok((idx, ann)) = rx.try_recv() {
-                    had_ocr_work = true;
-                    state.handle_ocr_recognition_result(idx, ann);
                 }
             }
         }
@@ -1217,10 +1222,12 @@ fn run_headless_batch(
             Err(e) => { eprintln!("[Batch] Failed to open {}: {e}", file.display()); continue; }
         };
         let t_img = std::time::Instant::now();
+        let t_det = std::time::Instant::now();
         let det = match engine.detect_lines(&image) {
             Ok(d) => d,
             Err(e) => { eprintln!("[Batch] Detection failed for {}: {e}", file.display()); continue; }
         };
+        println!("[OCR timing] Line detection:       {:>8.2} ms ({} boxes)", t_det.elapsed().as_secs_f64() * 1000.0, det.boxes.len());
         let boxes = det.boxes;
         let rotated = det.rotated;
         // Save crops next to the source image.
@@ -1284,6 +1291,34 @@ mod tests {
         assert!(t.unclip.is_none());
         let t = parse_det_tuning(&args(&["--det-unclip=abc"]));
         assert_eq!(t.unclip, None);
+    }
+
+    /// Detection placeholders keep the box's index, carry a quad only when
+    /// the fitted rect is meaningfully rotated, and survive a short rotated
+    /// list.
+    #[test]
+    fn detection_annotations_keep_indices_and_quads() {
+        let boxes = vec![
+            BoundingBox::new(0, 0, 10, 10, 0.9),
+            BoundingBox::new(20, 20, 30, 10, 0.8),
+        ];
+        let rotated = vec![
+            RotatedBox::new(5.0, 5.0, 10.0, 10.0, 0.0, 0.9),
+            RotatedBox::new(35.0, 25.0, 30.0, 10.0, 0.3, 0.8),
+        ];
+        let anns = detection_annotations(&boxes, &rotated);
+        assert_eq!(anns.len(), 2);
+        assert_eq!(
+            (anns[0].bbox.x, anns[0].bbox.y, anns[0].bbox.w, anns[0].bbox.h),
+            (0, 0, 10, 10)
+        );
+        assert!(anns[0].quad.is_none(), "axis-aligned rect has no quad");
+        assert!(anns[0].line.is_none());
+        assert!(anns[1].quad.is_some(), "tilted rect keeps its quad");
+
+        let anns = detection_annotations(&boxes, &rotated[..1]);
+        assert_eq!(anns.len(), 2, "every box gets a placeholder");
+        assert!(anns[1].quad.is_none());
     }
 
     /// Regression for the JIS layout: `=` is Shift+`-`, so the modified key
