@@ -14,6 +14,7 @@ use crate::util::japanese;
 use crate::util::kanji_variants::KanjiVariantTable;
 use crate::util::oov_candidates::OovCandidates;
 use crate::util::oov_suggestions;
+use crate::util::oov_suggestions::Source;
 
 /// Result of a dictionary lookup.
 pub struct LookupResult {
@@ -352,10 +353,21 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
             candidates.push(AlternativeChar {
                 char: GAP_CHAR,
                 is_selected: true,
+                source: Source::Head,
             });
+            // Mobile tags the blank path's LM-ranked entries `Lm`: the model
+            // chose their order (or, for the fallback, their within-class
+            // order), so the tint shows what the LM did. Without a model the
+            // pool keeps discovery order and the entries are head evidence.
+            let ranked_source = if lm.is_some() {
+                Source::Lm
+            } else {
+                Source::Head
+            };
             candidates.extend(ranked.into_iter().map(|ch| AlternativeChar {
                 char: ch,
                 is_selected: false,
+                source: ranked_source,
             }));
             return Some(AlternativesUiState { candidates });
         }
@@ -387,6 +399,7 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                 .map(|s| AlternativeChar {
                     char: s.ch,
                     is_selected: s.ch == current_char,
+                    source: s.source,
                 })
                 .collect(),
         })
@@ -2800,6 +2813,71 @@ mod tests {
         state.install_kanji_variants(Some(Arc::new(KanjiVariantTable::parse("摑\t掴\n"))));
         let ui = state.get_alternatives_ui_state().expect("blank panel");
         assert_eq!(panel_chars(&ui), vec![GAP_CHAR, '、', '。']);
+    }
+
+    /// The panel carries each entry's source so the tint is truthful: head
+    /// evidence reads `Head`, component neighbours and variant forms read
+    /// `Components`/`Variant`, and the blank's ranked entries read `Lm` with
+    /// a model installed (`Head` on discovery order without one).
+    #[test]
+    fn panel_entries_carry_their_source_for_the_tint() {
+        // Tapped character: head entry, then the component neighbour.
+        let mut state = state_at(blank_line("仲", vec![vec![('仲', 1.0)]], vec![]), 0);
+        state.install_oov_candidates(Some(Arc::new(fixture_oov())));
+        let ui = state.get_alternatives_ui_state().expect("char panel");
+        let sources: Vec<(char, Source)> =
+            ui.candidates.iter().map(|c| (c.char, c.source)).collect();
+        assert_eq!(sources, vec![('仲', Source::Head), ('伜', Source::Components)]);
+
+        // Tapped character: head entry, then the obsolete variant form.
+        let mut state = state_at(blank_line("掴", vec![vec![('掴', 1.0)]], vec![]), 0);
+        state.install_kanji_variants(Some(Arc::new(KanjiVariantTable::parse("摑\t掴\n"))));
+        let ui = state.get_alternatives_ui_state().expect("char panel");
+        let sources: Vec<(char, Source)> =
+            ui.candidates.iter().map(|c| (c.char, c.source)).collect();
+        assert_eq!(sources, vec![('掴', Source::Head), ('摑', Source::Variant)]);
+
+        // Blank without a model: the placeholder and the discovery-order
+        // evidence are head entries.
+        let mut state = state_at(
+            blank_line(
+                "私\u{25CC}う",
+                vec![vec![('私', 1.0)], vec![(GAP_CHAR, 0.0)], vec![('う', 1.0)]],
+                vec![vec![('、', 0.7), ('。', 0.5)]],
+            ),
+            1,
+        );
+        let ui = state.get_alternatives_ui_state().expect("blank panel");
+        let sources: Vec<(char, Source)> =
+            ui.candidates.iter().map(|c| (c.char, c.source)).collect();
+        assert_eq!(
+            sources,
+            vec![(GAP_CHAR, Source::Head), ('、', Source::Head), ('。', Source::Head)]
+        );
+
+        // Blank with the shipped model: the ranked entries read `Lm`.
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/lm/char_lm.bin");
+        let Some(lm) = CharLm::load(&path) else {
+            eprintln!("skipping LM half: {} not present", path.display());
+            return;
+        };
+        let mut state = state_at(
+            blank_line(
+                "私\u{25CC}う",
+                vec![vec![('私', 1.0)], vec![(GAP_CHAR, 0.0)], vec![('う', 1.0)]],
+                vec![vec![('、', 0.7), ('。', 0.5)]],
+            ),
+            1,
+        );
+        state.install_char_lm(Some(Arc::new(lm)));
+        let ui = state.get_alternatives_ui_state().expect("blank panel");
+        assert_eq!(ui.candidates[0].source, Source::Head, "the placeholder");
+        assert!(
+            ui.candidates[1..].iter().all(|c| c.source == Source::Lm),
+            "ranked entries are the model's: {:?}",
+            ui.candidates.iter().map(|c| (c.char, c.source)).collect::<Vec<_>>()
+        );
     }
 }
 
