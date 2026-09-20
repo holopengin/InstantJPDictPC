@@ -781,8 +781,13 @@ fn run_ocr_viewer(
     // re-run detection when the viewer's tuning keys change the values.
     let tune_tx = std::sync::Mutex::new(tune_tx);
 
+    // #43/#86: read once per run like the other Behaviour switches, so a
+    // change applies to the next launch.
+    let show_pitch = app_settings.pitch_accent;
     let boot = move || {
         let mut viewer = OcrViewer::new_empty(screen_w, screen_h, face);
+        // #43/#86: the pitch line is opt-in (off by default, like mobile).
+        viewer.show_pitch = show_pitch;
         viewer.state.install_char_lm(char_lm.clone());
         viewer.state.install_oov_candidates(oov_candidates.clone());
         viewer.state.install_kanji_variants(kanji_variants.clone());

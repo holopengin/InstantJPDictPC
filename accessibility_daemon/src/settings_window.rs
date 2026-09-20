@@ -37,6 +37,9 @@ pub enum SettingsMessage {
     /// #100: the furigana (ruby) rule switch. The frontend owns the settings
     /// file; this window renders the checkbox and reports the change.
     SetFuriganaFilter(bool),
+    /// #43/#86: the pitch-accent line switch (mobile's default-off
+    /// home-screen toggle). Same ownership as the furigana switch.
+    SetPitchAccent(bool),
     /// Font face switch, rendered here so all behaviour lives in one place.
     /// Like the furigana switch, the frontend owns the file and saves.
     SetFontFace(FontFace),
@@ -62,7 +65,8 @@ pub struct SettingsWindow {
     db: Arc<DictionaryDatabase>,
     /// Snapshot of the persisted app settings (rendered by the Behaviour
     /// section). The frontend owns the file and saves changes; this copy is
-    /// refreshed by [`SettingsMessage::SetFuriganaFilter`].
+    /// refreshed by [`SettingsMessage::SetFuriganaFilter`],
+    /// [`SettingsMessage::SetPitchAccent`] and [`SettingsMessage::SetFontFace`].
     app_settings: AppSettings,
     entry_count: usize,
     dictionaries: Vec<DictionaryMeta>,
@@ -312,6 +316,12 @@ impl SettingsWindow {
                 // The frontend owns settings.json and saves the change; keep
                 // this window's rendered copy in step.
                 self.app_settings.furigana_filter = enabled;
+                Task::none()
+            }
+
+            SettingsMessage::SetPitchAccent(enabled) => {
+                // Same ownership as the furigana switch: the frontend saves.
+                self.app_settings.pitch_accent = enabled;
                 Task::none()
             }
 
@@ -591,6 +601,26 @@ impl SettingsWindow {
             .style(text::secondary),
         );
 
+        // #43/#86: the pitch-accent line, off by default like mobile's
+        // home-screen toggle. Applies to the next launch (the viewer reads the
+        // setting once at startup).
+        let pitch_check = checkbox(self.app_settings.pitch_accent)
+            .on_toggle(SettingsMessage::SetPitchAccent);
+        content = content.push(
+            row![
+                pitch_check,
+                Text::new("Show pitch accent").size(14),
+            ]
+            .spacing(6)
+            .align_y(Vertical::Center),
+        );
+        content = content.push(
+            Text::new("Draws the pitch-accent line under each entry's headwords. \
+                        Takes effect next launch.")
+                .size(12)
+                .style(text::secondary),
+        );
+
         // Font face, moved here from the frontend menu so all behaviour lives
         // in one place. Applies to the overlay and the dictionary panel alike
         // (both register the same face at viewer startup).
@@ -828,4 +858,27 @@ fn import_progress_lines<'a>(
         );
     }
     content
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An empty throwaway database for window tests (an in-memory SQLite
+    /// file: no fixture rows, no disk writes).
+    fn empty_db() -> Arc<DictionaryDatabase> {
+        Arc::new(DictionaryDatabase::open(":memory:").expect("in-memory db"))
+    }
+
+    /// #43/#86: the pitch message updates the window's snapshot copy (the
+    /// frontend owns the file and saves; the furigana switch is the model).
+    #[test]
+    fn pitch_message_updates_snapshot_copy() {
+        let mut window = SettingsWindow::new(empty_db(), AppSettings::default());
+        assert!(!window.app_settings.pitch_accent);
+        let _ = window.update(SettingsMessage::SetPitchAccent(true));
+        assert!(window.app_settings.pitch_accent);
+        let _ = window.update(SettingsMessage::SetPitchAccent(false));
+        assert!(!window.app_settings.pitch_accent);
+    }
 }

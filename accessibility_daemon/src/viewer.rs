@@ -1795,6 +1795,11 @@ pub struct OcrViewer {
     pub det_busy: bool,
     /// HUD visibility (F1).
     pub det_hud_visible: bool,
+    /// #43/#86: whether the dictionary panel draws the pitch-accent line.
+    /// Loaded once from [`crate::app_settings::AppSettings`] at startup, so a
+    /// settings change applies to the next launch (same as the other
+    /// Behaviour switches). Off by default, matching mobile.
+    pub show_pitch: bool,
 }
 
 impl OcrViewer {
@@ -1839,6 +1844,7 @@ impl OcrViewer {
             det_box_count: 0,
             det_busy: false,
             det_hud_visible: true,
+            show_pitch: false,
         }
     }
 
@@ -2632,7 +2638,7 @@ impl OcrViewer {
             if let Some(chain) = &entry.deinflection {
                 entry_col = entry_col.push(Self::deinflection_row(chain, &entry.term));
             }
-            entry_col = entry_col.push(Self::headword_block(entry));
+            entry_col = entry_col.push(Self::headword_block(entry, self.show_pitch));
             for group in &entry.reading_groups {
                 // A reading that repeats an already-rendered glossary shows its
                 // headword but not a second copy of the senses (and examples).
@@ -2725,7 +2731,11 @@ impl OcrViewer {
     /// Headword block for one entry. Kanji (KANJIDIC) entries render their big
     /// glyph with 訓/音 rows; ordinary term entries render every headword with
     /// its reading in one comma-separated row.
-    fn headword_block(entry: &FormattedEntry) -> Container<'static, Message> {
+    ///
+    /// #43/#86: the pitch-accent line below the headwords only renders when
+    /// `show_pitch` is on (mobile's default-off toggle); the Kanjium data is
+    /// still attached either way.
+    fn headword_block(entry: &FormattedEntry, show_pitch: bool) -> Container<'static, Message> {
         let cyan = Color::from_rgb(0.0, 1.0, 1.0); // Android CYAN
         let gray = Color::from_rgb(0.75, 0.75, 0.75);
         let mut content = Column::new().spacing(2);
@@ -2791,12 +2801,9 @@ impl OcrViewer {
             }
             content = content.push(row);
 
-            // #43: pitch accents for every reading of this entry, one line.
-            let items: Vec<(String, Vec<i32>)> = term_groups
-                .iter()
-                .filter(|g| !g.pitch_positions.is_empty())
-                .map(|g| (g.reading.clone(), g.pitch_positions.clone()))
-                .collect();
+            // #43: pitch accents for every reading of this entry, one line —
+            // gated by the pitch switch (#43/#86), off by default.
+            let items: Vec<(String, Vec<i32>)> = Self::pitch_items(entry, show_pitch);
             if !items.is_empty() {
                 content = content.push(Self::pitch_line(&items));
             }
@@ -2813,6 +2820,22 @@ impl OcrViewer {
             .align_y(alignment::Vertical::Center)
             .push(Text::new(label.to_string()).size(12).color(gray))
             .push(Text::new(readings.to_string()).size(13).color(light_gray))
+    }
+
+    /// #43/#86: the pitch rows the headword block draws — every non-kanji
+    /// reading group that carries Kanjium downstep positions, or nothing when
+    /// the pitch switch is off (or no group has pitch data). Split out so the
+    /// gate is unit-testable without rendering iced widgets.
+    fn pitch_items(entry: &FormattedEntry, show_pitch: bool) -> Vec<(String, Vec<i32>)> {
+        if !show_pitch {
+            return Vec::new();
+        }
+        entry
+            .reading_groups
+            .iter()
+            .filter(|g| !g.is_kanji_entry && !g.pitch_positions.is_empty())
+            .map(|g| (g.reading.clone(), g.pitch_positions.clone()))
+            .collect()
     }
 
     /// #43: one comma-separated pitch line; high morae white, low gray, with a
@@ -4280,5 +4303,65 @@ mod tests {
             })
             .collect();
         assert_eq!(second, "あ。", "。 rides with the previous character");
+    }
+
+    /// One term entry with Kanjium pitch data, for the pitch-gate tests.
+    fn entry_with_pitch() -> FormattedEntry {
+        FormattedEntry {
+            term: "分".to_string(),
+            reading_groups: vec![FormattedReadingGroup {
+                reading: "ぶん".to_string(),
+                headwords: vec![FormattedHeadword {
+                    kanji: "分".to_string(),
+                    onyomi: None,
+                    kunyomi: None,
+                }],
+                sense_groups: Vec::new(),
+                is_kanji_entry: false,
+                pitch_positions: vec![1],
+                render_senses: true,
+            }],
+            deinflection: None,
+            dictionary_name: None,
+        }
+    }
+
+    /// #43/#86: the pitch switch gates the panel's pitch line — on shows the
+    /// reading's downstep row, off hides it even though the data is attached.
+    #[test]
+    fn pitch_line_renders_only_when_the_switch_is_on() {
+        let entry = entry_with_pitch();
+        let on = OcrViewer::pitch_items(&entry, true);
+        assert_eq!(on, vec![("ぶん".to_string(), vec![1])]);
+
+        assert!(
+            OcrViewer::pitch_items(&entry, false).is_empty(),
+            "the switch off hides the pitch line"
+        );
+    }
+
+    /// No pitch data, no line — the switch on must not invent one, and a
+    /// kanji (KANJIDIC) group's positions never reach the term pitch row.
+    #[test]
+    fn pitch_line_needs_real_term_pitch_data() {
+        let mut bare = entry_with_pitch();
+        bare.reading_groups[0].pitch_positions.clear();
+        assert!(OcrViewer::pitch_items(&bare, true).is_empty());
+
+        let mut kanji = entry_with_pitch();
+        kanji.reading_groups[0].is_kanji_entry = true;
+        assert!(
+            OcrViewer::pitch_items(&kanji, true).is_empty(),
+            "kanji groups keep their 訓/音 rows, not a pitch line"
+        );
+    }
+
+    /// The viewer ships with the line off, matching mobile's default-off
+    /// toggle; `main.rs` flips it on from the saved setting at startup.
+    #[test]
+    fn pitch_line_ships_off() {
+        let viewer =
+            OcrViewer::new_empty(1280.0, 720.0, crate::overlay_font::FontFace::Sans);
+        assert!(!viewer.show_pitch, "the pitch line ships off");
     }
 }
