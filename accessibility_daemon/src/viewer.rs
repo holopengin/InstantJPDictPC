@@ -3686,6 +3686,7 @@ mod tests {
             text: text.into(),
             char_boxes: boxes,
             alternatives: vec![],
+            raw_alternatives: vec![],
             sample_txt: None,
             is_vertical,
             chunk_boxes: vec![],
