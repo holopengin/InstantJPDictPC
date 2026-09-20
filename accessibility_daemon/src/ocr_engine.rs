@@ -48,6 +48,9 @@ pub struct OcrEngine {
     pub ppocr_vocab: Vec<String>,
     /// Pruned CTC head remap: remap[pruned_id] = original class id (#39).
     pub rec_remap: Vec<i32>,
+    /// Kana small/large correction model (#44). `None` when the assets are
+    /// missing or ncnn refuses them; callers then leave the page untouched.
+    pub kana_size: Option<std::sync::Arc<crate::kana_size::KanaSizeNet>>,
     pub recognition_mode: RecognitionMode,
     pub batch_size: usize,
     /// Live detection tuning from the viewer (`Message::TuneDet`). `None`
@@ -131,6 +134,29 @@ fn load_ppocr_models(
     }
 
     Ok((ppocr_rec, ppocr_vocab, rec_remap))
+}
+
+/// Load the kana small/large correction model (#44) from `assets/kana_size`.
+///
+/// Mobile loads it lazily on the first `correctPage` and treats any failure as
+/// "correction unavailable" rather than an error, so the page still renders.
+/// This does the same at engine construction: the model is ~190 KB and is
+/// shared by all recognition workers.
+fn load_kana_size(model_dir: &Path) -> Option<std::sync::Arc<crate::kana_size::KanaSizeNet>> {
+    let dir = model_dir.join("kana_size");
+    let param = dir.join("nb_all.param");
+    let bin = dir.join("nb_all.bin");
+    if !param.exists() || !bin.exists() {
+        eprintln!("[kana] model not found at {param:?}; kana size correction disabled");
+        return None;
+    }
+    match crate::kana_size::KanaSizeNet::load(&param, &bin) {
+        Ok(net) => Some(std::sync::Arc::new(net)),
+        Err(e) => {
+            eprintln!("[kana] model load failed ({e}); kana size correction disabled");
+            None
+        }
+    }
 }
 
 /// Bilinear sample of `src` at `(sx, sy)`; None when the point lies more than
@@ -1176,6 +1202,7 @@ impl OcrEngine {
         if ppocr_rec.is_none() {
             eprintln!("[PP-OCR] ncnn rec unavailable — recognition disabled");
         }
+        let kana_size = load_kana_size(model_path);
 
         println!("Recognition mode: {:?}, batch size: {}", recognition_mode, batch_size);
 
@@ -1184,6 +1211,7 @@ impl OcrEngine {
             ppocr_rec,
             ppocr_vocab,
             rec_remap,
+            kana_size,
             recognition_mode,
             batch_size,
             det_thresh_override: None,
@@ -1682,6 +1710,7 @@ pub fn recognize_boxes_streaming(
     sorted: &[BoundingBox],
     rotated: &[RotatedBox],
     rec: Option<std::sync::Arc<RecNet>>,
+    kana_size: Option<std::sync::Arc<crate::kana_size::KanaSizeNet>>,
     ppocr_vocab: &[String],
     rec_remap: &[i32],
     _batch_size: usize,
@@ -1785,6 +1814,7 @@ pub fn recognize_boxes_streaming(
             for _worker_id in 0..workers {
             let q = std::sync::Arc::clone(&job_queue);
             let rec = std::sync::Arc::clone(&rec);
+            let kana = kana_size.clone();
             let voc = ppocr_vocab.to_vec();
             let remap = rec_remap.to_vec();
             let snd = sender.clone();
@@ -1816,6 +1846,67 @@ pub fn recognize_boxes_streaming(
                                 for (c, _) in alts.iter_mut() {
                                     *c = crate::util::japanese::vertical_punctuation_char(*c);
                                 }
+                            }
+                        }
+
+                        // #44 kana small/large correction, at the same pipeline
+                        // position as mobile: after recognition (and the
+                        // vertical punctuation normalisation) and before the
+                        // char-box layout. Mobile runs KanaSizeFix.correctPage
+                        // over the ordered page on IO; here results stream one
+                        // line at a time, and a line's windows never cross a
+                        // line boundary, so correcting a one-line page is the
+                        // same decision. Only the text changes: the flip
+                        // preserves the character count, so charCols/char boxes
+                        // and the recogniser's alternatives stay aligned and are
+                        // not rewritten (mobile rewrites text + its `overrides`
+                        // map only, which this port does not have). Running
+                        // before save_line_sample keeps the dataset sidecar
+                        // label matching the displayed text.
+                        if let Some(kana) = kana.as_ref() {
+                            let probe = LineResult {
+                                text: text.clone(),
+                                char_boxes: Vec::new(),
+                                alternatives: Vec::new(),
+                                sample_txt: None,
+                                is_vertical: job.is_vertical,
+                                chunk_boxes: Vec::new(),
+                            };
+                            let correction = crate::kana_size::correct_lines(
+                                std::slice::from_ref(&probe),
+                                |w, b| kana.logits(w, b).ok(),
+                                crate::kana_size::EPSILON,
+                            );
+                            if let Some(line) = correction.lines.first() {
+                                text = line.text.clone();
+                            }
+                            if !correction.flips.is_empty() {
+                                let flips: Vec<String> = correction
+                                    .flips
+                                    .iter()
+                                    .map(|f| {
+                                        format!(
+                                            "{}→{}@{} p={:.3}",
+                                            f.from, f.to, f.index, f.p_big
+                                        )
+                                    })
+                                    .collect();
+                                eprintln!(
+                                    "[kana] line {}: {} flip(s): {}",
+                                    job.idx,
+                                    flips.len(),
+                                    flips.join(", ")
+                                );
+                            }
+                            // Mobile surfaces the declined detail so the
+                            // correction is visible whether or not it fired;
+                            // the summary carries no surrounding text.
+                            if !correction.declined.is_empty() {
+                                eprintln!(
+                                    "[kana] line {} declined: {}",
+                                    job.idx,
+                                    correction.declined_summary()
+                                );
                             }
                         }
 
@@ -2398,7 +2489,7 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             crate::ocr_engine::recognize_boxes_streaming(
                 &img, &det.boxes, &det.rotated,
-                eng.ppocr_rec.clone(), &eng.ppocr_vocab, &eng.rec_remap,
+                eng.ppocr_rec.clone(), eng.kana_size.clone(), &eng.ppocr_vocab, &eng.rec_remap,
                 4, RecognitionMode::Both, tx, std::path::Path::new("/tmp"),
             )
             .unwrap();
