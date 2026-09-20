@@ -76,6 +76,22 @@ fn main() {
             Err(e) => panic!("Failed to copy assets: {}", e),
         }
     }
+
+    // ------------------------------------------------------------------
+    // Fonts -> target/{profile}/fonts (next to the executable)
+    // ------------------------------------------------------------------
+    // find_jp_font_path()/find_jp_bold_font_path() check exe_dir/fonts
+    // first, so copying here keeps both faces discoverable regardless of the
+    // working directory (dev builds, systemd app launches, AppImage).
+    let fonts_src = manifest_dir.join("fonts");
+    let fonts_dest = target_dir.join(&profile).join("fonts");
+    if fonts_src.exists() {
+        println!("cargo:rerun-if-changed=fonts/");
+        if let Err(e) = copy_dir_all(&fonts_src, &fonts_dest) {
+            panic!("Failed to copy fonts: {}", e);
+        }
+        println!("cargo:warning=Copied fonts to {:?}", fonts_dest);
+    }
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
