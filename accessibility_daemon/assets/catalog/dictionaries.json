@@ -1,0 +1,35 @@
+{
+  "comment": [
+    "Download catalog for the desktop settings window. Mirrors the two",
+    "recommended rows of mobile's assets/catalog/dictionaries.json (#71):",
+    "hand-maintained Yomitan zips pinned to a DATED release URL (never",
+    "/releases/latest/) plus a byte size and SHA-256, so an install is",
+    "integrity-checked before a single row reaches the database. `family` is",
+    "the dictionary's stable title family; the installed meta name may append",
+    "a revision (e.g. \"Jitendex.org [2026-08-11]\")."
+  ],
+  "entries": [
+    {
+      "id": "jitendex",
+      "name": "Jitendex",
+      "description": "The richest dictionary option and replacement for the legacy \"JMdict Extra.\"",
+      "url": "https://github.com/stephenmk/stephenmk.github.io/releases/download/2026.08.11.0/jitendex-yomitan.zip",
+      "bytes": 38698313,
+      "sha256": "8364e69e7bd0881c42011e96af921a7399d7fe06e2bf4fff4da6d18affff74fc",
+      "family": "Jitendex.org",
+      "license": "CC BY-SA 4.0",
+      "source": "stephenmk/stephenmk.github.io @ 2026.08.11.0"
+    },
+    {
+      "id": "kanjidic-english",
+      "name": "KANJIDIC (English)",
+      "description": "Supplementary kanji dictionary for readings, meanings, JLPT grade, stroke count and frequency.",
+      "url": "https://github.com/yomidevs/jmdict-yomitan/releases/download/2026-09-15/KANJIDIC_english.zip",
+      "bytes": 721032,
+      "sha256": "51a7a1aa3f996e60742b9e5f62144422926060d48208d9bdb9f51ecfe9dd4f74",
+      "family": "KANJIDIC",
+      "license": "CC BY-SA 4.0 (EDRDG)",
+      "source": "yomidevs/jmdict-yomitan @ 2026-09-15"
+    }
+  ]
+}

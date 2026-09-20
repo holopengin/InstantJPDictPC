@@ -1,0 +1,18 @@
+{
+  "id": "gap-01-discovery-order",
+  "kind": "gap",
+  "description": "No language model: the blank's pool is the recogniser's own per-timestep evidence in first-seen order (kana and punctuation included, CTC blank and placeholder dropped, duplicates collapsed). Mirrors mobile GapCandidatesTest.thePoolKeepsKanaAndPunctuationAndDeduplicates.",
+  "mobile_mirror": "GapCandidatesTest.thePoolKeepsKanaAndPunctuationAndDeduplicates",
+  "case": {
+    "text": "私◌う",
+    "gap_index": 1,
+    "expect_context": ["私"],
+    "alternatives": [
+      [["◌", 0.9], ["、", 0.5], ["思", 0.3]],
+      [["思", 0.8], ["阿", 0.2]]
+    ],
+    "limit": 15,
+    "lm": null,
+    "expect": ["、", "思", "阿"]
+  }
+}

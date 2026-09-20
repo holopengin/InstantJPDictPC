@@ -1,0 +1,22 @@
+KANJIDIC (English) — CC BY-SA 4.0 (EDRDG) attribution
+=====================================================
+
+Bundled as : accessibility_daemon/assets/dictionaries/KANJIDIC_english.zip
+             installed at first start as the dictionary titled
+             "KANJIDIC [2026-258]" (stable title family "KANJIDIC").
+Source     : KANJIDIC2 data, Electronic Dictionary Research and Development
+             Group (EDRDG), https://www.edrdg.org/wiki/index.php/KANJIDIC_Project
+Package    : https://github.com/yomidevs/jmdict-yomitan (yomitan-import)
+Release    : 2026-09-15 (revision "kanjidic2.2026-258")
+URL        : https://github.com/yomidevs/jmdict-yomitan/releases/download/2026-09-15/KANJIDIC_english.zip
+SHA-256    : 51a7a1aa3f996e60742b9e5f62144422926060d48208d9bdb9f51ecfe9dd4f74
+Licence    : Creative Commons Attribution-ShareAlike 4.0 International
+             (CC BY-SA 4.0) — licence text: ../texts/cc-by-sa-4.0.txt
+             EDRDG licence statement: ../texts/edrdg-licence.txt
+Attribution: "This publication has included material from the JMdict (EDICT,
+             etc.) dictionary files in accordance with the licence provisions
+             of the Electronic Dictionaries Research Group. See
+             http://www.edrdg.org/"
+
+Share-alike: the bundled copy is byte-identical to the pinned release
+(SHA-256 above); the app's importer does not alter the file.

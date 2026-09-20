@@ -1,0 +1,25 @@
+Kana size model — assets
+========================
+
+Source      : retrain "nb_all", kanadiff fp32 ONNX, sha256 132bcc3259354d00…
+              converted to ncnn by the model author's pipeline, which writes the weight stream
+              itself with explicit fp32 tags and asserts its byte total
+Author      : trained by the collaborating agent against Aozora Bunko + Japanese Wikipedia
+              (Aozora Bunko is public domain; Wikipedia is CC BY-SA 4.0)
+Licence     : the weights are CC BY-SA 4.0 — the same terms as the Wikipedia half of the training
+              corpus (Aozora Bunko is public domain). The code that generates and runs inference
+              against them is AGPL-3.0, like the rest of this app.
+
+Files
+-----
+
+  nb_all.param      1,585 B   17 layers; win (40 int32) + base (1 int32) -> logit
+  nb_all.bin      189,888 B   sequential weight stream, read in param order
+
+Verified
+--------
+
+The ten published logits in the artifact's validation_vectors.json reproduce to 3.8e-06 under
+ncnn (host harness, fp32 — fp16, bf16 and packing pinned off, since fp16 alone costs 1.5e-03).
+An independent direct C++ forward pass, since deleted, agreed to 5.8e-06. KanaSizeNcnn.selfCheck
+re-runs the same ten vectors through this device's own encoder and JNI.

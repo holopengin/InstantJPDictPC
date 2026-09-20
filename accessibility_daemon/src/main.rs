@@ -1,9 +1,15 @@
+mod app_settings;
 mod nav_graph;
 mod capture;
+#[cfg(test)]
+mod conformance;
 mod data;
 mod frontend;
+mod furigana;
+mod kana_size;
 mod models;
 mod ocr_engine;
+mod overlay_font;
 mod overlay_state;
 mod ppocr;
 mod ppocr_ncnn;
@@ -51,6 +57,11 @@ enum BootstrapMsg {
     ImageReady(iced::widget::image::Handle, Vec<u8>, u32, u32),
     DictReady(Arc<DictionaryDatabase>),
     DeinflectReady(Arc<Deinflector>),
+    /// Complete initial result set: `annotations[i]` is detection box `i`,
+    /// detection-only (`line: None`) where recognition produced no text.
+    Results(Vec<DetectedAnnotation>),
+    /// Complete replacement detection+recognition result after a live retune.
+    Retuned(Vec<DetectedAnnotation>),
 }
 
 use iced::window::settings::PlatformSpecific;
@@ -224,11 +235,18 @@ fn main() -> Result<()> {
         println!("No image argument provided. Opening frontend window...");
         let db_path = data_dir.join("dictionary.sqlite");
         let db = Arc::new(DictionaryDatabase::open(&db_path)?);
+        // #43: the bundled pitch dictionary installs on a worker thread; the
+        // settings window opens (and stays responsive) while a first run
+        // imports.
+        crate::data::bundled::spawn_bundled_install(
+            Arc::clone(&db),
+            std::path::PathBuf::from(resolve_asset_dir()),
+        );
         run_frontend(db, data_dir)?;
         return Ok(());
     }
 
-    run_ocr_viewer(args)
+    run_ocr_viewer(args, &data_dir)
 }
 
 fn run_capture(extra_args: &[String], data_dir: &std::path::Path) -> Result<()> {
@@ -248,7 +266,7 @@ fn run_capture(extra_args: &[String], data_dir: &std::path::Path) -> Result<()> 
     let mut args: Vec<String> = vec!["accessibility_daemon".to_string()];
     args.extend(extra_args.iter().cloned());
     args.push(path.to_string_lossy().into_owned());
-    run_ocr_viewer(args)
+    run_ocr_viewer(args, data_dir)
 }
 
 fn print_usage() {
@@ -272,6 +290,10 @@ fn print_usage() {
     println!("      --hybrid               Hybrid mode: both horizontal and vertical recognition");
     println!("  -b, --batch-size <N>       Recognition batch size (default: 10)");
     println!("      --batch-size=<N>       (alternative syntax)");
+    println!("      --det-thresh <F>       Detection threshold 0.01-0.99 (default 0.25)");
+    println!("      --det-thresh=<F>       (alternative syntax)");
+    println!("      --det-unclip <F>       DB unclip ratio 0.0-5.0 (default 0.7)");
+    println!("      --det-unclip=<F>       (alternative syntax)");
     println!();
     println!("CAPTURE MODE (for a global shortcut):");
     println!("  --capture takes the screenshot itself — the focused window, no");
@@ -290,6 +312,10 @@ fn print_usage() {
     println!("    - Launch File Watcher     (monitors ~/Pictures/Screenshots and new");
     println!("                              images in /tmp; replaced with");
     println!("                              \"Stop File Watcher\" while it is running)");
+    println!("  It also carries the overlay font choice: a \"Serif font\" checkbox");
+    println!("  (sans is the default) persisted to settings.json next to");
+    println!("  dictionary.sqlite, applied to the overlay and dictionary panel on");
+    println!("  the next launch.");
     println!();
     println!("ARGUMENTS:");
     println!("  <IMAGE_PATH>               Path to a screenshot image for OCR analysis");
@@ -311,6 +337,10 @@ fn print_usage() {
     println!("  D / Shift+J                Scroll dictionary down");
     println!("  F / Shift+K                Scroll dictionary up");
     println!("  Esc / Q                    Close viewer / back out of a selection");
+    println!("  [ / ]                      Lower / raise DET_UNCLIP by 0.05 (live)");
+    println!("  - / =                      Lower / raise DET_THRESH by 0.01 (live)");
+    println!("  R                          Reset detection tuning to startup values");
+    println!("  F1                         Show/hide the detection tuning HUD");
 }
 
 fn run_frontend(db: Arc<DictionaryDatabase>, data_dir: std::path::PathBuf) -> Result<()> {
@@ -332,8 +362,95 @@ fn run_frontend(db: Arc<DictionaryDatabase>, data_dir: std::path::PathBuf) -> Re
     Ok(())
 }
 
+/// Detection tunables supplied on the command line.
+#[derive(Clone, Copy, Default)]
+struct DetTuning {
+    thresh: Option<f32>,
+    unclip: Option<f32>,
+}
+
+/// A live retune request sent from the viewer to the OCR worker.
+#[derive(Clone, Copy)]
+struct TuneCmd {
+    thresh: f32,
+    unclip: f32,
+}
+
+/// `--det-thresh[=F]` / `--det-unclip[=F]`, both clamped to plausible ranges.
+/// Unknown arguments are ignored here; the main parser handles the rest.
+fn parse_det_tuning(args: &[String]) -> DetTuning {
+    let mut tuning = DetTuning::default();
+    let clamp_thresh = |v: f32| v.clamp(0.01, 0.99);
+    let clamp_unclip = |v: f32| v.clamp(0.0, 5.0);
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if let Some(v) = arg.strip_prefix("--det-thresh=") {
+            tuning.thresh = v.parse::<f32>().ok().map(clamp_thresh);
+            i += 1;
+        } else if arg == "--det-thresh" {
+            if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                tuning.thresh = Some(clamp_thresh(v));
+            }
+            i += 2;
+        } else if let Some(v) = arg.strip_prefix("--det-unclip=") {
+            tuning.unclip = v.parse::<f32>().ok().map(clamp_unclip);
+            i += 1;
+        } else if arg == "--det-unclip" {
+            if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                tuning.unclip = Some(clamp_unclip(v));
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    tuning
+}
+
+/// Viewer tuning keys, matched on the **modified** key so layouts that put
+/// tuning characters behind Shift still work: on JIS (`jp106`) `=` is
+/// Shift+`-` on the same physical key as `-`, and matching the unmodified key
+/// made both decrease the threshold.
+fn tune_key_message(modified_key: &iced::keyboard::Key) -> Option<Message> {
+    use iced::keyboard::Key;
+
+    match modified_key {
+        Key::Character(c) if c.as_ref() == "[" => {
+            Some(Message::TuneDet { param: DetParam::Unclip, delta: -0.05 })
+        }
+        Key::Character(c) if c.as_ref() == "]" => {
+            Some(Message::TuneDet { param: DetParam::Unclip, delta: 0.05 })
+        }
+        Key::Character(c) if c.as_ref() == "-" || c.as_ref() == "_" => {
+            Some(Message::TuneDet { param: DetParam::Threshold, delta: -0.01 })
+        }
+        Key::Character(c) if c.as_ref() == "=" || c.as_ref() == "+" => {
+            Some(Message::TuneDet { param: DetParam::Threshold, delta: 0.01 })
+        }
+        Key::Character(c) if c.as_ref() == "r" || c.as_ref() == "R" => Some(Message::TuneReset),
+        Key::Named(iced::keyboard::key::Named::F1) => Some(Message::ToggleDetHud),
+        _ => None,
+    }
+}
+
+/// Detection-only annotations for every box, indexed by the box's original
+/// index. The recognition pass replaces the entries that produced text, so
+/// boxes that recognise nothing still reach the viewer as placeholders.
+fn detection_annotations(boxes: &[BoundingBox], rotated: &[RotatedBox]) -> Vec<DetectedAnnotation> {
+    boxes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let quad = rotated.get(i).copied().filter(|r| r.is_rotated());
+            DetectedAnnotation { bbox: b.clone(), quad, line: None }
+        })
+        .collect()
+}
+
 fn run_ocr_viewer(
     args: Vec<String>,
+    data_dir: &std::path::Path,
 ) -> Result<()> {
     let t_start = std::time::Instant::now();
     let mut image_paths: Vec<String> = Vec::new();
@@ -363,22 +480,102 @@ fn run_ocr_viewer(
         else { image_paths.push(args[i].clone()); i += 1; }
     }
     let _ = font_path;
+    let tuning = parse_det_tuning(&args);
+
+    // Persisted app settings, read once per run: every capture/watcher child
+    // is a fresh process, so a change applies to the next run (mobile reads
+    // its preferences per detection run).
+    let app_settings = crate::app_settings::AppSettings::load(data_dir);
 
     // Headless batch mode: OCR a directory or a list of images, saving line
     // crops + sidecar text files next to each source image.
     if headless {
-        return run_headless_batch(image_paths, recognition_mode, batch_size);
+        return run_headless_batch(
+            image_paths,
+            recognition_mode,
+            batch_size,
+            tuning,
+            app_settings.furigana_filter,
+        );
     }
+
+    // The face the overlay (and, below, the iced dictionary panel) paints in.
+    // Persisted by the frontend's Sans/Serif checkbox; loaded once per run, so
+    // a change applies to the next launch.
+    let face = app_settings.overlay_font;
+
+    // The character n-gram model behind the blank's candidate ranking (#44).
+    // 14 MB, loaded once per process like the fonts; a missing asset only
+    // narrows the blank's list, so it is never fatal.
+    let char_lm = {
+        let path = std::path::Path::new(&resolve_asset_dir()).join("lm/char_lm.bin");
+        match crate::util::char_lm::CharLm::load(&path) {
+            Some(lm) => {
+                println!("[Bootstrap] CharLm loaded: {} entries", lm.entries());
+                Some(std::sync::Arc::new(lm))
+            }
+            None => {
+                eprintln!(
+                    "[Bootstrap] CharLm unavailable at {}; blank lists keep discovery order",
+                    path.display()
+                );
+                None
+            }
+        }
+    };
+
+    // The kanji component table behind a tapped character's extra candidates
+    // (#44). Small text asset, loaded once per process like the LM; a missing
+    // asset only narrows the list to the head ranking, so it is never fatal.
+    let oov_candidates = {
+        let path =
+            std::path::Path::new(&resolve_asset_dir()).join("components/krad_components.txt");
+        match crate::util::component_table::ComponentTable::load(&path) {
+            Some(table) => {
+                println!("[Bootstrap] ComponentTable loaded: {} entries", table.entry_count());
+                Some(std::sync::Arc::new(crate::util::oov_candidates::OovCandidates::new(table)))
+            }
+            None => {
+                eprintln!(
+                    "[Bootstrap] ComponentTable unavailable at {}; tapped lists stay head-only",
+                    path.display()
+                );
+                None
+            }
+        }
+    };
+
+    // The kanji variant forms offered last in a tapped character's list
+    // (#44). Same load-once shape as the tables above.
+    let kanji_variants = {
+        let path =
+            std::path::Path::new(&resolve_asset_dir()).join("variants/kanji_variants.txt");
+        match crate::util::kanji_variants::KanjiVariantTable::load(&path) {
+            Some(table) => {
+                println!("[Bootstrap] KanjiVariants loaded: {} variants", table.entry_count());
+                Some(std::sync::Arc::new(table))
+            }
+            None => {
+                eprintln!(
+                    "[Bootstrap] KanjiVariants unavailable at {}; no variant forms offered",
+                    path.display()
+                );
+                None
+            }
+        }
+    };
 
     let image_path = image_paths.first().cloned().context("No image path provided")?;
 
-    // Bootstrap channel — one-shot events (image, dict, deinflector)
+    // Bootstrap channel — one-shot events (image, dict, deinflector,
+    // initial results, retunes)
     let (bootstrap_tx, bootstrap_rx) = std::sync::mpsc::channel::<BootstrapMsg>();
-    // OCR channel — streamed detection boxes and recognition results
-    let (ocr_tx, ocr_rx) = std::sync::mpsc::channel::<(usize, DetectedAnnotation)>();
+    // Live tuning channel — the viewer's tune keys send the latest
+    // DET_THRESH / DET_UNCLIP values to the OCR worker.
+    let (tune_tx, tune_rx) = std::sync::mpsc::channel::<TuneCmd>();
 
-    let ocr_tx2 = ocr_tx.clone();
     let image_path2 = image_path.clone();
+    let furigana_filter = app_settings.furigana_filter;
     std::thread::Builder::new()
         .name("bootstrap".into())
         .spawn(move || {
@@ -413,7 +610,15 @@ fn run_ocr_viewer(
                 Ok(d) => { println!("[Bootstrap] Dictionary database loaded: {} entries", d.get_entry_count().unwrap_or(0)); d }
                 Err(e) => { eprintln!("[Bootstrap] Failed to load dictionary: {e}"); return; }
             };
-            if bootstrap_tx.send(BootstrapMsg::DictReady(Arc::new(db))).is_err() { return; }
+            // #43: install the bundled pitch dictionary if it is missing, on
+            // its own worker thread, so the OCR pipeline is never delayed by a
+            // first-run import. Subsequent starts skip after one query.
+            let db = Arc::new(db);
+            crate::data::bundled::spawn_bundled_install(
+                Arc::clone(&db),
+                std::path::PathBuf::from(resolve_asset_dir()),
+            );
+            if bootstrap_tx.send(BootstrapMsg::DictReady(db)).is_err() { return; }
 
             // Phase 3: load deinflector
             let deinf_path = resolve_asset_path("deinflect.json");
@@ -431,6 +636,12 @@ fn run_ocr_viewer(
                     Ok(e) => e,
                     Err(err) => { eprintln!("[Bootstrap] OCR engine error: {err}"); return; }
                 };
+                // CLI tuning flags apply to the very first detection; the
+                // viewer's tune keys adjust the same overrides live.
+                engine.det_thresh_override = tuning.thresh;
+                engine.det_unclip_override = tuning.unclip;
+                // #100: the furigana (ruby) rule switch, off by default.
+                engine.det_furigana = furigana_filter;
                 println!("[Bootstrap] OCR engine created ({} chars) in {:.0} ms",
                     engine.ppocr_vocab.len(), t_engine.elapsed().as_secs_f64() * 1000.0);
 
@@ -447,14 +658,10 @@ fn run_ocr_viewer(
                 let detect_ms = t_detect.elapsed().as_secs_f64() * 1000.0;
                 println!("[OCR timing] Line detection:       {:>8.2} ms ({} boxes)", detect_ms, boxes.len());
 
-                // Send boxes with their original indices
-                for (i, b) in boxes.iter().enumerate() {
-                    let quad = rotated.get(i).copied().filter(|r| r.is_rotated());
-                    if ocr_tx2.send((
-                        i,
-                        DetectedAnnotation { bbox: b.clone(), quad, line: None }
-                    )).is_err() { return; }
-                }
+                // Detection-only annotations for every box, indexed by the
+                // box's original index. Recognition below replaces the
+                // entries that produced text; the rest stay as placeholders.
+                let mut results = detection_annotations(&boxes, &rotated);
 
                 // Recognition
                 let ppocr_vocab = engine.ppocr_vocab.clone();
@@ -462,17 +669,73 @@ fn run_ocr_viewer(
                 let batch_sz = engine.batch_size;
                 let rec_mode = engine.recognition_mode;
                 let t_recognize = std::time::Instant::now();
-                if let Err(e) = ocr_engine::recognize_boxes_streaming(
+                match ocr_engine::recognize_boxes_collect(
                     &image, &boxes, &rotated,
                     engine.ppocr_rec.clone(),
+                    engine.kana_size.clone(),
                     &ppocr_vocab, &rec_remap, batch_sz, rec_mode,
-                    ocr_tx2,
                     std::path::Path::new("/tmp"),
                 ) {
-                    eprintln!("[OCR] Recognition error: {e}");
+                    Ok(recognized) => {
+                        for (idx, ann) in recognized {
+                            if let Some(slot) = results.get_mut(idx) {
+                                *slot = ann;
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("[OCR] Recognition error: {e}"),
                 }
                 let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;
                 println!("[OCR timing] Character recognition: {:>8.2} ms", recognize_ms);
+                if bootstrap_tx.send(BootstrapMsg::Results(results)).is_err() { return; }
+
+                // ── Live detection tuning ────────────────────────────────
+                // Keep the engine + image alive so the viewer can sweep
+                // DET_THRESH / DET_UNCLIP without restarting. Commands that
+                // pile up while a sweep is running are coalesced to the latest.
+                while let Ok(first) = tune_rx.recv() {
+                    let mut cmd = first;
+                    while let Ok(next) = tune_rx.try_recv() {
+                        cmd = next;
+                    }
+                    engine.det_thresh_override = Some(cmd.thresh);
+                    engine.det_unclip_override = Some(cmd.unclip);
+                    let t_tune = std::time::Instant::now();
+                    let det = match engine.detect_lines(&image) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!("[Tune] detection error: {e}");
+                            continue;
+                        }
+                    };
+                    let boxes = det.boxes;
+                    let rotated = det.rotated;
+                    let mut anns = detection_annotations(&boxes, &rotated);
+                    match ocr_engine::recognize_boxes_collect(
+                        &image, &boxes, &rotated,
+                        engine.ppocr_rec.clone(),
+                        engine.kana_size.clone(),
+                        &ppocr_vocab, &rec_remap, batch_sz, rec_mode,
+                        std::path::Path::new("/tmp"),
+                    ) {
+                        Ok(recognized) => {
+                            for (idx, ann) in recognized {
+                                if idx < anns.len() {
+                                    anns[idx] = ann;
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("[Tune] recognition error: {e}"),
+                    }
+                    println!(
+                        "[Tune] DET_THRESH={:.2} DET_UNCLIP={:.2} → {} boxes in {:.0} ms",
+                        cmd.thresh, cmd.unclip, anns.len(),
+                        t_tune.elapsed().as_secs_f64() * 1000.0
+                    );
+                    if bootstrap_tx.send(BootstrapMsg::Retuned(anns)).is_err() {
+                        break;
+                    }
+                }
             }
         })?;
 
@@ -485,8 +748,6 @@ fn run_ocr_viewer(
 
     let bootstrap_rx = Arc::new(std::sync::Mutex::new(Some(bootstrap_rx)));
     let rx_for_update = Arc::clone(&bootstrap_rx);
-    let ocr_rx = Arc::new(std::sync::Mutex::new(Some(ocr_rx)));
-    let ocr_rx_update = Arc::clone(&ocr_rx);
 
     // Detect native screen resolution for UI scaling.
     // Scale factor = screen_w / 1280 so that the logical viewport is always
@@ -516,10 +777,31 @@ fn run_ocr_viewer(
         screen_h / ui_scale,
     );
 
-    let boot = move || OcrViewer::new_empty(screen_w, screen_h);
+    // The UI keeps the sending end; the worker owns the receiver so it can
+    // re-run detection when the viewer's tuning keys change the values.
+    let tune_tx = std::sync::Mutex::new(tune_tx);
+
+    let boot = move || {
+        let mut viewer = OcrViewer::new_empty(screen_w, screen_h, face);
+        viewer.state.install_char_lm(char_lm.clone());
+        viewer.state.install_oov_candidates(oov_candidates.clone());
+        viewer.state.install_kanji_variants(kanji_variants.clone());
+        if let Some(t) = tuning.thresh {
+            viewer.det_thresh = t;
+            viewer.det_thresh_default = t;
+        }
+        if let Some(u) = tuning.unclip {
+            viewer.det_unclip = u;
+            viewer.det_unclip_default = u;
+        }
+        viewer
+    };
 
     let update = move |state: &mut OcrViewer, msg: Message| -> iced::Task<Message> {
-        // Drain bootstrap channel (image, dict, deinflector)
+        // Track whether any channel drained anything — if so, schedule the
+        // next frame immediately so we keep draining until they are empty.
+        let mut had_ocr_work = false;
+        // Drain bootstrap channel (image, dict, deinflector, results, retunes)
         if let Ok(mut guard) = rx_for_update.lock() {
             if let Some(rx) = guard.as_mut() {
                 while let Ok(event) = rx.try_recv() {
@@ -533,18 +815,16 @@ fn run_ocr_viewer(
                         BootstrapMsg::DeinflectReady(d) => {
                             state.deinflector = Some(d);
                         }
+                        BootstrapMsg::Results(annotations) => {
+                            state.apply_ocr_batch(annotations);
+                            had_ocr_work = true;
+                        }
+                        BootstrapMsg::Retuned(annotations) => {
+                            state.apply_retune(annotations);
+                            state.det_busy = false;
+                            had_ocr_work = true;
+                        }
                     }
-                }
-            }
-        }
-        // Track whether we drained anything — if so, schedule the next frame
-        // immediately so we keep draining until the channel is empty.
-        let mut had_ocr_work = false;
-        if let Ok(mut guard) = ocr_rx_update.lock() {
-            if let Some(rx) = guard.as_mut() {
-                while let Ok((idx, ann)) = rx.try_recv() {
-                    had_ocr_work = true;
-                    state.handle_ocr_recognition_result(idx, ann);
                 }
             }
         }
@@ -751,6 +1031,29 @@ fn run_ocr_viewer(
                     }
                 }
             }
+            Message::TuneDet { param, delta } => {
+                state.adjust_det_tuning(param, delta);
+                state.det_busy = true;
+                if let Ok(tx) = tune_tx.lock() {
+                    let _ = tx.send(TuneCmd {
+                        thresh: state.det_thresh,
+                        unclip: state.det_unclip,
+                    });
+                }
+            }
+            Message::TuneReset => {
+                state.reset_det_tuning();
+                state.det_busy = true;
+                if let Ok(tx) = tune_tx.lock() {
+                    let _ = tx.send(TuneCmd {
+                        thresh: state.det_thresh,
+                        unclip: state.det_unclip,
+                    });
+                }
+            }
+            Message::ToggleDetHud => {
+                state.det_hud_visible = !state.det_hud_visible;
+            }
             Message::Tick => {
                 // Nav graph rebuild is deferred to navigate() — no need
                 // to rebuild here every frame during streaming.
@@ -782,16 +1085,36 @@ fn run_ocr_viewer(
         }
     };
 
+    // The bytes registered with iced and the family name must agree with the
+    // face actually found: a serif selection whose file is missing falls back
+    // to the sans file (with a warning), so ask for the sans family — never
+    // for a family nothing registered.
+    let font_path = crate::overlay_font::find_font_path(face);
+    let loaded_face = font_path
+        .as_deref()
+        .map(crate::overlay_font::face_of)
+        .unwrap_or(face);
+    let font_bytes = font_path
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok())
+        .unwrap_or_default();
+    // The dictionary panel's flow layout packs lines against the real face;
+    // give it the same bytes iced renders with.
+    crate::viewer::init_panel_metrics(&font_bytes);
+
     let app = iced::application(boot, update, OcrViewer::view)
-        // Use the SAME font as the overlay glyph cache for all iced text
-        // (dictionary panel etc.) — mixing fonts shows different stroke
-        // forms (e.g. JP vs traditional-CN variants) for the same char.
-        .font(if let Some(fp) = crate::viewer::find_jp_font_path() {
-            std::fs::read(&fp).unwrap_or_default()
-        } else {
-            Vec::new()
-        })
-        .default_font(iced::Font::with_name("Noto Sans JP"))
+        // One selected face for the overlay glyph cache AND the iced text
+        // (dictionary panel etc.): mixing fonts shows different stroke forms
+        // (e.g. JP vs traditional-CN variants) for the same char. Mobile
+        // splits the two — its panel goes back to the platform face because
+        // the bundled Noto line box is 1.448 em there — but that has no
+        // desktop counterpart: PC has no guaranteed system JP face to
+        // return to (the bundled files *are* the fallback chain), and the
+        // panel layout here was tuned against the same face as the overlay.
+        // So the Sans/Serif setting applies to both; only the highlight
+        // weight may differ (serif ships no bold, so it fake-bolds).
+        .font(font_bytes)
+        .default_font(iced::Font::with_name(loaded_face.family_name()))
         .window(iced::window::Settings {
             // iced treats this as LOGICAL pixels and multiplies by the app
             // scale factor (ui_scale = screen_w / 1280) when creating the
@@ -838,7 +1161,7 @@ fn run_ocr_viewer(
                 |event: iced_futures::subscription::Event| {
                     match &event {
                         iced_futures::subscription::Event::Interaction {
-                            event: iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }),
+                            event: iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modified_key, .. }),
                             ..
                         } => {
                             // If we already have a held keyboard action, this is an
@@ -863,7 +1186,11 @@ fn run_ocr_viewer(
                                     || *k == iced::keyboard::Key::Character("k".into()) => GamepadAction::NavigateUp,
                                 k if *k == iced::keyboard::Key::Character("d".into()) => GamepadAction::ScrollDown,
                                 k if *k == iced::keyboard::Key::Character("f".into()) => GamepadAction::ScrollUp,
-                                _ => return None,
+                                // Tuning keys match the MODIFIED key (see
+                                // `tune_key_message`): on JIS layouts `=` is
+                                // Shift+`-`, so the unmodified key `-` would
+                                // otherwise collide with decrease.
+                                _ => return tune_key_message(modified_key),
                             };
                             // Set keyboard repeat tracking so ZoomTick can fire repeats.
                             *KB_ACTION_HELD.lock().unwrap() = Some((nav_action, Instant::now()));
@@ -922,6 +1249,8 @@ fn run_headless_batch(
     image_paths: Vec<String>,
     recognition_mode: RecognitionMode,
     batch_size: usize,
+    tuning: DetTuning,
+    furigana_filter: bool,
 ) -> Result<()> {
     use std::path::{Path, PathBuf};
 
@@ -966,6 +1295,9 @@ fn run_headless_batch(
 
     let t_engine = std::time::Instant::now();
     let mut engine = ocr_engine::OcrEngine::new(&resolve_asset_dir(), recognition_mode, batch_size)?;
+    engine.det_thresh_override = tuning.thresh;
+    engine.det_unclip_override = tuning.unclip;
+    engine.det_furigana = furigana_filter;
     println!("[Batch] OCR engine created in {:.0} ms", t_engine.elapsed().as_secs_f64() * 1000.0);
 
     let ppocr_vocab = engine.ppocr_vocab.clone();
@@ -977,10 +1309,12 @@ fn run_headless_batch(
             Err(e) => { eprintln!("[Batch] Failed to open {}: {e}", file.display()); continue; }
         };
         let t_img = std::time::Instant::now();
+        let t_det = std::time::Instant::now();
         let det = match engine.detect_lines(&image) {
             Ok(d) => d,
             Err(e) => { eprintln!("[Batch] Detection failed for {}: {e}", file.display()); continue; }
         };
+        println!("[OCR timing] Line detection:       {:>8.2} ms ({} boxes)", t_det.elapsed().as_secs_f64() * 1000.0, det.boxes.len());
         let boxes = det.boxes;
         let rotated = det.rotated;
         // Save crops next to the source image.
@@ -991,17 +1325,160 @@ fn run_headless_batch(
         if let Err(e) = ocr_engine::recognize_boxes_streaming(
             &image, &boxes, &rotated,
             engine.ppocr_rec.clone(),
+            engine.kana_size.clone(),
             &ppocr_vocab, &rec_remap, batch_size, recognition_mode,
             tx, out_dir,
         ) {
             eprintln!("[Batch] Recognition error for {}: {e}", file.display());
         }
-        drop(rx);
+        // The channel buffers every finished line; drain it so results are
+        // not dropped, and print one machine-readable record per box when
+        // `PPOCR_DUMP_LINES` is set (the tuning sweep parses these).
+        let dump = std::env::var("PPOCR_DUMP_LINES").is_ok();
+        while let Ok((idx, ann)) = rx.recv() {
+            if !dump {
+                continue;
+            }
+            let (text, conf, vert) = match ann.line.as_ref() {
+                Some(l) => {
+                    // `alternatives` stores raw CTC logits; a softmax over the
+                    // top-K gives a comparable per-char confidence in (0, 1].
+                    let mut sum = 0.0f32;
+                    let mut n = 0usize;
+                    for alts in &l.alternatives {
+                        if alts.is_empty() {
+                            continue;
+                        }
+                        let m = alts.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
+                        let z: f32 = alts.iter().map(|(_, s)| (s - m).exp()).sum();
+                        sum += if z > 0.0 { 1.0 / z } else { 0.0 };
+                        n += 1;
+                    }
+                    let conf = if n == 0 { 0.0 } else { sum / n as f32 };
+                    (l.text.as_str(), conf, l.is_vertical)
+                }
+                None => ("", 0.0, false),
+            };
+            println!(
+                "[LINE] i={idx} x={} y={} w={} h={} vert={} conf={conf:.4} text={text}",
+                ann.bbox.x, ann.bbox.y, ann.bbox.w, ann.bbox.h, u8::from(vert),
+            );
+        }
         println!(
             "[Batch] {}: {} line(s) in {:.0} ms",
             file.display(), boxes.len(), t_img.elapsed().as_secs_f64() * 1000.0
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        std::iter::once("accessibility_daemon".to_string())
+            .chain(v.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn det_tuning_parses_both_syntaxes() {
+        let t = parse_det_tuning(&args(&[
+            "--det-thresh=0.42",
+            "--det-unclip",
+            "1.25",
+            "img.png",
+        ]));
+        assert_eq!(t.thresh, Some(0.42));
+        assert_eq!(t.unclip, Some(1.25));
+    }
+
+    #[test]
+    fn det_tuning_clamps_out_of_range_values() {
+        let t = parse_det_tuning(&args(&["--det-thresh", "9.0", "--det-unclip=99"]));
+        assert_eq!(t.thresh, Some(0.99));
+        assert_eq!(t.unclip, Some(5.0));
+        let t = parse_det_tuning(&args(&["--det-thresh=-1"]));
+        assert_eq!(t.thresh, Some(0.01));
+    }
+
+    #[test]
+    fn det_tuning_ignores_missing_and_unparsable_values() {
+        let t = parse_det_tuning(&args(&["--det-thresh", "--vert", "img.png"]));
+        assert_eq!(t.thresh, None);
+        assert!(t.unclip.is_none());
+        let t = parse_det_tuning(&args(&["--det-unclip=abc"]));
+        assert_eq!(t.unclip, None);
+    }
+
+    /// Detection placeholders keep the box's index, carry a quad only when
+    /// the fitted rect is meaningfully rotated, and survive a short rotated
+    /// list.
+    #[test]
+    fn detection_annotations_keep_indices_and_quads() {
+        let boxes = vec![
+            BoundingBox::new(0, 0, 10, 10, 0.9),
+            BoundingBox::new(20, 20, 30, 10, 0.8),
+        ];
+        let rotated = vec![
+            RotatedBox::new(5.0, 5.0, 10.0, 10.0, 0.0, 0.9),
+            RotatedBox::new(35.0, 25.0, 30.0, 10.0, 0.3, 0.8),
+        ];
+        let anns = detection_annotations(&boxes, &rotated);
+        assert_eq!(anns.len(), 2);
+        assert_eq!(
+            (anns[0].bbox.x, anns[0].bbox.y, anns[0].bbox.w, anns[0].bbox.h),
+            (0, 0, 10, 10)
+        );
+        assert!(anns[0].quad.is_none(), "axis-aligned rect has no quad");
+        assert!(anns[0].line.is_none());
+        assert!(anns[1].quad.is_some(), "tilted rect keeps its quad");
+
+        let anns = detection_annotations(&boxes, &rotated[..1]);
+        assert_eq!(anns.len(), 2, "every box gets a placeholder");
+        assert!(anns[1].quad.is_none());
+    }
+
+    /// Regression for the JIS layout: `=` is Shift+`-`, so the modified key
+    /// must map to increase while the unmodified `-` decreases.
+    #[test]
+    fn tune_keys_use_the_modified_character() {
+        use iced::keyboard::Key;
+
+        assert!(matches!(
+            tune_key_message(&Key::Character("=".into())),
+            Some(Message::TuneDet { param: DetParam::Threshold, delta }) if delta > 0.0
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Character("+".into())),
+            Some(Message::TuneDet { param: DetParam::Threshold, delta }) if delta > 0.0
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Character("-".into())),
+            Some(Message::TuneDet { param: DetParam::Threshold, delta }) if delta < 0.0
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Character("_".into())),
+            Some(Message::TuneDet { param: DetParam::Threshold, delta }) if delta < 0.0
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Character("[".into())),
+            Some(Message::TuneDet { param: DetParam::Unclip, delta }) if delta < 0.0
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Character("]".into())),
+            Some(Message::TuneDet { param: DetParam::Unclip, delta }) if delta > 0.0
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Character("R".into())),
+            Some(Message::TuneReset)
+        ));
+        assert!(matches!(
+            tune_key_message(&Key::Named(iced::keyboard::key::Named::F1)),
+            Some(Message::ToggleDetHud)
+        ));
+        assert!(tune_key_message(&Key::Character("x".into())).is_none());
+    }
 }
 

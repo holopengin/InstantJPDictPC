@@ -1,0 +1,15 @@
+{
+  "id": "furigana-02-receipt-line",
+  "kind": "furigana",
+  "description": "The #99 receipt regression: a thin but nearly-as-wide real line above a heading must survive. Horizontal candidates need BOTH dimensions, not thinness alone.",
+  "mobile_mirror": "FuriganaRuleTest.thinButWideRealLineIsNotRuby",
+  "case": {
+    "img": [1000, 1000],
+    "pairs": [
+      { "name": "receipt detail line above heading",
+        "small_raw": [100, 270, 600, 300], "big_raw": [100, 300, 600, 360],
+        "small_un": [85, 258, 615, 312], "big_un": [90, 290, 610, 370],
+        "orientation": "horizontal", "expect_ruby": false }
+    ]
+  }
+}
