@@ -227,6 +227,12 @@ fn main() -> Result<()> {
         println!("No image argument provided. Opening frontend window...");
         let db_path = data_dir.join("dictionary.sqlite");
         let db = Arc::new(DictionaryDatabase::open(&db_path)?);
+        // #43: bundled dictionaries install on a worker thread; the settings
+        // window opens (and stays responsive) while a first run imports.
+        crate::data::bundled::spawn_bundled_install(
+            Arc::clone(&db),
+            std::path::PathBuf::from(resolve_asset_dir()),
+        );
         run_frontend(db, data_dir)?;
         return Ok(());
     }
@@ -500,7 +506,15 @@ fn run_ocr_viewer(
                 Ok(d) => { println!("[Bootstrap] Dictionary database loaded: {} entries", d.get_entry_count().unwrap_or(0)); d }
                 Err(e) => { eprintln!("[Bootstrap] Failed to load dictionary: {e}"); return; }
             };
-            if bootstrap_tx.send(BootstrapMsg::DictReady(Arc::new(db))).is_err() { return; }
+            // #43: install any bundled dictionary that is missing, on its own
+            // worker thread, so the OCR pipeline below is never delayed by a
+            // first-run import. Subsequent starts skip after one query each.
+            let db = Arc::new(db);
+            crate::data::bundled::spawn_bundled_install(
+                Arc::clone(&db),
+                std::path::PathBuf::from(resolve_asset_dir()),
+            );
+            if bootstrap_tx.send(BootstrapMsg::DictReady(db)).is_err() { return; }
 
             // Phase 3: load deinflector
             let deinf_path = resolve_asset_path("deinflect.json");

@@ -31,6 +31,17 @@ pub enum SettingsMessage {
     CloseWindow,
 }
 
+/// Dictionaries the user may manage. Built-ins (the bundled zips) are app
+/// state, not user state — Android hides them from the manager, and hiding
+/// them here also keeps ▲/▼ from swapping with an invisible row.
+fn user_dictionaries(db: &DictionaryDatabase) -> Vec<DictionaryMeta> {
+    db.get_all_dictionaries()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| !d.built_in)
+        .collect()
+}
+
 pub struct SettingsWindow {
     db: Arc<DictionaryDatabase>,
     entry_count: usize,
@@ -64,7 +75,7 @@ impl SettingsWindow {
 
     fn refresh(&mut self) {
         self.entry_count = self.db.get_entry_count().unwrap_or(0) as usize;
-        self.dictionaries = self.db.get_all_dictionaries().unwrap_or_default();
+        self.dictionaries = user_dictionaries(&self.db);
     }
 
     pub fn update(&mut self, message: SettingsMessage) -> Task<SettingsMessage> {
@@ -267,10 +278,7 @@ impl SettingsWindow {
     }
 
     fn swap_priority(&self, id: i64, up: bool) {
-        let dicts = match self.db.get_all_dictionaries() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let dicts = user_dictionaries(&self.db);
         let pos = match dicts.iter().position(|d| d.id == id) {
             Some(p) => p,
             None => return,

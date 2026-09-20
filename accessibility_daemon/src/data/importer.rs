@@ -27,6 +27,19 @@ pub struct ImportProgress {
     pub current_file: String,
 }
 
+/// Provenance for an import beyond the plain file-picker path.
+/// Mirrors Android's `importZipStream` keyword arguments.
+#[derive(Debug, Clone, Default)]
+pub struct ImportOptions {
+    /// True for a dictionary bundled with the app. The flag is written to the
+    /// meta row only after every bank has landed (Android's completion
+    /// marker), so an import killed part-way is retried next start.
+    pub built_in: bool,
+    /// Stable id of the catalog/bundled entry this import came from, if any.
+    /// `None` for the file picker.
+    pub catalog_id: Option<String>,
+}
+
 /// Imports Yomitan-format dictionary ZIP files into the database.
 pub struct DictionaryImporter<'a> {
     db: &'a DictionaryDatabase,
@@ -43,6 +56,18 @@ impl<'a> DictionaryImporter<'a> {
         &self,
         path: P,
         progress: Option<ImportProgressFn>,
+    ) -> Result<usize> {
+        self.import_zip_with(path, progress, ImportOptions::default())
+    }
+
+    /// Import a Yomitan dictionary ZIP file, stamping the meta row with the
+    /// provenance in `options` (bundled flag, catalog id). `import_zip` is
+    /// this with [`ImportOptions::default`].
+    pub fn import_zip_with<P: AsRef<Path>>(
+        &self,
+        path: P,
+        progress: Option<ImportProgressFn>,
+        options: ImportOptions,
     ) -> Result<usize> {
         let path = path.as_ref();
         let file = File::open(path).context("Failed to open ZIP file")?;
@@ -124,10 +149,12 @@ impl<'a> DictionaryImporter<'a> {
 
             if dictionary_id.is_none() {
                 let max_priority = self.db.get_max_priority()?.unwrap_or(-1);
-                dictionary_id = Some(
-                    self.db
-                        .insert_dictionary(&dict_title, max_priority + 1)?,
-                );
+                dictionary_id = Some(self.db.insert_dictionary_with(
+                    &dict_title,
+                    max_priority + 1,
+                    false,
+                    options.catalog_id.as_deref(),
+                )?);
             }
             let did = dictionary_id.unwrap();
 
@@ -175,16 +202,28 @@ impl<'a> DictionaryImporter<'a> {
             if name.starts_with("tag_bank_") && name.ends_with(".json") {
                 if dictionary_id.is_none() {
                     let max_priority = self.db.get_max_priority()?.unwrap_or(-1);
-                    dictionary_id = Some(
-                        self.db
-                            .insert_dictionary(&dict_title, max_priority + 1)?,
-                    );
+                    dictionary_id = Some(self.db.insert_dictionary_with(
+                        &dict_title,
+                        max_priority + 1,
+                        false,
+                        options.catalog_id.as_deref(),
+                    )?);
                 }
                 let did = dictionary_id.unwrap();
                 let mut content = String::new();
                 entry.read_to_string(&mut content)?;
                 let tags = Self::parse_tag_bank(&content, did)?;
                 self.db.insert_tags(&tags)?;
+            }
+        }
+
+        // #43: `built_in` is the completion marker, not a label. Flipping it
+        // only after every bank is written means an import killed part-way
+        // leaves a non-built-in row, so the next launch imports again instead
+        // of trusting a half-present dictionary.
+        if options.built_in {
+            if let Some(id) = dictionary_id {
+                self.db.set_dictionary_built_in(id, true)?;
             }
         }
 
