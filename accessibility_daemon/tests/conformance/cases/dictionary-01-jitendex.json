@@ -1,0 +1,18 @@
+{
+  "id": "dictionary-01-jitendex",
+  "kind": "dictionary",
+  "description": "Jitendex structured-content formatting of the pinned お前 row: headword/reading groups, sense groups with POS header, and the example box split into Japanese and English. Payload by reference to the shared tests/data/jitendex/entries.json fixture (same inputs as Android JitendexStructuredContentTest).",
+  "mobile_mirror": "JitendexStructuredContentTest",
+  "case": {
+    "term": "お前",
+    "reading": "おまえ",
+    "definitions_ref": "../../data/jitendex/entries.json",
+    "expect": {
+      "headwords": ["お前"],
+      "readings": ["おまえ"],
+      "min_sense_groups": 1,
+      "example_ja": "にしよう",
+      "example_en": "my daughter's husband"
+    }
+  }
+}

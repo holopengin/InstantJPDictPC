@@ -1,0 +1,17 @@
+{
+  "id": "detection-02-v-columns",
+  "kind": "detection",
+  "description": "Two tategaki columns: both frames flag vertical from their own sizes and sort right-to-left (the right column first), horizontals-before-verticals concatenation.",
+  "mobile_mirror": "RotatedGeometryTest (isVerticalLineBox) + OcrEngineTest.readingOrder",
+  "tolerances": { "box_px": 2 },
+  "case": {
+    "image": "images/v-columns.png",
+    "det_thresh": 0.25,
+    "det_unclip": 0.7,
+    "furigana_filter": false,
+    "expect_lines": [
+      { "box": [115, 13, 30, 293], "vertical": true },
+      { "box": [25, 13, 30, 293], "vertical": true }
+    ]
+  }
+}

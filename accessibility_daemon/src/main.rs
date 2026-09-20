@@ -1,6 +1,8 @@
 mod app_settings;
 mod nav_graph;
 mod capture;
+#[cfg(test)]
+mod conformance;
 mod data;
 mod frontend;
 mod furigana;
