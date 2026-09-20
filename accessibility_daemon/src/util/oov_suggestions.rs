@@ -22,18 +22,16 @@ pub const MIN_IDF_FRACTION: f32 = 0.7;
 pub const MAX_COMPONENT_CANDIDATES: usize = 15;
 pub const MAX_VARIANT_CANDIDATES: usize = 15;
 
-/// Where a popup entry came from. (The panel does not tint yet; the source
-/// is kept so the two implementations stay comparable and a future tint has
-/// the signal.)
+/// Where a popup entry came from. The panel tints non-head entries by
+/// source so the provenance is visible at a glance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Head,
     Components,
     Variant,
     /// The blank path's LM-ranked entries (mobile tags them; the PC blank
-    /// path builds its list without `assemble`, so nothing constructs this
-    /// yet — kept so the two implementations stay comparable).
-    #[allow(dead_code)]
+    /// path tags its ranked list `Lm` when a model is loaded, `Head` when
+    /// the pool keeps discovery order).
     Lm,
 }
 

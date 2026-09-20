@@ -3398,13 +3398,26 @@ impl OcrViewer {
                 let msg = Message::SelectAlternative(c.char);
                 let is_selected = c.is_selected;
                 let ch = c.char;
+                // Source tint: head evidence stays white, component-table
+                // entries (neighbours + variants) read amber, LM-ranked
+                // blank entries read blue. Selection still wins outright.
+                let tint = match c.source {
+                    crate::util::oov_suggestions::Source::Head => Color::WHITE,
+                    crate::util::oov_suggestions::Source::Components
+                    | crate::util::oov_suggestions::Source::Variant => {
+                        Color::from_rgb(1.0, 0.8, 0.4)
+                    }
+                    crate::util::oov_suggestions::Source::Lm => {
+                        Color::from_rgb(0.55, 0.85, 1.0)
+                    }
+                };
 
                 let vertical_ch = chip_text(&ch.to_string(), self.is_landscape());
 
                 let btn: Element<'a, Message> = Container::new(
                     Text::new(vertical_ch)
                         .size(Pixels(box_size * BUTTON_CHAR_RATIO))
-                        .color(if is_selected { Color::BLACK } else { Color::WHITE })
+                        .color(if is_selected { Color::BLACK } else { tint })
                         .align_x(alignment::Horizontal::Center)
                         .align_y(alignment::Vertical::Center),
                 )

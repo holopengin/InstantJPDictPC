@@ -440,6 +440,9 @@ pub struct NeighborLine {
 pub struct AlternativeChar {
     pub char: char,
     pub is_selected: bool,
+    /// Where the entry came from (mobile `OovSuggestions.Source`): the
+    /// panel tints non-head entries so the source is visible at a glance.
+    pub source: crate::util::oov_suggestions::Source,
 }
 
 #[derive(Debug, Clone)]
