@@ -3862,7 +3862,7 @@ mod tests {
     /// on the first non-empty line.
     #[test]
     fn apply_ocr_batch_fills_all_slots_in_one_pass() {
-        let mut v = OcrViewer::new_empty(1280.0, 720.0);
+        let mut v = OcrViewer::new_empty(1280.0, 720.0, crate::overlay_font::FontFace::Sans);
         v.set_image(
             iced::widget::image::Handle::from_bytes(Vec::new()),
             Vec::new(),
@@ -3925,7 +3925,7 @@ mod tests {
     /// A batch of detection-only placeholders must not seed the cursor.
     #[test]
     fn apply_ocr_batch_without_text_leaves_cursor_unset() {
-        let mut v = OcrViewer::new_empty(1280.0, 720.0);
+        let mut v = OcrViewer::new_empty(1280.0, 720.0, crate::overlay_font::FontFace::Sans);
         v.apply_ocr_batch(vec![DetectedAnnotation {
             bbox: BoundingBox::new(0, 0, 10, 10, 0.5),
             quad: None,

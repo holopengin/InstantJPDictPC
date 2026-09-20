@@ -1791,7 +1791,7 @@ pub fn recognize_boxes_streaming(
     _out_dir: &std::path::Path,
 ) -> Result<()> {
     recognize_boxes_core(
-        image, sorted, rotated, rec, ppocr_vocab, rec_remap,
+        image, sorted, rotated, rec, kana_size, ppocr_vocab, rec_remap,
         std::sync::Arc::new(move |idx, ann| sender.send((idx, ann)).is_ok()),
     )
 }
@@ -1806,6 +1806,7 @@ pub fn recognize_boxes_collect(
     sorted: &[BoundingBox],
     rotated: &[RotatedBox],
     rec: Option<std::sync::Arc<RecNet>>,
+    kana_size: Option<std::sync::Arc<crate::kana_size::KanaSizeNet>>,
     ppocr_vocab: &[String],
     rec_remap: &[i32],
     _batch_size: usize,
@@ -1816,7 +1817,7 @@ pub fn recognize_boxes_collect(
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = std::sync::Arc::clone(&collected);
     recognize_boxes_core(
-        image, sorted, rotated, rec, ppocr_vocab, rec_remap,
+        image, sorted, rotated, rec, kana_size, ppocr_vocab, rec_remap,
         std::sync::Arc::new(move |idx, ann| {
             sink.lock().unwrap().push((idx, ann));
             true
@@ -1838,6 +1839,7 @@ fn recognize_boxes_core(
     sorted: &[BoundingBox],
     rotated: &[RotatedBox],
     rec: Option<std::sync::Arc<RecNet>>,
+    kana_size: Option<std::sync::Arc<crate::kana_size::KanaSizeNet>>,
     ppocr_vocab: &[String],
     rec_remap: &[i32],
     emit: std::sync::Arc<ResultEmitter>,
@@ -2001,6 +2003,7 @@ fn recognize_boxes_core(
                                 text: text.clone(),
                                 char_boxes: Vec::new(),
                                 alternatives: Vec::new(),
+                                raw_alternatives: Vec::new(),
                                 sample_txt: None,
                                 is_vertical: job.is_vertical,
                                 chunk_boxes: Vec::new(),
@@ -2807,7 +2810,8 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             recognize_boxes_streaming(
                 &img, &det.boxes, &det.rotated,
-                eng.ppocr_rec.clone(), &eng.ppocr_vocab, &eng.rec_remap,
+                eng.ppocr_rec.clone(), eng.kana_size.clone(),
+                &eng.ppocr_vocab, &eng.rec_remap,
                 4, RecognitionMode::Both, tx, std::path::Path::new("/tmp"),
             )
             .unwrap();
@@ -2816,7 +2820,8 @@ mod tests {
 
             let collected = recognize_boxes_collect(
                 &img, &det.boxes, &det.rotated,
-                eng.ppocr_rec.clone(), &eng.ppocr_vocab, &eng.rec_remap,
+                eng.ppocr_rec.clone(), eng.kana_size.clone(),
+                &eng.ppocr_vocab, &eng.rec_remap,
                 4, RecognitionMode::Both, std::path::Path::new("/tmp"),
             )
             .unwrap();

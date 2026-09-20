@@ -114,6 +114,8 @@ impl DictionaryDatabase {
     // Dictionary meta CRUD
     // -------------------------------------------------------------------------
 
+    /// Test convenience wrapper for a plain dictionary row.
+    #[cfg(test)]
     pub fn insert_dictionary(&self, name: &str, priority: i32) -> Result<i64> {
         self.insert_dictionary_with(name, priority, false, None)
     }
