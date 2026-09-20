@@ -13,6 +13,9 @@ const PPOCR_DET_LONG_SIDE: u32 = 960;
 const PPOCR_DET_THRESH: f32 = 0.3;
 const PPOCR_DET_BOX_THRESH: f32 = 0.8;
 const PPOCR_DET_UNCLIP_RATIO: f32 = 1.5;
+/// Mobile `xOverlapThresh` pref default: union two straight boxes when their
+/// intersection covers at least this fraction of the smaller box.
+const X_OVERLAP_THRESHOLD: f32 = 0.40;
 
 // Furigana (ruby) filter (#28) — conservative: better to recognize ruby than
 // to drop real small text. Matching runs on RAW contour geometry (pre-unclip:
@@ -1547,11 +1550,94 @@ impl OcrEngine {
     pub fn detect_lines(&mut self, image: &DynamicImage) -> Result<DetectionResult> {
         let det = self.detect(image)?;
         let pairs: Vec<(BoundingBox, RotatedBox)> = det.boxes.into_iter().zip(det.rotated).collect();
-        // Merge disabled — render ALL boxes
-        let sorted = self.sort_detected_boxes(pairs);
+        // Mobile's axis-aligned path merges overlapping boxes
+        // (`mergeOverlappingBoxes`); the rotated path deliberately does not.
+        // Apply the same rule to the straight boxes so a long line whose DB
+        // blob breaks into overlapping components comes back as one Line.
+        let merged = merge_straight_boxes(pairs);
+        let sorted = self.sort_detected_boxes(merged);
         let (boxes, rotated): (Vec<_>, Vec<_>) = sorted.into_iter().unzip();
         Ok(DetectionResult { boxes, rotated })
     }
+}
+
+/// Mobile `OcrEngine.shouldMerge`: the intersection must cover at least
+/// `X_OVERLAP_THRESHOLD` of the smaller box and the centres must sit within
+/// one average height of each other.
+fn should_merge_straight(a: &BoundingBox, b: &BoundingBox) -> bool {
+    let (ax1, ay1, ax2, ay2) = (a.x, a.y, a.x + a.w, a.y + a.h);
+    let (bx1, by1, bx2, by2) = (b.x, b.y, b.x + b.w, b.y + b.h);
+    let (ix1, iy1) = (ax1.max(bx1), ay1.max(by1));
+    let (ix2, iy2) = (ax2.min(bx2), ay2.min(by2));
+    if ix1 >= ix2 || iy1 >= iy2 {
+        return false;
+    }
+    let inter = (ix2 - ix1) as f32 * (iy2 - iy1) as f32;
+    let min_area = (a.w * a.h).min(b.w * b.h) as f32;
+    if min_area <= 0.0 {
+        return false;
+    }
+    if inter / min_area < X_OVERLAP_THRESHOLD {
+        return false;
+    }
+    let y_diff = ((ay1 + ay2) as f32 / 2.0 - (by1 + by2) as f32 / 2.0).abs();
+    let avg_h = (a.h + b.h) as f32 / 2.0;
+    y_diff <= avg_h
+}
+
+/// Union of two AABBs, keeping the stronger confidence.
+fn union_boxes(a: &BoundingBox, b: &BoundingBox) -> BoundingBox {
+    let x1 = a.x.min(b.x);
+    let y1 = a.y.min(b.y);
+    let x2 = (a.x + a.w).max(b.x + b.w);
+    let y2 = (a.y + a.h).max(b.y + b.h);
+    BoundingBox::new(x1, y1, x2 - x1, y2 - y1, a.confidence.max(b.confidence))
+}
+
+/// Mobile `OcrEngine.mergeOverlappingBoxes`, restricted to straight frames
+/// (no quad): the rotated path has no merge on mobile, so only boxes that
+/// would have been axis-aligned there take part. A merged box becomes a
+/// plain axis-aligned frame (angle 0).
+fn merge_straight_boxes(pairs: Vec<(BoundingBox, RotatedBox)>) -> Vec<(BoundingBox, RotatedBox)> {
+    if pairs.len() < 2 {
+        return pairs;
+    }
+    let straight: Vec<bool> = pairs.iter().map(|(_, r)| !r.is_rotated()).collect();
+    let mut order: Vec<usize> = (0..pairs.len()).collect();
+    // Largest box first, like mobile (`sortedByDescending { area }`).
+    order.sort_by_key(|&i| std::cmp::Reverse(pairs[i].0.w as i64 * pairs[i].0.h as i64));
+    let mut handled = vec![false; pairs.len()];
+    let mut out = Vec::with_capacity(pairs.len());
+    for &i in &order {
+        if handled[i] {
+            continue;
+        }
+        handled[i] = true;
+        if !straight[i] {
+            out.push(pairs[i].clone());
+            continue;
+        }
+        let mut cur = pairs[i].0.clone();
+        for &j in &order {
+            if handled[j] || !straight[j] {
+                continue;
+            }
+            if should_merge_straight(&cur, &pairs[j].0) {
+                cur = union_boxes(&cur, &pairs[j].0);
+                handled[j] = true;
+            }
+        }
+        let frame = RotatedBox::new(
+            cur.x as f32 + cur.w as f32 / 2.0,
+            cur.y as f32 + cur.h as f32 / 2.0,
+            cur.w as f32,
+            cur.h as f32,
+            0.0,
+            cur.confidence,
+        );
+        out.push((cur, frame));
+    }
+    out
 }
 
 
@@ -1909,6 +1995,45 @@ mod tests {
         assert!((uncl[0].w - pre[0].w - 12.0).abs() < 0.01, "uncapped");
         let (_, capped) = components(&map, 60, 30, 2.0);
         assert!((capped[0].w - pre[0].w - 4.0).abs() < 0.01, "capped at 2/side");
+    }
+
+    /// Mobile's axis-path merge applied to straight frames: overlapping
+    /// halves of one long line union (IoM ≥ 0.40), rotated frames never.
+    #[test]
+    fn straight_boxes_merge_like_mobile() {
+        let frame = |x: i32, y: i32, w: i32, h: i32| {
+            RotatedBox::new(
+                x as f32 + w as f32 / 2.0,
+                y as f32 + h as f32 / 2.0,
+                w as f32,
+                h as f32,
+                0.0,
+                0.8,
+            )
+        };
+        // Overlap 30x20 of a 100x20 box: IoM 0.30 < 0.40, stays split.
+        let apart = merge_straight_boxes(vec![
+            (BoundingBox::new(0, 0, 100, 20, 0.8), frame(0, 0, 100, 20)),
+            (BoundingBox::new(70, 0, 100, 20, 0.8), frame(70, 0, 100, 20)),
+        ]);
+        assert_eq!(apart.len(), 2);
+        // Overlap 50x20: IoM 0.50, union to (0,0,150,20).
+        let merged = merge_straight_boxes(vec![
+            (BoundingBox::new(0, 0, 100, 20, 0.8), frame(0, 0, 100, 20)),
+            (BoundingBox::new(50, 0, 100, 20, 0.8), frame(50, 0, 100, 20)),
+        ]);
+        assert_eq!(merged.len(), 1, "overlapping halves must merge");
+        assert_eq!((merged[0].0.x, merged[0].0.y, merged[0].0.w, merged[0].0.h), (0, 0, 150, 20));
+        assert!(!merged[0].1.is_rotated());
+        // A genuinely rotated frame takes no part.
+        let mixed = merge_straight_boxes(vec![
+            (BoundingBox::new(0, 0, 100, 20, 0.8), frame(0, 0, 100, 20)),
+            (
+                BoundingBox::new(50, 0, 100, 20, 0.8),
+                RotatedBox::new(100.0, 10.0, 100.0, 20.0, 10.0f32.to_radians(), 0.8),
+            ),
+        ]);
+        assert_eq!(mixed.len(), 2, "rotated frames never merge");
     }
 
     /// D3.8: a DB blob that merged several lines — its frame encloses two
