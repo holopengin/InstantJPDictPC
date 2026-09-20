@@ -2,6 +2,7 @@ mod nav_graph;
 mod capture;
 mod data;
 mod frontend;
+mod kana_size;
 mod models;
 mod ocr_engine;
 mod overlay_state;
@@ -555,6 +556,7 @@ fn run_ocr_viewer(
                 if let Err(e) = ocr_engine::recognize_boxes_streaming(
                     &image, &boxes, &rotated,
                     engine.ppocr_rec.clone(),
+                    engine.kana_size.clone(),
                     &ppocr_vocab, &rec_remap, batch_sz, rec_mode,
                     ocr_tx2,
                     std::path::Path::new("/tmp"),
@@ -597,6 +599,7 @@ fn run_ocr_viewer(
                     if let Err(e) = ocr_engine::recognize_boxes_streaming(
                         &image, &boxes, &rotated,
                         engine.ppocr_rec.clone(),
+                        engine.kana_size.clone(),
                         &ppocr_vocab, &rec_remap, batch_sz, rec_mode,
                         tx,
                         std::path::Path::new("/tmp"),
@@ -1185,6 +1188,7 @@ fn run_headless_batch(
         if let Err(e) = ocr_engine::recognize_boxes_streaming(
             &image, &boxes, &rotated,
             engine.ppocr_rec.clone(),
+            engine.kana_size.clone(),
             &ppocr_vocab, &rec_remap, batch_size, recognition_mode,
             tx, out_dir,
         ) {
