@@ -44,6 +44,11 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # soname that differs across distros (libbz2.so.1.0 on Arch, .so.1 on Fedora).
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
+# Catalog downloads (#71): a plain HTTPS GET with rustls + webpki roots, and
+# the SHA-256 the pinned catalog entries are verified against.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+sha2 = "0.10"
+
 # Lazy static initialization
 lazy_static = "1.4"
 
@@ -54,7 +59,6 @@ rayon = "1.8"
 rfd = "0.14"
 
 # Open URLs in browser
-open = "5.0"
 
 # Async timers (works with Iced's executor)
 futures-timer = "3.0"
