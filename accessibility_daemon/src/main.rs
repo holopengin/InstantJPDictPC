@@ -287,9 +287,9 @@ fn print_usage() {
     println!("      --hybrid               Hybrid mode: both horizontal and vertical recognition");
     println!("  -b, --batch-size <N>       Recognition batch size (default: 10)");
     println!("      --batch-size=<N>       (alternative syntax)");
-    println!("      --det-thresh <F>       Detection threshold 0.01-0.99 (default 0.65)");
+    println!("      --det-thresh <F>       Detection threshold 0.01-0.99 (default 0.25)");
     println!("      --det-thresh=<F>       (alternative syntax)");
-    println!("      --det-unclip <F>       DB unclip ratio 0.0-5.0 (default 1.2)");
+    println!("      --det-unclip <F>       DB unclip ratio 0.0-5.0 (default 0.7)");
     println!("      --det-unclip=<F>       (alternative syntax)");
     println!();
     println!("CAPTURE MODE (for a global shortcut):");
@@ -1264,7 +1264,37 @@ fn run_headless_batch(
         ) {
             eprintln!("[Batch] Recognition error for {}: {e}", file.display());
         }
-        drop(rx);
+        // The channel buffers every finished line; drain it so results are
+        // not dropped, and print one machine-readable record per box when
+        // `PPOCR_DUMP_LINES` is set (the tuning sweep parses these).
+        let dump = std::env::var("PPOCR_DUMP_LINES").is_ok();
+        while let Ok((idx, ann)) = rx.recv() {
+            if !dump {
+                continue;
+            }
+            let (text, conf, vert) = match ann.line.as_ref() {
+                Some(l) => {
+                    // `alternatives` stores raw CTC logits; a softmax over the
+                    // top-K gives a comparable per-char confidence in (0, 1].
+                    let mut sum = 0.0f32;
+                    let mut n = 0usize;
+                    for alts in &l.alternatives {
+                        let Some((_, top)) = alts.first() else { continue };
+                        let m = alts.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
+                        let z: f32 = alts.iter().map(|(_, s)| (s - m).exp()).sum();
+                        sum += if z > 0.0 { 1.0 / z } else { 0.0 };
+                        n += 1;
+                    }
+                    let conf = if n == 0 { 0.0 } else { sum / n as f32 };
+                    (l.text.as_str(), conf, l.is_vertical)
+                }
+                None => ("", 0.0, false),
+            };
+            println!(
+                "[LINE] i={idx} x={} y={} w={} h={} vert={} conf={conf:.4} text={text}",
+                ann.bbox.x, ann.bbox.y, ann.bbox.w, ann.bbox.h, u8::from(vert),
+            );
+        }
         println!(
             "[Batch] {}: {} line(s) in {:.0} ms",
             file.display(), boxes.len(), t_img.elapsed().as_secs_f64() * 1000.0
