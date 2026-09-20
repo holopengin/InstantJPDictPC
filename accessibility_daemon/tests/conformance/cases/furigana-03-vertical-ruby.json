@@ -1,0 +1,15 @@
+{
+  "id": "furigana-03-vertical-ruby",
+  "kind": "furigana",
+  "description": "Narrow short tategaki column beside its column is ruby: much shorter AND narrower, center outside the big box, inside the gap band. The tategaki-with-ruby capture class.",
+  "mobile_mirror": "FuriganaRuleTest.narrowShortColumnBesideItsColumnIsRuby",
+  "case": {
+    "img": [1000, 1000],
+    "pairs": [
+      { "name": "ruby column beside body column",
+        "small_raw": [276, 200, 300, 300], "big_raw": [300, 50, 360, 850],
+        "small_un": [266, 190, 310, 310], "big_un": [290, 40, 370, 860],
+        "orientation": "vertical", "expect_ruby": true }
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "id": "gap-04-context-clip",
+  "kind": "gap",
+  "description": "The LM context is the characters before the gap capped at order-1 (three): older characters are ignored, and a placeholder directly before the gap blocks the context (never read as a real character).",
+  "mobile_mirror": "GapCandidatesTest.theContextStopsAtThePlaceholderAndTheModelOrder",
+  "case": {
+    "text": "あいうえお◌",
+    "gap_index": 5,
+    "expect_context": ["う", "え", "お"],
+    "alternatives": [[["あ", 0.5]]],
+    "limit": 15,
+    "lm": null,
+    "expect": ["あ"]
+  }
+}
