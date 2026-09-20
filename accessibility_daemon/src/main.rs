@@ -1,9 +1,11 @@
+mod app_settings;
 mod nav_graph;
 mod capture;
 mod data;
 mod frontend;
 mod models;
 mod ocr_engine;
+mod overlay_font;
 mod overlay_state;
 mod ppocr;
 mod ppocr_ncnn;
@@ -230,7 +232,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_ocr_viewer(args)
+    run_ocr_viewer(args, &data_dir)
 }
 
 fn run_capture(extra_args: &[String], data_dir: &std::path::Path) -> Result<()> {
@@ -250,7 +252,7 @@ fn run_capture(extra_args: &[String], data_dir: &std::path::Path) -> Result<()> 
     let mut args: Vec<String> = vec!["accessibility_daemon".to_string()];
     args.extend(extra_args.iter().cloned());
     args.push(path.to_string_lossy().into_owned());
-    run_ocr_viewer(args)
+    run_ocr_viewer(args, data_dir)
 }
 
 fn print_usage() {
@@ -296,6 +298,10 @@ fn print_usage() {
     println!("    - Launch File Watcher     (monitors ~/Pictures/Screenshots and new");
     println!("                              images in /tmp; replaced with");
     println!("                              \"Stop File Watcher\" while it is running)");
+    println!("  It also carries the overlay font choice: a \"Serif font\" checkbox");
+    println!("  (sans is the default) persisted to settings.json next to");
+    println!("  dictionary.sqlite, applied to the overlay and dictionary panel on");
+    println!("  the next launch.");
     println!();
     println!("ARGUMENTS:");
     println!("  <IMAGE_PATH>               Path to a screenshot image for OCR analysis");
@@ -416,6 +422,7 @@ fn tune_key_message(modified_key: &iced::keyboard::Key) -> Option<Message> {
 
 fn run_ocr_viewer(
     args: Vec<String>,
+    data_dir: &std::path::Path,
 ) -> Result<()> {
     let t_start = std::time::Instant::now();
     let mut image_paths: Vec<String> = Vec::new();
@@ -452,6 +459,11 @@ fn run_ocr_viewer(
     if headless {
         return run_headless_batch(image_paths, recognition_mode, batch_size, tuning);
     }
+
+    // The face the overlay (and, below, the iced dictionary panel) paints in.
+    // Persisted by the frontend's Sans/Serif checkbox; loaded once per run, so
+    // a change applies to the next launch.
+    let face = crate::app_settings::AppSettings::load(data_dir).overlay_font;
 
     let image_path = image_paths.first().cloned().context("No image path provided")?;
 
@@ -665,7 +677,7 @@ fn run_ocr_viewer(
     let tune_tx = std::sync::Mutex::new(tune_tx);
 
     let boot = move || {
-        let mut viewer = OcrViewer::new_empty(screen_w, screen_h);
+        let mut viewer = OcrViewer::new_empty(screen_w, screen_h, face);
         if let Some(t) = tuning.thresh {
             viewer.det_thresh = t;
             viewer.det_thresh_default = t;
@@ -969,16 +981,33 @@ fn run_ocr_viewer(
         }
     };
 
+    // The bytes registered with iced and the family name must agree with the
+    // face actually found: a serif selection whose file is missing falls back
+    // to the sans file (with a warning), so ask for the sans family — never
+    // for a family nothing registered.
+    let font_path = crate::overlay_font::find_font_path(face);
+    let loaded_face = font_path
+        .as_deref()
+        .map(crate::overlay_font::face_of)
+        .unwrap_or(face);
+    let font_bytes = font_path
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok())
+        .unwrap_or_default();
+
     let app = iced::application(boot, update, OcrViewer::view)
-        // Use the SAME font as the overlay glyph cache for all iced text
-        // (dictionary panel etc.) — mixing fonts shows different stroke
-        // forms (e.g. JP vs traditional-CN variants) for the same char.
-        .font(if let Some(fp) = crate::viewer::find_jp_font_path() {
-            std::fs::read(&fp).unwrap_or_default()
-        } else {
-            Vec::new()
-        })
-        .default_font(iced::Font::with_name("Noto Sans JP"))
+        // One selected face for the overlay glyph cache AND the iced text
+        // (dictionary panel etc.): mixing fonts shows different stroke forms
+        // (e.g. JP vs traditional-CN variants) for the same char. Mobile
+        // splits the two — its panel goes back to the platform face because
+        // the bundled Noto line box is 1.448 em there — but that has no
+        // desktop counterpart: PC has no guaranteed system JP face to
+        // return to (the bundled files *are* the fallback chain), and the
+        // panel layout here was tuned against the same face as the overlay.
+        // So the Sans/Serif setting applies to both; only the highlight
+        // weight may differ (serif ships no bold, so it fake-bolds).
+        .font(font_bytes)
+        .default_font(iced::Font::with_name(loaded_face.family_name()))
         .window(iced::window::Settings {
             // iced treats this as LOGICAL pixels and multiplies by the app
             // scale factor (ui_scale = screen_w / 1280) when creating the
