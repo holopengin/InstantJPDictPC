@@ -491,6 +491,7 @@ mod tests {
             text: text.to_string(),
             char_boxes: Vec::new(),
             alternatives: Vec::new(),
+            raw_alternatives: Vec::new(),
             sample_txt: None,
             is_vertical: false,
             chunk_boxes: Vec::new(),
