@@ -7,15 +7,17 @@
 //!     running, the button becomes "Stop File Watcher" instead.
 
 use iced::{
-    alignment::Horizontal,
-    widget::{button, column, text, Button, Space, Text},
+    alignment::{Horizontal, Vertical},
+    widget::{button, checkbox, column, row, text, Button, Space, Text},
     Element, Length, Pixels, Subscription, Task,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::app_settings::AppSettings;
 use crate::data::db::DictionaryDatabase;
+use crate::overlay_font::FontFace;
 use crate::settings_window::{SettingsMessage, SettingsWindow};
 use crate::watcher;
 
@@ -27,12 +29,14 @@ pub enum FrontMsg {
     StartWatcher,
     StopWatcher,
     WatcherTick,
+    SetFontFace(FontFace),
     Settings(SettingsMessage),
 }
 
 pub struct FrontendWindow {
     db: Arc<DictionaryDatabase>,
     data_dir: PathBuf,
+    app_settings: AppSettings,
     settings: Option<SettingsWindow>,
     watcher_running: bool,
 }
@@ -40,9 +44,11 @@ pub struct FrontendWindow {
 impl FrontendWindow {
     pub fn new(db: Arc<DictionaryDatabase>, data_dir: PathBuf) -> Self {
         let watcher_running = watcher::is_running(&data_dir);
+        let app_settings = AppSettings::load(&data_dir);
         Self {
             db,
             data_dir,
+            app_settings,
             settings: None,
             watcher_running,
         }
@@ -88,6 +94,15 @@ impl FrontendWindow {
             }
             FrontMsg::WatcherTick => {
                 self.refresh_watcher();
+                Task::none()
+            }
+            FrontMsg::SetFontFace(face) => {
+                if self.app_settings.overlay_font != face {
+                    self.app_settings.overlay_font = face;
+                    if let Err(e) = self.app_settings.save(&self.data_dir) {
+                        eprintln!("[Frontend] Failed to save settings: {e}");
+                    }
+                }
                 Task::none()
             }
             FrontMsg::Settings(m) => {
@@ -171,6 +186,23 @@ impl FrontendWindow {
         .size(13)
         .style(text::secondary);
 
+        // Font face: a single checkbox off the sans default, persisted next
+        // to dictionary.sqlite. Applies to the OCR overlay and the dictionary
+        // panel alike (both register the same face at viewer startup).
+        let serif_check = checkbox(self.app_settings.overlay_font == FontFace::Serif)
+            .on_toggle(|serif| {
+                FrontMsg::SetFontFace(if serif { FontFace::Serif } else { FontFace::Sans })
+            });
+        let font_row = row![
+            serif_check,
+            Text::new("Serif font (Noto Serif JP)").size(14),
+        ]
+        .spacing(6)
+        .align_y(Vertical::Center);
+        let font_hint = Text::new("Overlay & dictionary panel — takes effect next launch.")
+            .size(12)
+            .style(text::secondary);
+
         column![
             title,
             subtitle,
@@ -179,6 +211,9 @@ impl FrontendWindow {
             Space::new().height(Pixels(8.0)),
             watcher_btn,
             Space::new().height(Pixels(16.0)),
+            font_row,
+            font_hint,
+            Space::new().height(Pixels(12.0)),
             status,
         ]
         .spacing(8)
