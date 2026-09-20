@@ -77,14 +77,36 @@ const OVERLAY_FG: (u8, u8, u8) = (255, 119, 119);
 /// Yellow for highlighted/matched characters.
 const OVERLAY_HL: (u8, u8, u8) = (255, 255, 0);
 
-struct CachedGlyph {
-    /// Ink bitmap size in pixels. Zero means the glyph has no ink (a space,
-    /// or `.notdef` in a font without one) — mobile skips those outright.
-    w: u32,
-    h: u32,
-    xmin: i32,
-    ymin: i32,
-    handles: [ImageHandle; 2], // [pink, yellow]
+/// Which face/variant a cached raster belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum GlyphKind {
+    /// Regular face, pink.
+    Pink,
+    /// Bold companion face, highlight yellow.
+    Bold,
+    /// Synthetic bold derived from the regular face (no bold companion).
+    Synthetic,
+}
+
+/// Lazily rasterizes characters at requested pixel sizes, caching RGBA
+/// image handles. Thread‑safe via RefCell for interior mutability.
+pub struct GlyphCache {
+    font: Font,
+    /// Real bold companion for highlighted glyphs; `None` falls back to
+    /// synthetic emboldening (mobile ships Regular only).
+    bold_font: Option<Font>,
+    /// Rasterized glyphs keyed by `(kind, glyph id, px)`: the id may be a
+    /// GSUB substitution (vertical forms), not just the cmap glyph.
+    cache: HashMap<(GlyphKind, u16, u32), RasterGlyph>,
+    /// GSUB `vert`/`vrt2` resolution results (source glyph -> vertical glyph).
+    vert_cache: HashMap<u16, u16>,
+    /// Same for the bold companion face.
+    bold_vert_cache: HashMap<u16, u16>,
+    /// Font-parser view of the regular bytes, for cmap and GSUB `vert`/`vrt2`
+    /// resolution (fontdue exposes neither).
+    vface: Option<ttf_parser::Face<'static>>,
+    /// Same for the bold companion.
+    bold_vface: Option<ttf_parser::Face<'static>>,
 }
 
 /// Resolve the Japanese UI font file used by BOTH the OCR overlay glyph
@@ -109,30 +131,46 @@ pub fn find_jp_font_path() -> Option<std::path::PathBuf> {
     candidates.iter().flatten().find(|p| p.exists()).map(|p| p.to_path_buf())
 }
 
-/// Lazily rasterizes characters at requested pixel sizes, caching RGBA
-/// image handles. Thread‑safe via RefCell for interior mutability.
-pub struct GlyphCache {
-    font: Font,
-    /// Rasterized glyphs keyed by `(glyph id, px)`: the id may be a GSUB
-    /// substitution (vertical forms), not just the cmap glyph of the char.
-    cache: HashMap<(u16, u32), CachedGlyph>,
-    /// GSUB `vert`/`vrt2` resolution results (source glyph -> vertical glyph).
-    vert_cache: HashMap<u16, u16>,
-    /// Font-parser view of the same bytes, for cmap and GSUB `vert`/`vrt2`
-    /// resolution (fontdue exposes neither).
-    vface: Option<ttf_parser::Face<'static>>,
+/// Resolve the bold companion face used for highlighted glyphs. Only the
+/// bundled static TTF is considered: fontdue cannot read TrueType
+/// collections (`.ttc`), so the system NotoSansCJK collections are not
+/// candidates here. `None` falls back to synthetic bold.
+pub fn find_jp_bold_font_path() -> Option<std::path::PathBuf> {
+    let exe_path = std::env::current_exe().ok();
+    let exe_dir = exe_path.as_ref().and_then(|p| p.parent());
+    let exe_font = exe_dir.map(|d| d.join("fonts").join("NotoSansJP-Bold.ttf"));
+    let appdir = std::env::var("APPDIR").ok();
+    let appdir_font = appdir
+        .as_ref()
+        .map(|d| std::path::Path::new(d).join("usr").join("bin").join("fonts").join("NotoSansJP-Bold.ttf"));
+    let candidates = [
+        exe_font.as_ref().map(|p| p.as_path()),
+        appdir_font.as_ref().map(|p| p.as_path()),
+        Some(std::path::Path::new("fonts/NotoSansJP-Bold.ttf")),
+    ];
+    candidates.iter().flatten().find(|p| p.exists()).map(|p| p.to_path_buf())
 }
 
 impl GlyphCache {
     pub fn new() -> Option<Rc<RefCell<Self>>> {
-        Self::from_path(find_jp_font_path())
+        Self::from_paths(find_jp_font_path(), find_jp_bold_font_path())
     }
 
-    /// Load the cache from a specific font file. A missing path or an
-    /// unreadable face yields `None` and the overlay draws boxes without
-    /// glyphs — mobile falls back to the platform face and never crashes the
-    /// overlay for a missing bundled font (OverlayFont #84).
+    /// Test/helper entry: regular face only (synthetic bold fallback).
+    #[cfg(test)]
     fn from_path(path: Option<std::path::PathBuf>) -> Option<Rc<RefCell<Self>>> {
+        Self::from_paths(path, None)
+    }
+
+    /// Load the cache from specific font files: the regular face and an
+    /// optional bold companion. A missing regular path or an unreadable face
+    /// yields `None` and the overlay draws boxes without glyphs — mobile
+    /// falls back to the platform face and never crashes the overlay for a
+    /// missing bundled font (OverlayFont #84).
+    fn from_paths(
+        path: Option<std::path::PathBuf>,
+        bold_path: Option<std::path::PathBuf>,
+    ) -> Option<Rc<RefCell<Self>>> {
         let Some(path) = path else {
             eprintln!("[GlyphCache] no CJK font found, overlay text will not render");
             return None;
@@ -145,40 +183,128 @@ impl GlyphCache {
         // font, one cache), so leak that copy.
         let face_data: &'static [u8] = Box::leak(data.clone().into_boxed_slice());
         let vface = ttf_parser::Face::parse(face_data, 0).ok();
-        match Font::from_bytes(data, fontdue::FontSettings::default()) {
-            Ok(font) => Some(Rc::new(RefCell::new(GlyphCache {
-                font,
-                cache: HashMap::new(),
-                vert_cache: HashMap::new(),
-                vface,
-            }))),
-            Err(_) => {
-                eprintln!("[GlyphCache] failed to parse font {}", path.display());
-                None
+        let Ok(font) = Font::from_bytes(data, fontdue::FontSettings::default()) else {
+            eprintln!("[GlyphCache] failed to parse font {}", path.display());
+            return None;
+        };
+        let (bold_font, bold_vface) = match bold_path {
+            Some(bp) => match std::fs::read(&bp) {
+                Ok(bdata) => {
+                    let bface_data: &'static [u8] =
+                        Box::leak(bdata.clone().into_boxed_slice());
+                    let bface = ttf_parser::Face::parse(bface_data, 0).ok();
+                    match Font::from_bytes(bdata, fontdue::FontSettings::default()) {
+                        Ok(bf) => {
+                            println!("[GlyphCache] bold face: {}", bp.display());
+                            (Some(bf), bface)
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "[GlyphCache] failed to parse bold font {}; highlights use synthetic bold",
+                                bp.display()
+                            );
+                            (None, None)
+                        }
+                    }
+                }
+                Err(_) => (None, None),
+            },
+            None => {
+                eprintln!("[GlyphCache] no bold face found; highlights use synthetic bold");
+                (None, None)
             }
-        }
+        };
+        Some(Rc::new(RefCell::new(GlyphCache {
+            font,
+            bold_font,
+            cache: HashMap::new(),
+            vert_cache: HashMap::new(),
+            bold_vert_cache: HashMap::new(),
+            vface,
+            bold_vface,
+        })))
     }
 
-    /// Ensure both tinted handles exist for (char, px_size) and return one
-    /// with the ink metrics. The highlighted handle is fake-bolded, like
-    /// mobile (`paint.isFakeBoldText`): the bundled faces ship Regular only.
-    fn get_handle(&mut self, gid: u16, px: u32, highlighted: bool) -> Option<(&ImageHandle, u32, u32, i32, i32)> {
-        let entry = self.cache.entry((gid, px)).or_insert_with(|| {
-            let (metrics, coverage) = self.font.rasterize_config(fontdue::layout::GlyphRasterConfig {
-                glyph_index: gid,
-                px: px as f32,
-                font_hash: 0,
-            });
-            // Keep the true ink size: zero is how a blank glyph reports itself.
-            let w = metrics.width as u32;
-            let h = metrics.height as u32;
-            let pink = Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2);
-            let bold = embolden(&coverage, w, h, fake_bold_radius(px));
-            let yellow = Self::make_handle(w, h, &bold, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2);
-            CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
-        });
-        let idx = if highlighted { 1 } else { 0 };
-        Some((&entry.handles[idx], entry.w, entry.h, entry.xmin, entry.ymin))
+    /// Look up or rasterize `ch` and return its drawable variant. Highlighted
+    /// glyphs come from the bundled bold companion face when one is present;
+    /// otherwise they fall back to synthetic emboldening (mobile's
+    /// `paint.isFakeBoldText`, which grows the stroke without clipping it).
+    fn glyph_for(
+        &mut self,
+        ch: char,
+        vertical: bool,
+        px: u32,
+        highlighted: bool,
+    ) -> Option<RasterGlyph> {
+        if highlighted {
+            if self.bold_font.is_some() {
+                if let Some(gid) = self.bold_glyph_id(ch, vertical) {
+                    return Some(self.variant(GlyphKind::Bold, gid, px));
+                }
+            }
+            let gid = self.glyph_id(ch, vertical)?;
+            return Some(self.variant(GlyphKind::Synthetic, gid, px));
+        }
+        let gid = self.glyph_id(ch, vertical)?;
+        Some(self.variant(GlyphKind::Pink, gid, px))
+    }
+
+    /// Rasterize (or fetch) one glyph variant. `gid` must belong to the face
+    /// selected by `kind`.
+    fn variant(&mut self, kind: GlyphKind, gid: u16, px: u32) -> RasterGlyph {
+        if let Some(entry) = self.cache.get(&(kind, gid, px)) {
+            return entry.clone();
+        }
+        let raster = match kind {
+            GlyphKind::Synthetic => {
+                let (m, coverage) = Self::rasterize(&self.font, gid, px);
+                let (w, h) = (m.width as u32, m.height as u32);
+                let radius = fake_bold_radius(px);
+                let (bold, bw, bh) = synthetic_bold(&coverage, w, h, radius);
+                RasterGlyph {
+                    handle: Self::make_handle(bw, bh, &bold, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2),
+                    w: bw,
+                    h: bh,
+                    xmin: m.xmin - radius,
+                    ymin: m.ymin - radius,
+                }
+            }
+            GlyphKind::Bold => {
+                let Some(face) = self.bold_font.as_ref() else {
+                    return self.variant(GlyphKind::Synthetic, gid, px);
+                };
+                let (m, coverage) = Self::rasterize(face, gid, px);
+                let (w, h) = (m.width as u32, m.height as u32);
+                RasterGlyph {
+                    handle: Self::make_handle(w, h, &coverage, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2),
+                    w,
+                    h,
+                    xmin: m.xmin,
+                    ymin: m.ymin,
+                }
+            }
+            GlyphKind::Pink => {
+                let (m, coverage) = Self::rasterize(&self.font, gid, px);
+                let (w, h) = (m.width as u32, m.height as u32);
+                RasterGlyph {
+                    handle: Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2),
+                    w,
+                    h,
+                    xmin: m.xmin,
+                    ymin: m.ymin,
+                }
+            }
+        };
+        self.cache.insert((kind, gid, px), raster.clone());
+        raster
+    }
+
+    fn rasterize(font: &Font, gid: u16, px: u32) -> (fontdue::Metrics, Vec<u8>) {
+        font.rasterize_config(fontdue::layout::GlyphRasterConfig {
+            glyph_index: gid,
+            px: px as f32,
+            font_hash: 0,
+        })
     }
 
     fn make_handle(w: u32, h: u32, cov: &[u8], r: u8, g: u8, b: u8) -> ImageHandle {
@@ -197,23 +323,12 @@ impl GlyphCache {
         ImageHandle::from_rgba(w, h, rgba)
     }
 
-    /// Pre-warm the cache for a glyph at the given pixel size.
-    /// Called from the update handler so glyph rasterization happens off
-    /// the view/draw path, preventing first-frame stutter.
-    pub fn ensure_glyph(&mut self, gid: u16, px_size: u32) {
-        self.cache.entry((gid, px_size)).or_insert_with(|| {
-            let (metrics, coverage) = self.font.rasterize_config(fontdue::layout::GlyphRasterConfig {
-                glyph_index: gid,
-                px: px_size as f32,
-                font_hash: 0,
-            });
-            let w = metrics.width as u32;
-            let h = metrics.height as u32;
-            let pink = Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2);
-            let bold = embolden(&coverage, w, h, fake_bold_radius(px_size));
-            let yellow = Self::make_handle(w, h, &bold, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2);
-            CachedGlyph { w, h, xmin: metrics.xmin, ymin: metrics.ymin, handles: [pink, yellow] }
-        });
+    /// Pre-warm both tinted variants for a character at the given pixel size.
+    /// Called from the update handler so glyph rasterization happens off the
+    /// view/draw path, preventing first-frame stutter.
+    pub fn ensure_glyph(&mut self, ch: char, vertical: bool, px_size: u32) {
+        let _ = self.glyph_for(ch, vertical, px_size, false);
+        let _ = self.glyph_for(ch, vertical, px_size, true);
     }
 
     /// The glyph to rasterize for `ch` in this line orientation. Vertical
@@ -246,47 +361,89 @@ impl GlyphCache {
                 None
             }
         });
-        let vert = self.gsub_vert_glyph(gid).or(fallback).unwrap_or(gid);
+        let vert = self
+            .vface
+            .as_ref()
+            .and_then(|face| gsub_vert_glyph(face, gid))
+            .or(fallback)
+            .unwrap_or(gid);
         self.vert_cache.insert(gid, vert);
         Some(vert)
     }
 
-    /// GSUB `vert`/`vrt2` single substitution for a glyph, if the font has
-    /// one. Both features carry the same lookups in this font; the union of
-    /// their single-substitution subtables is applied.
-    fn gsub_vert_glyph(&self, gid: u16) -> Option<u16> {
-        use ttf_parser::gsub::{SingleSubstitution, SubstitutionSubtable};
-
-        let face = self.vface.as_ref()?;
-        let gsub = face.tables().gsub?;
-        let vert = ttf_parser::Tag::from_bytes(b"vert");
-        let vrt2 = ttf_parser::Tag::from_bytes(b"vrt2");
-        for fi in 0..gsub.features.len() {
-            let Some(feature) = gsub.features.get(fi) else { continue };
-            if feature.tag != vert && feature.tag != vrt2 {
-                continue;
+    /// Same resolution as [`Self::glyph_id`], on the bold companion face.
+    /// `None` when no bold face is loaded or it has no glyph for `ch`.
+    fn bold_glyph_id(&mut self, ch: char, vertical: bool) -> Option<u16> {
+        if self.bold_font.is_none() {
+            return None;
+        }
+        let gid = match self.bold_vface.as_ref() {
+            Some(face) => match face.glyph_index(ch) {
+                Some(g) => g.0,
+                None => self.bold_font.as_ref()?.lookup_glyph_index(ch),
+            },
+            None => self.bold_font.as_ref()?.lookup_glyph_index(ch),
+        };
+        if !vertical {
+            return Some(gid);
+        }
+        if let Some(v) = self.bold_vert_cache.get(&gid) {
+            return Some(*v);
+        }
+        let fallback = self.bold_vface.as_ref().and_then(|face| {
+            let vch = crate::util::japanese::to_vertical_glyph(ch);
+            if vch != ch {
+                face.glyph_index(vch).map(|g| g.0)
+            } else {
+                None
             }
-            for li in feature.lookup_indices {
-                let Some(lookup) = gsub.lookups.get(li) else { continue };
-                for sub in lookup
-                    .subtables
-                    .into_iter::<SubstitutionSubtable>()
-                {
-                    if let SubstitutionSubtable::Single(single) = sub {
-                        match single {
-                            SingleSubstitution::Format1 { coverage, delta } => {
-                                if coverage.get(ttf_parser::GlyphId(gid)).is_some() {
-                                    return Some(gid.wrapping_add(delta as u16));
-                                }
+        });
+        let vert = self
+            .bold_vface
+            .as_ref()
+            .and_then(|face| gsub_vert_glyph(face, gid))
+            .or(fallback)
+            .unwrap_or(gid);
+        self.bold_vert_cache.insert(gid, vert);
+        Some(vert)
+    }
+
+}
+
+/// GSUB `vert`/`vrt2` single substitution for a glyph, if the font has one.
+/// Both features carry the same lookups in this font; the union of their
+/// single-substitution subtables is applied.
+fn gsub_vert_glyph(face: &ttf_parser::Face, gid: u16) -> Option<u16> {
+    use ttf_parser::gsub::{SingleSubstitution, SubstitutionSubtable};
+
+    let gsub = face.tables().gsub?;
+    let vert = ttf_parser::Tag::from_bytes(b"vert");
+    let vrt2 = ttf_parser::Tag::from_bytes(b"vrt2");
+    for fi in 0..gsub.features.len() {
+        let Some(feature) = gsub.features.get(fi) else { continue };
+        if feature.tag != vert && feature.tag != vrt2 {
+            continue;
+        }
+        for li in feature.lookup_indices {
+            let Some(lookup) = gsub.lookups.get(li) else { continue };
+            for sub in lookup
+                .subtables
+                .into_iter::<SubstitutionSubtable>()
+            {
+                if let SubstitutionSubtable::Single(single) = sub {
+                    match single {
+                        SingleSubstitution::Format1 { coverage, delta } => {
+                            if coverage.get(ttf_parser::GlyphId(gid)).is_some() {
+                                return Some(gid.wrapping_add(delta as u16));
                             }
-                            SingleSubstitution::Format2 {
-                                coverage,
-                                substitutes,
-                            } => {
-                                if let Some(idx) = coverage.get(ttf_parser::GlyphId(gid)) {
-                                    if let Some(sub) = substitutes.get(idx) {
-                                        return Some(sub.0);
-                                    }
+                        }
+                        SingleSubstitution::Format2 {
+                            coverage,
+                            substitutes,
+                        } => {
+                            if let Some(idx) = coverage.get(ttf_parser::GlyphId(gid)) {
+                                if let Some(sub) = substitutes.get(idx) {
+                                    return Some(sub.0);
                                 }
                             }
                         }
@@ -294,9 +451,8 @@ impl GlyphCache {
                 }
             }
         }
-        None
     }
-
+    None
 }
 
 /// Skia's fake-bold stroke is ~1/24 of the text size end to end, so the
@@ -307,7 +463,7 @@ fn fake_bold_radius(px: u32) -> i32 {
 
 /// Grow a glyph's coverage by `radius` pixels in every direction — the
 /// bitmap equivalent of `paint.isFakeBoldText`, used for highlighted glyphs
-/// because the bundled faces have Regular only.
+/// when no bold companion face is bundled.
 fn embolden(coverage: &[u8], w: u32, h: u32, radius: i32) -> Vec<u8> {
     let (w, h) = (w as i32, h as i32);
     if w <= 0 || h <= 0 || radius <= 0 {
@@ -335,8 +491,27 @@ fn embolden(coverage: &[u8], w: u32, h: u32, radius: i32) -> Vec<u8> {
     out
 }
 
+/// Grow a glyph's coverage without clipping it: pad the ink box by `radius`
+/// first so the dilation has room, then dilate into the padding. The caller
+/// must offset the placement by `-radius` to keep the ink aligned.
+fn synthetic_bold(coverage: &[u8], w: u32, h: u32, radius: i32) -> (Vec<u8>, u32, u32) {
+    let r = radius.max(0) as u32;
+    if w == 0 || h == 0 || r == 0 {
+        return (coverage.to_vec(), w, h);
+    }
+    let (bw, bh) = (w + 2 * r, h + 2 * r);
+    let mut padded = vec![0u8; (bw * bh) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            padded[((y + r) * bw + (x + r)) as usize] = coverage[(y * w + x) as usize];
+        }
+    }
+    (embolden(&padded, bw, bh, radius), bw, bh)
+}
+
 /// A rasterized glyph ready to draw: the ink bitmap plus the font metrics
 /// needed to place it on its natural baseline.
+#[derive(Clone)]
 struct RasterGlyph {
     handle: ImageHandle,
     w: u32,
@@ -349,13 +524,12 @@ struct RasterGlyph {
 /// Returns None if no glyph cache is available.
 fn draw_glyph(
     cache: &RefCell<GlyphCache>,
-    gid: u16,
+    ch: char,
+    vertical: bool,
     px_size: u32,
     highlighted: bool,
 ) -> Option<RasterGlyph> {
-    let mut c = cache.borrow_mut();
-    let (handle, w, h, xmin, ymin) = c.get_handle(gid, px_size, highlighted)?;
-    Some(RasterGlyph { handle: handle.clone(), w, h, xmin, ymin })
+    cache.borrow_mut().glyph_for(ch, vertical, px_size, highlighted)
 }
 
 /// Screen-space top-left of a glyph's ink bitmap inside its char box,
@@ -1237,9 +1411,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         continue;
                     }
                     let em_px = text_px.round().clamp(1.0, 1024.0) as u32;
-                    let ref_gid = cache.borrow_mut().glyph_id('あ', line.is_vertical);
-                    let ref_ink = ref_gid
-                        .and_then(|gid| draw_glyph(cache, gid, em_px, false))
+                    let ref_ink = draw_glyph(cache, 'あ', line.is_vertical, em_px, false)
                         .map(|g| (g.w as f32, g.h as f32, g.xmin as f32, g.ymin as f32));
 
                     for (i, char_box) in line.char_boxes.iter().enumerate() {
@@ -1271,8 +1443,7 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         // GSUB `vert`/`vrt2` picks the vertical presentation
                         // glyph for vertical lines (Unicode form fallback for
                         // what the font does not cover).
-                        let Some(gid) = cache.borrow_mut().glyph_id(ch, line.is_vertical) else { continue };
-                        let Some(g) = draw_glyph(cache, gid, em_px, highlighted) else { continue };
+                        let Some(g) = draw_glyph(cache, ch, line.is_vertical, em_px, highlighted) else { continue };
                         // Mobile skips a glyph with no ink (space, .notdef).
                         if g.w == 0 || g.h == 0 {
                             continue;
@@ -2005,13 +2176,9 @@ impl OcrViewer {
                         .clamp(1.0, 1024.0) as u32;
                     let mut cache = gc.borrow_mut();
                     let vertical = line.is_vertical;
-                    if let Some(gid) = cache.glyph_id('あ', false) {
-                        cache.ensure_glyph(gid, px);
-                    }
+                    cache.ensure_glyph('あ', false, px);
                     for ch in line.text.chars() {
-                        if let Some(gid) = cache.glyph_id(ch, vertical) {
-                            cache.ensure_glyph(gid, px);
-                        }
+                        cache.ensure_glyph(ch, vertical, px);
                     }
                 }
             }
@@ -3399,11 +3566,9 @@ mod tests {
     #[test]
     fn blank_glyphs_report_no_ink() {
         let cache = GlyphCache::new().expect("bundled JP font");
-        let gid = cache.borrow_mut().glyph_id(' ', false).expect("space glyph");
-        let g = draw_glyph(&cache, gid, 54, false).expect("glyph");
+        let g = draw_glyph(&cache, ' ', false, 54, false).expect("glyph");
         assert_eq!((g.w, g.h), (0, 0), "space must report no ink");
-        let gid = cache.borrow_mut().glyph_id('あ', false).expect("glyph id");
-        let g = draw_glyph(&cache, gid, 54, false).expect("glyph");
+        let g = draw_glyph(&cache, 'あ', false, 54, false).expect("glyph");
         assert!(g.w > 0 && g.h > 0, "kana has ink");
     }
 
@@ -3469,6 +3634,41 @@ mod tests {
         assert_eq!(embolden(&cov, 5, 5, 0), cov);
         assert_eq!(fake_bold_radius(54), 1);
         assert_eq!(fake_bold_radius(200), 4);
+    }
+
+    /// Synthetic bold must grow the ink box instead of clipping the stroke:
+    /// a fully inked 1×1 glyph becomes a fully inked 3×3 at radius 1.
+    #[test]
+    fn synthetic_bold_does_not_clip_grown_ink() {
+        let (bold, w, h) = synthetic_bold(&[255u8], 1, 1, 1);
+        assert_eq!((w, h), (3, 3));
+        assert!(bold.iter().all(|&a| a == 255), "grown ink was clipped: {bold:?}");
+    }
+
+    /// The bundled bold companion face loads and resolves glyphs, including
+    /// the GSUB vertical forms, so highlights rasterize from it rather than
+    /// the synthetic fallback.
+    #[test]
+    fn bundled_bold_face_loads_and_resolves() {
+        let dir = format!("{}/fonts", env!("CARGO_MANIFEST_DIR"));
+        let cache = GlyphCache::from_paths(
+            Some(std::path::PathBuf::from(format!("{dir}/NotoSansJP-Regular.ttf"))),
+            Some(std::path::PathBuf::from(format!("{dir}/NotoSansJP-Bold.ttf"))),
+        )
+        .expect("glyph cache with bundled faces");
+        let mut c = cache.borrow_mut();
+        let gid = c.bold_glyph_id('一', false).expect("bold glyph for 一");
+        assert_ne!(gid, 0, "bold cmap must resolve 一");
+        // Vertical forms resolve on the bold face too (GSUB vert).
+        let stop = c.bold_glyph_id('。', true).expect("bold vertical 。");
+        assert_ne!(stop, 0);
+        // No bold face is loaded when the bold path is absent.
+        let no_bold = GlyphCache::from_paths(
+            Some(std::path::PathBuf::from(format!("{dir}/NotoSansJP-Regular.ttf"))),
+            None,
+        )
+        .expect("regular-only cache");
+        assert!(no_bold.borrow_mut().bold_glyph_id('一', false).is_none());
     }
 
     #[test]
@@ -3606,13 +3806,11 @@ mod tests {
         let px = 54u32;
         let (cx, cy) = (100.0f32, 100.0f32);
         let ref_ink = {
-            let gid = cache.borrow_mut().glyph_id('あ', true).expect("glyph id");
-            let g = draw_glyph(&cache, gid, px, false).expect("glyph");
+            let g = draw_glyph(&cache, 'あ', true, px, false).expect("glyph");
             (g.w as f32, g.h as f32, g.xmin as f32, g.ymin as f32)
         };
         let place = |ch: char| -> (f32, f32, f32, f32) {
-            let gid = cache.borrow_mut().glyph_id(ch, true).expect("glyph id");
-            let g = draw_glyph(&cache, gid, px, false).expect("glyph");
+            let g = draw_glyph(&cache, ch, true, px, false).expect("glyph");
             let glyph = (g.w as f32, g.h as f32, g.xmin as f32, g.ymin as f32);
             let (dx, dy) = glyph_ink_origin(true, cx, cy, glyph, ref_ink);
             (dx, dy, glyph.0, glyph.1)
@@ -3628,8 +3826,7 @@ mod tests {
         // Across the axis the reference `あ` anchors the ink, so a bracket's
         // x is its own bearing relative to the reference ink centre.
         let (dx, _, gw, _) = place('\u{FE41}');
-        let gid = cache.borrow_mut().glyph_id('\u{FE41}', true).expect("glyph id");
-        let g = draw_glyph(&cache, gid, px, false).expect("glyph");
+        let g = draw_glyph(&cache, '\u{FE41}', true, px, false).expect("glyph");
         let ref_centre = ref_ink.2 + ref_ink.0 / 2.0;
         let own_centre = g.xmin as f32 + gw / 2.0;
         assert!(
