@@ -2520,20 +2520,25 @@ impl OcrViewer {
                     entry_col = entry_col.push(Self::sense_group(sg.clone()));
                 }
                 // 1px divider per reading group (Android: DKGRAY, alpha 0.3).
+                // The background must wrap only the line: padding on the
+                // styled container would paint a full-width translucent box.
+                let divider = Container::new(
+                    iced::widget::Space::new().height(Pixels(1.0)).width(Length::Fill),
+                )
+                .width(Length::Fill)
+                .style(|_t: &Theme| container::Style {
+                    background: Some(iced::Background::Color(Color::from_rgba(
+                        169.0 / 255.0,
+                        169.0 / 255.0,
+                        169.0 / 255.0,
+                        0.3,
+                    ))),
+                    ..Default::default()
+                });
                 entry_col = entry_col.push(
-                    Container::new(
-                        iced::widget::Space::new().height(Pixels(1.0)).width(Length::Fill),
-                    )
-                    .padding([10.0, 0.0])
-                    .style(|_t: &Theme| container::Style {
-                        background: Some(iced::Background::Color(Color::from_rgba(
-                            169.0 / 255.0,
-                            169.0 / 255.0,
-                            169.0 / 255.0,
-                            0.3,
-                        ))),
-                        ..Default::default()
-                    }),
+                    Column::new()
+                        .push(divider)
+                        .padding(iced::Padding { top: 10.0, bottom: 10.0, ..Default::default() }),
                 );
             }
             // Dictionary source, bottom of the entry (one caption per section).

@@ -810,6 +810,11 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
             for (dict_id, dict_entries) in by_dict {
                 // Glossaries already rendered for an earlier reading of this word.
                 let mut seen_glossaries: HashSet<String> = HashSet::new();
+                // Rows whose glossary already rendered for this word: Jitendex
+                // (and JMdict) store one row per headword form, and the forms
+                // of one word carry identical payloads (e.g. この/此の/斯の).
+                // Such a row keeps its headword but must not repeat the senses.
+                let mut seen_row_glossaries: HashSet<String> = HashSet::new();
                 let mut reading_groups: Vec<FormattedReadingGroup> = Vec::new();
 
                 let mut grouped: Vec<(String, Vec<&DictionaryEntry>)> = Vec::new();
@@ -886,6 +891,13 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
                     }
 
                     for e in &reading_entries {
+                        // A repeated headword form (identical payload already
+                        // rendered for this word) keeps its headword in the
+                        // list above but adds no senses: mobile's
+                        // `seenGlossaries` rule, applied per row.
+                        if !seen_row_glossaries.insert(e.definitions.clone()) {
+                            continue;
+                        }
                         // Fail open on a non-array definition payload: a bare
                         // string is one sense, not zero.
                         let definitions_value: serde_json::Value =
@@ -1819,6 +1831,7 @@ mod tests {
         [(1i64, "Jitendex".to_string())].into_iter().collect()
     }
 
+
     fn formatted_groups(matches: Vec<TermMatch>) -> Vec<FormattedEntry> {
         let mut state = OcrOverlayState::new(1024.0, 768.0);
         state.format_dictionary_results(&matches, &dict_names())
@@ -1889,6 +1902,37 @@ mod tests {
             .filter(|n| matches!(n, DefinitionNode::Example(_)))
             .count();
         assert_eq!(examples, 1, "the example must render exactly once");
+    }
+
+    /// Jitendex (and JMdict) store one row per headword form with identical
+    /// payloads (この/此の/斯の, 九/９/玖): every form lists as a headword, the
+    /// senses render once.
+    #[test]
+    fn identical_headword_rows_render_senses_once() {
+        let defs = fixture("お前");
+        let matches = vec![TermMatch {
+            term: "お前".to_string(),
+            entries: vec![
+                entry("お前", "おまえ", &defs),
+                entry("御前", "おまえ", &defs),
+            ],
+            chain: None,
+        }];
+        let entry = formatted_groups(matches).single_like();
+        let group = entry.reading_groups.single_ref();
+        assert_eq!(
+            group.headwords.iter().map(|h| h.kanji.clone()).collect::<Vec<_>>(),
+            vec!["お前", "御前"],
+            "every headword form still lists"
+        );
+        let examples = group
+            .sense_groups
+            .iter()
+            .flat_map(|sg| sg.senses.iter())
+            .flat_map(|s| flatten(&s.nodes))
+            .filter(|n| matches!(n, DefinitionNode::Example(_)))
+            .count();
+        assert_eq!(examples, 1, "the shared payload renders exactly once");
     }
 
     #[test]
