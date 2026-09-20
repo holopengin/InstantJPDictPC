@@ -522,6 +522,47 @@ fn run_ocr_viewer(
         }
     };
 
+    // The kanji component table behind a tapped character's extra candidates
+    // (#44). Small text asset, loaded once per process like the LM; a missing
+    // asset only narrows the list to the head ranking, so it is never fatal.
+    let oov_candidates = {
+        let path =
+            std::path::Path::new(&resolve_asset_dir()).join("components/krad_components.txt");
+        match crate::util::component_table::ComponentTable::load(&path) {
+            Some(table) => {
+                println!("[Bootstrap] ComponentTable loaded: {} entries", table.entry_count());
+                Some(std::sync::Arc::new(crate::util::oov_candidates::OovCandidates::new(table)))
+            }
+            None => {
+                eprintln!(
+                    "[Bootstrap] ComponentTable unavailable at {}; tapped lists stay head-only",
+                    path.display()
+                );
+                None
+            }
+        }
+    };
+
+    // The kanji variant forms offered last in a tapped character's list
+    // (#44). Same load-once shape as the tables above.
+    let kanji_variants = {
+        let path =
+            std::path::Path::new(&resolve_asset_dir()).join("variants/kanji_variants.txt");
+        match crate::util::kanji_variants::KanjiVariantTable::load(&path) {
+            Some(table) => {
+                println!("[Bootstrap] KanjiVariants loaded: {} variants", table.entry_count());
+                Some(std::sync::Arc::new(table))
+            }
+            None => {
+                eprintln!(
+                    "[Bootstrap] KanjiVariants unavailable at {}; no variant forms offered",
+                    path.display()
+                );
+                None
+            }
+        }
+    };
+
     let image_path = image_paths.first().cloned().context("No image path provided")?;
 
     // Bootstrap channel — one-shot events (image, dict, deinflector,
@@ -741,6 +782,8 @@ fn run_ocr_viewer(
     let boot = move || {
         let mut viewer = OcrViewer::new_empty(screen_w, screen_h, face);
         viewer.state.install_char_lm(char_lm.clone());
+        viewer.state.install_oov_candidates(oov_candidates.clone());
+        viewer.state.install_kanji_variants(kanji_variants.clone());
         if let Some(t) = tuning.thresh {
             viewer.det_thresh = t;
             viewer.det_thresh_default = t;
