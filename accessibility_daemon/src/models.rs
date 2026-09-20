@@ -34,6 +34,14 @@ pub const VERTICAL_MIN_ASPECT: f32 = 1.25;
 /// no rotated crop).
 pub const AXIS_ALIGNED_TOL_RAD: f32 = 1.0 * std::f32::consts::PI / 180.0;
 
+/// Extra straightness allowance for the fit's own quantization. The boundary
+/// points are pixel outer corners (±0.5px), so a visually level blob can fit
+/// a fraction of a degree off before any real tilt exists; scaled by the
+/// frame's long side this is the "indistinguishable from straight" band.
+/// (Mobile's constant 1° tolerance is the floor; this only widens it for
+/// short noisy frames such as UI text.)
+pub const AXIS_ALIGNED_QUANT_TOL_PX: f32 = 1.5;
+
 /// One line's upright-crop frame — the mobile `JpDictQuad`, stored as centre +
 /// local extents + the local x axis angle. Corners `c0..c3` are the crop's
 /// local `(0,0),(w,0),(w,h),(0,h)` in source pixels: `w` is the crop's x axis
@@ -113,7 +121,18 @@ impl RotatedBox {
     /// reading axis' deviation from its upright axis is exactly `angle` for
     /// both orientations (the fit orients vertical frames the same way).
     pub fn is_rotated(&self) -> bool {
-        self.angle.abs() > AXIS_ALIGNED_TOL_RAD
+        !self.is_axis_aligned()
+    }
+
+    /// Mobile `RotatedGeometry.isAxisAligned` (`|tiltDeg| <= 1°`), widened by
+    /// the fit's own half-pixel quantization over the frame's long side: a
+    /// boundary-corner fit of a visually level blob is indistinguishable from
+    /// straight inside that band, so short noisy frames (UI text, tiny
+    /// fragments) must not be un-rotated for recognition.
+    pub fn is_axis_aligned(&self) -> bool {
+        let long = self.w.max(self.h).max(1.0);
+        let quantization = (AXIS_ALIGNED_QUANT_TOL_PX / long).atan();
+        self.angle.abs() <= AXIS_ALIGNED_TOL_RAD.max(quantization)
     }
 
     /// Mobile `RotatedGeometry.unclip`: grow both local axes by
@@ -708,6 +727,24 @@ mod tests {
         let (x, y, w, h) = out.aabb();
         assert!(close(x, -6.0, 0.01) && close(y, -6.0, 0.01));
         assert!(close(w, 52.0, 0.01) && close(h, 22.0, 0.01));
+    }
+
+    /// The fit's half-pixel boundary quantization must not make visually
+    /// level short lines count as rotated (they would be un-rotated for
+    /// recognition and back); mobile's 1° floor still governs long frames.
+    #[test]
+    fn short_noisy_fits_snap_to_straight() {
+        // 70px UI text fitted 1.2°: ~1.5px drift, straight in practice.
+        let short = RotatedBox::new(0.0, 0.0, 70.0, 6.0, 1.2f32.to_radians(), 1.0);
+        assert!(!short.is_rotated());
+        // 2° on the same frame is a real tilt.
+        let tilted = RotatedBox::new(0.0, 0.0, 70.0, 6.0, 2.0f32.to_radians(), 1.0);
+        assert!(tilted.is_rotated());
+        // Long frames keep mobile's 1° tolerance.
+        let long = RotatedBox::new(0.0, 0.0, 500.0, 30.0, 0.9f32.to_radians(), 1.0);
+        assert!(!long.is_rotated());
+        let long_tilted = RotatedBox::new(0.0, 0.0, 500.0, 30.0, 3.0f32.to_radians(), 1.0);
+        assert!(long_tilted.is_rotated());
     }
 
     /// Mobile anAxisAlignedFrameMapsLocalBoxesOneToOne.
