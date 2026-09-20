@@ -30,6 +30,10 @@ pub struct AppSettings {
     /// line. There is no camera mode on desktop, so this is the only furigana
     /// switch (mobile also has a separate camera key).
     pub furigana_filter: bool,
+    /// #43/#86: mobile's "Display pitch accent" home-screen switch, **off**
+    /// by default. Gates the pitch-accent line under each dictionary entry's
+    /// headwords; the Kanjium data still installs and loads either way.
+    pub pitch_accent: bool,
 }
 
 impl AppSettings {
@@ -97,6 +101,7 @@ mod tests {
         assert_eq!(settings, AppSettings::default());
         assert_eq!(settings.overlay_font, FontFace::Sans);
         assert!(!settings.furigana_filter, "the furigana rule ships off");
+        assert!(!settings.pitch_accent, "the pitch line ships off");
     }
 
     /// #100: the furigana switch round-trips through the store.
@@ -116,6 +121,27 @@ mod tests {
         };
         off.save(&dir).expect("save off");
         assert!(!AppSettings::load(&dir).furigana_filter);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #43/#86: the pitch switch round-trips through the store.
+    #[test]
+    fn pitch_accent_round_trips() {
+        let dir = sandbox("pitch");
+        let on = AppSettings {
+            pitch_accent: true,
+            ..AppSettings::default()
+        };
+        on.save(&dir).expect("save on");
+        assert!(AppSettings::load(&dir).pitch_accent);
+
+        let off = AppSettings {
+            pitch_accent: false,
+            ..AppSettings::default()
+        };
+        off.save(&dir).expect("save off");
+        assert!(!AppSettings::load(&dir).pitch_accent);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -153,6 +179,16 @@ mod tests {
 
         std::fs::write(dir.join(SETTINGS_FILE), "{}").unwrap();
         assert_eq!(AppSettings::load(&dir), AppSettings::default());
+
+        // #43/#86: an old file without the pitch key reads as off.
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"overlay_font":"sans","furigana_filter":true}"#,
+        )
+        .unwrap();
+        let loaded = AppSettings::load(&dir);
+        assert!(loaded.furigana_filter);
+        assert!(!loaded.pitch_accent, "missing pitch key reads as off");
 
         std::fs::write(
             dir.join(SETTINGS_FILE),

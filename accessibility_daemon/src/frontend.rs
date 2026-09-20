@@ -111,6 +111,14 @@ impl FrontendWindow {
                             }
                         }
                     }
+                    SettingsMessage::SetPitchAccent(enabled) => {
+                        if self.app_settings.pitch_accent != *enabled {
+                            self.app_settings.pitch_accent = *enabled;
+                            if let Err(e) = self.app_settings.save(&self.data_dir) {
+                                eprintln!("[Frontend] Failed to save settings: {e}");
+                            }
+                        }
+                    }
                     SettingsMessage::SetFontFace(face) => {
                         if self.app_settings.overlay_font != *face {
                             self.app_settings.overlay_font = *face;
