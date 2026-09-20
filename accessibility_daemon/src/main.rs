@@ -501,6 +501,26 @@ fn run_ocr_viewer(
     // a change applies to the next launch.
     let face = app_settings.overlay_font;
 
+    // The character n-gram model behind the blank's candidate ranking (#44).
+    // 14 MB, loaded once per process like the fonts; a missing asset only
+    // narrows the blank's list, so it is never fatal.
+    let char_lm = {
+        let path = std::path::Path::new(&resolve_asset_dir()).join("lm/char_lm.bin");
+        match crate::util::char_lm::CharLm::load(&path) {
+            Some(lm) => {
+                println!("[Bootstrap] CharLm loaded: {} entries", lm.entries());
+                Some(std::sync::Arc::new(lm))
+            }
+            None => {
+                eprintln!(
+                    "[Bootstrap] CharLm unavailable at {}; blank lists keep discovery order",
+                    path.display()
+                );
+                None
+            }
+        }
+    };
+
     let image_path = image_paths.first().cloned().context("No image path provided")?;
 
     // Bootstrap channel — one-shot events (image, dict, deinflector,
@@ -719,6 +739,7 @@ fn run_ocr_viewer(
 
     let boot = move || {
         let mut viewer = OcrViewer::new_empty(screen_w, screen_h, face);
+        viewer.state.install_char_lm(char_lm.clone());
         if let Some(t) = tuning.thresh {
             viewer.det_thresh = t;
             viewer.det_thresh_default = t;
@@ -1279,7 +1300,9 @@ fn run_headless_batch(
                     let mut sum = 0.0f32;
                     let mut n = 0usize;
                     for alts in &l.alternatives {
-                        let Some((_, top)) = alts.first() else { continue };
+                        if alts.is_empty() {
+                            continue;
+                        }
                         let m = alts.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
                         let z: f32 = alts.iter().map(|(_, s)| (s - m).exp()).sum();
                         sum += if z > 0.0 { 1.0 / z } else { 0.0 };
