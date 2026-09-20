@@ -1176,10 +1176,12 @@ fn run_headless_batch(
             Err(e) => { eprintln!("[Batch] Failed to open {}: {e}", file.display()); continue; }
         };
         let t_img = std::time::Instant::now();
+        let t_det = std::time::Instant::now();
         let det = match engine.detect_lines(&image) {
             Ok(d) => d,
             Err(e) => { eprintln!("[Batch] Detection failed for {}: {e}", file.display()); continue; }
         };
+        println!("[OCR timing] Line detection:       {:>8.2} ms ({} boxes)", t_det.elapsed().as_secs_f64() * 1000.0, det.boxes.len());
         let boxes = det.boxes;
         let rotated = det.rotated;
         // Save crops next to the source image.
