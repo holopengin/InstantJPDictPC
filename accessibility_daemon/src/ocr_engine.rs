@@ -19,22 +19,6 @@ const PPOCR_DET_UNCLIP_RATIO: f32 = 1.2;
 /// intersection covers at least this fraction of the smaller box.
 const X_OVERLAP_THRESHOLD: f32 = 0.40;
 
-// Furigana (ruby) filter (#28) — conservative: better to recognize ruby than
-// to drop real small text. Matching runs on RAW contour geometry (pre-unclip:
-// unclip padding fabricates overlap for stacked fragments); only the gap test
-// uses UNCLIPPED boxes (raw gutters are real pixels, unclip closes them).
-const FURIGANA_SIZE_RATIO: f32 = 0.3; // small long-side < 30% of large long-side
-const FURIGANA_THIN_RATIO: f32 = 0.75; // horizontal ruby runs long but thin
-const FURIGANA_HSHORT_RATIO: f32 = 0.85; // horizontal short-side ceiling
-const FURIGANA_WIDTH_RATIO: f32 = 0.65; // vertical small short-side ceiling
-const FURIGANA_GAP_RATIO: f32 = 0.5;
-const FURIGANA_OVERLAP_RATIO: f32 = 0.5;
-// Absolute ceiling: real short columns dwarf ruby runs even when the ratio
-// matches — ruby longer than 12% of the image side is not ruby.
-const FURIGANA_MAX_FRAC: f32 = 0.12;
-// Absolute floor on the annotated box: ruby hugs full-size body text, not
-// compact blocks (logo boxes, badges).
-const FURIGANA_BIG_MIN_FRAC: f32 = 0.2;
 
 
 /// Rec workers sharing the one loaded ncnn net (mobile fans out to 4;
@@ -60,6 +44,12 @@ pub struct OcrEngine {
     /// mobile defaults.
     pub det_thresh_override: Option<f32>,
     pub det_unclip_override: Option<f32>,
+    /// #100: mobile's "Filter furigana in screenshots" switch, **off** by
+    /// default — the rule is flaky on camera photos and a wrong drop costs a
+    /// whole line. Off keeps every small contour, so ruby survives as its own
+    /// line. Read once per run from `settings.json` (each capture/watcher
+    /// child is a fresh process, matching mobile's per-run preference read).
+    pub det_furigana: bool,
 }
 
 /// Effective `DET_THRESH`: environment override, else the PC default 0.65
@@ -396,18 +386,25 @@ fn fit_components(
 }
 
 /// Mobile `detectRotated`'s post-fit stages: furigana rejection on AABB
-/// geometry (same rule and raw-vs-unclipped pair as the axis path), the
-/// local-size filter, the enclosing-blob filter (#53) and the vertical 5%
-/// cross-axis inset. Returns the surviving frames.
+/// geometry (same rule and raw-vs-unclipped pair as the axis path; skipped
+/// when `furigana` is off, #100), the local-size filter, the enclosing-blob
+/// filter (#53) and the vertical 5% cross-axis inset. Returns the surviving
+/// frames.
 fn filter_fitted_quads(
     pre_quads: &[RotatedBox],
     quads: &[RotatedBox],
     orig_w: i32,
     orig_h: i32,
+    furigana: bool,
 ) -> Vec<RotatedBox> {
     let pre_rects: Vec<BoundingBox> = pre_quads.iter().map(rect_of).collect();
     let uncl_rects: Vec<BoundingBox> = quads.iter().map(rect_of).collect();
-    let keep = filter_furigana(&pre_rects, &uncl_rects, orig_w, orig_h);
+    // The switch can turn the whole rule off; then every contour is kept.
+    let keep = if furigana {
+        filter_furigana(&pre_rects, &uncl_rects, orig_w, orig_h)
+    } else {
+        vec![true; quads.len()]
+    };
 
     // Min-size filter uses the frame's own local sizes (mobile).
     let mut min_sized: Vec<RotatedBox> = Vec::new();
@@ -455,99 +452,9 @@ fn is_square_box(b: &BoundingBox) -> bool {
     w.min(h) >= w.max(h) / VERTICAL_MIN_ASPECT
 }
 
-fn overlap_len(a1: i32, a2: i32, b1: i32, b2: i32) -> i32 {
-    (a2.min(b2) - a1.max(b1)).max(0)
-}
-
-fn gap_len(a1: i32, a2: i32, b1: i32, b2: i32) -> i32 {
-    (a1.max(b1) - a2.min(b2)).max(0)
-}
-
-/// Tiny vertical box hugging a much larger vertical box (either side) (#28).
-/// The center must lie OUTSIDE the big box: stacked column fragments (tail of
-/// the column above/below, overlapping only via unclip padding) share its
-/// x-range. Size/center/overlap use RAW contour geometry; gap uses UNCLIPPED
-/// (raw gutters are real pixels, unclip closes them to ruby distance).
-fn is_ruby_vertical(
-    s_raw: &BoundingBox,
-    b_raw: &BoundingBox,
-    s_un: &BoundingBox,
-    b_un: &BoundingBox,
-    img_h: i32,
-) -> bool {
-    let img_h = img_h as f32;
-    let (sh, bh) = (s_raw.h as f32, b_raw.h as f32);
-    if bh < img_h * FURIGANA_BIG_MIN_FRAC {
-        return false;
-    }
-    if sh >= bh * FURIGANA_SIZE_RATIO {
-        return false;
-    }
-    if sh >= img_h * FURIGANA_MAX_FRAC {
-        return false;
-    }
-    if s_un.w as f32 >= b_un.w as f32 * FURIGANA_WIDTH_RATIO {
-        return false;
-    }
-    let cx = (s_raw.x + s_raw.x + s_raw.w) / 2;
-    if cx >= b_raw.x && cx <= b_raw.x + b_raw.w {
-        return false;
-    }
-    if (gap_len(s_un.x, s_un.x + s_un.w, b_un.x, b_un.x + b_un.w) as f32)
-        > b_un.w as f32 * FURIGANA_GAP_RATIO
-    {
-        return false;
-    }
-    if (overlap_len(s_raw.y, s_raw.y + s_raw.h, b_raw.y, b_raw.y + b_raw.h) as f32)
-        < sh * FURIGANA_OVERLAP_RATIO
-    {
-        return false;
-    }
-    true
-}
-
-/// Tiny horizontal box right above a much larger horizontal box (#28).
-/// Judged by THINNESS alone, not length: horizontal ruby runs long or short,
-/// but its glyphs are always smaller.
-fn is_ruby_horizontal(
-    s_raw: &BoundingBox,
-    b_raw: &BoundingBox,
-    s_un: &BoundingBox,
-    b_un: &BoundingBox,
-    img_w: i32,
-    img_h: i32,
-) -> bool {
-    let (img_w, img_h) = (img_w as f32, img_h as f32);
-    if (b_raw.w as f32) < img_w * FURIGANA_BIG_MIN_FRAC {
-        return false;
-    }
-    if (s_raw.h as f32) >= b_raw.h as f32 * FURIGANA_THIN_RATIO {
-        return false;
-    }
-    if s_raw.h as f32 >= img_h * FURIGANA_MAX_FRAC {
-        return false;
-    }
-    if (s_un.h as f32) >= b_un.h as f32 * FURIGANA_HSHORT_RATIO {
-        return false;
-    }
-    // Above-ness on RAW geometry: unclip grows both boxes toward each other,
-    // flipping genuinely-above ruby to overlapping.
-    if s_raw.y + s_raw.h > b_raw.y + 2 {
-        return false;
-    }
-    if (b_un.y - (s_un.y + s_un.h)) as f32 > (b_un.h as f32) * FURIGANA_GAP_RATIO {
-        return false;
-    }
-    if (overlap_len(s_raw.x, s_raw.x + s_raw.w, b_raw.x, b_raw.x + b_raw.w) as f32)
-        < s_raw.w as f32 * FURIGANA_OVERLAP_RATIO
-    {
-        return false;
-    }
-    true
-}
-
 /// Mobile `filterFurigana` (#28): keep-flags for likely-furigana boxes.
 /// `raw`/`uncl` are index-aligned (raw contour AABBs vs unclipped boxes).
+/// The geometry rules themselves live in [`crate::furigana`].
 fn filter_furigana(raw: &[BoundingBox], uncl: &[BoundingBox], img_w: i32, img_h: i32) -> Vec<bool> {
     if raw.len() < 2 {
         return vec![true; raw.len()];
@@ -561,10 +468,14 @@ fn filter_furigana(raw: &[BoundingBox], uncl: &[BoundingBox], img_w: i32, img_h:
                 j != i
                     && ((check_vert
                         && is_vertical_box(big)
-                        && is_ruby_vertical(&raw[i], big, &uncl[i], &uncl[j], img_h))
+                        && crate::furigana::is_ruby_vertical(
+                            &raw[i], big, &uncl[i], &uncl[j], img_h,
+                        ))
                         || (check_horiz
                             && !is_vertical_box(big)
-                            && is_ruby_horizontal(&raw[i], big, &uncl[i], &uncl[j], img_w, img_h)))
+                            && crate::furigana::is_ruby_horizontal(
+                                &raw[i], big, &uncl[i], &uncl[j], img_w, img_h,
+                            )))
             })
         })
         .collect()
@@ -1286,6 +1197,7 @@ impl OcrEngine {
             batch_size,
             det_thresh_override: None,
             det_unclip_override: None,
+            det_furigana: false,
         })
     }
 
@@ -1437,9 +1349,15 @@ impl OcrEngine {
         );
 
         // 6-9. Mobile detectRotated's post-fit stages: furigana rejection on
-        // AABB geometry, the local-size filter, the enclosing-blob filter
-        // (#53) and the vertical 5% cross-axis inset.
-        let kept = filter_fitted_quads(&pre_quads, &quads, orig_w as i32, orig_h as i32);
+        // AABB geometry (gated by the #100 switch), the local-size filter, the
+        // enclosing-blob filter (#53) and the vertical 5% cross-axis inset.
+        let kept = filter_fitted_quads(
+            &pre_quads,
+            &quads,
+            orig_w as i32,
+            orig_h as i32,
+            self.det_furigana,
+        );
 
         // The PC-only orientation knobs default to Android behaviour (off).
         let h_down: f32 = std::env::var("DET_H_DOWN")
@@ -2283,7 +2201,7 @@ mod tests {
         });
         let (pre, quads) = components(&map, 240, 240, f32::INFINITY);
         assert_eq!(quads.len(), 3, "ring + two lines");
-        let kept = filter_fitted_quads(&pre, &quads, 240, 240);
+        let kept = filter_fitted_quads(&pre, &quads, 240, 240, true);
         assert_eq!(kept.len(), 2, "the enclosing ring must be dropped");
         for q in &kept {
             assert!(q.w > q.h, "line frames survive: {:?}", q);
@@ -2445,6 +2363,30 @@ mod tests {
             filter_furigana(&raw, &un, 1000, 1000),
             vec![true, false, true],
             "horizontal ruby must be dropped, tall short line kept"
+        );
+    }
+
+    /// #100: the furigana rule is off by default — with the switch off, the
+    /// ruby quad survives the post-fit stages alongside its line.
+    #[test]
+    fn furigana_switch_off_keeps_ruby() {
+        // The mobile horizontal-ruby shape as fitted frames: a 500x60 line
+        // with a 120x24 ruby strip above it.
+        let big = RotatedBox::new(350.0, 330.0, 500.0, 60.0, 0.0, 1.0);
+        let ruby = RotatedBox::new(260.0, 288.0, 120.0, 24.0, 0.0, 1.0);
+        let big_un = RotatedBox::new(350.0, 330.0, 520.0, 80.0, 0.0, 1.0);
+        let ruby_un = RotatedBox::new(260.0, 287.0, 144.0, 42.0, 0.0, 1.0);
+        let pre = vec![big, ruby];
+        let un = vec![big_un, ruby_un];
+        assert_eq!(
+            filter_fitted_quads(&pre, &un, 1000, 1000, true).len(),
+            1,
+            "rule on: the ruby strip is dropped"
+        );
+        assert_eq!(
+            filter_fitted_quads(&pre, &un, 1000, 1000, false).len(),
+            2,
+            "rule off: ruby survives as its own line"
         );
     }
 

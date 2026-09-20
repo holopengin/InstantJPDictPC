@@ -24,6 +24,12 @@ pub struct AppSettings {
     /// panel too (see `run_ocr_viewer` for why the mobile overlay/panel split
     /// has no desktop counterpart).
     pub overlay_font: FontFace,
+    /// #100: mobile's "Filter furigana in screenshots" switch, **off** by
+    /// default — the rule is flaky on camera photos and a wrong drop costs a
+    /// whole line. Off keeps every small contour, so ruby survives as its own
+    /// line. There is no camera mode on desktop, so this is the only furigana
+    /// switch (mobile also has a separate camera key).
+    pub furigana_filter: bool,
 }
 
 impl AppSettings {
@@ -90,6 +96,28 @@ mod tests {
         let settings = AppSettings::load(&dir);
         assert_eq!(settings, AppSettings::default());
         assert_eq!(settings.overlay_font, FontFace::Sans);
+        assert!(!settings.furigana_filter, "the furigana rule ships off");
+    }
+
+    /// #100: the furigana switch round-trips through the store.
+    #[test]
+    fn furigana_filter_round_trips() {
+        let dir = sandbox("furigana");
+        let on = AppSettings {
+            furigana_filter: true,
+            ..AppSettings::default()
+        };
+        on.save(&dir).expect("save on");
+        assert!(AppSettings::load(&dir).furigana_filter);
+
+        let off = AppSettings {
+            furigana_filter: false,
+            ..AppSettings::default()
+        };
+        off.save(&dir).expect("save off");
+        assert!(!AppSettings::load(&dir).furigana_filter);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Selecting serif survives a save/load cycle, and switching back does too.
@@ -98,6 +126,7 @@ mod tests {
         let dir = sandbox("round_trip");
         let serif = AppSettings {
             overlay_font: FontFace::Serif,
+            ..AppSettings::default()
         };
         serif.save(&dir).expect("save serif");
         assert_eq!(AppSettings::load(&dir), serif);
@@ -107,6 +136,7 @@ mod tests {
 
         let sans = AppSettings {
             overlay_font: FontFace::Sans,
+            ..AppSettings::default()
         };
         sans.save(&dir).expect("save sans");
         assert_eq!(AppSettings::load(&dir).overlay_font, FontFace::Sans);
