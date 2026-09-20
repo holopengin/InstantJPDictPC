@@ -35,7 +35,6 @@ impl DictionaryDatabase {
                 name TEXT NOT NULL,
                 priority INTEGER NOT NULL DEFAULT 0,
                 enabled INTEGER NOT NULL DEFAULT 1,
-                built_in INTEGER NOT NULL DEFAULT 0,
                 catalog_id TEXT
             );
 
@@ -73,18 +72,13 @@ impl DictionaryDatabase {
             ",
         )?;
 
-        // #43/#71 follow-up (D1.8): databases created before the bundled
-        // dictionaries existed have no built_in/catalog_id. CREATE TABLE IF
-        // NOT EXISTS is a no-op on those, so the columns are added by hand —
-        // the same ALTER-shape as Android's MIGRATION_3_4 and the catalogId
-        // DDL, chosen over a destructive rebuild so a populated
-        // dictionary.sqlite keeps every imported row.
-        Self::ensure_column(
-            &conn,
-            "dictionary_meta",
-            "built_in",
-            "ALTER TABLE dictionary_meta ADD COLUMN built_in INTEGER NOT NULL DEFAULT 0",
-        )?;
+        // #71 follow-up (D1.8): databases created before the download catalog
+        // existed have no catalog_id. CREATE TABLE IF NOT EXISTS is a no-op on
+        // those, so the column is added by hand — the same ALTER-shape as
+        // Android's catalogId DDL, chosen over a destructive rebuild so a
+        // populated dictionary.sqlite keeps every imported row. (The old
+        // `built_in` column is left in place where it exists and is no longer
+        // read or written: nothing is bundled any more.)
         Self::ensure_column(
             &conn,
             "dictionary_meta",
@@ -117,24 +111,21 @@ impl DictionaryDatabase {
     /// Test convenience wrapper for a plain dictionary row.
     #[cfg(test)]
     pub fn insert_dictionary(&self, name: &str, priority: i32) -> Result<i64> {
-        self.insert_dictionary_with(name, priority, false, None)
+        self.insert_dictionary_with(name, priority, None)
     }
 
     /// Insert a meta row with the full provenance the importer tracks.
-    /// `built_in` starts false for a bundled import and is flipped by
-    /// [`Self::set_dictionary_built_in`] only after every bank has landed.
     pub fn insert_dictionary_with(
         &self,
         name: &str,
         priority: i32,
-        built_in: bool,
         catalog_id: Option<&str>,
     ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO dictionary_meta (name, priority, built_in, catalog_id)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![name, priority, built_in, catalog_id],
+            "INSERT INTO dictionary_meta (name, priority, catalog_id)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![name, priority, catalog_id],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -142,7 +133,7 @@ impl DictionaryDatabase {
     pub fn get_all_dictionaries(&self) -> Result<Vec<DictionaryMeta>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, priority, enabled, built_in, catalog_id
+            "SELECT id, name, priority, enabled, catalog_id
              FROM dictionary_meta ORDER BY priority ASC",
         )?;
         let dicts = stmt
@@ -152,29 +143,11 @@ impl DictionaryDatabase {
                     name: row.get(1)?,
                     priority: row.get(2)?,
                     enabled: row.get::<_, i32>(3)? != 0,
-                    built_in: row.get::<_, i32>(4)? != 0,
-                    catalog_id: row.get(5)?,
+                    catalog_id: row.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(dicts)
-    }
-
-    /// Every dictionary whose name is `family` exactly, or a revision of it
-    /// (`family [..]`) — the stable-title match the catalog describes. Used by
-    /// bundled installs to decide whether a dictionary is already present
-    /// without caring which upstream revision it carries.
-    ///
-    /// The comparison is done in Rust rather than SQL `LIKE`: `_` and `%` in a
-    /// title family would otherwise be wildcard characters. `dictionary_meta`
-    /// holds a handful of rows, so the scan is free.
-    pub fn dictionaries_by_family(&self, family: &str) -> Result<Vec<DictionaryMeta>> {
-        let prefix = format!("{} [", family);
-        Ok(self
-            .get_all_dictionaries()?
-            .into_iter()
-            .filter(|d| d.name == family || d.name.starts_with(&prefix))
-            .collect())
     }
 
     pub fn delete_dictionary(&self, dictionary_id: i64) -> Result<()> {
@@ -243,18 +216,6 @@ impl DictionaryDatabase {
         conn.execute(
             "UPDATE dictionary_meta SET enabled = ?1 WHERE id = ?2",
             [&enabled as &dyn rusqlite::ToSql, &dictionary_id as &dyn rusqlite::ToSql],
-        )?;
-        Ok(())
-    }
-
-    /// Flip the completion marker on a bundled import. Mirrors Android's
-    /// `updateBuiltIn`: it is set only once every bank is written, so a
-    /// half-finished install stays non-built-in and is retried next start.
-    pub fn set_dictionary_built_in(&self, dictionary_id: i64, built_in: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE dictionary_meta SET built_in = ?1 WHERE id = ?2",
-            rusqlite::params![built_in, dictionary_id],
         )?;
         Ok(())
     }
@@ -399,6 +360,20 @@ impl DictionaryDatabase {
 
 }
 
+/// Whether `name` is the stable title `family` itself or a bracketed revision
+/// of it (`family [2026-08-11]`) — the catalog's "already installed" match,
+/// which does not care which upstream revision a row carries. Mirrors the
+/// family rule mobile's `InstalledDictionary` uses.
+///
+/// The comparison is done in Rust rather than SQL `LIKE`: `_` and `%` in a
+/// title family would otherwise be wildcard characters.
+pub fn name_matches_family(name: &str, family: &str) -> bool {
+    name == family
+        || name
+            .strip_prefix(family)
+            .is_some_and(|rest| rest.starts_with(" ["))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,14 +417,14 @@ mod tests {
     }
 
     #[test]
-    fn old_schema_gains_built_in_and_catalog_id_columns() {
+    fn old_schema_gains_catalog_id_column() {
         let dir = std::env::temp_dir().join(format!("ijd_db_migrate_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("old.db");
         {
-            // A pre-bundled-dictionary database: dictionary_meta has only the
-            // original four columns, plus a row that must survive the upgrade.
+            // A pre-catalog database: dictionary_meta has only the original
+            // four columns, plus a row that must survive the upgrade.
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
                 "CREATE TABLE dictionary_meta (
@@ -467,32 +442,20 @@ mod tests {
         let dicts = db.get_all_dictionaries().unwrap();
         assert_eq!(dicts.len(), 1, "migration must not touch existing rows");
         assert_eq!(dicts[0].name, "KANJIDIC [old]");
-        assert!(!dicts[0].built_in);
         assert_eq!(dicts[0].catalog_id, None);
-
-        db.set_dictionary_built_in(dicts[0].id, true).unwrap();
-        assert!(db.get_all_dictionaries().unwrap()[0].built_in);
     }
 
     #[test]
-    fn family_lookup_matches_exact_title_and_bracketed_revision() {
-        let db = temp_db("family");
-        let id = db
-            .insert_dictionary_with("Jitendex.org [2026-08-11]", 0, false, None)
-            .unwrap();
-        let found = db.dictionaries_by_family("Jitendex.org").unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].id, id);
+    fn family_match_accepts_exact_title_and_bracketed_revision() {
+        assert!(name_matches_family("Jitendex.org [2026-08-11]", "Jitendex.org"));
+        assert!(name_matches_family("Jitendex.org", "Jitendex.org"));
+        assert!(name_matches_family("KANJIDIC", "KANJIDIC"));
+        assert!(name_matches_family("KANJIDIC [2026-258]", "KANJIDIC"));
 
         // A different family, and a longer title that only shares the prefix,
         // are not revisions of "Jitendex.org".
-        assert!(db.dictionaries_by_family("Jitendex").unwrap().is_empty());
-        db.insert_dictionary("Jitendex.org Extra", 1).unwrap();
-        assert_eq!(db.dictionaries_by_family("Jitendex.org").unwrap().len(), 1);
-
-        // The exact family title matches too (Kanjium-style titles have no
-        // revision suffix).
-        db.insert_dictionary("KANJIDIC", 2).unwrap();
-        assert_eq!(db.dictionaries_by_family("KANJIDIC").unwrap().len(), 1);
+        assert!(!name_matches_family("Jitendex", "Jitendex.org"));
+        assert!(!name_matches_family("Jitendex.org Extra", "Jitendex.org"));
+        assert!(!name_matches_family("Jitendex.org[old]", "Jitendex.org"));
     }
 }

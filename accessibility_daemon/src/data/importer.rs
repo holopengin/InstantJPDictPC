@@ -31,11 +31,7 @@ pub struct ImportProgress {
 /// Mirrors Android's `importZipStream` keyword arguments.
 #[derive(Debug, Clone, Default)]
 pub struct ImportOptions {
-    /// True for a dictionary bundled with the app. The flag is written to the
-    /// meta row only after every bank has landed (Android's completion
-    /// marker), so an import killed part-way is retried next start.
-    pub built_in: bool,
-    /// Stable id of the catalog/bundled entry this import came from, if any.
+    /// Stable id of the catalog entry this import came from, if any.
     /// `None` for the file picker.
     pub catalog_id: Option<String>,
 }
@@ -61,7 +57,7 @@ impl<'a> DictionaryImporter<'a> {
     }
 
     /// Import a Yomitan dictionary ZIP file, stamping the meta row with the
-    /// provenance in `options` (bundled flag, catalog id). `import_zip` is
+    /// provenance in `options` (catalog id). `import_zip` is
     /// this with [`ImportOptions::default`].
     pub fn import_zip_with<P: AsRef<Path>>(
         &self,
@@ -152,7 +148,6 @@ impl<'a> DictionaryImporter<'a> {
                 dictionary_id = Some(self.db.insert_dictionary_with(
                     &dict_title,
                     max_priority + 1,
-                    false,
                     options.catalog_id.as_deref(),
                 )?);
             }
@@ -205,7 +200,6 @@ impl<'a> DictionaryImporter<'a> {
                     dictionary_id = Some(self.db.insert_dictionary_with(
                         &dict_title,
                         max_priority + 1,
-                        false,
                         options.catalog_id.as_deref(),
                     )?);
                 }
@@ -214,16 +208,6 @@ impl<'a> DictionaryImporter<'a> {
                 entry.read_to_string(&mut content)?;
                 let tags = Self::parse_tag_bank(&content, did)?;
                 self.db.insert_tags(&tags)?;
-            }
-        }
-
-        // #43: `built_in` is the completion marker, not a label. Flipping it
-        // only after every bank is written means an import killed part-way
-        // leaves a non-built-in row, so the next launch imports again instead
-        // of trusting a half-present dictionary.
-        if options.built_in {
-            if let Some(id) = dictionary_id {
-                self.db.set_dictionary_built_in(id, true)?;
             }
         }
 

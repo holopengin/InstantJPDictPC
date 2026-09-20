@@ -3,17 +3,18 @@
 use iced::{
     alignment::{Horizontal, Vertical},
     widget::{
-        button, checkbox, column, container, row, scrollable, text, Space,
-        Button, Container, Text,
+        button, checkbox, column, container, row, scrollable, text, Button, Column,
+        Container, Space, Text,
     },
     Element, Length, Pixels, Task,
 };
 use std::sync::{Arc, Mutex};
 
 use crate::app_settings::AppSettings;
+use crate::data::catalog::{self, CatalogEntry};
 use crate::data::db::DictionaryDatabase;
 use crate::data::models::DictionaryMeta;
-use crate::data::importer::{DictionaryImporter, ImportProgress};
+use crate::data::importer::{DictionaryImporter, ImportOptions, ImportProgress};
 use futures_timer::Delay;
 use std::time::Duration;
 
@@ -23,6 +24,10 @@ pub enum SettingsMessage {
     ImportDictionary,
     ImportProgress,
     ImportDone(Result<usize, String>),
+    /// #71: one-click install of a catalog entry (download, verify, import).
+    InstallCatalog(String),
+    InstallProgress,
+    InstallDone(Result<usize, String>),
     RefreshStatus,
     DeleteDictionary(i64),
     ToggleEnabled(i64, bool),
@@ -31,19 +36,22 @@ pub enum SettingsMessage {
     /// #100: the furigana (ruby) rule switch. The frontend owns the settings
     /// file; this window renders the checkbox and reports the change.
     SetFuriganaFilter(bool),
-    OpenDownloadPage,
     CloseWindow,
 }
 
-/// Dictionaries the user may manage. Built-ins (the bundled zips) are app
-/// state, not user state — Android hides them from the manager, and hiding
-/// them here also keeps ▲/▼ from swapping with an invisible row.
-fn user_dictionaries(db: &DictionaryDatabase) -> Vec<DictionaryMeta> {
-    db.get_all_dictionaries()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|d| !d.built_in)
-        .collect()
+/// Progress of a catalog install: the download phase, then the import phase
+/// (whose `DONE:`/`ERROR:` sentinel marks completion, like the file picker).
+#[derive(Debug, Clone)]
+enum InstallProgress {
+    Download { written: u64, total: u64 },
+    Import(ImportProgress),
+}
+
+/// Every dictionary the manager lists. Nothing is app-owned any more (the
+/// vendored zips are gone): catalog installs and file-picker imports are both
+/// ordinary rows the user can reorder or delete.
+fn all_dictionaries(db: &DictionaryDatabase) -> Vec<DictionaryMeta> {
+    db.get_all_dictionaries().unwrap_or_default()
 }
 
 pub struct SettingsWindow {
@@ -62,6 +70,14 @@ pub struct SettingsWindow {
     import_progress: Option<ImportProgress>,
     import_shared: Arc<Mutex<Option<ImportProgress>>>,
     import_join_handle: Option<std::thread::JoinHandle<Result<usize, String>>>,
+
+    // Catalog install progress (#71)
+    catalog: &'static [CatalogEntry],
+    install_running: bool,
+    install_entry: Option<String>,
+    install_progress: Option<InstallProgress>,
+    install_shared: Arc<Mutex<Option<InstallProgress>>>,
+    install_join_handle: Option<std::thread::JoinHandle<Result<usize, String>>>,
 }
 
 impl SettingsWindow {
@@ -77,6 +93,12 @@ impl SettingsWindow {
             import_progress: None,
             import_shared: Arc::new(Mutex::new(None)),
             import_join_handle: None,
+            catalog: catalog::entries(),
+            install_running: false,
+            install_entry: None,
+            install_progress: None,
+            install_shared: Arc::new(Mutex::new(None)),
+            install_join_handle: None,
         };
         window.refresh();
         window
@@ -84,7 +106,7 @@ impl SettingsWindow {
 
     fn refresh(&mut self) {
         self.entry_count = self.db.get_entry_count().unwrap_or(0) as usize;
-        self.dictionaries = user_dictionaries(&self.db);
+        self.dictionaries = all_dictionaries(&self.db);
     }
 
     pub fn update(&mut self, message: SettingsMessage) -> Task<SettingsMessage> {
@@ -283,10 +305,144 @@ impl SettingsWindow {
                 Task::none()
             }
 
-            SettingsMessage::OpenDownloadPage => {
-                let _ = open::that("https://github.com/yomidevs/jmdict-yomitan");
+            SettingsMessage::InstallCatalog(id) => {
+                if self.busy {
+                    return Task::none();
+                }
+                let Some(entry) = self.catalog.iter().find(|e| e.id == id).cloned() else {
+                    return Task::none();
+                };
+                self.status_text = format!("Downloading {}...", entry.name);
+                self.install_progress = None;
+                *self.install_shared.lock().unwrap() = None;
+                println!(
+                    "[Catalog] Installing '{}' from {} ({})",
+                    entry.name, entry.source, entry.license
+                );
+
+                let db = Arc::clone(&self.db);
+                let shared = Arc::clone(&self.install_shared);
+                let name = entry.name.clone();
+
+                let join_handle = std::thread::spawn(move || -> Result<usize, String> {
+                    let dest = std::env::temp_dir().join(format!("ijd-catalog-{}.zip", entry.id));
+                    let result = (|| -> Result<usize, String> {
+                        // Download and verify first: nothing reaches the
+                        // database until the pinned size and SHA-256 match.
+                        {
+                            let shared = Arc::clone(&shared);
+                            let mut on_progress = move |written: u64, total: u64| {
+                                *shared.lock().unwrap() =
+                                    Some(InstallProgress::Download { written, total });
+                            };
+                            crate::data::download::download_verified(
+                                &entry,
+                                &dest,
+                                &mut on_progress,
+                            )
+                            .map_err(|e| format!("{e:#}"))?;
+                        }
+
+                        let importer = DictionaryImporter::new(&db);
+                        let shared_for_cb = Arc::clone(&shared);
+                        let cb = Box::new(move |p: ImportProgress| {
+                            *shared_for_cb.lock().unwrap() = Some(InstallProgress::Import(p));
+                        });
+                        importer
+                            .import_zip_with(
+                                &dest,
+                                Some(cb),
+                                ImportOptions {
+                                    catalog_id: Some(entry.id.clone()),
+                                },
+                            )
+                            .map_err(|e| e.to_string())
+                    })();
+                    let _ = std::fs::remove_file(&dest);
+
+                    // Write the completion sentinel the poll loop watches for,
+                    // on success or failure alike: a failed download must not
+                    // leave the window polling forever.
+                    let final_progress = match &result {
+                        Ok(count) => ImportProgress {
+                            entries_imported: *count,
+                            banks_done: 0,
+                            banks_total: 0,
+                            current_file: format!("DONE:{count}"),
+                        },
+                        Err(e) => ImportProgress {
+                            entries_imported: 0,
+                            banks_done: 0,
+                            banks_total: 0,
+                            current_file: format!("ERROR:{e}"),
+                        },
+                    };
+                    *shared.lock().unwrap() = Some(InstallProgress::Import(final_progress));
+                    result
+                });
+
+                self.install_running = true;
+                self.busy = true;
+                self.install_entry = Some(name);
+                self.install_join_handle = Some(join_handle);
+
+                Task::perform(async {}, |_| SettingsMessage::InstallProgress)
+            }
+
+            SettingsMessage::InstallProgress => {
+                let progress = self.install_shared.lock().unwrap().clone();
+                let done = match &progress {
+                    Some(InstallProgress::Import(p)) => {
+                        p.current_file.starts_with("DONE:") || p.current_file.starts_with("ERROR:")
+                    }
+                    _ => false,
+                };
+
+                if done {
+                    self.install_running = false;
+                    self.busy = false;
+                    self.install_entry = None;
+                    self.install_join_handle = None;
+                    self.install_progress = None;
+                    *self.install_shared.lock().unwrap() = None;
+
+                    let result = match progress {
+                        Some(InstallProgress::Import(p)) => {
+                            if let Some(count) = p.current_file.strip_prefix("DONE:") {
+                                Ok(count.parse().unwrap_or(0))
+                            } else {
+                                Err(p
+                                    .current_file
+                                    .strip_prefix("ERROR:")
+                                    .unwrap_or("Unknown error")
+                                    .to_string())
+                            }
+                        }
+                        _ => Err("Install finished without a result".to_string()),
+                    };
+                    Task::perform(async move { result }, SettingsMessage::InstallDone)
+                } else {
+                    self.install_progress = progress;
+                    Task::perform(
+                        async {
+                            Delay::new(Duration::from_millis(80)).await;
+                        },
+                        |_| SettingsMessage::InstallProgress,
+                    )
+                }
+            }
+
+            SettingsMessage::InstallDone(result) => {
+                match result {
+                    Ok(count) => {
+                        self.status_text = format!("Installed {count} entries");
+                        self.refresh();
+                    }
+                    Err(e) => self.status_text = format!("Install failed: {e}"),
+                }
                 Task::none()
             }
+
             SettingsMessage::CloseWindow => {
                 std::process::exit(0);
             }
@@ -294,7 +450,7 @@ impl SettingsWindow {
     }
 
     fn swap_priority(&self, id: i64, up: bool) {
-        let dicts = user_dictionaries(&self.db);
+        let dicts = all_dictionaries(&self.db);
         let pos = match dicts.iter().position(|d| d.id == id) {
             Some(p) => p,
             None => return,
@@ -362,45 +518,29 @@ impl SettingsWindow {
             );
         }
 
-        // --- Import progress display ---
+        // --- Import / catalog install progress display ---
         if self.import_running {
             if let Some(ref progress) = self.import_progress {
-                let percentage = if progress.banks_total > 0 {
-                    (progress.banks_done as f32 / progress.banks_total as f32) * 100.0
-                } else {
-                    0.0
-                };
-
-                let progress_text = if progress.banks_total > 0 {
-                    format!(
-                        "Importing: {} entries ({} / {} banks, {:.0}%)",
-                        progress.entries_imported,
-                        progress.banks_done,
-                        progress.banks_total,
-                        percentage
-                    )
-                } else {
-                    format!("Importing: {} entries...", progress.entries_imported)
-                };
-
+                content = import_progress_lines(progress, content);
+            }
+            content = content.push(Space::new().height(Pixels(4.0)));
+        }
+        if self.install_running {
+            if let Some(InstallProgress::Download { written, total }) = &self.install_progress {
+                let mb = |b: u64| b as f64 / 1_048_576.0;
                 content = content.push(
-                    Text::new(progress_text)
-                        .size(13)
-                        .style(text::secondary),
+                    Text::new(format!(
+                        "Downloading {}: {:.1} / {:.1} MB",
+                        self.install_entry.as_deref().unwrap_or("dictionary"),
+                        mb(*written),
+                        mb(*total),
+                    ))
+                    .size(13)
+                    .style(text::secondary),
                 );
-
-                // Show current file being processed
-                if !progress.current_file.is_empty() {
-                    let file_name = std::path::Path::new(&progress.current_file)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(&progress.current_file);
-                    content = content.push(
-                        Text::new(format!("  → {file_name}"))
-                            .size(11)
-                            .style(text::secondary),
-                    );
-                }
+            }
+            if let Some(InstallProgress::Import(progress)) = &self.install_progress {
+                content = import_progress_lines(progress, content);
             }
             content = content.push(Space::new().height(Pixels(4.0)));
         }
@@ -410,11 +550,6 @@ impl SettingsWindow {
         // --- Action buttons (disabled while busy) ---
 
         let disabled = self.busy;
-        content = content.push(action_button(
-            "Download Dictionaries",
-            SettingsMessage::OpenDownloadPage,
-            disabled,
-        ));
         content = content.push(action_button(
             "Import Yomitan Dictionary (.zip)",
             SettingsMessage::ImportDictionary,
@@ -456,6 +591,17 @@ impl SettingsWindow {
         content = content.push(Text::new("Dictionaries").size(18).style(text::primary));
         content = content.push(Space::new().height(Pixels(4.0)));
 
+        // --- One-click installs (#71): the dictionaries that used to be
+        // bundled. A row disappears once its family is installed; the
+        // dictionary is then in the list below, where it can be reordered. ---
+        for entry in self
+            .catalog
+            .iter()
+            .filter(|e| !catalog::is_installed(&self.dictionaries, e))
+        {
+            content = content.push(self.catalog_row(entry, disabled));
+        }
+
         // --- Dictionary list (disabled while busy) ---
 
         if self.dictionaries.is_empty() {
@@ -474,6 +620,44 @@ impl SettingsWindow {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// One catalog row: name, description + size, and an Install button.
+    fn catalog_row<'a>(
+        &'a self,
+        entry: &'a CatalogEntry,
+        disabled: bool,
+    ) -> Container<'a, SettingsMessage> {
+        let info = column![
+            Text::new(&entry.name).size(15),
+            Text::new(format!(
+                "{} · {:.1} MB · {}",
+                entry.description,
+                entry.bytes as f64 / 1_048_576.0,
+                entry.license
+            ))
+            .size(12)
+            .style(text::secondary),
+        ]
+        .spacing(2);
+
+        let install_btn = if disabled {
+            Button::new(Text::new("Install").size(13))
+        } else {
+            Button::new(Text::new("Install").size(13))
+                .on_press(SettingsMessage::InstallCatalog(entry.id.clone()))
+        };
+
+        let row_content = row![
+            info,
+            Space::new().width(Length::Fill),
+            install_btn
+        ]
+        .spacing(10)
+        .align_y(Vertical::Center)
+        .width(Length::Fill);
+
+        container(row_content).padding(8).style(container::rounded_box)
     }
 
     fn dict_row<'a>(
@@ -545,4 +729,42 @@ fn action_button<'a>(
     } else {
         btn.on_press(msg)
     }
+}
+
+/// The progress lines both import phases share: entry/bank counts and the
+/// current file (never the `DONE:`/`ERROR:` sentinel, which the poll loop
+/// consumes instead of rendering).
+fn import_progress_lines<'a>(
+    progress: &ImportProgress,
+    mut content: Column<'a, SettingsMessage>,
+) -> Column<'a, SettingsMessage> {
+    let percentage = if progress.banks_total > 0 {
+        (progress.banks_done as f32 / progress.banks_total as f32) * 100.0
+    } else {
+        0.0
+    };
+    let progress_text = if progress.banks_total > 0 {
+        format!(
+            "Importing: {} entries ({} / {} banks, {:.0}%)",
+            progress.entries_imported, progress.banks_done, progress.banks_total, percentage
+        )
+    } else {
+        format!("Importing: {} entries...", progress.entries_imported)
+    };
+    content = content.push(Text::new(progress_text).size(13).style(text::secondary));
+
+    let sentinel = progress.current_file.starts_with("DONE:")
+        || progress.current_file.starts_with("ERROR:");
+    if !progress.current_file.is_empty() && !sentinel {
+        let file_name = std::path::Path::new(&progress.current_file)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&progress.current_file);
+        content = content.push(
+            Text::new(format!("  → {file_name}"))
+                .size(11)
+                .style(text::secondary),
+        );
+    }
+    content
 }
