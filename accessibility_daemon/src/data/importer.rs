@@ -27,11 +27,24 @@ pub struct ImportProgress {
     pub current_file: String,
 }
 
+/// Provenance for an import beyond the plain file-picker path.
+/// Mirrors Android's `importZipStream` keyword arguments.
+#[derive(Debug, Clone, Default)]
+pub struct ImportOptions {
+    /// True for the dictionary bundled with the app. The flag is written to
+    /// the meta row only after every bank has landed (Android's completion
+    /// marker), so an import killed part-way is retried next start, and the
+    /// settings manager keeps the completed row from being deleted.
+    pub built_in: bool,
+    /// Stable id of the catalog entry this import came from, if any.
+    /// `None` for the file picker.
+    pub catalog_id: Option<String>,
+}
+
 /// Imports Yomitan-format dictionary ZIP files into the database.
 pub struct DictionaryImporter<'a> {
     db: &'a DictionaryDatabase,
 }
-
 impl<'a> DictionaryImporter<'a> {
     pub fn new(db: &'a DictionaryDatabase) -> Self {
         Self { db }
@@ -44,6 +57,18 @@ impl<'a> DictionaryImporter<'a> {
         &self,
         path: P,
         progress: Option<ImportProgressFn>,
+    ) -> Result<usize> {
+        self.import_zip_with(path, progress, ImportOptions::default())
+    }
+
+    /// Import a Yomitan dictionary ZIP file, stamping the meta row with the
+    /// provenance in `options` (catalog id). `import_zip` is
+    /// this with [`ImportOptions::default`].
+    pub fn import_zip_with<P: AsRef<Path>>(
+        &self,
+        path: P,
+        progress: Option<ImportProgressFn>,
+        options: ImportOptions,
     ) -> Result<usize> {
         let path = path.as_ref();
         let file = File::open(path).context("Failed to open ZIP file")?;
@@ -72,6 +97,9 @@ impl<'a> DictionaryImporter<'a> {
                 bank_indices.push((i, name, BankType::Term));
             } else if name.starts_with("kanji_bank_") && name.ends_with(".json") {
                 bank_indices.push((i, name, BankType::Kanji));
+            } else if name.starts_with("term_meta_bank_") && name.ends_with(".json") {
+                // #43: pitch-accent (and frequency, skipped) term metadata.
+                bank_indices.push((i, name, BankType::TermMeta));
             }
         }
 
@@ -87,6 +115,7 @@ impl<'a> DictionaryImporter<'a> {
         let mut banks_done = 0;
 
         // Process index.json first if present.
+        let mut declared_title: Option<String> = None;
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).context("Failed to read ZIP entry")?;
             let name = entry.name().to_string();
@@ -98,12 +127,19 @@ impl<'a> DictionaryImporter<'a> {
                 {
                     if let Some(title) = map.get("title").and_then(|v| v.as_str()) {
                         dict_title = title.to_string();
+                        declared_title = Some(title.to_string());
                         if let Some(id) = dictionary_id {
                             self.db.update_dictionary_name(id, &dict_title)?;
                         }
                     }
                 }
             }
+        }
+
+        // Re-importing a dictionary replaces the copy that declares the same
+        // title instead of stacking a duplicate (#43/#71).
+        if let Some(title) = &declared_title {
+            self.db.delete_dictionary_by_name(title)?;
         }
 
         // Process term/kanji banks.
@@ -114,10 +150,12 @@ impl<'a> DictionaryImporter<'a> {
 
             if dictionary_id.is_none() {
                 let max_priority = self.db.get_max_priority()?.unwrap_or(-1);
-                dictionary_id = Some(
-                    self.db
-                        .insert_dictionary(&dict_title, max_priority + 1)?,
-                );
+                dictionary_id = Some(self.db.insert_dictionary_with(
+                    &dict_title,
+                    max_priority + 1,
+                    false,
+                    options.catalog_id.as_deref(),
+                )?);
             }
             let did = dictionary_id.unwrap();
 
@@ -133,6 +171,12 @@ impl<'a> DictionaryImporter<'a> {
                 }
                 BankType::Kanji => {
                     let entries = Self::parse_kanji_bank(&content, did)?;
+                    let c = entries.len();
+                    self.db.insert_entries(&entries)?;
+                    c
+                }
+                BankType::TermMeta => {
+                    let entries = Self::parse_term_meta_bank(&content, did)?;
                     let c = entries.len();
                     self.db.insert_entries(&entries)?;
                     c
@@ -159,16 +203,28 @@ impl<'a> DictionaryImporter<'a> {
             if name.starts_with("tag_bank_") && name.ends_with(".json") {
                 if dictionary_id.is_none() {
                     let max_priority = self.db.get_max_priority()?.unwrap_or(-1);
-                    dictionary_id = Some(
-                        self.db
-                            .insert_dictionary(&dict_title, max_priority + 1)?,
-                    );
+                    dictionary_id = Some(self.db.insert_dictionary_with(
+                        &dict_title,
+                        max_priority + 1,
+                        false,
+                        options.catalog_id.as_deref(),
+                    )?);
                 }
                 let did = dictionary_id.unwrap();
                 let mut content = String::new();
                 entry.read_to_string(&mut content)?;
                 let tags = Self::parse_tag_bank(&content, did)?;
                 self.db.insert_tags(&tags)?;
+            }
+        }
+
+        // `built_in` is the completion marker, not a label. Flipping it only
+        // after every bank is written means an import killed part-way leaves a
+        // non-built-in row, so the next launch imports again instead of
+        // trusting a half-present dictionary.
+        if options.built_in {
+            if let Some(id) = dictionary_id {
+                self.db.set_dictionary_built_in(id, true)?;
             }
         }
 
@@ -203,8 +259,17 @@ impl<'a> DictionaryImporter<'a> {
                 _ => continue,
             };
 
-            let kanji = arr[0].as_str().unwrap_or("").to_string();
-            let reading = arr[1].as_str().unwrap_or("").to_string();
+            // Android's `reader.nextString()` throws on a non-string row, so
+            // the row is dropped; fail the same way instead of inserting an
+            // empty entry.
+            let Some(kanji) = arr[0].as_str() else {
+                continue;
+            };
+            let Some(reading) = arr[1].as_str() else {
+                continue;
+            };
+            let kanji = kanji.to_string();
+            let reading = reading.to_string();
             let tags1 = Self::value_to_string(&arr[2]);
             let rules = Self::value_to_string(&arr[3]);
             let popularity = arr[4].as_i64().unwrap_or(0) as i32;
@@ -308,6 +373,47 @@ impl<'a> DictionaryImporter<'a> {
         Ok(entries)
     }
 
+    /// #43: Yomitan term-meta bank rows are `[term, type, data]`. Only `pitch`
+    /// rows with a reading are kept (freq/ipa skipped); each becomes an entry
+    /// keyed on the term with its reading and the data stored verbatim as the
+    /// definition payload so render-time parsing sees exact integers.
+    fn parse_term_meta_bank(content: &str, dictionary_id: i64) -> Result<Vec<DictionaryEntry>> {
+        let data: Vec<Value> = serde_json::from_str(content)
+            .context("Failed to parse term meta bank JSON")?;
+        let mut entries = Vec::new();
+
+        for item in data {
+            let Some(arr) = item.as_array() else { continue };
+            if arr.len() < 3 {
+                continue;
+            }
+            let term = arr[0].as_str().unwrap_or("");
+            let meta_type = arr[1].as_str().unwrap_or("");
+            let payload = &arr[2];
+            if meta_type != "pitch" || term.is_empty() {
+                continue;
+            }
+            let reading = payload
+                .as_object()
+                .and_then(|m| m.get("reading"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if reading.is_empty() {
+                continue;
+            }
+            entries.push(DictionaryEntry::new(
+                term.to_string(),
+                reading.to_string(),
+                payload.to_string(),
+                String::new(),
+                0,
+                dictionary_id,
+            ));
+        }
+
+        Ok(entries)
+    }
+
     fn parse_tag_bank(content: &str, dictionary_id: i64) -> Result<Vec<DictionaryTag>> {
         let data: Vec<Value> = serde_json::from_str(content)
             .context("Failed to parse tag bank JSON")?;
@@ -357,4 +463,105 @@ impl<'a> DictionaryImporter<'a> {
 enum BankType {
     Term,
     Kanji,
+    TermMeta,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::overlay_state::OcrOverlayState;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ijd_importer_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_zip(path: &Path, files: &[(&str, &str)]) {
+        let file = File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in files {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn reimporting_the_same_zip_replaces_the_dictionary() {
+        let dir = scratch_dir("idempotent");
+        let db = DictionaryDatabase::open(dir.join("dict.db")).unwrap();
+        let zip_path = dir.join("jitendex.zip");
+        write_zip(
+            &zip_path,
+            &[
+                ("index.json", r#"{"title":"Jitendex.org"}"#),
+                (
+                    "term_bank_1.json",
+                    r#"[["支持杭","しじぐい","","",0,["bearing pile"],1,""]]"#,
+                ),
+            ],
+        );
+        let importer = DictionaryImporter::new(&db);
+        importer.import_zip(&zip_path, None).unwrap();
+        importer.import_zip(&zip_path, None).unwrap();
+        assert_eq!(db.get_entry_count().unwrap(), 1);
+        assert_eq!(db.get_all_dictionaries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn term_meta_pitch_rows_are_imported_and_verifiable() {
+        let dir = scratch_dir("pitch");
+        let db = DictionaryDatabase::open(dir.join("dict.db")).unwrap();
+        let zip_path = dir.join("kanjium.zip");
+        write_zip(
+            &zip_path,
+            &[
+                ("index.json", r#"{"title":"Kanjium"}"#),
+                (
+                    "term_meta_bank_1.json",
+                    r#"[["分","pitch",{"reading":"ぶん","pitches":[{"position":1}]}],
+                       ["分","freq",{"value":100}],
+                       ["ふん","pitch",{"reading":"ふん","pitches":[{"position":2}]}]]"#,
+                ),
+            ],
+        );
+        DictionaryImporter::new(&db).import_zip(&zip_path, None).unwrap();
+        let rows = db.find_by_texts(&["分".to_string()]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reading, "ぶん");
+        assert_eq!(
+            OcrOverlayState::pitch_positions_of(&rows[0].definitions),
+            Some(vec![1])
+        );
+    }
+
+    #[test]
+    fn malformed_term_rows_are_dropped() {
+        let dir = scratch_dir("malformed");
+        let db = DictionaryDatabase::open(dir.join("dict.db")).unwrap();
+        let zip_path = dir.join("odd.zip");
+        write_zip(
+            &zip_path,
+            &[
+                ("index.json", r#"{"title":"Odd"}"#),
+                (
+                    "term_bank_1.json",
+                    r#"[[null,"x","","",0,["dropped"],1,""],
+                        [123,"y","","",0,["dropped"],2,""],
+                        ["ok","よみ","","",0,["kept"],3,""]]"#,
+                ),
+            ],
+        );
+        DictionaryImporter::new(&db).import_zip(&zip_path, None).unwrap();
+        let rows = db.find_by_texts(&["ok".to_string()]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kanji, "ok");
+        assert_eq!(db.get_entry_count().unwrap(), 1);
+    }
 }

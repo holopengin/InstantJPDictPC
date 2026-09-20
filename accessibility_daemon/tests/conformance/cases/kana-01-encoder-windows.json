@@ -1,0 +1,14 @@
+{
+  "id": "kana-01-encoder-windows",
+  "kind": "kana",
+  "description": "The kana-size window encoder against the published validation vectors: left context leftmost-first, right context nearest-first, target excluded, line-domain clip at 。, off-ends zero padding. A wrong cell order, padding convention, or missing clip changes these bytes.",
+  "mobile_mirror": "KanaSizeEncoderTest (validation vectors)",
+  "case": {
+    "encoder": [
+      { "text": "かれはいっとう。", "index": 4,
+        "expect_window_head": [0, 0, 0, 0, 227, 129, 139, 0, 227, 130, 140, 0, 227, 129, 175, 0, 227, 129, 132, 0, 227, 129, 168, 0, 227, 129, 134, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
+      { "text": "シーツをあらう。", "index": 2,
+        "expect_window_head": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 227, 130, 183, 0, 227, 131, 188, 0, 227, 130, 146, 0, 227, 129, 130, 0, 227, 130, 137, 0, 227, 129, 134, 0, 0, 0, 0, 0] }
+    ]
+  }
+}

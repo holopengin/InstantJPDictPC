@@ -41,6 +41,22 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NCNN_PC_DIR");
 
     // ------------------------------------------------------------------
+    // Kana small/large model (#44) C ABI (native/kana_size)
+    // ------------------------------------------------------------------
+    // Separate from the shared PP-OCR core on purpose: this model is not part
+    // of it (the mobile side has a JNI wrapper, not a core file), but it links
+    // the same pinned ncnn fork.
+    cc::Build::new()
+        .cpp(true)
+        .std("c++17")
+        .warnings(false)
+        .include(&ncnn_include_dir)
+        .include(manifest_dir.join("native/kana_size"))
+        .file(manifest_dir.join("native/kana_size/kana_size_capi.cpp"))
+        .compile("kana_size");
+    println!("cargo:rerun-if-changed=native/kana_size");
+
+    // ------------------------------------------------------------------
     // Assets -> target/{profile}/assets (existing behaviour)
     // ------------------------------------------------------------------
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -75,6 +91,23 @@ fn main() {
             Ok(()) => println!("cargo:warning=Copied assets to {:?}", dest_dir),
             Err(e) => panic!("Failed to copy assets: {}", e),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Fonts -> target/{profile}/fonts (next to the executable)
+    // ------------------------------------------------------------------
+    // overlay_font::find_font_path()/find_bold_font_path() check exe_dir/fonts
+    // first, so copying here keeps every bundled face (sans + serif, plus the
+    // sans bold companion) discoverable regardless of the working directory
+    // (dev builds, systemd app launches, AppImage).
+    let fonts_src = manifest_dir.join("fonts");
+    let fonts_dest = target_dir.join(&profile).join("fonts");
+    if fonts_src.exists() {
+        println!("cargo:rerun-if-changed=fonts/");
+        if let Err(e) = copy_dir_all(&fonts_src, &fonts_dest) {
+            panic!("Failed to copy fonts: {}", e);
+        }
+        println!("cargo:warning=Copied fonts to {:?}", fonts_dest);
     }
 }
 

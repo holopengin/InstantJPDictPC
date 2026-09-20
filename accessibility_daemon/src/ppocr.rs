@@ -45,6 +45,12 @@ pub struct PpocrResult {
     /// crop). Exact, unlike `seq_len_total` which counts padded model
     /// timesteps: the content only spans `target_w` of `model_w`.
     pub step_px: f32,
+    /// Top-K alternatives for EVERY timestep, blanks included, descending by
+    /// score — mobile `PPOcrResult.rawAlternatives`. One inner vec per
+    /// timestep; blank class 0 decodes to `'\u{3000}'` like mobile, so
+    /// `re_decode_raw_alternatives` can tell blank from space. The cache that
+    /// makes a re-decode possible without re-running the model.
+    pub raw_alternatives: Vec<Vec<(char, f32)>>,
 }
 
 impl PpocrResult {
@@ -55,6 +61,7 @@ impl PpocrResult {
             char_cols: Vec::new(),
             seq_len_total: 0,
             step_px: 0.0,
+            raw_alternatives: Vec::new(),
         }
     }
 }
@@ -133,30 +140,105 @@ fn peak_offset(v0: f32, v1: f32, v2: f32) -> f32 {
     (0.5f32 * (v0 - v2) / denom).clamp(-0.5, 0.5)
 }
 
-/// Top-15 char alternatives for one timestep from full logits, descending.
-fn top15_alternatives(vocab: &[String], remap: &[i32], slice: &[f32]) -> Vec<(char, f32)> {
-    let mut scored: Vec<(usize, f32)> = slice.iter().copied().enumerate().collect();
-    scored.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1)
+/// Mobile `OcrEngine.top15Alternatives`' heap order: a Java `PriorityQueue`
+/// (binary min-heap by score, lowest index not privileged) fed every class id
+/// and polled whenever it exceeds TOP_K, then read in backing-array order.
+/// Reproduced here because the final stable sort's tie order depends on it.
+struct JavaMinHeap<'a> {
+    data: Vec<usize>,
+    score: &'a [f32],
+}
+
+impl JavaMinHeap<'_> {
+    fn add(&mut self, k: usize) {
+        self.data.push(k);
+        let mut child = self.data.len() - 1;
+        while child > 0 {
+            let parent = (child - 1) / 2;
+            // Java siftUp breaks on compare(key, parent) >= 0.
+            if self.score[self.data[child]] >= self.score[self.data[parent]] {
+                break;
+            }
+            self.data.swap(child, parent);
+            child = parent;
+        }
+    }
+
+    fn poll(&mut self) -> Option<usize> {
+        let n = self.data.len();
+        if n == 0 {
+            return None;
+        }
+        let result = self.data[0];
+        let last = self.data.pop().unwrap();
+        if n > 1 {
+            self.data[0] = last;
+            let mut parent = 0usize;
+            loop {
+                let left = 2 * parent + 1;
+                if left >= self.data.len() {
+                    break;
+                }
+                let mut child = left;
+                let right = left + 1;
+                if right < self.data.len()
+                    && self.score[self.data[right]] < self.score[self.data[left]]
+                {
+                    child = right;
+                }
+                // Java siftDown breaks on compare(key, child) <= 0.
+                if self.score[self.data[parent]] <= self.score[self.data[child]] {
+                    break;
+                }
+                self.data.swap(parent, child);
+                parent = child;
+            }
+        }
+        Some(result)
+    }
+}
+
+/// Mobile `top15Alternatives` index order: heap selection + stable
+/// descending sort (see `JavaMinHeap`).
+fn java_topk_order(slice: &[f32], k: usize) -> Vec<usize> {
+    let mut heap = JavaMinHeap { data: Vec::new(), score: slice };
+    for i in 0..slice.len() {
+        heap.add(i);
+        if heap.data.len() > k {
+            heap.poll();
+        }
+    }
+    let mut order = heap.data;
+    order.sort_by(|&a, &b| {
+        slice[b]
+            .partial_cmp(&slice[a])
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
     });
-    scored
+    order.truncate(k);
+    order
+}
+
+/// Top-15 char alternatives for one timestep from full logits, in mobile's
+/// exact order: heap selection, then a stable descending sort — so equal
+/// scores keep the Java heap's backing-array order (D6.1).
+fn top15_alternatives(vocab: &[String], remap: &[i32], slice: &[f32]) -> Vec<(char, f32)> {
+    java_topk_order(slice, top_k())
         .into_iter()
-        .take(top_k())
-        .map(|(idx, v)| (decode_char(vocab, remap_class(remap, idx as i32)), v))
+        .map(|idx| (decode_char(vocab, remap_class(remap, idx as i32)), slice[idx]))
         .collect()
 }
 
 /// Greedy CTC decode from native top-15 lists (#42): entry 0 is the argmax
 /// (native emits descending, lowest-id wins ties); blank/space tests use the
 /// remapped pruned indices. Mirrors mobile `ctcDecodeTopK` with
-/// blankThreshold 0 (pure greedy).
+/// blankThreshold 0 (pure greedy). `top_chars` is kept as the result's
+/// `raw_alternatives` (mobile passes the same lists to `ctcDecodeTopK` and
+/// copies them onto the result), so it is taken by value.
 fn ctc_decode_topk(
     vocab: &[String],
     remap: &[i32],
     top_pruned: &[Vec<i32>],
-    top_chars: &[Vec<(char, f32)>],
+    top_chars: Vec<Vec<(char, f32)>>,
     seq_len: usize,
 ) -> PpocrResult {
     let mut text = String::new();
@@ -217,11 +299,14 @@ fn ctc_decode_topk(
         char_cols,
         seq_len_total: seq_len,
         step_px: 0.0,
+        raw_alternatives: top_chars,
     }
 }
 
 /// Greedy CTC decode from full logits, mobile `ctcDecode` with
-/// blankThreshold 0.
+/// blankThreshold 0. Builds `raw_alternatives` per timestep exactly like the
+/// mobile fallback (`top15Alternatives(cropLogits[t])`), so a re-decode works
+/// the same on both paths.
 fn ctc_decode_full(
     vocab: &[String],
     remap: &[i32],
@@ -232,6 +317,7 @@ fn ctc_decode_full(
     let mut text = String::new();
     let mut alts: Vec<Vec<(char, f32)>> = Vec::new();
     let mut char_cols: Vec<f32> = Vec::new();
+    let mut raw_alternatives: Vec<Vec<(char, f32)>> = Vec::with_capacity(seq_len);
     let mut prev_class: i32 = 0;
 
     let wval = |tt: usize, cls: i32| -> Option<f32> {
@@ -240,8 +326,12 @@ fn ctc_decode_full(
     };
 
     for t in 0..seq_len {
-        let Some(slice) = logits.get(t) else { continue };
+        let Some(slice) = logits.get(t) else {
+            raw_alternatives.push(Vec::new());
+            continue;
+        };
         if slice.len() < num_classes {
+            raw_alternatives.push(Vec::new());
             continue;
         }
         let (max_idx, &max_val) = slice
@@ -259,6 +349,7 @@ fn ctc_decode_full(
         };
         let class_idx = remap_class(remap, max_idx as i32);
         let indexed = top15_alternatives(vocab, remap, slice);
+        raw_alternatives.push(indexed.clone());
 
         if class_idx == 0 {
             prev_class = 0;
@@ -286,6 +377,7 @@ fn ctc_decode_full(
         char_cols,
         seq_len_total: seq_len,
         step_px: 0.0,
+        raw_alternatives,
     }
 }
 
@@ -355,6 +447,19 @@ fn infer_resized(
     vocab: &[String],
     remap: &[i32],
 ) -> Result<PpocrResult> {
+    infer_resized_with_topk(rec, src, target_w, vocab, remap, None)
+}
+
+/// `topk_override` is a test seam for the native top-K call (D5.1: a top-K
+/// failure must degrade to full logits, not drop the line).
+fn infer_resized_with_topk(
+    rec: &RecNet,
+    src: &DynamicImage,
+    target_w: u32,
+    vocab: &[String],
+    remap: &[i32],
+    topk_override: Option<Result<Vec<f32>>>,
+) -> Result<PpocrResult> {
     let model_w = target_w.div_ceil(REC_STRIDE) * REC_STRIDE;
     let seq_len = (model_w / REC_STRIDE) as usize;
     // Exact source px per timestep: the resized content spans `target_w`
@@ -366,24 +471,41 @@ fn infer_resized(
     let input = build_rec_input(rgb.as_raw(), target_w, REC_TARGET_H, model_w);
 
     let k = top_k();
-    let packed = rec.infer_topk(&input, model_w as usize, REC_TARGET_H as usize)?;
-    let packed_ok = packed.len() == seq_len * k * 2
-        && !remap.is_empty()
-        && (0..seq_len * k).all(|i| {
-            let id = packed[i * 2] as i32;
-            id >= 0 && (id as usize) < remap.len()
-        });
+    // Mobile degrades to full logits when the native top-K entry fails
+    // (`UnsatisfiedLinkError` there); a top-K error must not drop the line.
+    let packed = match topk_override {
+        Some(result) => result,
+        None => rec.infer_topk(&input, model_w as usize, REC_TARGET_H as usize),
+    };
+    let packed = match packed {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("[PP-OCR] rec topK failed ({e}) — trying full logits");
+            None
+        }
+    };
+    let packed_ok = packed.as_ref().is_some_and(|packed| {
+        packed.len() == seq_len * k * 2
+            && !remap.is_empty()
+            && (0..seq_len * k).all(|i| {
+                let id = packed[i * 2] as i32;
+                id >= 0 && (id as usize) < remap.len()
+            })
+    });
 
     if !packed_ok {
         // Full-logits fallback: downloads seqLen×numClasses floats, then
-        // decodes identically (used when native top-K layout/ids disagree
-        // with the loaded remap, e.g. after a head re-prune).
-        if packed.len() != seq_len * k * 2 {
-            eprintln!(
-                "[PP-OCR] rec topK bad size {} (want {}) — trying full logits",
-                packed.len(),
-                seq_len * k * 2
-            );
+        // decodes identically (used when native top-K fails or its
+        // layout/ids disagree with the loaded remap, e.g. after a head
+        // re-prune).
+        if let Some(packed) = &packed {
+            if packed.len() != seq_len * k * 2 {
+                eprintln!(
+                    "[PP-OCR] rec topK bad size {} (want {}) — trying full logits",
+                    packed.len(),
+                    seq_len * k * 2
+                );
+            }
         }
         let flat = rec.infer(&input, model_w as usize, REC_TARGET_H as usize)?;
         let num_out = remap.len();
@@ -404,6 +526,7 @@ fn infer_resized(
         return Ok(decoded);
     }
 
+    let packed = packed.expect("packed_ok checked above");
     let mut top_pruned: Vec<Vec<i32>> = Vec::with_capacity(seq_len);
     let mut top_chars: Vec<Vec<(char, f32)>> = Vec::with_capacity(seq_len);
     for t in 0..seq_len {
@@ -418,7 +541,7 @@ fn infer_resized(
         top_pruned.push(ids);
         top_chars.push(chars);
     }
-    let mut decoded = ctc_decode_topk(vocab, remap, &top_pruned, &top_chars, seq_len);
+    let mut decoded = ctc_decode_topk(vocab, remap, &top_pruned, top_chars, seq_len);
     decoded.step_px = step_px;
     Ok(decoded)
 }
@@ -438,6 +561,9 @@ struct Chunk {
     chars: Vec<char>,
     char_cols: Vec<f32>,
     alts: Vec<Vec<(char, f32)>>,
+    /// Full per-timestep top-K of the chunk (mobile `rawAltsPerTimestep`);
+    /// phase 2 concatenates every chunk's list onto the result, like mobile.
+    raw_alts: Vec<Vec<(char, f32)>>,
     seq_len: usize,
     /// Source px per chunk-local timestep (for the single-chunk fast path).
     step_px: f32,
@@ -510,6 +636,7 @@ fn stitch_long_line(
             chars,
             char_cols: decoded.char_cols,
             alts: decoded.alternatives,
+            raw_alts: decoded.raw_alternatives,
             seq_len,
             step_px: decoded.step_px,
             offset_px: pos as f32,
@@ -543,6 +670,7 @@ fn stitch_long_line(
             char_cols: c.char_cols.clone(),
             seq_len_total: c.seq_len,
             step_px: c.step_px,
+            raw_alternatives: c.raw_alts.clone(),
         }));
     }
 
@@ -628,6 +756,10 @@ fn stitch_phase2(
     let mut alts: Vec<Vec<(char, f32)>> = chunks[0].alts.clone();
     let mut cols: Vec<f32> = chunks[0].char_cols.clone();
     let mut global: Vec<f32> = centers[0].clone();
+    // Mobile `stitchedRawAll`: per-chunk raw lists concatenated, never
+    // truncated/re-based (the walk in `re_decode_raw_alternatives` simply
+    // mismatches the stitched text and yields nothing, like mobile's).
+    let mut stitched_raw: Vec<Vec<(char, f32)>> = chunks[0].raw_alts.clone();
 
     for i in 1..chunks.len() {
         let curr = &chunks[i];
@@ -649,6 +781,7 @@ fn stitch_phase2(
                     global.push(cand_px);
                 }
             }
+            stitched_raw.extend(curr.raw_alts.iter().cloned());
             continue;
         }
 
@@ -737,6 +870,7 @@ fn stitch_phase2(
                 }
             }
         }
+        stitched_raw.extend(curr.raw_alts.iter().cloned());
     }
 
     // Collapse double spaces. Mobile rewrites the text only; we drop the
@@ -762,6 +896,7 @@ fn stitch_phase2(
         char_cols: cols,
         seq_len_total: total_seq_len,
         step_px: timestep_px,
+        raw_alternatives: stitched_raw,
     }
 }
 
@@ -779,6 +914,101 @@ pub fn recognize_ppocr_batch(
         results.push(recognize_crop(rec, crop, vocab, remap)?);
     }
     Ok(results)
+}
+
+// ——— Re-decode from cached raw alternatives (no model) ———
+
+/// Model-free re-decode output: text, per-emitted-character alternatives and
+/// fractional CTC columns, ready to rebuild a `LineResult`.
+#[allow(dead_code)] // only reached through `DetectedAnnotation::re_decode_line` (unwired yet)
+#[derive(Debug, Clone)]
+pub struct ReDecodedLine {
+    pub text: String,
+    pub alternatives: Vec<Vec<(char, f32)>>,
+    pub char_cols: Vec<f32>,
+}
+
+/// Mobile `OcrEngine.reDecodeLineResult`'s walk, without the `LineResult`
+/// plumbing: greedy CTC over the cached
+/// [`raw_alternatives`](PpocrResult::raw_alternatives) — entry 0 is the
+/// argmax, `'\u{3000}'` is the blank marker (so blank resets the collapse
+/// state), a space never collapses, any other character collapses only
+/// against the immediately preceding emitted character. Emits at most one
+/// character per timestep; `alternatives` stays index-aligned with `text`.
+/// Columns carry the winner's own score at the neighbouring timesteps
+/// (matched by character, absent → integer column), like the live decode —
+/// except that the live full-logits decode reads the neighbour's whole row,
+/// so it can interpolate from a class outside the neighbour's top-K while
+/// this walk cannot (mobile's `ctcDecode.wval` vs `reDecodeLineResult.wval`).
+/// Vertical lines get the emit path's punctuation normalisation applied to
+/// the text and to every alternative entry, so cached pre-fix raw data cannot
+/// reintroduce ASCII `?`/horizontal `…`.
+///
+/// `None` when nothing is cached (mobile returns the line unchanged).
+#[allow(dead_code)] // only reached through `DetectedAnnotation::re_decode_line` (unwired yet)
+pub fn re_decode_raw_alternatives(
+    raw: &[Vec<(char, f32)>],
+    is_vertical: bool,
+) -> Option<ReDecodedLine> {
+    if raw.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    let mut new_alts: Vec<Vec<(char, f32)>> = Vec::new();
+    let mut char_cols: Vec<f32> = Vec::new();
+    let mut prev_char: Option<char> = None;
+
+    // Winner score at a neighbouring timestep, matched by character
+    // (mobile `wval`; first match wins).
+    let wval = |t: usize, ch: char| -> Option<f32> {
+        raw.get(t)?
+            .iter()
+            .find(|(c, _)| *c == ch)
+            .map(|(_, s)| *s)
+    };
+    let frac_for = |t: usize, ch: char, v1: f32| -> f32 {
+        let w0 = if t > 0 { wval(t - 1, ch) } else { None };
+        match (w0, wval(t + 1, ch)) {
+            (Some(w0), Some(w2)) => peak_offset(w0, v1, w2),
+            _ => 0.0,
+        }
+    };
+
+    for (t, alts) in raw.iter().enumerate() {
+        let Some(&(top_char, top_score)) = alts.first() else {
+            continue;
+        };
+        if top_char == '\u{3000}' {
+            // Blank: resets the repeat state but is never emitted.
+            prev_char = None;
+        } else if top_char == ' ' {
+            text.push(' ');
+            prev_char = Some(' ');
+            char_cols.push(t as f32 + frac_for(t, ' ', top_score));
+            new_alts.push(alts.clone());
+        } else if prev_char == Some(top_char) {
+            // collapse repeat
+        } else {
+            text.push(top_char);
+            char_cols.push(t as f32 + frac_for(t, top_char, top_score));
+            new_alts.push(alts.clone());
+            prev_char = Some(top_char);
+        }
+    }
+
+    if is_vertical {
+        text = crate::util::japanese::vertical_punctuation(&text);
+        for alts in new_alts.iter_mut() {
+            for (c, _) in alts.iter_mut() {
+                *c = crate::util::japanese::vertical_punctuation_char(*c);
+            }
+        }
+    }
+    Some(ReDecodedLine {
+        text,
+        alternatives: new_alts,
+        char_cols,
+    })
 }
 
 #[cfg(test)]
@@ -865,6 +1095,12 @@ mod tests {
             "charCols/text lengths differ: {} vs {}",
             res.char_cols.len(),
             res.text.chars().count()
+        );
+        // Stitched lines still cache raw alternatives (mobile concatenates
+        // every chunk's per-timestep lists onto the result).
+        assert!(
+            !res.raw_alternatives.is_empty(),
+            "stitched lines must keep the raw cache"
         );
         assert!(
             glyphs.chars().count() * 100 >= expected.chars().count() * 80,
@@ -1042,5 +1278,263 @@ mod tests {
             .collect();
         let from_full = ctc_decode_full(&f.vocab, &f.remap, &logits, num_out, seq_len);
         assert_eq!(via_decode.text, from_full.text);
+
+        // Both paths cache one descending top-K list per timestep, and the
+        // re-decode walks it back to the same characters — the raw shape the
+        // mobile re-decode contract assumes.
+        assert_eq!(via_decode.raw_alternatives.len(), via_decode.seq_len_total);
+        for raw in &via_decode.raw_alternatives {
+            assert_eq!(raw.len(), k, "one top-K list per timestep");
+            assert!(raw.windows(2).all(|w| w[0].1 >= w[1].1), "descending");
+        }
+        assert_eq!(from_full.raw_alternatives.len(), seq_len);
+        let re = re_decode_raw_alternatives(&via_decode.raw_alternatives, false).unwrap();
+        assert_eq!(re.text, via_decode.text);
+        assert_eq!(re.alternatives, via_decode.alternatives);
+        // The top-K live decode also matches neighbours inside the top-K, so
+        // its columns round-trip exactly on this line.
+        assert_eq!(re.char_cols, via_decode.char_cols);
+        let re_full = re_decode_raw_alternatives(&from_full.raw_alternatives, false).unwrap();
+        assert_eq!(re_full.text, from_full.text);
+        assert_eq!(re_full.alternatives, from_full.alternatives);
+        // The full-logits live decode reads the neighbour's WHOLE row, so it
+        // can interpolate from a class the neighbour's top-15 dropped; the
+        // re-decode only has the cache and falls back to the integer column
+        // (mobile's `ctcDecode.wval` vs `reDecodeLineResult.wval` asymmetry).
+        // Both columns still name the same winner timestep.
+        assert_eq!(re_full.char_cols.len(), from_full.char_cols.len());
+        for (a, b) in re_full.char_cols.iter().zip(&from_full.char_cols) {
+            assert!((a - b).abs() < 1.0, "re-decode column {a} vs live {b}");
+        }
+    }
+
+    /// D6.1: mobile's alternative tie order is the Java PriorityQueue's
+    /// backing-array order after a stable descending sort. Expected orders
+    /// were generated by running the exact Android code (PriorityQueue +
+    /// `sortedByDescending`) on the JDK.
+    #[test]
+    fn topk_order_matches_java_priority_queue() {
+        assert_eq!(java_topk_order(&[0.5, 0.5, 0.5], 2), vec![2, 1]);
+        assert_eq!(java_topk_order(&[0.1, 0.9, 0.5, 0.5], 3), vec![1, 3, 2]);
+        assert_eq!(
+            java_topk_order(
+                &[
+                    0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.0, 1.0, 0.9, 0.9,
+                    0.5, 0.5, 0.5, 0.2, 0.2, 0.1
+                ],
+                15
+            ),
+            vec![9, 10, 11, 8, 12, 13, 7, 6, 5, 14, 16, 4, 15, 3, 2]
+        );
+        assert_eq!(
+            java_topk_order(
+                &[
+                    0.7, 0.7, 0.3, 0.3, 0.9, 0.9, 0.1, 0.1, 0.5, 0.5, 0.5, 0.5, 0.2, 0.8,
+                    0.8, 0.4, 0.4, 0.6, 0.6, 0.6, 0.05, 0.95, 0.95, 0.35, 0.35, 0.75, 0.75,
+                    0.15, 0.15, 0.55, 0.55, 0.25, 0.65, 0.65, 0.45, 0.45, 0.85, 0.85, 0.0,
+                    1.0
+                ],
+                15
+            ),
+            vec![39, 21, 22, 4, 5, 36, 37, 13, 14, 26, 25, 1, 0, 33, 32]
+        );
+    }
+
+    /// D5.1: a failing native top-K entry degrades to full logits and still
+    /// decodes the line (mobile catches `UnsatisfiedLinkError` there).
+    #[test]
+    fn topk_failure_falls_back_to_full_logits() {
+        let f = fixture();
+        let img = image::open(repo_path("test_images/synth/line_03_h.png")).unwrap();
+        let (w, h) = img.dimensions();
+        let target_w = ((w as f32 * REC_TARGET_H as f32 / h as f32).round() as u32).max(4);
+        let normal = infer_resized(&f.rec, &img, target_w, &f.vocab, &f.remap).unwrap();
+        let fallback = infer_resized_with_topk(
+            &f.rec,
+            &img,
+            target_w,
+            &f.vocab,
+            &f.remap,
+            Some(Err(anyhow::anyhow!("simulated native top-K failure"))),
+        )
+        .unwrap();
+        assert!(!fallback.text.is_empty(), "fallback dropped the line");
+        assert_eq!(normal.text, fallback.text);
+        // The fallback caches a full raw list too, and it re-decodes to the
+        // same line (mobile builds `rawAlts` on both paths).
+        assert_eq!(fallback.raw_alternatives.len(), fallback.seq_len_total);
+        assert!(fallback.raw_alternatives.iter().all(|r| r.len() == top_k()));
+        let re = re_decode_raw_alternatives(&fallback.raw_alternatives, false).unwrap();
+        assert_eq!(re.text, fallback.text);
+        assert_eq!(re.alternatives, fallback.alternatives);
+    }
+
+    // ——— raw alternatives + re-decode (no model) ———
+
+    /// One synthetic CTC timestep: `(class, char, score)` entries, entry 0 the
+    /// argmax. Class ids drive the live decode (blank 0, space 18709); the
+    /// chars drive the re-decode walk — mobile's `topPruned`/`topChars` split.
+    fn step(entries: &[(i32, char, f32)]) -> (Vec<i32>, Vec<(char, f32)>) {
+        (
+            entries.iter().map(|&(c, _, _)| c).collect(),
+            entries.iter().map(|&(_, ch, s)| (ch, s)).collect(),
+        )
+    }
+
+    const TEST_VOCAB: [&str; 5] = ["あ", "い", "う", "え", "お"];
+
+    fn decode_topk(steps: &[(Vec<i32>, Vec<(char, f32)>)]) -> PpocrResult {
+        let vocab: Vec<String> = TEST_VOCAB.iter().map(|s| s.to_string()).collect();
+        let remap: Vec<i32> = (0..=TEST_VOCAB.len() as i32).collect();
+        let top_pruned: Vec<Vec<i32>> = steps.iter().map(|(p, _)| p.clone()).collect();
+        let top_chars: Vec<Vec<(char, f32)>> = steps.iter().map(|(_, c)| c.clone()).collect();
+        ctc_decode_topk(&vocab, &remap, &top_pruned, top_chars, steps.len())
+    }
+
+    fn re_decode(steps: &[(Vec<i32>, Vec<(char, f32)>)], is_vertical: bool) -> ReDecodedLine {
+        let raw: Vec<Vec<(char, f32)>> = steps.iter().map(|(_, c)| c.clone()).collect();
+        re_decode_raw_alternatives(&raw, is_vertical).expect("raw is not empty")
+    }
+
+    /// The top-K decode's text/columns and the raw cache it leaves behind: one
+    /// descending list per timestep, blanks included, entry 0 the argmax.
+    #[test]
+    fn topk_decode_pins_text_cols_and_raw_shape() {
+        let steps = [
+            step(&[(1, 'あ', 0.9), (2, 'い', 0.5), (0, '\u{3000}', 0.1)]),
+            step(&[(1, 'あ', 0.8), (2, 'い', 0.3), (0, '\u{3000}', 0.2)]),
+            step(&[(0, '\u{3000}', 0.95), (1, 'あ', 0.4), (2, 'い', 0.2)]),
+            step(&[(1, 'あ', 0.7), (3, 'う', 0.6), (0, '\u{3000}', 0.1)]),
+            step(&[(18709, ' ', 0.6), (1, 'あ', 0.5), (0, '\u{3000}', 0.1)]),
+            step(&[(18709, ' ', 0.5), (2, 'い', 0.4), (0, '\u{3000}', 0.1)]),
+            step(&[(2, 'い', 0.9), (0, '\u{3000}', 0.3), (1, 'あ', 0.1)]),
+        ];
+        let res = decode_topk(&steps);
+        assert_eq!(res.text, "ああ  い");
+        assert_eq!(res.char_cols, vec![0.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(res.alternatives.len(), 5);
+
+        assert_eq!(res.raw_alternatives.len(), steps.len());
+        for (t, raw) in res.raw_alternatives.iter().enumerate() {
+            assert_eq!(raw.len(), steps[t].1.len(), "t{t} keeps every entry");
+            assert!(raw.windows(2).all(|w| w[0].1 >= w[1].1), "t{t} descending");
+        }
+        assert_eq!(
+            res.raw_alternatives[2][0],
+            ('\u{3000}', 0.95),
+            "the blank is cached as the ideographic space"
+        );
+        // Every emitted column's entry 0 is the character the decode emitted.
+        let top0: Vec<char> = res.raw_alternatives.iter().map(|r| r[0].0).collect();
+        for (ch, col) in res.text.chars().zip(&res.char_cols) {
+            assert_eq!(top0[*col as usize], ch);
+        }
+    }
+
+    /// The re-decode's fractional columns match the live decode's: the
+    /// winner's own score at the neighbouring timesteps (mobile
+    /// `wval`/`peakOffset`), absent on either side → integer column.
+    #[test]
+    fn re_decode_pins_fractional_columns() {
+        let steps = [
+            step(&[(2, 'い', 1.0), (1, 'あ', 1.0)]),
+            step(&[(1, 'あ', 3.0), (2, 'い', 0.5)]),
+            step(&[(1, 'あ', 0.0), (2, 'い', 0.5)]),
+        ];
+        let live = decode_topk(&steps);
+        assert_eq!(live.text, "いあ");
+        assert_eq!(live.char_cols, vec![0.0, 0.9]);
+
+        let re = re_decode(&steps, false);
+        assert_eq!(re.text, live.text);
+        assert_eq!(re.char_cols, live.char_cols);
+        assert_eq!(re.alternatives, live.alternatives);
+    }
+
+    /// Mobile's full-logits live decode reads the neighbour's whole row
+    /// (`ctcDecode.wval` indexes `cropLogits[t][cls]`), so it can interpolate
+    /// from a class the neighbour's top-K dropped; the re-decode only has the
+    /// cached top-K and falls back to the integer column. Both columns still
+    /// name the same winner timestep — the same asymmetry mobile ships.
+    #[test]
+    fn full_logits_interpolation_can_exceed_the_raw_cache() {
+        let vocab: Vec<String> = TEST_VOCAB.iter().map(|s| s.to_string()).collect();
+        let remap: Vec<i32> = (0..20).collect();
+        let num_classes = 20;
+        // t0: い wins; あ (0.49) ranks below fifteen 0.5 fillers → not cached.
+        let mut t0 = vec![0.0f32; num_classes];
+        t0[2] = 1.0;
+        for c in 3..18 {
+            t0[c] = 0.5;
+        }
+        t0[1] = 0.49;
+        // t1: あ wins 3.0; its neighbour scores (0.49, 0.0) interpolate it.
+        let mut t1 = vec![0.05f32; num_classes];
+        t1[1] = 3.0;
+        // t2: い wins; あ (0.0) is not in this row's top-K either.
+        let mut t2 = vec![0.05f32; num_classes];
+        t2[2] = 0.9;
+        t2[0] = 0.1;
+        t2[1] = 0.0;
+        let logits = vec![t0, t1, t2];
+
+        let live = ctc_decode_full(&vocab, &remap, &logits, num_classes, 3);
+        assert_eq!(live.text, "いあい");
+        assert!(
+            live.raw_alternatives[0].iter().all(|(c, _)| *c != 'あ'),
+            "あ must be outside t0's top-K for this pin"
+        );
+        let expected = 1.0 + peak_offset(0.49, 3.0, 0.0);
+        assert_eq!(live.char_cols[1], expected, "live interpolates the whole row");
+
+        let re = re_decode_raw_alternatives(&live.raw_alternatives, false).unwrap();
+        assert_eq!(re.text, live.text);
+        assert_eq!(re.char_cols[1], 1.0, "no neighbour entry → integer column");
+    }
+
+    /// Mobile's documented walk (the Kotlin `timestepColumns` fixture): a
+    /// blank resets the repeat state, a space never collapses, and the
+    /// alternatives stay one entry per emitted character.
+    #[test]
+    fn re_decode_walk_matches_mobile() {
+        let steps = [
+            step(&[(1, 'あ', 0.90), (0, '\u{3000}', 0.10)]),
+            step(&[(1, 'あ', 0.80), (0, '\u{3000}', 0.10)]),
+            step(&[(0, '\u{3000}', 0.90)]),
+            step(&[(1, 'あ', 0.70), (0, '\u{3000}', 0.10)]),
+            step(&[(18709, ' ', 0.60), (0, '\u{3000}', 0.10)]),
+            step(&[(18709, ' ', 0.50), (0, '\u{3000}', 0.10)]),
+            step(&[(2, 'い', 0.90), (0, '\u{3000}', 0.10)]),
+        ];
+        let re = re_decode(&steps, false);
+        assert_eq!(re.text, "ああ  い");
+        assert_eq!(re.char_cols, vec![0.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(re.alternatives.len(), 5);
+        assert_eq!(re.alternatives[1], steps[3].1, "repeat after a blank is emitted");
+        assert!(re_decode_raw_alternatives(&[], false).is_none());
+    }
+
+    /// Vertical re-decode normalises the text and every alternative entry
+    /// (mobile maps the whole list), so cached pre-fix raw data cannot
+    /// reintroduce ASCII `?` or horizontal `…`/`‥`.
+    #[test]
+    fn re_decode_normalises_vertical_punctuation() {
+        let steps = [
+            step(&[(3, '?', 0.9), (0, '\u{3000}', 0.1)]),
+            step(&[(4, '…', 0.8), (0, '\u{3000}', 0.1)]),
+            step(&[(1, 'あ', 0.9), (3, '?', 0.5)]),
+        ];
+        let horizontal = re_decode(&steps, false);
+        assert_eq!(horizontal.text, "?…あ");
+
+        let vertical = re_decode(&steps, true);
+        assert_eq!(vertical.text, "？︙あ");
+        assert_eq!(vertical.alternatives[0][0].0, '？');
+        assert_eq!(vertical.alternatives[1][0].0, '︙');
+        assert_eq!(
+            vertical.alternatives[2][1].0,
+            '？',
+            "non-top entries are normalised too"
+        );
     }
 }

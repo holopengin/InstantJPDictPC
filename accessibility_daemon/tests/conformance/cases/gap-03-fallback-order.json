@@ -1,0 +1,16 @@
+{
+  "id": "gap-03-fallback-order",
+  "kind": "gap",
+  "description": "A blank with no evidence offers nothing from the pool, but the fallback list is never empty and stays punctuation-first: the model orders WITHIN a class, never across it. Mirrors mobile BlankGapsTest and GapCandidatesTest fallbacks.",
+  "mobile_mirror": "GapCandidatesTest (fallback) + BlankGapsTest",
+  "case": {
+    "text": "の◌。",
+    "gap_index": 1,
+    "expect_context": ["の"],
+    "alternatives": [],
+    "limit": 15,
+    "lm": { "mass": 500, "entries": [["の", 200], ["、", 80], ["。", 70], ["は", 30]] },
+    "expect": [],
+    "expect_fallback_first": "、"
+  }
+}

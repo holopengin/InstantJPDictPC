@@ -1,0 +1,18 @@
+{
+  "id": "detection-01-h-bars",
+  "kind": "detection",
+  "description": "Three horizontal text-line bars: the stand-in prob map finds three frames, the straight-box merge keeps them separate, the sort is top-to-bottom. Seeds mobile-parity detection post-processing (threshold, component walk, quad fit, merge).",
+  "mobile_mirror": null,
+  "tolerances": { "box_px": 2 },
+  "case": {
+    "image": "images/h-bars.png",
+    "det_thresh": 0.25,
+    "det_unclip": 0.7,
+    "furigana_filter": false,
+    "expect_lines": [
+      { "box": [25, 15, 269, 23], "vertical": false },
+      { "box": [25, 75, 269, 23], "vertical": false },
+      { "box": [25, 135, 269, 23], "vertical": false }
+    ]
+  }
+}

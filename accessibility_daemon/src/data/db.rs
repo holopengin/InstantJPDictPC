@@ -34,7 +34,9 @@ impl DictionaryDatabase {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 priority INTEGER NOT NULL DEFAULT 0,
-                enabled INTEGER NOT NULL DEFAULT 1
+                enabled INTEGER NOT NULL DEFAULT 1,
+                built_in INTEGER NOT NULL DEFAULT 0,
+                catalog_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS dictionary (
@@ -70,6 +72,52 @@ impl DictionaryDatabase {
             CREATE INDEX IF NOT EXISTS idx_tag_dict_id ON dictionary_tag(dictionary_id);
             ",
         )?;
+
+        // #71 follow-up (D1.8): databases created before the bundled
+        // dictionaries existed have no built_in/catalog_id. CREATE TABLE IF
+        // NOT EXISTS is a no-op on those, so the columns are added by hand —
+        // the same ALTER-shape as Android's MIGRATION_3_4 and the catalogId
+        // DDL, chosen over a destructive rebuild so a populated
+        // dictionary.sqlite keeps every imported row.
+        Self::ensure_column(
+            &conn,
+            "dictionary_meta",
+            "built_in",
+            "ALTER TABLE dictionary_meta ADD COLUMN built_in INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::ensure_column(
+            &conn,
+            "dictionary_meta",
+            "catalog_id",
+            "ALTER TABLE dictionary_meta ADD COLUMN catalog_id TEXT",
+        )?;
+
+        // The app used to bundle Jitendex and KANJIDIC too. Those are ordinary
+        // catalog-downloaded rows now (deletable and re-installable), so only
+        // the pitch asset that still ships keeps its completion marker; any
+        // other legacy built-in flag is cleared. Idempotent, and a no-op on
+        // databases that never had the three-way bundle.
+        conn.execute(
+            "UPDATE dictionary_meta SET built_in = 0
+              WHERE built_in = 1 AND catalog_id IS NOT 'kanjium-pitch-accents'",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Add `column` to `table` when an older database is missing it.
+    /// `CREATE TABLE IF NOT EXISTS` cannot alter an existing table, and
+    /// `PRAGMA table_info` is what tells the two cases apart.
+    fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(());
+            }
+        }
+        conn.execute_batch(ddl)?;
         Ok(())
     }
 
@@ -77,11 +125,27 @@ impl DictionaryDatabase {
     // Dictionary meta CRUD
     // -------------------------------------------------------------------------
 
+    /// Test convenience wrapper for a plain dictionary row.
+    #[cfg(test)]
     pub fn insert_dictionary(&self, name: &str, priority: i32) -> Result<i64> {
+        self.insert_dictionary_with(name, priority, false, None)
+    }
+
+    /// Insert a meta row with the full provenance the importer tracks.
+    /// `built_in` starts false for a bundled import and is flipped by
+    /// [`Self::set_dictionary_built_in`] only after every bank has landed.
+    pub fn insert_dictionary_with(
+        &self,
+        name: &str,
+        priority: i32,
+        built_in: bool,
+        catalog_id: Option<&str>,
+    ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO dictionary_meta (name, priority) VALUES (?1, ?2)",
-            [name, &priority.to_string()],
+            "INSERT INTO dictionary_meta (name, priority, built_in, catalog_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![name, priority, built_in, catalog_id],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -89,7 +153,8 @@ impl DictionaryDatabase {
     pub fn get_all_dictionaries(&self) -> Result<Vec<DictionaryMeta>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, priority, enabled FROM dictionary_meta ORDER BY priority ASC",
+            "SELECT id, name, priority, enabled, built_in, catalog_id
+             FROM dictionary_meta ORDER BY priority ASC",
         )?;
         let dicts = stmt
             .query_map([], |row| {
@@ -98,6 +163,8 @@ impl DictionaryDatabase {
                     name: row.get(1)?,
                     priority: row.get(2)?,
                     enabled: row.get::<_, i32>(3)? != 0,
+                    built_in: row.get::<_, i32>(4)? != 0,
+                    catalog_id: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -118,6 +185,32 @@ impl DictionaryDatabase {
             "DELETE FROM dictionary_meta WHERE id = ?1",
             [&dictionary_id],
         )?;
+        Ok(())
+    }
+
+    /// Remove any existing dictionary with this declared title, so a re-import
+    /// replaces it instead of stacking a duplicate.
+    /// Mirrors Android's `DictionaryImporter.replaceExisting`.
+    pub fn delete_dictionary_by_name(&self, name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM dictionary_meta WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            conn.execute(
+                "DELETE FROM dictionary WHERE dictionary_id = ?1",
+                [&id],
+            )?;
+            conn.execute(
+                "DELETE FROM dictionary_tag WHERE dictionary_id = ?1",
+                [&id],
+            )?;
+            conn.execute("DELETE FROM dictionary_meta WHERE id = ?1", [&id])?;
+        }
         Ok(())
     }
 
@@ -148,6 +241,18 @@ impl DictionaryDatabase {
         Ok(())
     }
 
+    /// Flip the completion marker on a bundled import. Mirrors Android's
+    /// `updateBuiltIn`: it is set only once every bank is written, so a
+    /// half-finished install stays non-built-in and is retried next start.
+    pub fn set_dictionary_built_in(&self, dictionary_id: i64, built_in: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE dictionary_meta SET built_in = ?1 WHERE id = ?2",
+            rusqlite::params![built_in, dictionary_id],
+        )?;
+        Ok(())
+    }
+
     pub fn get_max_priority(&self) -> Result<Option<i32>> {
         let conn = self.conn.lock().unwrap();
         let val: Option<i32> = conn
@@ -159,6 +264,17 @@ impl DictionaryDatabase {
             .optional()?
             .and_then(|x| x);
         Ok(val)
+    }
+
+    /// id → display name for every dictionary, used for per-entry source
+    /// captions. Mirrors Android's `DictionaryProvider.dictionaryNames()`.
+    pub fn dictionary_names(&self) -> Result<std::collections::HashMap<i64, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, name FROM dictionary_meta")?;
+        let names = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+        Ok(names)
     }
 
     // -------------------------------------------------------------------------
@@ -204,7 +320,8 @@ impl DictionaryDatabase {
                     d.dictionary_id, d.onyomi, d.kunyomi, d.jlpt
              FROM dictionary d
              JOIN dictionary_meta m ON d.dictionary_id = m.id
-             WHERE d.kanji IN ({}) OR d.reading IN ({})
+             WHERE m.enabled = 1
+               AND (d.kanji IN ({}) OR d.reading IN ({}))
              ORDER BY m.priority ASC, d.popularity DESC",
             placeholders, placeholders
         );
@@ -274,4 +391,141 @@ impl DictionaryDatabase {
     }
 
 
+}
+
+/// Whether `name` is the stable title `family` itself or a bracketed revision
+/// of it (`family [2026-08-11]`) — the catalog's "already installed" match,
+/// which does not care which upstream revision a row carries. Mirrors the
+/// family rule mobile's `InstalledDictionary` uses.
+///
+/// The comparison is done in Rust rather than SQL `LIKE`: `_` and `%` in a
+/// title family would otherwise be wildcard characters.
+pub fn name_matches_family(name: &str, family: &str) -> bool {
+    name == family
+        || name
+            .strip_prefix(family)
+            .is_some_and(|rest| rest.starts_with(" ["))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(name: &str) -> DictionaryDatabase {
+        let dir = std::env::temp_dir().join(format!("ijd_db_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        DictionaryDatabase::open(dir.join("d.db")).unwrap()
+    }
+
+    #[test]
+    fn lookup_skips_disabled_dictionaries() {
+        let db = temp_db("enabled");
+        let on = db.insert_dictionary("On", 0).unwrap();
+        let off = db.insert_dictionary("Off", 1).unwrap();
+        db.insert_entries(&[
+            DictionaryEntry::new(
+                "分".into(), "ぶん".into(), r#"["on"]"#.into(), String::new(), 0, on,
+            ),
+            DictionaryEntry::new(
+                "分".into(), "ぶん".into(), r#"["off"]"#.into(), String::new(), 0, off,
+            ),
+        ])
+        .unwrap();
+        assert_eq!(db.find_by_texts(&["分".to_string()]).unwrap().len(), 2);
+        db.set_dictionary_enabled(off, false).unwrap();
+        let rows = db.find_by_texts(&["分".to_string()]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].definitions.contains("on"));
+        db.set_dictionary_enabled(off, true).unwrap();
+        assert_eq!(db.find_by_texts(&["分".to_string()]).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn dictionary_names_maps_ids_to_titles() {
+        let db = temp_db("names");
+        let id = db.insert_dictionary("Jitendex.org", 0).unwrap();
+        let names = db.dictionary_names().unwrap();
+        assert_eq!(names.get(&id).map(String::as_str), Some("Jitendex.org"));
+    }
+
+    #[test]
+    fn old_schema_gains_built_in_and_catalog_id_columns() {
+        let dir = std::env::temp_dir().join(format!("ijd_db_migrate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            // A pre-bundled-dictionary database: dictionary_meta has only the
+            // original four columns, plus a row that must survive the upgrade.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE dictionary_meta (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     name TEXT NOT NULL,
+                     priority INTEGER NOT NULL DEFAULT 0,
+                     enabled INTEGER NOT NULL DEFAULT 1
+                 );
+                 INSERT INTO dictionary_meta (name, priority) VALUES ('KANJIDIC [old]', 0);",
+            )
+            .unwrap();
+        }
+
+        let db = DictionaryDatabase::open(&path).unwrap();
+        let dicts = db.get_all_dictionaries().unwrap();
+        assert_eq!(dicts.len(), 1, "migration must not touch existing rows");
+        assert_eq!(dicts[0].name, "KANJIDIC [old]");
+        assert!(!dicts[0].built_in);
+        assert_eq!(dicts[0].catalog_id, None);
+
+        db.set_dictionary_built_in(dicts[0].id, true).unwrap();
+        assert!(db.get_all_dictionaries().unwrap()[0].built_in);
+    }
+
+    /// The app used to bundle Jitendex and KANJIDIC too; their legacy built-in
+    /// flags are cleared on open (they are ordinary, deletable catalog rows
+    /// now), while the pitch asset that still ships keeps its marker.
+    #[test]
+    fn legacy_bundled_flags_clear_except_the_pitch_asset() {
+        let dir = std::env::temp_dir().join(format!("ijd_db_builtin_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+
+        // What the three-way bundle left behind.
+        let db = DictionaryDatabase::open(&path).unwrap();
+        let jitendex = db
+            .insert_dictionary_with("Jitendex.org [2026-08-11]", 0, true, Some("jitendex"))
+            .unwrap();
+        let pitch = db
+            .insert_dictionary_with(
+                "Kanjium Pitch Accents",
+                1,
+                true,
+                Some("kanjium-pitch-accents"),
+            )
+            .unwrap();
+        drop(db);
+
+        // Re-opening runs the cleanup.
+        let db = DictionaryDatabase::open(&path).unwrap();
+        let metas = db.get_all_dictionaries().unwrap();
+        let built = |id: i64| metas.iter().find(|d| d.id == id).unwrap().built_in;
+        assert!(!built(jitendex), "Jitendex is a deletable catalog row now");
+        assert!(built(pitch), "the shipped pitch asset stays built in");
+    }
+
+    #[test]
+    fn family_match_accepts_exact_title_and_bracketed_revision() {
+        assert!(name_matches_family("Jitendex.org [2026-08-11]", "Jitendex.org"));
+        assert!(name_matches_family("Jitendex.org", "Jitendex.org"));
+        assert!(name_matches_family("KANJIDIC", "KANJIDIC"));
+        assert!(name_matches_family("KANJIDIC [2026-258]", "KANJIDIC"));
+
+        // A different family, and a longer title that only shares the prefix,
+        // are not revisions of "Jitendex.org".
+        assert!(!name_matches_family("Jitendex", "Jitendex.org"));
+        assert!(!name_matches_family("Jitendex.org Extra", "Jitendex.org"));
+        assert!(!name_matches_family("Jitendex.org[old]", "Jitendex.org"));
+    }
 }

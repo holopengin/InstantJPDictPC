@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::app_settings::AppSettings;
 use crate::data::db::DictionaryDatabase;
 use crate::settings_window::{SettingsMessage, SettingsWindow};
 use crate::watcher;
@@ -33,6 +34,7 @@ pub enum FrontMsg {
 pub struct FrontendWindow {
     db: Arc<DictionaryDatabase>,
     data_dir: PathBuf,
+    app_settings: AppSettings,
     settings: Option<SettingsWindow>,
     watcher_running: bool,
 }
@@ -40,9 +42,11 @@ pub struct FrontendWindow {
 impl FrontendWindow {
     pub fn new(db: Arc<DictionaryDatabase>, data_dir: PathBuf) -> Self {
         let watcher_running = watcher::is_running(&data_dir);
+        let app_settings = AppSettings::load(&data_dir);
         Self {
             db,
             data_dir,
+            app_settings,
             settings: None,
             watcher_running,
         }
@@ -58,7 +62,10 @@ impl FrontendWindow {
         match msg {
             FrontMsg::OpenSettings => {
                 if self.settings.is_none() {
-                    self.settings = Some(SettingsWindow::new(Arc::clone(&self.db)));
+                    self.settings = Some(SettingsWindow::new(
+                        Arc::clone(&self.db),
+                        self.app_settings.clone(),
+                    ));
                 }
                 Task::none()
             }
@@ -91,6 +98,29 @@ impl FrontendWindow {
                 Task::none()
             }
             FrontMsg::Settings(m) => {
+                // The Behaviour switches are app state, not dictionary state:
+                // the settings window only renders them, the frontend owns the
+                // file. Keep our copy in step so a later save cannot write a
+                // stale value back.
+                match &m {
+                    SettingsMessage::SetFuriganaFilter(enabled) => {
+                        if self.app_settings.furigana_filter != *enabled {
+                            self.app_settings.furigana_filter = *enabled;
+                            if let Err(e) = self.app_settings.save(&self.data_dir) {
+                                eprintln!("[Frontend] Failed to save settings: {e}");
+                            }
+                        }
+                    }
+                    SettingsMessage::SetFontFace(face) => {
+                        if self.app_settings.overlay_font != *face {
+                            self.app_settings.overlay_font = *face;
+                            if let Err(e) = self.app_settings.save(&self.data_dir) {
+                                eprintln!("[Frontend] Failed to save settings: {e}");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 if let Some(sw) = self.settings.as_mut() {
                     sw.update(m).map(FrontMsg::Settings)
                 } else {
