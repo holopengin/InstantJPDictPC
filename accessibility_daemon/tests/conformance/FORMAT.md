@@ -174,6 +174,45 @@ duplicated. Expectations pin the formatted DOM shape: headword/reading lists
 exact, sense-group counts as lower bounds (dictionaries grow), example
 Japanese/English split as substring match.
 
+### `recognition` — vendored photo/screenshot in, line texts out
+
+```json
+"case": {
+  "image": "images/recognition/phone-photo.jpg",
+  "det_thresh": 0.25, "det_unclip": 0.7, "furigana_filter": false,
+  "recognition_mode": "both",
+  "expect_lines": [
+    { "i": 0, "box": [x, y, w, h], "vertical": false,
+      "text": "…", "char_boxes": [[x, y, w, h], ...] },
+    ...
+  ]
+}
+```
+
+The harness runs the full hosted pipeline in pipeline order —
+`detect_lines` (real ncnn detector + merge + reading-order sort) →
+`recognize_boxes_collect` (real ncnn recognizer + kana-size correction) —
+with the case's `det_thresh` / `det_unclip` / `furigana_filter`, never the
+platform defaults, and `recognition_mode` `both`. `expect_lines` is in
+detection (reading) order. `i` is the detection box index: boxes the crop
+stage skips (un-croppable quads) have no entry, and the pinned `i` fails
+loudly if that set ever changes. `box` is the final axis-aligned
+`BoundingBox` (compared within `box_px`); `vertical` is the recognized
+line's own orientation flag (exact); `text` is the recognized line text
+(exact, `null` when the box yields no line); `char_boxes` pins every
+character box in order (count exact, each within `box_px`). Rotated quads
+are not pinned per-line here (`quad` is `None` for these fixtures);
+rotated-frame conventions stay covered by the `geometry` kind.
+
+Regenerating: `CONFORMANCE_DUMP=1 cargo test recognition_cases` prints one
+`DUMP-JSON <id> {...}` record per recognized line for every case without
+failing, so a single run refreshes the whole kind — paste the records into
+the case files only after spot-checking the texts against the images
+(mis-recognition is a finding to record in the ticket, never something to
+hand-edit away). Plain `cargo test` enforces every pin. This is the one
+kind whose expectations are machine-generated wholesale; the other kinds
+keep the dump-then-verify-one-case pattern from the parity-bug rule below.
+
 ## Adding a case (the parity-bug rule)
 
 A parity bug fix adds a conformance case: write the JSON, run
