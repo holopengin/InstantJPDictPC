@@ -27,6 +27,12 @@ pub struct DictionaryMeta {
     pub name: String,
     pub priority: i32,
     pub enabled: bool,
+    /// True for the app's own bundled dictionary (the Kanjium pitch accents
+    /// zip shipped next to the binary). Mirrors Android's `builtIn`: it is
+    /// written only after every bank of the bundled import has landed, so it
+    /// doubles as the completion marker, and the settings manager uses it to
+    /// keep the row from being deleted.
+    pub built_in: bool,
     /// Catalog entry this dictionary was installed from, when it came through
     /// the catalog — else `None` (file picker). Mirrors Android's
     /// `catalogId`: the settings window matches a row to a catalog entry by

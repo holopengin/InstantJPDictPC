@@ -1,0 +1,30 @@
+Bundled dictionary — vendored, do not edit by hand.
+===================================================
+
+The Kanjium pitch accents zip ships next to the binary (build.rs copies this
+directory to target/{profile}/assets/dictionaries/, and build_appimage.sh
+bundles assets/* into the AppImage). On first start the app imports it into
+dictionary.sqlite, once, and marks it built-in; see src/data/bundled.rs. The
+row is not deletable from the settings manager. Nothing is downloaded.
+
+Jitendex and KANJIDIC are NOT bundled: they are one-click downloads from the
+pinned catalog in assets/catalog/dictionaries.json (mirroring mobile's
+assets/catalog/dictionaries.json).
+
+The pin below was verified with sha256sum against the downloaded artifact.
+
+Kanjium pitch accents
+---------------------
+File       : kanjium_pitch_accents.zip
+Size       : 1207703 bytes
+SHA-256    : c1cdb4f4d930ff569490fe0b7d93b58eef23880c75f54660fd5fbca05b71740f
+Title      : Kanjium Pitch Accents  (stable family: Kanjium Pitch Accents)
+Entries    : 124134
+Source     : https://github.com/mifunetoshiro/kanjium (data/source_files/raw/accents.txt)
+Source ref : 685d4d723d6d20bf9beb169103aeac188eb067ad
+Retrieved  : accents.txt as published by the Kanjium project
+License    : CC BY-SA 4.0
+             See licenses/notices/kanjium-pitch-accents.txt.
+
+The zip is redistributed under its own licence (CC BY-SA 4.0); the licence
+texts and upstream attribution notices are in ../licenses/.
