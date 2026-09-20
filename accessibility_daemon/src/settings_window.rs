@@ -592,14 +592,12 @@ impl SettingsWindow {
         content = content.push(Space::new().height(Pixels(4.0)));
 
         // --- One-click installs (#71): the dictionaries that used to be
-        // bundled. A row disappears once its family is installed; the
-        // dictionary is then in the list below, where it can be reordered. ---
-        for entry in self
-            .catalog
-            .iter()
-            .filter(|e| !catalog::is_installed(&self.dictionaries, e))
-        {
-            content = content.push(self.catalog_row(entry, disabled));
+        // bundled. An installed entry keeps its row and shows "Installed"
+        // (mobile's chip); the dictionary is also in the list below, where it
+        // can be reordered. ---
+        for entry in self.catalog {
+            let installed = catalog::is_installed(&self.dictionaries, entry);
+            content = content.push(self.catalog_row(entry, installed, disabled));
         }
 
         // --- Dictionary list (disabled while busy) ---
@@ -622,10 +620,12 @@ impl SettingsWindow {
             .into()
     }
 
-    /// One catalog row: name, description + size, and an Install button.
+    /// One catalog row: name, description + size + licence, and either an
+    /// Install button or the "Installed" marker (mobile's chip).
     fn catalog_row<'a>(
         &'a self,
         entry: &'a CatalogEntry,
+        installed: bool,
         disabled: bool,
     ) -> Container<'a, SettingsMessage> {
         let info = column![
@@ -641,17 +641,20 @@ impl SettingsWindow {
         ]
         .spacing(2);
 
-        let install_btn = if disabled {
-            Button::new(Text::new("Install").size(13))
+        let action: Element<'a, SettingsMessage> = if installed {
+            Text::new("Installed").size(13).style(text::secondary).into()
+        } else if disabled {
+            Button::new(Text::new("Install").size(13)).into()
         } else {
             Button::new(Text::new("Install").size(13))
                 .on_press(SettingsMessage::InstallCatalog(entry.id.clone()))
+                .into()
         };
 
         let row_content = row![
             info,
             Space::new().width(Length::Fill),
-            install_btn
+            action
         ]
         .spacing(10)
         .align_y(Vertical::Center)
