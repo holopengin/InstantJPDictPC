@@ -93,12 +93,16 @@ impl OcrOverlayState {
     }
 
 
-    /// Replace a single line result at the given index, expanding the vec if needed.
-    pub fn set_single_line_result(&mut self, index: usize, line: LineResult) {
-        while self.active_line_results.len() <= index {
-            self.active_line_results.push(None);
+    /// Replace many line results at once (index-keyed, any order). The
+    /// derived `active_line_boxes` / global char data are rebuilt once for
+    /// the whole set rather than after every line.
+    pub fn set_line_results_batch(&mut self, results: Vec<(usize, LineResult)>) {
+        for (index, line) in results {
+            while self.active_line_results.len() <= index {
+                self.active_line_results.push(None);
+            }
+            self.active_line_results[index] = Some(line);
         }
-        self.active_line_results[index] = Some(line);
         self.active_line_boxes.clear();
         self.active_line_boxes.extend(
             self.active_line_results
@@ -107,9 +111,6 @@ impl OcrOverlayState {
                 .flat_map(|line| line.chunk_boxes.clone()),
         );
         self.update_global_data();
-        // Nav graph is rebuilt lazily via mark_nav_dirty() + rebuild_nav_if_dirty()
-        // called on Tick and before navigate(). Do NOT call build_nav_graph() here
-        // — it's too expensive per streaming result.
     }
 
     pub fn get_global_idx(&self, line_idx: usize, char_idx_in_line: usize) -> usize {

@@ -1643,8 +1643,8 @@ pub struct OcrViewer {
     /// active_line_results. view() re-syncs and clears this flag.
     pub annotations_sync_dirty: Cell<bool>,
     /// Lines whose text has been user-edited (via alternative selection).
-    /// `handle_ocr_recognition_result` skips `set_single_line_result` for
-    /// these lines, preserving the user's edit against incoming OCR results.
+    /// `apply_ocr_batch` skips the overlay line-result update for these
+    /// lines, preserving the user's edit against incoming OCR results.
     pub edited_lines: HashSet<usize>,
     /// Cached total_scale from last view() frame, used for glyph pre-warm
     last_total_scale: Cell<f32>,
@@ -2109,95 +2109,88 @@ impl OcrViewer {
         centers
     }
 
-    /// Called when a recognition result streams in from the background OCR thread.
-    /// Replaces the detection-only annotation (bbox + line: None) at the given
-    /// index with the full annotation (bbox + line with text and char_boxes).
-    pub fn handle_ocr_recognition_result(&mut self, index: usize, mut annotation: DetectedAnnotation) {
-        // Mobile `addLineToResults` runs BlankGaps before layout (#44
-        // Feature 2), so the placeholder is part of the line from here on:
-        // text, char boxes and alternatives all grow together.
-        if let Some(line) = annotation.line.take() {
-            annotation.line = Some(apply_blank_gaps(&line));
-        }
-        let line = annotation.line.clone();
-        let quad = annotation.quad;
-        if line.is_some() {
-            let has_text = line.as_ref().map(|l| !l.text.is_empty()).unwrap_or(false);
-            println!(
-                "[VIEWER] recv ann idx={}: is_vertical={}, has_text={}, char_boxes={}",
-                index,
-                line.as_ref().map(|l| l.is_vertical).unwrap_or(false),
-                has_text,
-                line.as_ref().map(|l| l.char_boxes.len()).unwrap_or(0)
-            );
-        }
-        // Extend annotations vec if this is a new box beyond current length
-        if self.annotations.len() <= index {
-            // Use make_mut to grow in-place without cloning the whole vec
-            let anns = std::rc::Rc::make_mut(&mut self.annotations);
-            anns.resize(index + 1, DetectedAnnotation {
-                bbox: BoundingBox::new(0, 0, 0, 0, 0.0),
-                quad: None,
-                line: None,
-            });
-        }
-
-        // Replace the annotation at the given index — in-place via make_mut
-        let anns = std::rc::Rc::make_mut(&mut self.annotations);
-        anns[index] = annotation;
-
-        // If the annotation has a line result, update the overlay state
-        // UNLESS the user has edited this line's text — skip overwrite in
-        // that case to preserve the user's edit.
-        if let Some(ref line) = line {
-            if !self.edited_lines.contains(&index) {
-                self.state.set_single_line_result(index, line.clone());
+    /// Called once per complete recognition batch from the background OCR
+    /// thread. `annotations[i]` is detection box `i`; boxes whose
+    /// recognition produced no text stay as detection-only placeholders.
+    /// Per line this does exactly what the old per-result handler did
+    /// (BlankGaps, overlay line result, glyph pre-warm); the nav-dirty
+    /// marker, cursor seed and synced-annotation refresh run once for the
+    /// whole batch instead of once per line.
+    pub fn apply_ocr_batch(&mut self, annotations: Vec<DetectedAnnotation>) {
+        let mut lines: Vec<(usize, LineResult)> = Vec::new();
+        let mut anns: Vec<DetectedAnnotation> = Vec::with_capacity(annotations.len());
+        for (index, mut annotation) in annotations.into_iter().enumerate() {
+            // Mobile `addLineToResults` runs BlankGaps before layout (#44
+            // Feature 2), so the placeholder is part of the line from here on:
+            // text, char boxes and alternatives all grow together.
+            if let Some(line) = annotation.line.take() {
+                annotation.line = Some(apply_blank_gaps(&line));
             }
-        }
-
-        // Pre-warm glyph cache for this annotation's characters so view()
-        // doesn't rasterize them on the draw path (which causes visible
-        // stutter on the first frame new characters appear).
-        if let Some(ref line) = line {
-            if let Some(ref gc) = self.glyph_cache {
-                // The scale needs the real image size: before ImageReady
-                // arrives the content scale is unknown, and pre-warming
-                // against a bogus one costs seconds per line in `embolden`.
-                if let Some(total_scale) = content_scale(
-                    self.window_width,
-                    self.window_height,
-                    self.img_w,
-                    self.img_h,
-                    self.state.current_scale,
-                ) {
-                    // Exactly the draw pass's per-line text size.
-                    let px = line_text_px(line, quad.as_ref(), total_scale)
-                        .round()
-                        .clamp(1.0, 1024.0) as u32;
-                    let mut cache = gc.borrow_mut();
-                    let vertical = line.is_vertical;
-                    cache.ensure_glyph('あ', false, px);
-                    for ch in line.text.chars() {
-                        cache.ensure_glyph(ch, vertical, px);
-                    }
+            let line = annotation.line.clone();
+            let quad = annotation.quad;
+            if let Some(ref line) = line {
+                println!(
+                    "[VIEWER] recv ann idx={}: is_vertical={}, has_text={}, char_boxes={}",
+                    index,
+                    line.is_vertical,
+                    !line.text.is_empty(),
+                    line.char_boxes.len()
+                );
+            }
+            // If the annotation has a line result, update the overlay state
+            // UNLESS the user has edited this line's text — skip overwrite in
+            // that case to preserve the user's edit.
+            if let Some(ref line) = line {
+                if !self.edited_lines.contains(&index) {
+                    lines.push((index, line.clone()));
                 }
+                self.prewarm_line_glyphs(line, quad.as_ref());
             }
+            anns.push(annotation);
         }
-
-        // Mark nav graph dirty — will be rebuilt lazily on next navigation or
-        // render, instead of rebuilding on every streaming result.
+        self.annotations = Rc::new(anns);
+        self.det_box_count = self.annotations.len();
+        if !lines.is_empty() {
+            self.state.set_line_results_batch(lines);
+        }
+        // Mark nav graph dirty — rebuilt lazily on next navigation or render.
         self.state.mark_nav_dirty();
-
         // Update cursor if not yet set
         if self.state.current_tapped_line_idx < 0 || self.state.current_tapped_char_idx_in_line < 0 {
             self.state.ensure_cursor_position();
         }
-
-        // Keep synced_annotations cache in sync.
-        // Uses a NEW Rc with a fresh clone so self.annotations keeps refcount=1.
-        // This way Rc::make_mut above mutates in-place without deep-copying the
-        // whole Vec (which would happen if refcount > 1).
+        // Keep synced_annotations cache in sync. One fresh Rc for the whole
+        // batch so self.annotations keeps refcount=1 (in-place updates).
         *self.synced_annotations.borrow_mut() = Rc::new((*self.annotations).clone());
+    }
+
+    /// Pre-warm the glyph cache for one line's characters so view() doesn't
+    /// rasterize them on the draw path (which causes visible stutter on the
+    /// first frame new characters appear).
+    fn prewarm_line_glyphs(&self, line: &LineResult, quad: Option<&RotatedBox>) {
+        let Some(gc) = self.glyph_cache.as_ref() else { return };
+        // The scale needs the real image size: before ImageReady arrives the
+        // content scale is unknown, and pre-warming against a bogus one costs
+        // seconds per line in `embolden`.
+        let Some(total_scale) = content_scale(
+            self.window_width,
+            self.window_height,
+            self.img_w,
+            self.img_h,
+            self.state.current_scale,
+        ) else {
+            return;
+        };
+        // Exactly the draw pass's per-line text size.
+        let px = line_text_px(line, quad, total_scale)
+            .round()
+            .clamp(1.0, 1024.0) as u32;
+        let mut cache = gc.borrow_mut();
+        let vertical = line.is_vertical;
+        cache.ensure_glyph('あ', false, px);
+        for ch in line.text.chars() {
+            cache.ensure_glyph(ch, vertical, px);
+        }
     }
 
     /// Nudge a detection tunable (viewer tune keys). Clamped to plausible
@@ -2232,11 +2225,7 @@ impl OcrViewer {
         self.state.current_tapped_line_idx = -1;
         self.state.current_tapped_char_idx_in_line = -1;
         self.state.last_highlighted_coords.clear();
-        self.annotations = Rc::new(Vec::new());
-        self.det_box_count = annotations.len();
-        for (i, ann) in annotations.into_iter().enumerate() {
-            self.handle_ocr_recognition_result(i, ann);
-        }
+        self.apply_ocr_batch(annotations);
         self.annotations_sync_dirty.set(true);
     }
 
@@ -3866,5 +3855,88 @@ mod tests {
         assert_ne!(dash_v, gid_of('\u{FE31}'));
         // ！ has no vert entry; the Unicode vertical form is the fallback.
         assert_eq!(bang_v, Some(gid_of('\u{FE15}')));
+    }
+
+    /// The batch apply must fill every detection slot in one pass: placeholders
+    /// survive, recognized lines reach the overlay state, and the cursor seeds
+    /// on the first non-empty line.
+    #[test]
+    fn apply_ocr_batch_fills_all_slots_in_one_pass() {
+        let mut v = OcrViewer::new_empty(1280.0, 720.0);
+        v.set_image(
+            iced::widget::image::Handle::from_bytes(Vec::new()),
+            Vec::new(),
+            2400,
+            1080,
+        );
+        let batch = vec![
+            DetectedAnnotation {
+                bbox: BoundingBox::new(0, 0, 10, 10, 0.5),
+                quad: None,
+                line: None,
+            },
+            DetectedAnnotation {
+                bbox: BoundingBox::new(0, 20, 60, 60, 0.9),
+                quad: None,
+                line: Some(line_with_boxes(
+                    "日本",
+                    vec![
+                        BoundingBox::new(0, 20, 60, 60, 0.9),
+                        BoundingBox::new(60, 20, 60, 60, 0.9),
+                    ],
+                    false,
+                )),
+            },
+            DetectedAnnotation {
+                bbox: BoundingBox::new(0, 80, 60, 60, 0.9),
+                quad: None,
+                line: Some(line_with_boxes(
+                    "語",
+                    vec![BoundingBox::new(0, 80, 60, 60, 0.9)],
+                    false,
+                )),
+            },
+        ];
+        v.apply_ocr_batch(batch);
+
+        assert_eq!(v.annotations.len(), 3, "every detection slot survives");
+        assert!(v.annotations[0].line.is_none(), "placeholder stays a box");
+        assert_eq!(v.annotations[1].line.as_ref().unwrap().text, "日本");
+        assert_eq!(v.annotations[2].line.as_ref().unwrap().text, "語");
+        assert_eq!(v.det_box_count, 3, "HUD box count comes from the batch");
+
+        assert_eq!(v.state.active_line_results.len(), 3);
+        assert!(v.state.active_line_results[0].is_none());
+        assert_eq!(
+            v.state.active_line_results[1].as_ref().unwrap().text,
+            "日本"
+        );
+        assert_eq!(
+            v.state.active_line_results[2].as_ref().unwrap().text,
+            "語"
+        );
+        // Cursor seeds on the first non-empty line, not on the placeholder.
+        assert_eq!(v.state.current_tapped_line_idx, 1);
+        assert_eq!(v.state.current_tapped_char_idx_in_line, 0);
+        // Nav graph is left dirty for the next navigation/render.
+        assert!(v.state.nav_graph.is_none());
+    }
+
+    /// A batch of detection-only placeholders must not seed the cursor.
+    #[test]
+    fn apply_ocr_batch_without_text_leaves_cursor_unset() {
+        let mut v = OcrViewer::new_empty(1280.0, 720.0);
+        v.apply_ocr_batch(vec![DetectedAnnotation {
+            bbox: BoundingBox::new(0, 0, 10, 10, 0.5),
+            quad: None,
+            line: None,
+        }]);
+        assert_eq!(v.annotations.len(), 1);
+        assert!(
+            v.state.active_line_results.is_empty(),
+            "a placeholder is not an overlay line result"
+        );
+        assert_eq!(v.state.current_tapped_line_idx, -1);
+        assert_eq!(v.state.current_tapped_char_idx_in_line, -1);
     }
 }
