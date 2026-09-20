@@ -24,6 +24,7 @@ use iced::{
 use crate::data::db::DictionaryDatabase;
 use crate::data::models::DictionaryEntry;
 use crate::models::*;
+use crate::overlay_font::FontFace;
 use crate::overlay_state::OcrOverlayState;
 use crate::util::deinflector::Deinflector;
 use crate::util::japanese;
@@ -111,49 +112,25 @@ pub struct GlyphCache {
 
 /// Resolve the Japanese UI font file used by BOTH the OCR overlay glyph
 /// cache and the iced dictionary panel (they must render identically).
-/// Binary-relative paths first (AppImage deployment), then a bundled
-/// `fonts/` dir, then system Noto CJK installs.
-pub fn find_jp_font_path() -> Option<std::path::PathBuf> {
-    let exe_path = std::env::current_exe().ok();
-    let exe_dir = exe_path.as_ref().and_then(|p| p.parent());
-    let exe_font = exe_dir.map(|d| d.join("fonts").join("NotoSansJP-Regular.ttf"));
-    let appdir = std::env::var("APPDIR").ok();
-    let appdir_font = appdir
-        .as_ref()
-        .map(|d| std::path::Path::new(d).join("usr").join("bin").join("fonts").join("NotoSansJP-Regular.ttf"));
-    let candidates = [
-        exe_font.as_ref().map(|p| p.as_path()),
-        appdir_font.as_ref().map(|p| p.as_path()),
-        Some(std::path::Path::new("fonts/NotoSansJP-Regular.ttf")),
-        Some(std::path::Path::new("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc")),
-        Some(std::path::Path::new("/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc")),
-    ];
-    candidates.iter().flatten().find(|p| p.exists()).map(|p| p.to_path_buf())
-}
-
-/// Resolve the bold companion face used for highlighted glyphs. Only the
-/// bundled static TTF is considered: fontdue cannot read TrueType
-/// collections (`.ttc`), so the system NotoSansCJK collections are not
-/// candidates here. `None` falls back to synthetic bold.
-pub fn find_jp_bold_font_path() -> Option<std::path::PathBuf> {
-    let exe_path = std::env::current_exe().ok();
-    let exe_dir = exe_path.as_ref().and_then(|p| p.parent());
-    let exe_font = exe_dir.map(|d| d.join("fonts").join("NotoSansJP-Bold.ttf"));
-    let appdir = std::env::var("APPDIR").ok();
-    let appdir_font = appdir
-        .as_ref()
-        .map(|d| std::path::Path::new(d).join("usr").join("bin").join("fonts").join("NotoSansJP-Bold.ttf"));
-    let candidates = [
-        exe_font.as_ref().map(|p| p.as_path()),
-        appdir_font.as_ref().map(|p| p.as_path()),
-        Some(std::path::Path::new("fonts/NotoSansJP-Bold.ttf")),
-    ];
-    candidates.iter().flatten().find(|p| p.exists()).map(|p| p.to_path_buf())
-}
+/// Face selection and file resolution live in [`crate::overlay_font`]:
+/// sans (the default) or serif, with a serif selection whose bundled file
+/// is missing falling back to sans.
+///
+/// [`GlyphCache::new_for`] resolves the face actually painted.
 
 impl GlyphCache {
-    pub fn new() -> Option<Rc<RefCell<Self>>> {
-        Self::from_paths(find_jp_font_path(), find_jp_bold_font_path())
+    /// Cache for the selected face, with the bold companion that matches the
+    /// file actually resolved: a serif selection that falls back to the sans
+    /// file (its own missing) pairs with the sans bold, never a mismatched
+    /// one. `None` means the overlay draws boxes without glyphs — mobile
+    /// degrades the same way (#84) rather than crashing.
+    pub fn new_for(face: FontFace) -> Option<Rc<RefCell<Self>>> {
+        let regular = crate::overlay_font::find_font_path(face);
+        let bold = regular
+            .as_deref()
+            .map(crate::overlay_font::face_of)
+            .and_then(crate::overlay_font::find_bold_font_path);
+        Self::from_paths(regular, bold)
     }
 
     /// Test/helper entry: regular face only (synthetic bold fallback).
@@ -1701,7 +1678,8 @@ impl OcrViewer {
     /// Create a minimal viewer with no image, no db, no annotations.
     /// Everything is populated asynchronously via bootstrap events.
     /// `window_w` / `window_h` should be the native screen resolution (in physical pixels).
-    pub fn new_empty(window_w: f32, window_h: f32) -> Self {
+    /// `face` selects the overlay's bundled font (sans default, serif opt-in).
+    pub fn new_empty(window_w: f32, window_h: f32, face: FontFace) -> Self {
         Self {
             image_handle: None,
             image_bytes: None,
@@ -1727,7 +1705,7 @@ impl OcrViewer {
             is_zooming: false,
             zoom_idle_frames: 0,
             cached_preview: RefCell::new(None),
-            glyph_cache: GlyphCache::new(),
+            glyph_cache: GlyphCache::new_for(face),
             screen_physical_width: window_w,
             native_scale: 0.0,
             debounced_ui_scale: window_w / 1280.0,
@@ -3558,14 +3536,35 @@ mod tests {
         assert!(GlyphCache::from_path(None).is_none());
         assert!(GlyphCache::from_path(Some("/nonexistent/font.ttf".into())).is_none());
         // The bundled asset still loads when present.
-        assert!(GlyphCache::new().is_some());
+        assert!(GlyphCache::new_for(FontFace::Sans).is_some());
+    }
+
+    /// Selecting serif loads the bundled serif face, resolves horizontal and
+    /// GSUB-vertical glyphs, and rasterizes real ink — i.e. the switch changes
+    /// what the overlay draws rather than reusing the sans cache.
+    #[test]
+    fn serif_face_loads_and_resolves_vertical_forms() {
+        let cache = GlyphCache::new_for(FontFace::Serif).expect("bundled serif face");
+        {
+            let mut c = cache.borrow_mut();
+            let gid = c.glyph_id('一', false).expect("serif glyph for 一");
+            assert_ne!(gid, 0);
+            let stop = c.glyph_id('。', true).expect("serif vertical 。");
+            assert_ne!(stop, 0);
+        }
+        let g = draw_glyph(&cache, 'あ', true, 54, false).expect("serif kana");
+        assert!(g.w > 0 && g.h > 0, "serif kana has ink: {}x{}", g.w, g.h);
+        // Serif ships Regular only, so highlights fake-bold through the same
+        // face (the cache loaded no bold companion).
+        let hl = draw_glyph(&cache, 'あ', true, 54, true).expect("serif highlight");
+        assert!(hl.w >= g.w && hl.h >= g.h, "synthetic bold grows the ink box");
     }
 
     /// Mobile skips glyphs whose measured ink is degenerate (`glyphW <= 0 ||
     /// glyphH <= 0`); a blank cell must not draw a placeholder pixel.
     #[test]
     fn blank_glyphs_report_no_ink() {
-        let cache = GlyphCache::new().expect("bundled JP font");
+        let cache = GlyphCache::new_for(FontFace::Sans).expect("bundled JP font");
         let g = draw_glyph(&cache, ' ', false, 54, false).expect("glyph");
         assert_eq!((g.w, g.h), (0, 0), "space must report no ink");
         let g = draw_glyph(&cache, 'あ', false, 54, false).expect("glyph");
@@ -3803,7 +3802,7 @@ mod tests {
     /// cell: the vertical comma sits mid-cell, not top-right.
     #[test]
     fn vertical_glyphs_centre_their_own_ink() {
-        let cache = GlyphCache::new().expect("bundled JP font");
+        let cache = GlyphCache::new_for(FontFace::Sans).expect("bundled JP font");
         let px = 54u32;
         let (cx, cy) = (100.0f32, 100.0f32);
         let ref_ink = {
@@ -3843,7 +3842,7 @@ mod tests {
     /// font does not cover.
     #[test]
     fn vertical_glyphs_come_from_gsub() {
-        let cache = GlyphCache::new().expect("bundled JP font");
+        let cache = GlyphCache::new_for(FontFace::Sans).expect("bundled JP font");
         let gid_of = |ch: char| -> u16 {
             let borrowed = cache.borrow();
             let face = borrowed.vface.as_ref().expect("vface");

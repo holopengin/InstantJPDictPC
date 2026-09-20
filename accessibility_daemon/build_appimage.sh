@@ -31,7 +31,7 @@ rm -rf AppDir
 
 # Bundle the CJK fonts alongside the binary (resolved via current_exe())
 mkdir -p AppDir/usr/bin/fonts
-cp fonts/NotoSansJP-Regular.ttf fonts/NotoSansJP-Bold.ttf AppDir/usr/bin/fonts/
+cp fonts/NotoSansJP-Regular.ttf fonts/NotoSansJP-Bold.ttf fonts/NotoSerifJP-Regular.ttf AppDir/usr/bin/fonts/
 
 # Bundle OCR models and asset files
 mkdir -p AppDir/usr/bin/assets
