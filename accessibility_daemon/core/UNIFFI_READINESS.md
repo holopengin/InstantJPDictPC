@@ -37,17 +37,35 @@ format): image bytes in; boxes, text, char geometry, formatted entries out.
    must call the engine from one thread (or one engine per thread).
    `DictionaryDatabase` is `Send + Sync` and shareable.
 
-## Open before any binding: `OcrOverlayState` is `!Send + !Sync`
+## Resolved: `OcrOverlayState` is `!Send + !Sync` (ticket 04b, 2026-09-21)
 
-The state machine moved into core deliberately (it is the lookup/format
-pipeline, with no UI types — only `Rc` caches and `Cell` viewport fields),
-but its `Rc`/`Cell` interior makes it thread-confined. A binding needs one
-of: (a) pin the state to a defining thread and expose it as an opaque
-handle with a single-threaded executor on the host; (b) split the pure
-functions (`lookup_*`, `format_dictionary_results`, definition parsing)
-from the viewport state (`current_scale/trans`, window `Cell`s, nav graph)
-so the pure half becomes `Send`. Option (b) is recommended — the pure half
-is already separable (it takes `&DictionaryDatabase` + `&Deinflector` and
-returns owned data), while the viewport half stays desktop-only. Not done
-here: the desktop binary uses the state directly, and the split is only
-required once a real binding exists.
+Decision: **split**, not pin. The state machine stays in core for the
+desktop binary and remains thread-confined (`Rc` cache, `Cell` viewport);
+it is desktop-only and is never exposed to a binding.
+
+The pure lookup/format half now lives in `core/src/lookup.rs` as free
+functions over plain data:
+
+- `lookup::prepare_search_candidates(following_text, &Deinflector)`
+- `lookup::process_results(db_rows, candidates_by_length, following_text)`
+- `lookup::format_dictionary_results(matches, dict_names)`
+- `lookup::following_text(active_all_chars, global_idx)`
+- `lookup::lookup_term(active_all_chars, global_idx, following_text, db, deinflector)`
+  → `Option<LookupOutcome>`
+
+`LookupOutcome` carries an owned `Vec<FormattedEntry>`, not an `Rc`. The
+module has no `Rc`/`Cell`/interior mutability and is `Send`; the desktop
+`OcrOverlayState::lookup` / `format_dictionary_results` delegate to it with
+unchanged signatures, so the PC call sites and the viewport state (zoom,
+pan, nav graph, cursor, the `Rc` cache) are untouched. Nav-graph data
+(`nav_graph::NavGraph`) was already pure and sits on the same binding
+surface.
+
+A `uniffi::Object` was rejected: UniFFI 0.28 requires exported objects to
+be `Send + Sync` and calls them through `Arc<Self>` (so `&mut self` is not
+usable), which would force either an actor shell around the `!Send` state
+or an `Arc`/atomic/lock rewrite of the desktop viewport for no PC benefit.
+The binding surface is free functions, matching how mobile already consumes
+`nav_graph_core` (`build_nav_graph` / `navigate` + records, called
+synchronously from the UI thread). Full option scoring is in the ticket-04
+comment.

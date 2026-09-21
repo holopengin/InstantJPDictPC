@@ -31,10 +31,11 @@
 //!   engine and joins the workers before returning — no handle escapes).
 //! * [`data::db::DictionaryDatabase`] is `Send + Sync` (`Arc<Mutex<Connection>>`).
 //! * [`overlay_state::OcrOverlayState`] is `!Send + !Sync` (`Rc` caches,
-//!   `Cell` viewport): confine it to one thread. A future UniFFI binding
-//!   must either pin it to a defining thread or split the pure
-//!   lookup/format functions from the viewport state (see
-//!   `core/UNIFFI_READINESS.md`).
+//!   `Cell` viewport) and is **desktop-only**: confine it to the UI thread.
+//!   The pure lookup/format pipeline lives in [`lookup`] as free functions
+//!   over plain data (no `Rc`, no `Cell`), so it is `Send` and is the surface
+//!   a binding exposes; the desktop state delegates to it. See
+//!   `core/UNIFFI_READINESS.md`.
 //! * Callbacks are ownership-free: `recognize_boxes_collect` returns owned
 //!   `Vec`s; the streaming variant drives a caller-provided `Fn` emitter and
 //!   blocks until drained. Import progress is a pull/poll callback
@@ -51,6 +52,7 @@ pub mod app_settings;
 pub mod data;
 pub mod furigana;
 pub mod kana_size;
+pub mod lookup;
 pub mod models;
 pub mod nav_graph;
 pub mod ocr_engine;
