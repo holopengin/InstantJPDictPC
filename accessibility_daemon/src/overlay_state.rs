@@ -2530,7 +2530,7 @@ mod tests {
             })
             .expect("a deinflected 食べる candidate");
         assert_eq!(chain.surface, "食べた");
-        assert!(!chain.steps.is_empty());
+        assert_eq!(chain.steps, vec!["past"], "steps carry reason labels, not kana");
     }
 
     #[test]
