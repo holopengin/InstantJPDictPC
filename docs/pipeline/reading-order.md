@@ -18,6 +18,8 @@ east, west]` targets from char-box centres normalised by the page extents
   cost = primary + 10 × off-axis; greedy assignment.
 - Phase 2 (island connecting): unlimited distance, 45° cone, 1.5 × off-axis
   penalty, then connectivity enforcement.
+- Phase 3 (wrap fill): wrapping-only candidates from the opposite
+  half-plane fill remaining empty slots.
 - Fewer than 5 nodes take the `fallback` (`:262`); `navigate(idx, dir)`
   (`:255`) resolves the four directions. The viewer leaves the graph dirty
   after a batch and rebuilds on demand (`build_nav_graph`,
@@ -28,9 +30,11 @@ east, west]` targets from char-box centres normalised by the page extents
 
 - `OcrEngine.kt` (`sortDetectedBoxes` `:992`, `isVerticalLineBox` `:1013`,
   `:660` call site, `:2367` same comparators for line grouping).
-- The two-phase torus/greedy/connectivity nav graph is PC-side structure
-  with no direct mobile mirror; ordering semantics (which the graph consumes)
-  mirror mobile.
+- The three-phase torus/greedy/connectivity nav graph is PC-side structure
+  with no direct mobile mirror (mobile `nav_graph_core` has drifted: W2 3.0
+  vs 1.5, `DIR_MIN`, no cone + wrap bonus, different conflict resolution, no
+  `enforce_connectivity` — re-sync or spec-as-intentional is open);
+  ordering semantics (which the graph consumes) mirror mobile.
 
 ## Traps
 
