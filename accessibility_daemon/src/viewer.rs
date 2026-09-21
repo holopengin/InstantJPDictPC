@@ -50,6 +50,26 @@ enum InlineCell {
     Tag { text: String, width: f32 },
 }
 
+/// Ruby typography for the two display modes, shared by the aligned path
+/// (`ruby_view`) and the `full_ruby_view` fallback so both paint identically
+/// within a mode.
+///
+/// Mobile parity (ticket 06 verification): Android `createRubyView` paints
+/// the base CYAN + bold in *both* modes — full-size (32sp base / 13sp ruby)
+/// for the headword/term display, mini (15sp / 9sp) for definition-flow ruby
+/// (`OcrOverlayStateController` builds every definition `Ruby` with
+/// `isMini = true`, rendered at `OcrOverlayView.kt:2316` through
+/// `createBaseTextView`; the ruby row is LTGRAY in both). Definition-body
+/// ruby is therefore intentionally bold cyan, not body white: the PC matches
+/// mobile exactly.
+struct RubyStyle {
+    base_size: f32,
+    ruby_size: f32,
+    base: Color,
+    ruby: Color,
+    bold: bool,
+}
+
 /// Fontdue metrics for the same face iced renders the panel with, given once
 /// by the app at startup (`init_panel_metrics`). Without it — unit tests —
 /// the flow falls back to em-category estimates.
@@ -2918,6 +2938,17 @@ impl OcrViewer {
         })
     }
 
+    /// One shared palette for both ruby modes (see [`RubyStyle`]).
+    fn ruby_style(is_mini: bool) -> RubyStyle {
+        let base = Color::from_rgb(0.0, 1.0, 1.0);
+        let ruby = Color::from_rgb(0.75, 0.75, 0.75);
+        if is_mini {
+            RubyStyle { base_size: DEF_TEXT_SIZE, ruby_size: DEF_RUBY_SIZE, base, ruby, bold: true }
+        } else {
+            RubyStyle { base_size: 32.0, ruby_size: 13.0, base, ruby, bold: true }
+        }
+    }
+
     /// Minimal furigana (#55): ruby only over kanji spans, okurigana as plain
     /// base text. Falls back to full-reading ruby when unalignable.
     fn ruby_view(
@@ -2926,16 +2957,10 @@ impl OcrViewer {
         is_mini: bool,
         reserve_ruby_space: bool,
     ) -> Element<'static, Message> {
-        let cyan = Color::from_rgb(0.0, 1.0, 1.0);
-        let gray = Color::from_rgb(0.75, 0.75, 0.75);
-        let base_size = if is_mini { 15.0 } else { 32.0 };
-        let ruby_size = if is_mini { 9.0 } else { 13.0 };
+        let style = Self::ruby_style(is_mini);
         let base = |text: String| -> Element<'static, Message> {
-            Text::new(text)
-                .size(base_size)
-                .color(cyan)
-                .font(Self::bold_font())
-                .into()
+            let label = Text::new(text).size(style.base_size).color(style.base);
+            if style.bold { label.font(Self::bold_font()).into() } else { label.into() }
         };
         if term == reading {
             if !reserve_ruby_space {
@@ -2946,7 +2971,7 @@ impl OcrViewer {
             let mut stack = Column::new()
                 .align_x(alignment::Horizontal::Center)
                 .spacing(0);
-            stack = stack.push(Text::new(" ").size(ruby_size).color(gray));
+            stack = stack.push(Text::new(" ").size(style.ruby_size).color(style.ruby));
             stack = stack.push(base(term.to_string()));
             return stack.into();
         }
@@ -2965,7 +2990,7 @@ impl OcrViewer {
                     let mut stack = Column::new()
                         .align_x(alignment::Horizontal::Center)
                         .spacing(0);
-                    stack = stack.push(Text::new(ruby).size(ruby_size).color(gray));
+                    stack = stack.push(Text::new(ruby).size(style.ruby_size).color(style.ruby));
                     stack = stack.push(base(seg.base));
                     row = row.push(stack);
                 }
@@ -2974,21 +2999,26 @@ impl OcrViewer {
         row.into()
     }
 
+    /// Fallback when the reading cannot align over kanji spans: the whole
+    /// reading sits above the whole term. Paints from the same [`RubyStyle`]
+    /// as the aligned path, so unalignable (usually longest-compound) terms
+    /// match the mode's style exactly.
     fn full_ruby_view(term: &str, reading: &str, is_mini: bool) -> Element<'static, Message> {
-        let cyan = Color::from_rgb(0.0, 1.0, 1.0);
-        let gray = Color::from_rgb(0.75, 0.75, 0.75);
-        let base_size = if is_mini { 15.0 } else { 32.0 };
-        let ruby_size = if is_mini { 9.0 } else { 13.0 };
+        let style = Self::ruby_style(is_mini);
         let mut stack = Column::new()
             .align_x(alignment::Horizontal::Center)
             .spacing(0);
-        stack = stack.push(Text::new(reading.to_string()).size(ruby_size).color(gray));
-        stack = stack.push(
-            Text::new(term.to_string())
-                .size(base_size)
-                .color(cyan)
-                .font(Self::bold_font()),
-        );
+        stack = stack.push(Text::new(reading.to_string()).size(style.ruby_size).color(style.ruby));
+        if style.bold {
+            stack = stack.push(
+                Text::new(term.to_string())
+                    .size(style.base_size)
+                    .color(style.base)
+                    .font(Self::bold_font()),
+            );
+        } else {
+            stack = stack.push(Text::new(term.to_string()).size(style.base_size).color(style.base));
+        }
         stack.into()
     }
 
@@ -3207,6 +3237,7 @@ impl OcrViewer {
                 InlineCell::Char(c) => run.push(c),
                 InlineCell::Ruby { term, reading, .. } => {
                     row = flush_run(row, &mut run);
+                    // Body flow: mini ruby, mobile's definition-flow style (see RubyStyle).
                     row = row.push(Self::ruby_view(&term, &reading, true, false));
                 }
                 InlineCell::Tag { text, .. } => {
@@ -4311,6 +4342,35 @@ mod tests {
             })
             .collect();
         assert_eq!(second, "あ。", "。 rides with the previous character");
+    }
+
+    /// Ticket 06 verification: definition/example body ruby matches mobile's
+    /// mini ruby rather than the surrounding body type — a bold CYAN base at
+    /// body size with a gray ruby row (`OcrOverlayView.createRubyView(...,
+    /// isMini = true)` via `createBaseTextView`; definition `Ruby` nodes are
+    /// built with `isMini = true` in `OcrOverlayStateController` and rendered
+    /// at `OcrOverlayView.kt:2316`). Clear names and pinned values so these
+    /// can graduate to the conformance spec later.
+    #[test]
+    fn body_ruby_matches_mobile_mini_ruby_style() {
+        let body = OcrViewer::ruby_style(true);
+        assert_eq!(body.base_size, DEF_TEXT_SIZE, "mini base sits at body size");
+        assert_eq!(body.ruby_size, DEF_RUBY_SIZE);
+        assert_eq!(body.base, Color::from_rgb(0.0, 1.0, 1.0), "mini base stays cyan");
+        assert_eq!(body.ruby, Color::from_rgb(0.75, 0.75, 0.75), "mini ruby stays gray");
+        assert!(body.bold, "mobile paints mini ruby bases bold");
+    }
+
+    /// The headword block and term rows keep the full-size bold-cyan term
+    /// display (mobile non-mini `createRubyView`: 32sp base / 13sp ruby).
+    #[test]
+    fn term_ruby_keeps_full_size_term_display() {
+        let term = OcrViewer::ruby_style(false);
+        assert_eq!(term.base_size, 32.0);
+        assert_eq!(term.ruby_size, 13.0);
+        assert_eq!(term.base, Color::from_rgb(0.0, 1.0, 1.0), "term base stays cyan");
+        assert_eq!(term.ruby, Color::from_rgb(0.75, 0.75, 0.75), "term ruby stays gray");
+        assert!(term.bold, "term display stays bold");
     }
 
     /// One term entry with Kanjium pitch data, for the pitch-gate tests.
