@@ -14,6 +14,11 @@ pub struct DeinflectionRule {
     pub kana_out: String,
     #[serde(rename = "rulesOut")]
     pub rules_out: Vec<String>,
+    /// Top-level deinflect.json group key (e.g. "past").
+    /// Not in the JSON payloads — filled in at load time from the map key,
+    /// mirroring mobile's `Deinflector` (`reason = reason` copy on load).
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// Result of a deinflection: a candidate term with its grammatical type.
@@ -43,7 +48,16 @@ impl Deinflector {
         } else {
             let map: HashMap<String, Vec<DeinflectionRule>> = serde_json::from_str(&content)
                 .context("Failed to parse deinflection rules JSON object")?;
-            map.into_values().flatten().collect()
+            // The group key IS the human-readable reason ("past",
+            // "causative", …) — mobile fills it in at load time the same way.
+            map.into_iter()
+                .flat_map(|(reason, list)| {
+                    list.into_iter().map(move |mut rule| {
+                        rule.reason = reason.clone();
+                        rule
+                    })
+                })
+                .collect()
         };
 
         println!("Loaded {} deinflection rules", rules.len());
@@ -87,7 +101,14 @@ impl Deinflector {
                             term: root,
                             reasons: {
                                 let mut r = current.reasons.clone();
-                                r.push(rule.kana_in.clone());
+                                // Human-readable group label ("past"), not the
+                                // kana fragment — mobile pushes `rule.reason`.
+                                // An empty reason (bare-array JSON with no
+                                // group keys) adds nothing, so the identity
+                                // guard in `push_deinflections` still filters it.
+                                if !rule.reason.is_empty() {
+                                    r.push(rule.reason.clone());
+                                }
                                 r
                             },
                             rule_types: rule.rules_out.clone(),
@@ -107,5 +128,36 @@ impl Deinflector {
 
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mobile parity (`DeinflectionChainTest.reasons_carryRuleNames`): reasons
+    /// are readable group labels, not kana fragments.
+    #[test]
+    fn reasons_carry_rule_names() {
+        let deinflector = Deinflector::from_json_file("assets/deinflect.json").unwrap();
+        let hit = deinflector
+            .deinflect("食べた")
+            .into_iter()
+            .find(|r| r.term == "食べる")
+            .expect("a deinflected 食べる candidate");
+        assert_eq!(hit.reasons, vec!["past"]);
+    }
+
+    /// Mobile parity (`DeinflectionChainTest.identityResult_hasNoReasons`):
+    /// the identity result carries no reasons, so direct matches get no chain.
+    #[test]
+    fn identity_result_has_no_reasons() {
+        let deinflector = Deinflector::from_json_file("assets/deinflect.json").unwrap();
+        let identity = deinflector
+            .deinflect("食べた")
+            .into_iter()
+            .find(|r| r.term == "食べた")
+            .expect("the identity candidate");
+        assert!(identity.reasons.is_empty());
     }
 }
