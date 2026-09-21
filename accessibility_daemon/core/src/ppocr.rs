@@ -1017,7 +1017,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn repo_path(rel: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).join(rel)
     }
 
     struct Fixture {

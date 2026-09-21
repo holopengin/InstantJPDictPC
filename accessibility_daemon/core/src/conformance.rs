@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::furigana::{is_ruby_horizontal, is_ruby_vertical};
 use crate::kana_size::{self};
 use crate::util::deinflector::Deinflector;
-use crate::viewer::OcrViewer;
+use crate::ruby_style::ruby_style;
 use crate::data::models::DictionaryEntry;
 use crate::models::{
     BoundingBox, FormattedEntry, LineResult, RotatedBox, TermMatch, GAP_CHAR,
@@ -33,7 +33,7 @@ use crate::util::gap_candidates::{self, MAX as GAP_MAX};
 use crate::models::RecognitionMode;
 
 fn corpus_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
         .join("tests")
         .join("conformance")
 }
@@ -109,7 +109,7 @@ fn rect_of_json(a: &[Value]) -> BoundingBox {
 }
 
 fn test_engine() -> OcrEngine {
-    let dir = format!("{}/assets", env!("CARGO_MANIFEST_DIR"));
+    let dir = format!("{}/assets", concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
     OcrEngine::new(&dir, RecognitionMode::Both, 4).expect("engine loads")
 }
 
@@ -752,7 +752,7 @@ fn recognition_cases() {
 }
 
 fn deinflect_rules_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/deinflect.json")
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).join("assets/deinflect.json")
 }
 
 /// Ticket 07: the shipped `deinflect.json` group keys ride each derivation
@@ -800,18 +800,18 @@ fn deinflection_cases() {
 }
 
 /// Ticket 06: body ruby vs term-display ruby, pinned at the unit-testable
-/// style-resolution seam (`OcrViewer::ruby_style(is_mini)`), not rendered
+/// style-resolution seam (`ruby_style(is_mini)`), not rendered
 /// pixels — painting an iced `Text` needs the UI framework, and sizes plus
-/// the gray ruby row stay pinned in the `viewer.rs` unit tests. `mode`
-/// selects the renderer input: `body` is `is_mini = true` (everything
+/// the gray ruby row stay pinned in the binary's `viewer.rs` unit tests.
+/// `mode` selects the renderer input: `body` is `is_mini = true` (everything
 /// `inline_line` builds), `term` is `is_mini = false` (headword/term rows).
 /// `base` is a color label so a recolor fails with the values attached,
-/// never as a silent float drift: `white` is `Color::WHITE`, `cyan` is
-/// `(0, 1, 1)`.
-fn ruby_base_label(c: &iced::Color) -> &'static str {
-    if *c == iced::Color::WHITE {
+/// never as a silent float drift: `white` is `[1, 1, 1]`, `cyan` is
+/// `[0, 1, 1]`.
+fn ruby_base_label(c: &[f32; 3]) -> &'static str {
+    if *c == [1.0, 1.0, 1.0] {
         "white"
-    } else if *c == iced::Color::from_rgb(0.0, 1.0, 1.0) {
+    } else if *c == [0.0, 1.0, 1.0] {
         "cyan"
     } else {
         panic!("unmapped ruby base color {c:?} — extend the label map, never widen a tolerance");
@@ -828,7 +828,7 @@ fn ruby_style_cases() {
                 "term" => ("term", false),
                 o => panic!("{id}: bad mode {o} (body = is_mini, term = full-size display)"),
             };
-            let style = OcrViewer::ruby_style(is_mini);
+            let style = ruby_style(is_mini);
             if dump() {
                 println!(
                     "DUMP {id} {mode}: base={} bold={}",
@@ -851,7 +851,7 @@ fn ruby_style_cases() {
 }
 
 fn jitendex_definitions(term: &str, reading: &str) -> Value {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let path = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
         .join("tests")
         .join("data")
         .join("jitendex")

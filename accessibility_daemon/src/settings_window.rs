@@ -10,12 +10,12 @@ use iced::{
 };
 use std::sync::{Arc, Mutex};
 
-use crate::app_settings::AppSettings;
-use crate::data::catalog::{self, CatalogEntry};
-use crate::data::db::DictionaryDatabase;
-use crate::data::models::DictionaryMeta;
-use crate::data::importer::{DictionaryImporter, ImportOptions, ImportProgress};
-use crate::overlay_font::FontFace;
+use jpdict_core::app_settings::AppSettings;
+use jpdict_core::data::catalog::{self, CatalogEntry};
+use jpdict_core::data::db::DictionaryDatabase;
+use jpdict_core::data::models::DictionaryMeta;
+use jpdict_core::data::importer::{DictionaryImporter, ImportOptions, ImportProgress};
+use jpdict_core::overlay_font::FontFace;
 use futures_timer::Delay;
 use std::time::Duration;
 
@@ -361,7 +361,7 @@ impl SettingsWindow {
                                 *shared.lock().unwrap() =
                                     Some(InstallProgress::Download { written, total });
                             };
-                            crate::data::download::download_verified(
+                            jpdict_core::data::download::download_verified(
                                 &entry,
                                 &dest,
                                 &mut on_progress,

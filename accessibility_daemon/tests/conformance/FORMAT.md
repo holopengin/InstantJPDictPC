@@ -3,7 +3,7 @@
 One corpus of pipeline cases that both codebases run from their own test
 suites (ticket `pipeline-sharing/01`). Each case is a single JSON file in
 `cases/` plus, for image-level cases, a synthetic input PNG in `images/`.
-The PC harness is `src/conformance.rs` (runs under `cargo test`); the
+The PC harness is `core/src/conformance.rs` (runs under `cargo test`); the
 Android runner is a follow-up (see the ticket comments).
 
 ## Why this directory
