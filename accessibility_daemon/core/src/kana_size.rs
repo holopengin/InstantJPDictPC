@@ -978,7 +978,7 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/kana_size");
+        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).join("assets/kana_size");
         Fixture {
             net: KanaSizeNet::load(&dir.join("nb_all.param"), &dir.join("nb_all.bin"))
                 .expect("kana size model load"),

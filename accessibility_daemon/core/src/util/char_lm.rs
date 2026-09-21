@@ -253,7 +253,7 @@ mod tests {
     /// asset is absent (e.g. a checkout without it).
     #[test]
     fn shipped_model_parses_and_knows_japanese() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/lm/char_lm.bin");
+        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).join("assets/lm/char_lm.bin");
         let Some(lm) = CharLm::load(&path) else {
             eprintln!("skipping: {} not present", path.display());
             return;

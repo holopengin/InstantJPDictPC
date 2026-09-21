@@ -14,7 +14,7 @@ Detection (vertical lines only):
   on them (mobile `util/BlankGaps.kt:56`; PC `blank_gap_positions`,
   `src/viewer.rs:853`). Note mobile's detector also carries a horizontal
   threshold (`DEFAULT_HORIZONTAL_RATIO = 1.8f`); the PC never asks for it.
-- Each gap materialises as a `◌` (`GAP_CHAR`, U+25CC, `src/models.rs:385`;
+- Each gap materialises as a `◌` (`GAP_CHAR`, U+25CC, `core/src/models.rs:385`;
   mobile `OcrEngine.GAP_CHAR`) placeholder inserted right-to-left so
   detector indices stay valid, growing text/char-boxes/alternatives together
   (`with_gap_char` `:925`, `apply_blank_gaps` `:963`; mobile
@@ -79,7 +79,7 @@ Candidates for a blank:
   `an_installed_model_ranks_the_blank_list_by_context`).
 - Conformance: `gap-01-discovery-order`, `gap-02-lm-reorder`,
   `gap-03-fallback-order`, `gap-04-context-clip`, `charlm-01-counts-and-rank`,
-  via `gap_cases` / `char_lm_cases` (`src/conformance.rs:403` / `:464`).
+  via `gap_cases` / `char_lm_cases` (`core/src/conformance.rs:403` / `:464`).
 - Mobile: `BlankGapsTest` (placeholder geometry/idempotence/fill-retention),
   `GapCandidatesTest`
   (`the_pool_keeps_kana_and_punctuation_and_deduplicates`,

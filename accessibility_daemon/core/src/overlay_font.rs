@@ -210,17 +210,10 @@ mod tests {
         assert_eq!(unknown, FontFace::Sans);
     }
 
-    /// Sans is the default and serif is picked when selected: both resolve the
-    /// bundled file of their own face from the dev/test tree.
-    #[test]
-    fn face_resolution_prefers_the_selected_bundled_file() {
-        let sans = find_font_path(FontFace::Sans).expect("bundled sans face");
-        let serif = find_font_path(FontFace::Serif).expect("bundled serif face");
-        assert_eq!(sans.file_name().unwrap(), SANS_ASSET);
-        assert_eq!(serif.file_name().unwrap(), SERIF_ASSET);
-        assert_eq!(face_of(&sans), FontFace::Sans);
-        assert_eq!(face_of(&serif), FontFace::Serif);
-    }
+    /// Sans is the default and serif is picked when selected. The real-file
+    /// half of this lives in the binary's `tests/font_assets.rs`: dev-tree
+    /// resolution depends on the binary's working directory (`fonts/` next
+    /// to the crate root), so it runs where that holds, not here.
 
     /// The executable-relative copy is preferred over the working-dir one, so
     /// installed/AppImage runs never pick up a stray dev file.
@@ -274,14 +267,7 @@ mod tests {
         assert!(resolve_font_path(FontFace::Serif, &nothing).is_none());
     }
 
-    /// The real dev tree ships a sans bold companion; serif ships Regular
-    /// only, so its highlights use synthetic bold (mobile parity).
-    #[test]
-    fn bundled_bold_companion_is_found_for_sans() {
-        let bold = find_bold_font_path(FontFace::Sans).expect("bundled sans bold");
-        assert_eq!(bold.file_name().unwrap(), SANS_BOLD_ASSET);
-        if let Some(serif_bold) = find_bold_font_path(FontFace::Serif) {
-            assert_eq!(serif_bold.file_name().unwrap(), SERIF_BOLD_ASSET);
-        }
-    }
+    // NOTE: the real-file bold-companion half of this module lives in the
+    // binary's `tests/font_assets.rs` (see above): it depends on the
+    // binary's working directory, so it runs where that holds.
 }

@@ -6,7 +6,7 @@ Applied over ordered lines before layout (after recognition, before
 `compute_char_boxes` consumers):
 
 - Encoder: per-candidate 40-int window (`WINDOW_BYTES = 2·RADIUS·CELL`,
-  `RADIUS = 5`, `CELL = 4`; `src/kana_size.rs:164-167`), byte-packed base
+  `RADIUS = 5`, `CELL = 4`; `core/src/kana_size.rs:164-167`), byte-packed base
   indices over `BASE_ORDER` (20 pair families, big form first, hiragana then
   katakana; `:159`). The target character is NOT in its own window; context
   stops at `。`/newline (`BOUNDARY`, `:176`) and runs off line ends as zeros
@@ -41,13 +41,13 @@ Applied over ordered lines before layout (after recognition, before
 
 ## Pinning tests
 
-- PC unit (`src/kana_size.rs` tests): published-vector table `VECTORS`
+- PC unit (`core/src/kana_size.rs` tests): published-vector table `VECTORS`
   (`:548`), window-shape/encoder tests, epsilon-band tests including
   `a_page_below_the_kana_floor_is_still_corrected` and the declined-summary
   test.
 - Conformance: `kana-01-encoder-windows` (40-int window bytes exact),
   `kana-02-policy-flips`, `kana-03-policy-declines`, via `kana_cases`
-  (`src/conformance.rs:519`).
+  (`core/src/conformance.rs:519`).
 - Mobile: `KanaSizeEncoderTest`
   (``every published vector encodes byte for byte``,
   ``base index follows the model's table``,
