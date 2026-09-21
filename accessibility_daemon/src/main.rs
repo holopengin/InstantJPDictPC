@@ -334,9 +334,13 @@ fn print_usage() {
     println!("  {name}                     (opens the frontend window)");
     println!();
     println!("KEYBOARD SHORTCUTS (when GUI is shown):");
-    println!("  D / Shift+J                Scroll dictionary down");
-    println!("  F / Shift+K                Scroll dictionary up");
-    println!("  Esc / Q                    Close viewer / back out of a selection");
+    println!("  Right hand: H J K L (+ arrows) navigate, Enter select,");
+    println!("              Backspace back, U scroll up, M scroll down");
+    println!("  Left hand:  W A S D navigate, Space select, Esc back,");
+    println!("              E scroll up, C scroll down");
+    println!("  F                        Scroll dictionary up (alias)");
+    println!("  Q                        Close viewer / back out of a selection (alias)");
+    println!("  Esc / Backspace          Close viewer / back out of a selection");
     println!("  [ / ]                      Lower / raise DET_UNCLIP by 0.05 (live)");
     println!("  - / =                      Lower / raise DET_THRESH by 0.01 (live)");
     println!("  R                          Reset detection tuning to startup values");
@@ -431,9 +435,67 @@ fn tune_key_message(modified_key: &iced::keyboard::Key) -> Option<Message> {
         Key::Character(c) if c.as_ref() == "r" || c.as_ref() == "R" => Some(Message::TuneReset),
         // F1 shows/hides the tuning HUD (hidden by default): a Named key, so
         // it cannot collide with the character keys above — navigation
-        // (arrows/hjkl), scroll (d/f), Backspace aliases (q/Esc via `Back`),
-        // or the tune keys ([ ] - = r) on any layout.
+        // (arrows/hjkl/wasd), scroll (f/u/e up, m/c down), `Back`
+        // (q/Esc/Backspace), `Confirm` (Enter/Space), or the tune keys
+        // ([ ] - = r) on any layout.
         Key::Named(iced::keyboard::key::Named::F1) => Some(Message::ToggleDetHud),
+        _ => None,
+    }
+}
+
+/// Outcome of pressing a viewer key: a one-shot message, or a
+/// navigation/scroll action that also arms the hold-to-repeat machinery
+/// (`KB_ACTION_HELD`, repeated by `ZoomTick`, cleared on key release).
+enum ViewerKey {
+    /// Fires once; does not touch `KB_ACTION_HELD`.
+    Once(Message),
+    /// Fires once and arms `KB_ACTION_HELD` so `ZoomTick` repeats it.
+    Repeat(GamepadAction),
+}
+
+/// Single-hand keyboard layout, decided 2026-09-22 (ticket single-hand-ux/01).
+/// Either hand alone drives everything:
+///
+/// | Hand  | Navigate              | Select  | Back       | Scroll up | Scroll down |
+/// |-------|-----------------------|---------|------------|-----------|-------------|
+/// | Right | `h` `j` `k` `l` (+ arrows) | `Enter` | `Backspace` | `u` | `m`    |
+/// | Left  | `w` `a` `s` `d`       | `Space` | `Esc`      | `e`       | `c`         |
+///
+/// Deliberate reassignment: `d` moved from scroll-down to navigate-right — a
+/// key cannot both scroll and navigate, so the conflict forced the move.
+/// Kept as legacy aliases: arrows (nav), `f` (scroll up), `q` (back).
+/// `Enter`/`Esc` unchanged; `Backspace` is additive on the `Back` path.
+/// Gamepad bindings unchanged (out of scope). Returns `None` for keys the
+/// viewer map does not own (the caller falls back to `tune_key_message`).
+fn viewer_key_press(key: &iced::keyboard::Key) -> Option<ViewerKey> {
+    use iced::keyboard::Key;
+    use iced::keyboard::key::Named;
+
+    match key {
+        k if *k == Key::Named(Named::Escape)
+            || *k == Key::Character("q".into())
+            || *k == Key::Named(Named::Backspace) =>
+            Some(ViewerKey::Once(Message::Back)),
+        k if *k == Key::Named(Named::Enter)
+            || *k == Key::Named(Named::Space) =>
+            Some(ViewerKey::Once(Message::Navigate(GamepadAction::Confirm))),
+        k if *k == Key::Named(Named::ArrowRight)
+            || *k == Key::Character("l".into())
+            || *k == Key::Character("d".into()) => Some(ViewerKey::Repeat(GamepadAction::NavigateRight)),
+        k if *k == Key::Named(Named::ArrowLeft)
+            || *k == Key::Character("h".into())
+            || *k == Key::Character("a".into()) => Some(ViewerKey::Repeat(GamepadAction::NavigateLeft)),
+        k if *k == Key::Named(Named::ArrowDown)
+            || *k == Key::Character("j".into())
+            || *k == Key::Character("s".into()) => Some(ViewerKey::Repeat(GamepadAction::NavigateDown)),
+        k if *k == Key::Named(Named::ArrowUp)
+            || *k == Key::Character("k".into())
+            || *k == Key::Character("w".into()) => Some(ViewerKey::Repeat(GamepadAction::NavigateUp)),
+        k if *k == Key::Character("f".into())
+            || *k == Key::Character("u".into())
+            || *k == Key::Character("e".into()) => Some(ViewerKey::Repeat(GamepadAction::ScrollUp)),
+        k if *k == Key::Character("m".into())
+            || *k == Key::Character("c".into()) => Some(ViewerKey::Repeat(GamepadAction::ScrollDown)),
         _ => None,
     }
 }
@@ -747,8 +809,8 @@ fn run_ocr_viewer(
     if headless { println!("Headless: done (bootstrap running in background)"); return Ok(()); }
 
     // Gamepad input is not wired up: Steam Deck game mode prevents exclusive
-    // evdev grabs. Keyboard controls (arrow keys, Enter, Esc, D/F) are always
-    // available.
+    // evdev grabs. Keyboard controls (arrows/hjkl/wasd, Enter/Space,
+    // Esc/Backspace, scroll U/M/E/C/F) are always available.
 
     let bootstrap_rx = Arc::new(std::sync::Mutex::new(Some(bootstrap_rx)));
     let rx_for_update = Arc::clone(&bootstrap_rx);
@@ -1179,27 +1241,14 @@ fn run_ocr_viewer(
                             if KB_ACTION_HELD.lock().unwrap().is_some() {
                                 return None;
                             }
-                            let nav_action = match key {
-                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
-                                    || *k == iced::keyboard::Key::Character("q".into()) =>
-                                    return Some(Message::Back),
-                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) =>
-                                    return Some(Message::Navigate(GamepadAction::Confirm)),
-                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight)
-                                    || *k == iced::keyboard::Key::Character("l".into()) => GamepadAction::NavigateRight,
-                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft)
-                                    || *k == iced::keyboard::Key::Character("h".into()) => GamepadAction::NavigateLeft,
-                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown)
-                                    || *k == iced::keyboard::Key::Character("j".into()) => GamepadAction::NavigateDown,
-                                k if *k == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp)
-                                    || *k == iced::keyboard::Key::Character("k".into()) => GamepadAction::NavigateUp,
-                                k if *k == iced::keyboard::Key::Character("d".into()) => GamepadAction::ScrollDown,
-                                k if *k == iced::keyboard::Key::Character("f".into()) => GamepadAction::ScrollUp,
+                            let nav_action = match viewer_key_press(key) {
+                                Some(ViewerKey::Once(msg)) => return Some(msg),
+                                Some(ViewerKey::Repeat(action)) => action,
                                 // Tuning keys match the MODIFIED key (see
                                 // `tune_key_message`): on JIS layouts `=` is
                                 // Shift+`-`, so the unmodified key `-` would
                                 // otherwise collide with decrease.
-                                _ => return tune_key_message(modified_key),
+                                None => return tune_key_message(modified_key),
                             };
                             // Set keyboard repeat tracking so ZoomTick can fire repeats.
                             *KB_ACTION_HELD.lock().unwrap() = Some((nav_action, Instant::now()));
@@ -1488,6 +1537,125 @@ mod tests {
             Some(Message::ToggleDetHud)
         ));
         assert!(tune_key_message(&Key::Character("x".into())).is_none());
+    }
+
+    fn char_key(c: &str) -> iced::keyboard::Key {
+        iced::keyboard::Key::Character(c.into())
+    }
+
+    fn named(key: iced::keyboard::key::Named) -> iced::keyboard::Key {
+        iced::keyboard::Key::Named(key)
+    }
+
+    /// `Repeat` outcomes are the keys the subscription arms `KB_ACTION_HELD`
+    /// for (repeated by `ZoomTick`, cleared on release); `Once` outcomes
+    /// never touch hold state.
+    fn repeat_action(key: &iced::keyboard::Key) -> Option<GamepadAction> {
+        match viewer_key_press(key) {
+            Some(ViewerKey::Repeat(a)) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Backspace takes the exact same `Message::Back` path as Escape (and `q`).
+    #[test]
+    fn viewer_backspace_matches_escape_path() {
+        use iced::keyboard::key::Named;
+        for key in [named(Named::Backspace), named(Named::Escape), char_key("q")] {
+            assert!(
+                matches!(viewer_key_press(&key), Some(ViewerKey::Once(Message::Back))),
+                "{key:?} must produce Message::Back"
+            );
+        }
+    }
+
+    /// Decided single-hand map (2026-09-22): every new key produces its message.
+    #[test]
+    fn viewer_single_hand_map() {
+        use iced::keyboard::key::Named;
+        // Left hand: wasd nav, Space select, Esc back, e/c scroll.
+        assert_eq!(repeat_action(&char_key("w")), Some(GamepadAction::NavigateUp));
+        assert_eq!(repeat_action(&char_key("a")), Some(GamepadAction::NavigateLeft));
+        assert_eq!(repeat_action(&char_key("s")), Some(GamepadAction::NavigateDown));
+        assert_eq!(repeat_action(&char_key("d")), Some(GamepadAction::NavigateRight));
+        assert!(matches!(
+            viewer_key_press(&named(Named::Space)),
+            Some(ViewerKey::Once(Message::Navigate(GamepadAction::Confirm)))
+        ));
+        assert_eq!(repeat_action(&char_key("e")), Some(GamepadAction::ScrollUp));
+        assert_eq!(repeat_action(&char_key("c")), Some(GamepadAction::ScrollDown));
+        // Right hand: u/m scroll, Backspace back (hjkl/Enter covered below).
+        assert_eq!(repeat_action(&char_key("u")), Some(GamepadAction::ScrollUp));
+        assert_eq!(repeat_action(&char_key("m")), Some(GamepadAction::ScrollDown));
+    }
+
+    /// Deliberate reassignment: `d` navigates instead of scrolling — a key
+    /// cannot do both, so the conflict forced the move.
+    #[test]
+    fn viewer_d_reassigned_from_scroll_to_nav() {
+        assert_eq!(
+            repeat_action(&char_key("d")),
+            Some(GamepadAction::NavigateRight),
+            "`d` must navigate, not scroll"
+        );
+    }
+
+    /// Legacy aliases stay intact: arrows, hjkl, `f` scroll-up, `q` back,
+    /// `Enter` confirm, `Esc` back.
+    #[test]
+    fn viewer_legacy_aliases_intact() {
+        use iced::keyboard::key::Named;
+        assert_eq!(
+            repeat_action(&named(Named::ArrowUp)),
+            Some(GamepadAction::NavigateUp)
+        );
+        assert_eq!(
+            repeat_action(&named(Named::ArrowDown)),
+            Some(GamepadAction::NavigateDown)
+        );
+        assert_eq!(
+            repeat_action(&named(Named::ArrowLeft)),
+            Some(GamepadAction::NavigateLeft)
+        );
+        assert_eq!(
+            repeat_action(&named(Named::ArrowRight)),
+            Some(GamepadAction::NavigateRight)
+        );
+        assert_eq!(repeat_action(&char_key("h")), Some(GamepadAction::NavigateLeft));
+        assert_eq!(repeat_action(&char_key("j")), Some(GamepadAction::NavigateDown));
+        assert_eq!(repeat_action(&char_key("k")), Some(GamepadAction::NavigateUp));
+        assert_eq!(repeat_action(&char_key("l")), Some(GamepadAction::NavigateRight));
+        assert_eq!(repeat_action(&char_key("f")), Some(GamepadAction::ScrollUp));
+        assert!(matches!(
+            viewer_key_press(&named(Named::Enter)),
+            Some(ViewerKey::Once(Message::Navigate(GamepadAction::Confirm)))
+        ));
+        // Tune keys are not owned by the viewer map — the subscription still
+        // falls through to `tune_key_message` for them.
+        for key in ["r", "R", "[", "]", "-", "=", "x"] {
+            assert!(viewer_key_press(&char_key(key)).is_none(), "{key} stays unmapped");
+        }
+    }
+
+    /// New nav keys join the hold-to-repeat machinery: `Repeat` is exactly
+    /// the outcome the subscription arms `KB_ACTION_HELD` for, and the
+    /// release arm clears on any `Character` (covering wasd) plus arrows.
+    #[test]
+    fn viewer_nav_keys_join_hold_repeat() {
+        for key in ["w", "a", "s", "d", "h", "j", "k", "l"] {
+            assert!(
+                repeat_action(&char_key(key)).is_some(),
+                "{key} must arm hold-to-repeat"
+            );
+        }
+        // One-shot keys must not arm hold state.
+        use iced::keyboard::key::Named;
+        for key in [named(Named::Enter), named(Named::Space), named(Named::Escape), named(Named::Backspace)] {
+            assert!(
+                repeat_action(&key).is_none(),
+                "{key:?} must stay one-shot"
+            );
+        }
     }
 }
 
