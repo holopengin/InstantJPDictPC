@@ -1,6 +1,10 @@
+#[cfg(feature = "db")]
 pub mod bundled;
 pub mod catalog;
+#[cfg(feature = "db")]
 pub mod db;
+#[cfg(feature = "db")]
 pub mod download;
+#[cfg(feature = "db")]
 pub mod importer;
 pub mod models;
