@@ -34,12 +34,13 @@
   (`:685` axis-aligned comment, `:805` rect-vs-quad path, `:1013`
   `isVerticalLineBox`).
 - `LineOverlayView.kt:127` (`line.tiltDeg`).
-- DIVERGENCE PENDING: mobile `master` has only the plain 1° rule; the
-  quantization widening exists on Android only as `axisAlignedBoundDeg` on
-  the unmerged `conformance/01-android-runner` branch
-  (`RotatedGeometry.kt:47` there). Accept-or-revert is still open (ticket 01
-  comments). Do not "fix" the PC side toward plain-1° in the meantime:
-  `geometry-01` frame 8 pins the widening.
+- DECISION 2026-09-22: the formula is required behavior —
+  `max(1°, atan(1.5px / long side))`. The pre-emptive fix was reverted off
+  the Android conformance branch so the corpus enforces it: `geometry-01`
+  frame 8 fails there until the behavior lands (Android
+  `conformance/01-android-runner` @ `82d77bd`,
+  `conformance/02-graduated-rules` @ `e24e057`). Do not weaken the PC side
+  toward plain-1° in the meantime: `geometry-01` frame 8 pins the widening.
 
 ## Traps
 
