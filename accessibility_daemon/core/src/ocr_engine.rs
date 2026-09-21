@@ -888,7 +888,7 @@ fn ink_font_data() -> Option<&'static Vec<u8>> {
         }
         candidates.push(std::path::PathBuf::from("fonts/NotoSansJP-Regular.ttf"));
         candidates.push(std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
             "/fonts/NotoSansJP-Regular.ttf"
         )));
         candidates.push(std::path::PathBuf::from(
@@ -2071,7 +2071,7 @@ mod tests {
     use image::GenericImageView;
 
     fn test_engine() -> OcrEngine {
-        let dir = format!("{}/assets", env!("CARGO_MANIFEST_DIR"));
+        let dir = format!("{}/assets", concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
         OcrEngine::new(&dir, RecognitionMode::Both, 4).expect("engine loads")
     }
 
@@ -2241,7 +2241,7 @@ mod tests {
         let truth: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(format!(
                 "{}/test_images/synth/truth.json",
-                env!("CARGO_MANIFEST_DIR")
+                concat!(env!("CARGO_MANIFEST_DIR"), "/..")
             ))
             .unwrap(),
         )
@@ -2267,7 +2267,7 @@ mod tests {
                 bottom = bottom.max(y + h);
             }
             let img =
-                image::open(format!("{}/test_images/synth/{file}", env!("CARGO_MANIFEST_DIR")))
+                image::open(format!("{}/test_images/synth/{file}", concat!(env!("CARGO_MANIFEST_DIR"), "/..")))
                     .unwrap();
             let (iw, ih) = img.dimensions();
             let det = eng.detect(&img).unwrap();
@@ -2317,14 +2317,14 @@ mod tests {
         let truth: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(format!(
                 "{}/test_images/synth/truth.json",
-                env!("CARGO_MANIFEST_DIR")
+                concat!(env!("CARGO_MANIFEST_DIR"), "/..")
             ))
             .unwrap(),
         )
         .unwrap();
         let file = truth["lines"][0]["file"].as_str().unwrap();
         let img =
-            image::open(format!("{}/test_images/synth/{file}", env!("CARGO_MANIFEST_DIR")))
+            image::open(format!("{}/test_images/synth/{file}", concat!(env!("CARGO_MANIFEST_DIR"), "/..")))
                 .unwrap();
         let area = |b: &BoundingBox| (b.w as i64) * (b.h as i64);
 
@@ -2580,7 +2580,7 @@ mod tests {
         let truth: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(format!(
                 "{}/test_images/synth/truth.json",
-                env!("CARGO_MANIFEST_DIR")
+                concat!(env!("CARGO_MANIFEST_DIR"), "/..")
             ))
             .unwrap(),
         )
@@ -2590,7 +2590,7 @@ mod tests {
         for line in truth["lines"].as_array().unwrap() {
             let file = line["file"].as_str().unwrap();
             let img =
-                image::open(format!("{}/test_images/synth/{file}", env!("CARGO_MANIFEST_DIR")))
+                image::open(format!("{}/test_images/synth/{file}", concat!(env!("CARGO_MANIFEST_DIR"), "/..")))
                     .unwrap();
             let det = eng.detect_lines(&img).unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
@@ -2771,7 +2771,7 @@ mod tests {
         for file in ["line_00_h.png", "line_00_v.png"] {
             let img = image::open(format!(
                 "{}/test_images/synth/{file}",
-                env!("CARGO_MANIFEST_DIR")
+                concat!(env!("CARGO_MANIFEST_DIR"), "/..")
             ))
             .unwrap();
             let det = eng.detect_lines(&img).unwrap();

@@ -3,30 +3,26 @@ name = "accessibility_daemon"
 version = "0.1.0"
 edition = "2021"
 
-[build-dependencies]
-# Compiles the shared PP-OCRv6 ncnn core + C ABI (native/ppocr_ncnn)
-cc = "1"
+[workspace]
+members = ["core"]
 
 [dependencies]
-# Image processing
+# UI-free OCR + dictionary pipeline (see core/src/lib.rs for the boundary).
+jpdict_core = { path = "core" }
+
+# Image loading for captures and viewer display
 image = "0.25"
-imageproc = "0.25"
 # JPEG XL decoding (the `image` crate has no native JXL support)
 jxl-oxide = { version = "0.12", features = ["image"] }
 
-# Font rendering for labels (TTF)
+# Panel font metrics (fontdue) and vertical metrics (ttf-parser) for the overlay
 fontdue = "0.9"
-# Vertical font metrics (vmtx/vert) for the overlay. Same version and feature
-# set fontdue already pulls in, so this shares its build.
 ttf-parser = { version = "0.21", default-features = false, features = ["opentype-layout"] }
 
 # Utilities
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1.0"
-tokio = { version = "1.0", features = ["full"] }
 
 # Screenshot capture (--capture): talk to KWin's ScreenShot2 D-Bus API
 zbus = { version = "5", features = ["blocking-api"] }
@@ -35,30 +31,8 @@ zbus = { version = "5", features = ["blocking-api"] }
 iced = { version= "0.14.0", features = ["image", "canvas", "advanced", "tokio", "x11", "wgpu"] }
 iced_futures = "0.14.0"
 
-# Database: SQLite for dictionary storage
-rusqlite = { version = "0.37", features = ["bundled"] }
-
-# Dictionary import from Yomitan ZIP files.
-# Default features would pull bzip2/zstd/aes; Yomitan archives are plain
-# deflate ZIPs, and linking the system libbz2 makes the binary depend on a
-# soname that differs across distros (libbz2.so.1.0 on Arch, .so.1 on Fedora).
-zip = { version = "0.6", default-features = false, features = ["deflate"] }
-
-# Catalog downloads (#71): a plain HTTPS GET with rustls + webpki roots, and
-# the SHA-256 the pinned catalog entries are verified against.
-ureq = { version = "2.12", default-features = false, features = ["tls"] }
-sha2 = "0.10"
-
-# Lazy static initialization
-lazy_static = "1.4"
-
-# Parallel iteration
-rayon = "1.8"
-
 # File dialogs
 rfd = "0.14"
-
-# Open URLs in browser
 
 # Async timers (works with Iced's executor)
 futures-timer = "3.0"

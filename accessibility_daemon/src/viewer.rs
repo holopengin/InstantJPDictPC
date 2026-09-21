@@ -21,14 +21,14 @@ use iced::{
     Size, Theme, mouse, touch,
 };
 
-use crate::data::db::DictionaryDatabase;
-use crate::data::models::DictionaryEntry;
-use crate::models::*;
-use crate::overlay_font::FontFace;
-use crate::overlay_state::OcrOverlayState;
-use crate::util::deinflector::Deinflector;
-use crate::util::japanese;
-use crate::util::japanese::{is_half_width, to_vertical_glyph};
+use jpdict_core::data::db::DictionaryDatabase;
+use jpdict_core::data::models::DictionaryEntry;
+use jpdict_core::models::*;
+use jpdict_core::overlay_font::FontFace;
+use jpdict_core::overlay_state::OcrOverlayState;
+use jpdict_core::util::deinflector::Deinflector;
+use jpdict_core::util::japanese;
+use jpdict_core::util::japanese::{is_half_width, to_vertical_glyph};
 
 use fontdue::Font;
 use iced::widget::image::Handle as ImageHandle;
@@ -65,13 +65,10 @@ enum InlineCell {
 /// `InlineCell::Char` runs. The term display keeps bold cyan. Do NOT "fix"
 /// mini back to cyan+bold for parity: that would reintroduce the ticket-06
 /// symptom on both codebases by design.
-pub(crate) struct RubyStyle {
-    pub(crate) base_size: f32,
-    pub(crate) ruby_size: f32,
-    pub(crate) base: Color,
-    pub(crate) ruby: Color,
-    pub(crate) bold: bool,
-}
+///
+/// The resolved values live in [`jpdict_core::ruby_style`] (the single
+/// implementation; the conformance corpus pins it). This file only converts
+/// them to iced colours at the paint sites via [`ruby_base`] / [`ruby_tint`].
 
 /// Fontdue metrics for the same face iced renders the panel with, given once
 /// by the app at startup (`init_panel_metrics`). Without it — unit tests —
@@ -266,7 +263,7 @@ pub struct GlyphCache {
 
 /// Resolve the Japanese UI font file used by BOTH the OCR overlay glyph
 /// cache and the iced dictionary panel (they must render identically).
-/// Face selection and file resolution live in [`crate::overlay_font`]:
+/// Face selection and file resolution live in [`jpdict_core::overlay_font`]:
 /// sans (the default) or serif, with a serif selection whose bundled file
 /// is missing falling back to sans.
 ///
@@ -279,11 +276,11 @@ impl GlyphCache {
     /// one. `None` means the overlay draws boxes without glyphs — mobile
     /// degrades the same way (#84) rather than crashing.
     pub fn new_for(face: FontFace) -> Option<Rc<RefCell<Self>>> {
-        let regular = crate::overlay_font::find_font_path(face);
+        let regular = jpdict_core::overlay_font::find_font_path(face);
         let bold = regular
             .as_deref()
-            .map(crate::overlay_font::face_of)
-            .and_then(crate::overlay_font::find_bold_font_path);
+            .map(jpdict_core::overlay_font::face_of)
+            .and_then(jpdict_core::overlay_font::find_bold_font_path);
         Self::from_paths(regular, bold)
     }
 
@@ -485,7 +482,7 @@ impl GlyphCache {
             return Some(*v);
         }
         let fallback = self.vface.as_ref().and_then(|face| {
-            let vch = crate::util::japanese::to_vertical_glyph(ch);
+            let vch = jpdict_core::util::japanese::to_vertical_glyph(ch);
             if vch != ch {
                 face.glyph_index(vch).map(|g| g.0)
             } else {
@@ -522,7 +519,7 @@ impl GlyphCache {
             return Some(*v);
         }
         let fallback = self.bold_vface.as_ref().and_then(|face| {
-            let vch = crate::util::japanese::to_vertical_glyph(ch);
+            let vch = jpdict_core::util::japanese::to_vertical_glyph(ch);
             if vch != ch {
                 face.glyph_index(vch).map(|g| g.0)
             } else {
@@ -1820,7 +1817,7 @@ pub struct OcrViewer {
     /// screenshot viewer opens clean; the tuning keys still work while hidden.
     pub det_hud_visible: bool,
     /// #43/#86: whether the dictionary panel draws the pitch-accent line.
-    /// Loaded once from [`crate::app_settings::AppSettings`] at startup, so a
+    /// Loaded once from [`jpdict_core::app_settings::AppSettings`] at startup, so a
     /// settings change applies to the next launch (same as the other
     /// Behaviour switches). Off by default, matching mobile.
     pub show_pitch: bool,
@@ -1861,10 +1858,10 @@ impl OcrViewer {
             screen_physical_width: window_w,
             native_scale: 0.0,
             debounced_ui_scale: window_w / 1280.0,
-            det_thresh: crate::ocr_engine::default_det_thresh(),
-            det_unclip: crate::ocr_engine::default_det_unclip(),
-            det_thresh_default: crate::ocr_engine::default_det_thresh(),
-            det_unclip_default: crate::ocr_engine::default_det_unclip(),
+            det_thresh: jpdict_core::ocr_engine::default_det_thresh(),
+            det_unclip: jpdict_core::ocr_engine::default_det_unclip(),
+            det_thresh_default: jpdict_core::ocr_engine::default_det_thresh(),
+            det_unclip_default: jpdict_core::ocr_engine::default_det_unclip(),
             det_box_count: 0,
             det_busy: false,
             // The tuning HUD ships hidden (F1 reveals it); see `toggle_det_hud`.
@@ -2941,16 +2938,14 @@ impl OcrViewer {
         })
     }
 
-    /// One shared palette for both ruby modes (see [`RubyStyle`]).
-    /// Mini (body) is the deliberate departure: white regular base matching
-    /// the surrounding body runs. Term keeps the bold-cyan display.
-    pub(crate) fn ruby_style(is_mini: bool) -> RubyStyle {
-        let ruby = Color::from_rgb(0.75, 0.75, 0.75);
-        if is_mini {
-            RubyStyle { base_size: DEF_TEXT_SIZE, ruby_size: DEF_RUBY_SIZE, base: Color::WHITE, ruby, bold: false }
-        } else {
-            RubyStyle { base_size: 32.0, ruby_size: 13.0, base: Color::from_rgb(0.0, 1.0, 1.0), ruby, bold: true }
-        }
+    /// Base-text colour of the resolved [`jpdict_core::ruby_style::RubyStyle`].
+    fn ruby_base(style: &jpdict_core::ruby_style::RubyStyle) -> Color {
+        Color::from_rgb(style.base[0], style.base[1], style.base[2])
+    }
+
+    /// Ruby-row colour of the resolved [`jpdict_core::ruby_style::RubyStyle`].
+    fn ruby_tint(style: &jpdict_core::ruby_style::RubyStyle) -> Color {
+        Color::from_rgb(style.ruby[0], style.ruby[1], style.ruby[2])
     }
 
     /// Minimal furigana (#55): ruby only over kanji spans, okurigana as plain
@@ -2961,9 +2956,9 @@ impl OcrViewer {
         is_mini: bool,
         reserve_ruby_space: bool,
     ) -> Element<'static, Message> {
-        let style = Self::ruby_style(is_mini);
+        let style = jpdict_core::ruby_style::ruby_style(is_mini);
         let base = |text: String| -> Element<'static, Message> {
-            let label = Text::new(text).size(style.base_size).color(style.base);
+            let label = Text::new(text).size(style.base_size).color(Self::ruby_base(&style));
             if style.bold { label.font(Self::bold_font()).into() } else { label.into() }
         };
         if term == reading {
@@ -2975,7 +2970,7 @@ impl OcrViewer {
             let mut stack = Column::new()
                 .align_x(alignment::Horizontal::Center)
                 .spacing(0);
-            stack = stack.push(Text::new(" ").size(style.ruby_size).color(style.ruby));
+            stack = stack.push(Text::new(" ").size(style.ruby_size).color(Self::ruby_tint(&style)));
             stack = stack.push(base(term.to_string()));
             return stack.into();
         }
@@ -2994,7 +2989,7 @@ impl OcrViewer {
                     let mut stack = Column::new()
                         .align_x(alignment::Horizontal::Center)
                         .spacing(0);
-                    stack = stack.push(Text::new(ruby).size(style.ruby_size).color(style.ruby));
+                    stack = stack.push(Text::new(ruby).size(style.ruby_size).color(Self::ruby_tint(&style)));
                     stack = stack.push(base(seg.base));
                     row = row.push(stack);
                 }
@@ -3004,24 +2999,25 @@ impl OcrViewer {
     }
 
     /// Fallback when the reading cannot align over kanji spans: the whole
-    /// reading sits above the whole term. Paints from the same [`RubyStyle`]
+    /// reading sits above the whole term. Paints from the same
+    /// [`jpdict_core::ruby_style::RubyStyle`]
     /// as the aligned path, so unalignable (usually longest-compound) terms
     /// match the mode's style exactly.
     fn full_ruby_view(term: &str, reading: &str, is_mini: bool) -> Element<'static, Message> {
-        let style = Self::ruby_style(is_mini);
+        let style = jpdict_core::ruby_style::ruby_style(is_mini);
         let mut stack = Column::new()
             .align_x(alignment::Horizontal::Center)
             .spacing(0);
-        stack = stack.push(Text::new(reading.to_string()).size(style.ruby_size).color(style.ruby));
+        stack = stack.push(Text::new(reading.to_string()).size(style.ruby_size).color(Self::ruby_tint(&style)));
         if style.bold {
             stack = stack.push(
                 Text::new(term.to_string())
                     .size(style.base_size)
-                    .color(style.base)
+                    .color(Self::ruby_base(&style))
                     .font(Self::bold_font()),
             );
         } else {
-            stack = stack.push(Text::new(term.to_string()).size(style.base_size).color(style.base));
+            stack = stack.push(Text::new(term.to_string()).size(style.base_size).color(Self::ruby_base(&style)));
         }
         stack.into()
     }
@@ -3469,12 +3465,12 @@ impl OcrViewer {
                 // entries (neighbours + variants) read amber, LM-ranked
                 // blank entries read blue. Selection still wins outright.
                 let tint = match c.source {
-                    crate::util::oov_suggestions::Source::Head => Color::WHITE,
-                    crate::util::oov_suggestions::Source::Components
-                    | crate::util::oov_suggestions::Source::Variant => {
+                    jpdict_core::util::oov_suggestions::Source::Head => Color::WHITE,
+                    jpdict_core::util::oov_suggestions::Source::Components
+                    | jpdict_core::util::oov_suggestions::Source::Variant => {
                         Color::from_rgb(1.0, 0.8, 0.4)
                     }
-                    crate::util::oov_suggestions::Source::Lm => {
+                    jpdict_core::util::oov_suggestions::Source::Lm => {
                         Color::from_rgb(0.55, 0.85, 1.0)
                     }
                 };
@@ -4193,7 +4189,7 @@ mod tests {
     /// on the first non-empty line.
     #[test]
     fn apply_ocr_batch_fills_all_slots_in_one_pass() {
-        let mut v = OcrViewer::new_empty(1280.0, 720.0, crate::overlay_font::FontFace::Sans);
+        let mut v = OcrViewer::new_empty(1280.0, 720.0, jpdict_core::overlay_font::FontFace::Sans);
         v.set_image(
             iced::widget::image::Handle::from_bytes(Vec::new()),
             Vec::new(),
@@ -4256,7 +4252,7 @@ mod tests {
     /// A batch of detection-only placeholders must not seed the cursor.
     #[test]
     fn apply_ocr_batch_without_text_leaves_cursor_unset() {
-        let mut v = OcrViewer::new_empty(1280.0, 720.0, crate::overlay_font::FontFace::Sans);
+        let mut v = OcrViewer::new_empty(1280.0, 720.0, jpdict_core::overlay_font::FontFace::Sans);
         v.apply_ocr_batch(vec![DetectedAnnotation {
             bbox: BoundingBox::new(0, 0, 10, 10, 0.5),
             quad: None,
@@ -4357,11 +4353,11 @@ mod tests {
     /// graduate to the conformance spec later.
     #[test]
     fn body_ruby_uses_body_typeface_not_term_display() {
-        let body = OcrViewer::ruby_style(true);
+        let body = jpdict_core::ruby_style::ruby_style(true);
         assert_eq!(body.base_size, DEF_TEXT_SIZE, "mini base sits at body size");
         assert_eq!(body.ruby_size, DEF_RUBY_SIZE);
-        assert_eq!(body.base, Color::WHITE, "body ruby base matches plain body runs");
-        assert_eq!(body.ruby, Color::from_rgb(0.75, 0.75, 0.75), "body ruby row stays gray");
+        assert_eq!(OcrViewer::ruby_base(&body), Color::WHITE, "body ruby base matches plain body runs");
+        assert_eq!(OcrViewer::ruby_tint(&body), Color::from_rgb(0.75, 0.75, 0.75), "body ruby row stays gray");
         assert!(!body.bold, "body ruby is regular weight, like the surrounding text");
     }
 
@@ -4369,11 +4365,11 @@ mod tests {
     /// display (mobile non-mini `createRubyView`: 32sp base / 13sp ruby).
     #[test]
     fn term_ruby_keeps_full_size_term_display() {
-        let term = OcrViewer::ruby_style(false);
+        let term = jpdict_core::ruby_style::ruby_style(false);
         assert_eq!(term.base_size, 32.0);
         assert_eq!(term.ruby_size, 13.0);
-        assert_eq!(term.base, Color::from_rgb(0.0, 1.0, 1.0), "term base stays cyan");
-        assert_eq!(term.ruby, Color::from_rgb(0.75, 0.75, 0.75), "term ruby stays gray");
+        assert_eq!(OcrViewer::ruby_base(&term), Color::from_rgb(0.0, 1.0, 1.0), "term base stays cyan");
+        assert_eq!(OcrViewer::ruby_tint(&term), Color::from_rgb(0.75, 0.75, 0.75), "term ruby stays gray");
         assert!(term.bold, "term display stays bold");
     }
 
@@ -4433,7 +4429,7 @@ mod tests {
     #[test]
     fn pitch_line_ships_off() {
         let viewer =
-            OcrViewer::new_empty(1280.0, 720.0, crate::overlay_font::FontFace::Sans);
+            OcrViewer::new_empty(1280.0, 720.0, jpdict_core::overlay_font::FontFace::Sans);
         assert!(!viewer.show_pitch, "the pitch line ships off");
     }
 
@@ -4500,7 +4496,7 @@ mod tests {
     #[test]
     fn det_hud_ships_hidden_and_f1_toggles_it() {
         let mut viewer =
-            OcrViewer::new_empty(1280.0, 720.0, crate::overlay_font::FontFace::Sans);
+            OcrViewer::new_empty(1280.0, 720.0, jpdict_core::overlay_font::FontFace::Sans);
         assert!(!viewer.det_hud_visible, "the tuning HUD ships hidden");
         viewer.toggle_det_hud();
         assert!(viewer.det_hud_visible, "first F1 shows the HUD");

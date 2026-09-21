@@ -3,16 +3,16 @@
 ## Rule
 
 - CTC blank (class 0) is stored as the **ideographic space U+3000** so the
-  walk can tell blank from real space (`decode_char`, `src/ppocr.rs:114`;
+  walk can tell blank from real space (`decode_char`, `core/src/ppocr.rs:114`;
   mobile same convention into `ctcDecodeTopK`, `OcrEngine.kt:1907`).
 - Every timestep caches its full top-K list (`raw_alternatives`,
-  `PpocrResult`, `src/ppocr.rs:53`; built per timestep at `:320-380`;
+  `PpocrResult`, `core/src/ppocr.rs:53`; built per timestep at `:320-380`;
   mobile passes the same lists to `ctcDecodeTopK`).
 - Re-decode rebuilds text, char columns and per-character alternatives from
   the cache **without re-running the model**
   (`re_decode_raw_alternatives`, `:949`; entry 0 is the argmax, U+3000
   resets the collapse). PC entry point: `DetectedAnnotation::re_decode_line`
-  (`src/ocr_engine.rs:1136`), which recomputes boxes in the emit frame's
+  (`core/src/ocr_engine.rs:1136`), which recomputes boxes in the emit frame's
   geometry and keeps old boxes when `seq_len_total == 0` (mobile's
   `cropW == 0` fallback); mobile `reDecodeLineResult` (`OcrEngine.kt:2410`).
 - Top-K ordering matches the Java priority queue; top-K failure falls back
@@ -50,7 +50,7 @@
 
 ## Pinning tests
 
-- PC unit (`src/ppocr.rs` tests):
+- PC unit (`core/src/ppocr.rs` tests):
   `topk_decode_pins_text_cols_and_raw_shape` (blank cached as U+3000),
   `re_decode_pins_fractional_columns`, `re_decode_walk_matches_mobile`,
   `re_decode_normalises_vertical_punctuation`,
@@ -66,6 +66,6 @@
   `the_bundled_asset_still_has_12156_entries`).
 - Conformance: the `gap` kind pins pool discovery order from recorded
   top-K; the `recognition` kind pins end-to-end texts (`recognition_cases`,
-  `src/conformance.rs:648`).
+  `core/src/conformance.rs:648`).
 - Mobile: `BlankAlternativesTest`, `OovCandidatesTest`,
   `OovSuggestionsTest`, `ComponentTableTest`, `RotatedLineResultTest`.

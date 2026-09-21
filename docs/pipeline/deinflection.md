@@ -46,7 +46,7 @@ Chain plumbing and labels, graduated to the corpus by `c7dc78b`:
 - Conformance: `deinflection-01-past-verb`, `deinflection-02-te-form`,
   `deinflection-03-adjective-past`, `deinflection-04-dictionary-form-noop`
   (identity carries no reasons), via `deinflection_cases`
-  (`src/conformance.rs:767`) against the shipped `assets/deinflect.json`
+  (`core/src/conformance.rs:767`) against the shipped `assets/deinflect.json`
   (byte-identical to the Android asset copy at graduation).
 - Mobile: `DeinflectionChainTest` (`reasons_carryRuleNames`,
   `reasons_accumulateOutermostFirst_multiStep`, `identityResult_hasNoReasons`,

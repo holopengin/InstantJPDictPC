@@ -139,14 +139,14 @@ mod tests {
     /// The committed asset, parsed (mirrors mobile `KanjiVariantsTest`).
     fn table() -> Option<KanjiVariantTable> {
         let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/variants/kanji_variants.txt");
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).join("assets/variants/kanji_variants.txt");
         Some(KanjiVariantTable::parse(&std::fs::read_to_string(&path).ok()?))
     }
 
     #[test]
     fn parses_the_committed_asset() {
         let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/variants/kanji_variants.txt");
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).join("assets/variants/kanji_variants.txt");
         let Ok(text) = std::fs::read_to_string(&path) else {
             eprintln!("skipping: {} not present", path.display());
             return;

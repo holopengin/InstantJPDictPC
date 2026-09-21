@@ -207,7 +207,7 @@ mod tests {
     /// The real asset, read from disk (mirrors mobile `ComponentTableTest`).
     fn asset_text() -> Option<String> {
         let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/components/krad_components.txt");
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).join("assets/components/krad_components.txt");
         std::fs::read_to_string(&path).ok()
     }
 
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn the_bundled_asset_still_has_12156_entries() {
         let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/components/krad_components.txt");
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).join("assets/components/krad_components.txt");
         let Ok(text) = std::fs::read_to_string(&path) else {
             eprintln!("skipping: {} not present", path.display());
             return;

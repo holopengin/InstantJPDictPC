@@ -2,7 +2,7 @@
 
 ## Rule
 
-Both `is_ruby_vertical` (`src/furigana.rs:52`) and `is_ruby_horizontal`
+Both `is_ruby_vertical` (`core/src/furigana.rs:52`) and `is_ruby_horizontal`
 (`:96`) require a size difference in **both dimensions** (mobile #99):
 
 - Vertical: small height < 30% of big height (`SIZE_RATIO`, `:19`),
@@ -47,7 +47,7 @@ Both `is_ruby_vertical` (`src/furigana.rs:52`) and `is_ruby_horizontal`
 
 ## Pinning tests
 
-- PC unit (`src/furigana.rs` tests):
+- PC unit (`core/src/furigana.rs` tests):
   `thin_ruby_strip_above_its_line_is_ruby`,
   `thin_but_wide_real_line_is_not_ruby` (the #99 receipt regression),
   `narrow_short_column_beside_its_column_is_ruby`,
@@ -55,7 +55,7 @@ Both `is_ruby_vertical` (`src/furigana.rs:52`) and `is_ruby_horizontal`
 - Conformance: `furigana-01-horizontal-ruby`,
   `furigana-02-receipt-line`, `furigana-03-vertical-ruby`,
   `furigana-04-vertical-fullwidth`, `furigana-05-overlap-boundary`, via
-  `furigana_cases` (`src/conformance.rs:376`).
+  `furigana_cases` (`core/src/conformance.rs:376`).
 - Mobile: `FuriganaRuleTest` (`thinRubyStripAboveItsLine_isRuby`,
   `thinButWideRealLine_isNotRuby`, `narrowShortColumnBesideItsColumn_isRuby`,
   `fullWidthShortColumn_isNotRuby`); `ConformanceCorpusTest.furiganaCases`

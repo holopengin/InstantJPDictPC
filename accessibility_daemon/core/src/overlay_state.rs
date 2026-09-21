@@ -1860,7 +1860,7 @@ mod tests {
     // ---------------------------------------------------------------------
 
     fn fixtures() -> serde_json::Value {
-        serde_json::from_str(include_str!("../tests/data/jitendex/entries.json")).unwrap()
+        serde_json::from_str(include_str!("../../tests/data/jitendex/entries.json")).unwrap()
     }
 
     fn fixture_for(term: &str, reading: &str) -> serde_json::Value {
@@ -2514,7 +2514,7 @@ mod tests {
 
     #[test]
     fn deinflected_matches_carry_their_chain() {
-        let deinflector = Deinflector::from_json_file("assets/deinflect.json").unwrap();
+        let deinflector = Deinflector::from_json_file(concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/deinflect.json")).unwrap();
         let state = OcrOverlayState::new(1024.0, 768.0);
         let (terms, by_length) = state.prepare_search_candidates("食べた", &deinflector);
         assert!(terms.contains("食べる"), "terms: {terms:?}");
@@ -2709,7 +2709,7 @@ mod tests {
     /// when the asset is absent).
     #[test]
     fn an_installed_model_ranks_the_blank_list_by_context() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/lm/char_lm.bin");
+        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).join("assets/lm/char_lm.bin");
         let Some(lm) = CharLm::load(&path) else {
             eprintln!("skipping: {} not present", path.display());
             return;
@@ -2857,7 +2857,7 @@ mod tests {
 
         // Blank with the shipped model: the ranked entries read `Lm`.
         let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/lm/char_lm.bin");
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).join("assets/lm/char_lm.bin");
         let Some(lm) = CharLm::load(&path) else {
             eprintln!("skipping LM half: {} not present", path.display());
             return;
