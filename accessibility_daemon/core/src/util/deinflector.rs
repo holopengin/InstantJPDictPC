@@ -139,7 +139,7 @@ mod tests {
     /// are readable group labels, not kana fragments.
     #[test]
     fn reasons_carry_rule_names() {
-        let deinflector = Deinflector::from_json_file("assets/deinflect.json").unwrap();
+        let deinflector = Deinflector::from_json_file(concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/deinflect.json")).unwrap();
         let hit = deinflector
             .deinflect("食べた")
             .into_iter()
@@ -152,7 +152,7 @@ mod tests {
     /// the identity result carries no reasons, so direct matches get no chain.
     #[test]
     fn identity_result_has_no_reasons() {
-        let deinflector = Deinflector::from_json_file("assets/deinflect.json").unwrap();
+        let deinflector = Deinflector::from_json_file(concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/deinflect.json")).unwrap();
         let identity = deinflector
             .deinflect("食べた")
             .into_iter()

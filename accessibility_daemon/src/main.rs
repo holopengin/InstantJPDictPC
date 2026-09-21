@@ -1,20 +1,6 @@
-mod app_settings;
-mod nav_graph;
 mod capture;
-#[cfg(test)]
-mod conformance;
-mod data;
 mod frontend;
-mod furigana;
-mod kana_size;
-mod models;
-mod ocr_engine;
-mod overlay_font;
-mod overlay_state;
-mod ppocr;
-mod ppocr_ncnn;
 mod settings_window;
-mod util;
 mod viewer;
 
 /// Open an image file, including JPEG XL (`.jxl`) which the `image` crate
@@ -44,10 +30,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::data::db::DictionaryDatabase;
+use jpdict_core::data::db::DictionaryDatabase;
 use crate::frontend::FrontendWindow;
-use crate::models::*;
-use crate::util::deinflector::Deinflector;
+use jpdict_core::models::*;
+use jpdict_core::util::deinflector::Deinflector;
 use crate::viewer::OcrViewer;
 
 /// Messages from the bootstrap thread to the Iced UI update function.
@@ -238,7 +224,7 @@ fn main() -> Result<()> {
         // #43: the bundled pitch dictionary installs on a worker thread; the
         // settings window opens (and stays responsive) while a first run
         // imports.
-        crate::data::bundled::spawn_bundled_install(
+        jpdict_core::data::bundled::spawn_bundled_install(
             Arc::clone(&db),
             std::path::PathBuf::from(resolve_asset_dir()),
         );
@@ -551,7 +537,7 @@ fn run_ocr_viewer(
     // Persisted app settings, read once per run: every capture/watcher child
     // is a fresh process, so a change applies to the next run (mobile reads
     // its preferences per detection run).
-    let app_settings = crate::app_settings::AppSettings::load(data_dir);
+    let app_settings = jpdict_core::app_settings::AppSettings::load(data_dir);
 
     // Headless batch mode: OCR a directory or a list of images, saving line
     // crops + sidecar text files next to each source image.
@@ -575,7 +561,7 @@ fn run_ocr_viewer(
     // narrows the blank's list, so it is never fatal.
     let char_lm = {
         let path = std::path::Path::new(&resolve_asset_dir()).join("lm/char_lm.bin");
-        match crate::util::char_lm::CharLm::load(&path) {
+        match jpdict_core::util::char_lm::CharLm::load(&path) {
             Some(lm) => {
                 println!("[Bootstrap] CharLm loaded: {} entries", lm.entries());
                 Some(std::sync::Arc::new(lm))
@@ -596,10 +582,10 @@ fn run_ocr_viewer(
     let oov_candidates = {
         let path =
             std::path::Path::new(&resolve_asset_dir()).join("components/krad_components.txt");
-        match crate::util::component_table::ComponentTable::load(&path) {
+        match jpdict_core::util::component_table::ComponentTable::load(&path) {
             Some(table) => {
                 println!("[Bootstrap] ComponentTable loaded: {} entries", table.entry_count());
-                Some(std::sync::Arc::new(crate::util::oov_candidates::OovCandidates::new(table)))
+                Some(std::sync::Arc::new(jpdict_core::util::oov_candidates::OovCandidates::new(table)))
             }
             None => {
                 eprintln!(
@@ -616,7 +602,7 @@ fn run_ocr_viewer(
     let kanji_variants = {
         let path =
             std::path::Path::new(&resolve_asset_dir()).join("variants/kanji_variants.txt");
-        match crate::util::kanji_variants::KanjiVariantTable::load(&path) {
+        match jpdict_core::util::kanji_variants::KanjiVariantTable::load(&path) {
             Some(table) => {
                 println!("[Bootstrap] KanjiVariants loaded: {} variants", table.entry_count());
                 Some(std::sync::Arc::new(table))
@@ -680,7 +666,7 @@ fn run_ocr_viewer(
             // its own worker thread, so the OCR pipeline is never delayed by a
             // first-run import. Subsequent starts skip after one query.
             let db = Arc::new(db);
-            crate::data::bundled::spawn_bundled_install(
+            jpdict_core::data::bundled::spawn_bundled_install(
                 Arc::clone(&db),
                 std::path::PathBuf::from(resolve_asset_dir()),
             );
@@ -698,7 +684,7 @@ fn run_ocr_viewer(
             // Phase 4: OCR pipeline (engine creation → detection → recognition)
             {
                 let t_engine = std::time::Instant::now();
-                let mut engine = match ocr_engine::OcrEngine::new(&resolve_asset_dir(), recognition_mode, batch_size) {
+                let mut engine = match jpdict_core::ocr_engine::OcrEngine::new(&resolve_asset_dir(), recognition_mode, batch_size) {
                     Ok(e) => e,
                     Err(err) => { eprintln!("[Bootstrap] OCR engine error: {err}"); return; }
                 };
@@ -735,7 +721,7 @@ fn run_ocr_viewer(
                 let batch_sz = engine.batch_size;
                 let rec_mode = engine.recognition_mode;
                 let t_recognize = std::time::Instant::now();
-                match ocr_engine::recognize_boxes_collect(
+                match jpdict_core::ocr_engine::recognize_boxes_collect(
                     &image, &boxes, &rotated,
                     engine.ppocr_rec.clone(),
                     engine.kana_size.clone(),
@@ -777,7 +763,7 @@ fn run_ocr_viewer(
                     let boxes = det.boxes;
                     let rotated = det.rotated;
                     let mut anns = detection_annotations(&boxes, &rotated);
-                    match ocr_engine::recognize_boxes_collect(
+                    match jpdict_core::ocr_engine::recognize_boxes_collect(
                         &image, &boxes, &rotated,
                         engine.ppocr_rec.clone(),
                         engine.kana_size.clone(),
@@ -1160,10 +1146,10 @@ fn run_ocr_viewer(
     // face actually found: a serif selection whose file is missing falls back
     // to the sans file (with a warning), so ask for the sans family — never
     // for a family nothing registered.
-    let font_path = crate::overlay_font::find_font_path(face);
+    let font_path = jpdict_core::overlay_font::find_font_path(face);
     let loaded_face = font_path
         .as_deref()
-        .map(crate::overlay_font::face_of)
+        .map(jpdict_core::overlay_font::face_of)
         .unwrap_or(face);
     let font_bytes = font_path
         .as_ref()
@@ -1352,7 +1338,7 @@ fn run_headless_batch(
     );
 
     let t_engine = std::time::Instant::now();
-    let mut engine = ocr_engine::OcrEngine::new(&resolve_asset_dir(), recognition_mode, batch_size)?;
+    let mut engine = jpdict_core::ocr_engine::OcrEngine::new(&resolve_asset_dir(), recognition_mode, batch_size)?;
     engine.det_thresh_override = tuning.thresh;
     engine.det_unclip_override = tuning.unclip;
     engine.det_furigana = furigana_filter;
@@ -1380,7 +1366,7 @@ fn run_headless_batch(
             .unwrap_or(Path::new("/tmp"));
         // Keep the receiver alive so worker sends succeed for every line.
         let (tx, rx) = std::sync::mpsc::channel::<(usize, DetectedAnnotation)>();
-        if let Err(e) = ocr_engine::recognize_boxes_streaming(
+        if let Err(e) = jpdict_core::ocr_engine::recognize_boxes_streaming(
             &image, &boxes, &rotated,
             engine.ppocr_rec.clone(),
             engine.kana_size.clone(),

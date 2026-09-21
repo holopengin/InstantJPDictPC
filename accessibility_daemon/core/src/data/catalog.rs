@@ -45,7 +45,7 @@ pub fn entries() -> &'static [CatalogEntry] {
     static ENTRIES: OnceLock<Vec<CatalogEntry>> = OnceLock::new();
     ENTRIES.get_or_init(|| {
         let file: CatalogFile = serde_json::from_str(include_str!(
-            "../../assets/catalog/dictionaries.json"
+            "../../../assets/catalog/dictionaries.json"
         ))
         .expect("embedded dictionary catalog must parse");
         file.entries

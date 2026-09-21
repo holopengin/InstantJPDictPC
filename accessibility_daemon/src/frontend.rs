@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::app_settings::AppSettings;
-use crate::data::db::DictionaryDatabase;
+use jpdict_core::app_settings::AppSettings;
+use jpdict_core::data::db::DictionaryDatabase;
 use crate::settings_window::{SettingsMessage, SettingsWindow};
 use crate::watcher;
 
