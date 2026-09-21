@@ -2839,7 +2839,7 @@ mod tests {
 
         // Blank without a model: the placeholder and the discovery-order
         // evidence are head entries.
-        let mut state = state_at(
+        let state = state_at(
             blank_line(
                 "私\u{25CC}う",
                 vec![vec![('私', 1.0)], vec![(GAP_CHAR, 0.0)], vec![('う', 1.0)]],
