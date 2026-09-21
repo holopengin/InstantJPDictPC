@@ -429,6 +429,10 @@ fn tune_key_message(modified_key: &iced::keyboard::Key) -> Option<Message> {
             Some(Message::TuneDet { param: DetParam::Threshold, delta: 0.01 })
         }
         Key::Character(c) if c.as_ref() == "r" || c.as_ref() == "R" => Some(Message::TuneReset),
+        // F1 shows/hides the tuning HUD (hidden by default): a Named key, so
+        // it cannot collide with the character keys above — navigation
+        // (arrows/hjkl), scroll (d/f), Backspace aliases (q/Esc via `Back`),
+        // or the tune keys ([ ] - = r) on any layout.
         Key::Named(iced::keyboard::key::Named::F1) => Some(Message::ToggleDetHud),
         _ => None,
     }
@@ -1057,7 +1061,7 @@ fn run_ocr_viewer(
                 }
             }
             Message::ToggleDetHud => {
-                state.det_hud_visible = !state.det_hud_visible;
+                state.toggle_det_hud();
             }
             Message::Tick => {
                 // Nav graph rebuild is deferred to navigate() — no need
