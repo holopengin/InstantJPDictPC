@@ -501,3 +501,417 @@ fn enforce_connectivity(
         break;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Dedicated regression tests for [`NavGraph::build`] / [`NavGraph::navigate`].
+    //!
+    //! Box collection mirrors mobile
+    //! `OcrOverlayStateController.rebuildNavGraph` (collect every line's
+    //! `charBoxes` in order; build when `boxes.size >= 5`): the PC twin is
+    //! `build_nav_graph` (`src/overlay_state.rs:263`). Direction encoding is
+    //! `[north, south, east, west] = [0, 1, 2, 3]` on both sides (mobile
+    //! `OcrOverlayStateController.navigate` maps DPAD_UP/DOWN/RIGHT/LEFT to
+    //! 0/1/2/3; PC `overlay_state.rs:244-250` maps the same). The graph
+    //! internals are PC-side per `docs/pipeline/reading-order.md` — the
+    //! mobile `nav_graph_core` crate shares the shape (local/greedy/wrap
+    //! phases, `(i+1)%n` fallback ring) but not the constants — so these
+    //! tests pin exact PC neighbour indices.
+    //!
+    //! Test names (`nav_graph_0X_...`) are chosen so each can be promoted to
+    //! a `nav-graph-0X-...` conformance case later; no corpus cases are added
+    //! here.
+    use super::*;
+    use crate::models::{BoundingBox, RotatedBox};
+
+    /// Direction slots: [north, south, east, west].
+    const N: usize = 0;
+    const S: usize = 1;
+    const E: usize = 2;
+    const W: usize = 3;
+
+    fn bb(x: i32, y: i32, w: i32, h: i32) -> BoundingBox {
+        BoundingBox::new(x, y, w, h, 1.0)
+    }
+
+    fn nav(boxes: &[BoundingBox], idx: usize, dir: usize) -> Option<usize> {
+        NavGraph::build(boxes).navigate(idx, dir)
+    }
+
+    /// Two horizontal lines of six chars in reading order (the overlay feeds
+    /// char boxes line by line, as mobile `rebuildNavGraph` collects
+    /// `charBoxes`). 24px chars on a 32px advance, 80px line pitch.
+    fn h_lines_2x6() -> Vec<BoundingBox> {
+        let mut out = Vec::new();
+        for r in 0..2 {
+            for c in 0..6 {
+                out.push(bb(100 + c * 32, 100 + r * 80, 24, 24));
+            }
+        }
+        out
+    }
+
+    /// Two vertical columns of six chars in reading order: the right column
+    /// first, since `sort_detected_boxes` orders verticals right-edge-first
+    /// (`docs/pipeline/reading-order.md`; mobile `OcrEngine.sortDetectedBoxes`).
+    fn v_cols_2x6() -> Vec<BoundingBox> {
+        let mut out = Vec::new();
+        for &x in &[380, 300] {
+            for r in 0..6 {
+                out.push(bb(x, 100 + r * 32, 24, 24));
+            }
+        }
+        out
+    }
+
+    /// Future conformance case `nav-graph-01-h-lines`: east/west walk along
+    /// each line, south drops to the char directly below, north wraps to the
+    /// other line (torus). Nothing is within the 0.05 Phase-1 radius at this
+    /// spacing, so `initial_edges` stay sentinel and Phase 2+/wrap fill all
+    /// slots.
+    #[test]
+    fn nav_graph_01_horizontal_lines() {
+        let boxes = h_lines_2x6();
+        let g = NavGraph::build(&boxes);
+        assert_eq!(g.n, 12);
+        // Phase 1 (strict local, 0.05 radius) finds nothing at this spacing:
+        // neighbour pitch 32px over a 284px page extent is 0.11.
+        assert!(
+            g.initial_edges.iter().all(|e| *e == [12, 12, 12, 12]),
+            "no strict-local links at this spacing: {:?}",
+            g.initial_edges
+        );
+        let expect: [[usize; 4]; 12] = [
+            [7, 6, 1, 5],
+            [6, 7, 2, 0],
+            [9, 8, 3, 1],
+            [8, 9, 4, 2],
+            [9, 10, 5, 3],
+            [10, 11, 0, 4],
+            [0, 1, 7, 11],
+            [1, 0, 8, 6],
+            [2, 3, 9, 7],
+            [3, 2, 10, 8],
+            [4, 3, 11, 9],
+            [5, 4, 6, 10],
+        ];
+        for (i, want) in expect.iter().enumerate() {
+            assert_eq!(g.edges[i], *want, "node {i} neighbours");
+        }
+        // East/west walk the line; line ends wrap around the torus.
+        assert_eq!(nav(&boxes, 0, E), Some(1));
+        assert_eq!(nav(&boxes, 4, E), Some(5));
+        assert_eq!(nav(&boxes, 5, E), Some(0), "line end wraps east");
+        assert_eq!(nav(&boxes, 6, W), Some(11), "line start wraps west");
+        assert_eq!(nav(&boxes, 7, W), Some(6));
+        // South drops to the char directly below; north climbs back.
+        assert_eq!(nav(&boxes, 0, S), Some(6));
+        assert_eq!(nav(&boxes, 6, N), Some(0));
+        assert_eq!(nav(&boxes, 3, S), Some(9));
+        assert_eq!(nav(&boxes, 9, N), Some(3));
+        // North from the top line wraps to the lower line.
+        assert_eq!(nav(&boxes, 1, N), Some(6));
+        // South from the bottom line wraps to the upper line.
+        assert_eq!(nav(&boxes, 6, S), Some(1));
+        // Wrap targets honour the distinct-targets rule, so two top-line
+        // nodes can share one wrap target, and the 7-vs-9 wrap-cost tie for
+        // node 2 resolves by f32 rounding: both are valid torus wraps.
+        assert_eq!(nav(&boxes, 2, N), Some(9));
+        assert_eq!(nav(&boxes, 4, N), Some(9));
+    }
+
+    /// Future conformance case `nav-graph-02-v-columns`: north/south walk
+    /// down each column (column ends wrap), west steps across to the left
+    /// column, east from the right column wraps to the left column.
+    #[test]
+    fn nav_graph_02_vertical_columns() {
+        let boxes = v_cols_2x6();
+        let g = NavGraph::build(&boxes);
+        assert_eq!(g.n, 12);
+        assert!(
+            g.initial_edges.iter().all(|e| *e == [12, 12, 12, 12]),
+            "no strict-local links at this spacing: {:?}",
+            g.initial_edges
+        );
+        let expect: [[usize; 4]; 12] = [
+            [5, 1, 7, 6],
+            [0, 2, 6, 7],
+            [1, 3, 9, 8],
+            [2, 4, 8, 9],
+            [3, 5, 9, 10],
+            [4, 0, 10, 11],
+            [11, 7, 0, 1],
+            [6, 8, 1, 0],
+            [7, 9, 2, 3],
+            [8, 10, 3, 2],
+            [9, 11, 4, 3],
+            [10, 6, 5, 4],
+        ];
+        for (i, want) in expect.iter().enumerate() {
+            assert_eq!(g.edges[i], *want, "node {i} neighbours");
+        }
+        // South walks down the column; the column foot wraps to its head.
+        assert_eq!(nav(&boxes, 0, S), Some(1));
+        assert_eq!(nav(&boxes, 4, S), Some(5));
+        assert_eq!(nav(&boxes, 5, S), Some(0), "column foot wraps south");
+        // North climbs; the column head wraps to its foot (torus).
+        assert_eq!(nav(&boxes, 5, N), Some(4));
+        assert_eq!(nav(&boxes, 0, N), Some(5), "column head wraps north");
+        // West steps across to the left column at the same height.
+        assert_eq!(nav(&boxes, 0, W), Some(6));
+        assert_eq!(nav(&boxes, 3, W), Some(9));
+        // East off the right column wraps to the left column ...
+        assert_eq!(nav(&boxes, 6, E), Some(0), "... and back east");
+        assert_eq!(nav(&boxes, 1, W), Some(7));
+    }
+
+    /// Future conformance case `nav-graph-03-single-line`: one row of six
+    /// has no vertical neighbours, so every north/south slot stays the `n`
+    /// sentinel and `navigate` returns None; east/west chain with torus wraps
+    /// at the ends.
+    #[test]
+    fn nav_graph_03_single_line_has_no_vertical_neighbours() {
+        let boxes: Vec<_> = (0..6).map(|c| bb(100 + c * 32, 100, 24, 24)).collect();
+        let g = NavGraph::build(&boxes);
+        let expect: [[usize; 4]; 6] = [
+            [6, 6, 1, 5],
+            [6, 6, 2, 0],
+            [6, 6, 3, 1],
+            [6, 6, 4, 2],
+            [6, 6, 5, 3],
+            [6, 6, 0, 4],
+        ];
+        for (i, want) in expect.iter().enumerate() {
+            assert_eq!(g.edges[i], *want, "node {i} neighbours");
+        }
+        for i in 0..6 {
+            assert_eq!(nav(&boxes, i, N), None, "node {i} has no north");
+            assert_eq!(nav(&boxes, i, S), None, "node {i} has no south");
+        }
+        assert_eq!(nav(&boxes, 0, E), Some(1));
+        assert_eq!(nav(&boxes, 5, E), Some(0), "row end wraps east");
+        assert_eq!(nav(&boxes, 0, W), Some(5), "row start wraps west");
+    }
+
+    /// Phase 1 (strict local, 0.05 radius, 45° cone, cost = primary +
+    /// 10 × off-axis) links adjacent chars directly once the neighbour pitch
+    /// drops under 0.05 of the page extent: 25 chars on a 32px advance span
+    /// 792px, so the pitch is 0.040. `initial_edges` already hold the
+    /// east/west neighbours; north/south stay empty on a single row.
+    #[test]
+    fn nav_graph_03b_long_row_links_phase1_local() {
+        let boxes: Vec<_> = (0..25).map(|c| bb(100 + c * 32, 100, 24, 24)).collect();
+        let g = NavGraph::build(&boxes);
+        assert_eq!(g.n, 25);
+        // Mid-row node: Phase 1 already picked the adjacent neighbours.
+        assert_eq!(g.initial_edges[12], [25, 25, 13, 11]);
+        assert_eq!(g.initial_edges[1], [25, 25, 2, 0]);
+        // Row ends have no local wrap partner: west/east fill in Phase 3.
+        assert_eq!(g.initial_edges[0][W], 25);
+        assert_eq!(g.initial_edges[24][E], 25);
+        // Final graph: a clean east/west ring, no vertical neighbours.
+        for i in 0..25 {
+            assert_eq!(g.edges[i][E], (i + 1) % 25, "node {i} east");
+            assert_eq!(g.edges[i][W], (i + 24) % 25, "node {i} west");
+            assert_eq!(g.edges[i][N], 25, "node {i} has no north");
+            assert_eq!(g.edges[i][S], 25, "node {i} has no south");
+        }
+        assert_eq!(nav(&boxes, 24, E), Some(0));
+        assert_eq!(nav(&boxes, 0, W), Some(24));
+        assert_eq!(nav(&boxes, 12, N), None);
+    }
+
+    /// Future conformance case `nav-graph-04-fallback`: fewer than five nodes
+    /// take the `(i+1)%n` ring (`NavGraph::fallback`), the same formula as
+    /// mobile `nav_graph_core ... fallback`. Empty input builds an empty
+    /// graph where every `navigate` returns None.
+    #[test]
+    fn nav_graph_04_small_inputs_take_the_fallback_ring() {
+        // Empty: no nodes, no edges, no navigation.
+        let g = NavGraph::build(&[]);
+        assert_eq!(g.n, 0);
+        assert!(g.edges.is_empty());
+        assert_eq!(g.navigate(0, N), None);
+        // Single char: the ring is all self-loops, so navigation stays put.
+        // (Mobile `fallback` computes the identical `(i+1)%1 = 0` entries.)
+        let one = [bb(100, 100, 24, 24)];
+        let g = NavGraph::build(&one);
+        assert_eq!(g.edges, vec![[0, 0, 0, 0]]);
+        for dir in [N, S, E, W] {
+            assert_eq!(g.navigate(0, dir), Some(0), "single char stays put");
+        }
+        // Two nodes: [(i+1)%2, (i+2)%2, (i+3)%2, (i+4)%2].
+        let two: Vec<_> = (0..2).map(|c| bb(100 + c * 32, 100, 24, 24)).collect();
+        let g = NavGraph::build(&two);
+        assert_eq!(g.edges, vec![[1, 0, 1, 0], [0, 1, 0, 1]]);
+        assert_eq!(g.navigate(0, E), Some(1));
+        assert_eq!(g.navigate(1, W), Some(1), "two-node ring west is self");
+        // Four nodes: the full ring.
+        let four: Vec<_> = (0..4).map(|c| bb(100 + c * 32, 100, 24, 24)).collect();
+        let g = NavGraph::build(&four);
+        assert_eq!(
+            g.edges,
+            vec![[1, 2, 3, 0], [2, 3, 0, 1], [3, 0, 1, 2], [0, 1, 2, 3]]
+        );
+        assert_eq!(g.navigate(3, N), Some(0), "four-node ring wraps");
+    }
+
+    /// Future conformance case `nav-graph-05-mixed`: three horizontal chars
+    /// then three vertical chars (reading order is horizontals-first per
+    /// `docs/pipeline/reading-order.md`). East reaches from the line end into
+    /// the column head; the column's west reaches back; the 45° cone leaves
+    /// genuinely empty directions (`n` sentinel → `navigate` None).
+    #[test]
+    fn nav_graph_05_mixed_orientation_page() {
+        let mut boxes = Vec::new();
+        for c in 0..3 {
+            boxes.push(bb(100 + c * 32, 100, 24, 24));
+        }
+        for r in 0..3 {
+            boxes.push(bb(400, 100 + r * 32, 24, 24));
+        }
+        let g = NavGraph::build(&boxes);
+        assert_eq!(g.n, 6);
+        let expect: [[usize; 4]; 6] = [
+            [4, 6, 1, 3],
+            [5, 6, 2, 0],
+            [5, 6, 3, 1],
+            [5, 4, 0, 2],
+            [3, 5, 0, 2],
+            [4, 3, 1, 2],
+        ];
+        for (i, want) in expect.iter().enumerate() {
+            assert_eq!(g.edges[i], *want, "node {i} neighbours");
+        }
+        // The line end reaches east into the column head ...
+        assert_eq!(nav(&boxes, 2, E), Some(3));
+        // ... and the column head reaches back west along the line.
+        assert_eq!(nav(&boxes, 3, W), Some(2));
+        // The column walks north/south ...
+        assert_eq!(nav(&boxes, 3, S), Some(4));
+        assert_eq!(nav(&boxes, 5, N), Some(4));
+        assert_eq!(nav(&boxes, 4, S), Some(5));
+        // ... while the line's south looks past the far-right column
+        // (outside the 45° cone), so it stays empty.
+        assert_eq!(nav(&boxes, 0, S), None);
+        assert_eq!(nav(&boxes, 2, S), None);
+        // Column mid reaches east back to the line start (wrap).
+        assert_eq!(nav(&boxes, 4, E), Some(0));
+    }
+
+    /// The near-square-horizontal rule (`RotatedBox::is_vertical`, the exact
+    /// predicate `sort_detected_boxes` uses at `src/ocr_engine.rs:1545` to
+    /// split horizontals from verticals like mobile `isVerticalLineBox`):
+    /// a frame counts as vertical only at 1.25× elongation, so a lone
+    /// upright character is never fed sideways.
+    #[test]
+    fn nav_graph_06a_near_square_counts_as_horizontal() {
+        let frame = |w: f32, h: f32| RotatedBox::new(0.0, 0.0, w, h, 0.0, 1.0);
+        assert!(!frame(40.0, 40.0).is_vertical(), "square is horizontal");
+        assert!(!frame(40.0, 44.0).is_vertical(), "near-square is horizontal");
+        assert!(frame(32.0, 40.0).is_vertical(), "1.25x boundary is vertical");
+        assert!(!frame(33.0, 40.0).is_vertical(), "below 1.25x is horizontal");
+        assert!(frame(30.0, 200.0).is_vertical(), "column is vertical");
+        assert!(!frame(200.0, 30.0).is_vertical(), "line is horizontal");
+    }
+
+    /// Future conformance case `nav-graph-06-near-square`: a 40×40 box inline
+    /// in a horizontal line (same centres as a 24px char would have) sorts
+    /// with the horizontals and navigates east/west along the line — it is
+    /// never treated as a vertical column.
+    #[test]
+    fn nav_graph_06b_near_square_box_navigates_with_its_line() {
+        let mut boxes = Vec::new();
+        for c in 0..6 {
+            if c == 2 {
+                boxes.push(bb(100 + c * 32 - 8, 92, 40, 40));
+            } else {
+                boxes.push(bb(100 + c * 32, 100, 24, 24));
+            }
+        }
+        // The near-square frame classifies horizontal by the real rule ...
+        let quad = RotatedBox::new(176.0, 112.0, 40.0, 40.0, 0.0, 1.0);
+        assert!(!quad.is_vertical());
+        // ... and the graph walks straight through it along the line.
+        let g = NavGraph::build(&boxes);
+        let expect: [[usize; 4]; 6] = [
+            [6, 6, 1, 5],
+            [6, 6, 2, 0],
+            [6, 6, 3, 1],
+            [6, 6, 4, 2],
+            [6, 6, 5, 3],
+            [6, 6, 0, 4],
+        ];
+        for (i, want) in expect.iter().enumerate() {
+            assert_eq!(g.edges[i], *want, "node {i} neighbours");
+        }
+        assert_eq!(nav(&boxes, 1, E), Some(2), "east into the near-square box");
+        assert_eq!(nav(&boxes, 3, W), Some(2), "west into the near-square box");
+        assert_eq!(nav(&boxes, 2, E), Some(3), "east out of the near-square box");
+        assert_eq!(nav(&boxes, 2, W), Some(1), "west out of the near-square box");
+    }
+
+    /// Future conformance case `nav-graph-07-corpus-mixed`: the
+    /// `reading-order-01-mixed` corpus geometry in reading order
+    /// (horizontals including the near-square box first, then verticals
+    /// right-edge-first). The second line reaches south into the near-square
+    /// box; the left vertical reaches east across to the right column while
+    /// the right column's west reaches back; exhausted directions stay empty.
+    #[test]
+    fn nav_graph_07_corpus_mixed_geometry_in_reading_order() {
+        // Corpus boxes reordered to `expect_order` [0, 1, 4, 3, 2].
+        let boxes = [
+            bb(10, 10, 200, 30),
+            bb(10, 100, 200, 30),
+            bb(10, 200, 40, 40),
+            bb(300, 10, 30, 200),
+            bb(100, 10, 30, 200),
+        ];
+        // The corpus order itself follows the real rule: the 40×40 frame is
+        // horizontal, the 30×200 frames vertical.
+        assert!(!RotatedBox::new(0.0, 0.0, 40.0, 40.0, 0.0, 1.0).is_vertical());
+        assert!(RotatedBox::new(0.0, 0.0, 30.0, 200.0, 0.0, 1.0).is_vertical());
+        let g = NavGraph::build(&boxes);
+        assert_eq!(g.n, 5);
+        let expect: [[usize; 4]; 5] = [
+            [4, 1, 3, 5],
+            [4, 2, 3, 5],
+            [1, 4, 3, 5],
+            [1, 0, 5, 4],
+            [0, 1, 3, 5],
+        ];
+        for (i, want) in expect.iter().enumerate() {
+            assert_eq!(g.edges[i], *want, "node {i} neighbours");
+        }
+        // Down the horizontals into the near-square box ...
+        assert_eq!(nav(&boxes, 0, S), Some(1));
+        assert_eq!(nav(&boxes, 1, S), Some(2));
+        assert_eq!(nav(&boxes, 2, N), Some(1));
+        // ... east into the right vertical, west back across the columns.
+        assert_eq!(nav(&boxes, 0, E), Some(3));
+        assert_eq!(nav(&boxes, 4, E), Some(3));
+        assert_eq!(nav(&boxes, 3, W), Some(4));
+        // West off the horizontals is exhausted (both wrap candidates are
+        // already taken by other directions), so navigation stops.
+        assert_eq!(nav(&boxes, 0, W), None);
+        assert_eq!(nav(&boxes, 3, E), None);
+    }
+
+    /// `navigate` resolves sentinel slots and out-of-range inputs to None
+    /// (mobile `nav_graph_core ... navigate` returns None the same way).
+    #[test]
+    fn nav_graph_08_navigate_bounds() {
+        let boxes: Vec<_> = (0..6).map(|c| bb(100 + c * 32, 100, 24, 24)).collect();
+        let g = NavGraph::build(&boxes);
+        // Sentinel slot (single row has no north).
+        assert_eq!(g.navigate(0, N), None);
+        // Out-of-range node and direction.
+        assert_eq!(g.navigate(6, N), None);
+        assert_eq!(g.navigate(99, E), None);
+        assert_eq!(g.navigate(0, 4), None);
+        assert_eq!(g.navigate(0, 99), None);
+        // Empty graph: everything is out of range.
+        let empty = NavGraph::build(&[]);
+        assert_eq!(empty.navigate(0, N), None);
+    }
+}
