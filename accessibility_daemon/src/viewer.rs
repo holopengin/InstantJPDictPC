@@ -4373,6 +4373,65 @@ mod tests {
         assert!(!viewer.show_pitch, "the pitch line ships off");
     }
 
+    /// One plain term row for the chain tests below.
+    fn plain_term(term: &str, reading: &str) -> DictionaryEntry {
+        DictionaryEntry {
+            id: 1,
+            kanji: term.to_string(),
+            reading: reading.to_string(),
+            definitions: r#"["to eat"]"#.to_string(),
+            rules: "v1".to_string(),
+            popularity: 0,
+            dictionary_id: 1,
+            onyomi: None,
+            kunyomi: None,
+            jlpt: None,
+        }
+    }
+
+    /// #07 (mobile parity `OcrOverlayView.createDeinflectionRow`): a
+    /// populated chain renders "surface → term" plus one reason chip per
+    /// step. Pin the chain the row consumes, built through the same
+    /// `format_dictionary_results` path `lookup` uses.
+    #[test]
+    fn deinflected_entry_carries_reasons_for_the_chain_row() {
+        let mut state = OcrOverlayState::new(1024.0, 768.0);
+        let matches = vec![TermMatch {
+            term: "食べる".to_string(),
+            entries: vec![plain_term("食べる", "たべる")],
+            chain: Some(DeinflectionChain {
+                surface: "食べた".to_string(),
+                steps: vec!["past".to_string()],
+            }),
+        }];
+        let out = state.format_dictionary_results(&matches, &HashMap::new());
+        assert_eq!(out.len(), 1);
+        let chain = out[0]
+            .deinflection
+            .as_ref()
+            .expect("a populated chain for the row");
+        assert_eq!(chain.surface, "食べた");
+        assert_eq!(chain.steps, vec!["past"]);
+    }
+
+    /// #07: a direct (non-deinflected) match carries no chain, so
+    /// `dictionary_panel`'s `if let Some` renders no row and no stray chips.
+    #[test]
+    fn direct_entry_has_no_chain_so_no_row() {
+        let mut state = OcrOverlayState::new(1024.0, 768.0);
+        let matches = vec![TermMatch {
+            term: "食べる".to_string(),
+            entries: vec![plain_term("食べる", "たべる")],
+            chain: None,
+        }];
+        let out = state.format_dictionary_results(&matches, &HashMap::new());
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].deinflection.is_none(),
+            "a direct match renders exactly as before — no chain row"
+        );
+    }
+
     /// The tuning HUD ships hidden and F1 toggles it both ways.
     #[test]
     fn det_hud_ships_hidden_and_f1_toggles_it() {
