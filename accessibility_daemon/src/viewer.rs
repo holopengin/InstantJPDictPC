@@ -1793,7 +1793,8 @@ pub struct OcrViewer {
     pub det_box_count: usize,
     /// True while a live retune round-trip is in flight.
     pub det_busy: bool,
-    /// HUD visibility (F1).
+    /// HUD visibility, toggled at runtime with F1. Hidden by default so the
+    /// screenshot viewer opens clean; the tuning keys still work while hidden.
     pub det_hud_visible: bool,
     /// #43/#86: whether the dictionary panel draws the pitch-accent line.
     /// Loaded once from [`crate::app_settings::AppSettings`] at startup, so a
@@ -1843,7 +1844,8 @@ impl OcrViewer {
             det_unclip_default: crate::ocr_engine::default_det_unclip(),
             det_box_count: 0,
             det_busy: false,
-            det_hud_visible: true,
+            // The tuning HUD ships hidden (F1 reveals it); see `toggle_det_hud`.
+            det_hud_visible: false,
             show_pitch: false,
         }
     }
@@ -2313,6 +2315,12 @@ impl OcrViewer {
     pub fn reset_det_tuning(&mut self) {
         self.det_thresh = self.det_thresh_default;
         self.det_unclip = self.det_unclip_default;
+    }
+
+    /// Show/hide the tuning HUD (`F1` key). Runtime-only state: each process
+    /// starts hidden, so there is nothing to persist to settings.json.
+    pub fn toggle_det_hud(&mut self) {
+        self.det_hud_visible = !self.det_hud_visible;
     }
 
     /// Replace the whole detection result after a live retune. The box set
@@ -4363,5 +4371,17 @@ mod tests {
         let viewer =
             OcrViewer::new_empty(1280.0, 720.0, crate::overlay_font::FontFace::Sans);
         assert!(!viewer.show_pitch, "the pitch line ships off");
+    }
+
+    /// The tuning HUD ships hidden and F1 toggles it both ways.
+    #[test]
+    fn det_hud_ships_hidden_and_f1_toggles_it() {
+        let mut viewer =
+            OcrViewer::new_empty(1280.0, 720.0, crate::overlay_font::FontFace::Sans);
+        assert!(!viewer.det_hud_visible, "the tuning HUD ships hidden");
+        viewer.toggle_det_hud();
+        assert!(viewer.det_hud_visible, "first F1 shows the HUD");
+        viewer.toggle_det_hud();
+        assert!(!viewer.det_hud_visible, "second F1 hides it again");
     }
 }
