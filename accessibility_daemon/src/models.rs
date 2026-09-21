@@ -604,7 +604,7 @@ pub enum Message {
     TuneDet { param: DetParam, delta: f32 },
     /// Restore both detection tunables to their startup values.
     TuneReset,
-    /// Show/hide the detection tuning HUD.
+    /// Show/hide the detection tuning HUD (F1). Hidden by default.
     ToggleDetHud,
 }
 
