@@ -213,6 +213,67 @@ hand-edit away). Plain `cargo test` enforces every pin. This is the one
 kind whose expectations are machine-generated wholesale; the other kinds
 keep the dump-then-verify-one-case pattern from the parity-bug rule below.
 
+### `deinflection` — surface form in, dictionary term + reason labels out
+
+```json
+"case": {
+  "surface": "食べた",
+  "expect_term": "食べる",
+  "expect_reasons": ["past"]
+}
+```
+
+The harness loads the shipped `assets/deinflect.json` (the same file the
+app and the Android asset copy use — verified byte-identical at graduation)
+and runs the real `Deinflector::deinflect`. Derivations are deduplicated by
+term (first derivation wins), so terms are unique per surface: the runner
+finds `expect_term` and compares its reasons exactly against
+`expect_reasons` (ordered, outermost step first). The group key IS the
+reason (`past`, `-te`, …), filled in at load from the map key on both sides
+— a loader that drops the keys yields kana fragments or empty lists and
+fails these cases. The no-op case pins a dictionary-form surface whose
+identity candidate carries no reasons (no chain, no viewer row), so direct
+matches render exactly as before.
+
+Regenerating: `CONFORMANCE_DUMP=1 cargo test deinflection_cases` prints the
+candidate list per surface (`DUMP <id> term=… reasons=…`, first 25) — paste
+values only after checking they are the *correct* grammar (a wrong rule in
+`deinflect.json` is a finding, never something to bless by copying).
+
+### `ruby_style` — ruby base treatment per display mode (labels, not pixels)
+
+```json
+"case": {
+  "modes": [
+    { "mode": "body", "base": "white", "bold": false },
+    { "mode": "term", "base": "cyan", "bold": true }
+  ]
+}
+```
+
+`mode` selects the renderer input both harnesses share without a UI
+framework: `body` is PC `OcrViewer::ruby_style(is_mini = true)` /
+Android `RubyBaseStyle::forMini(true)` — every ruby node `inline_line`
+and `renderDefinition` build; `term` is the `false` path both headword
+flows use. `base` is a color label (`white` = `Color::WHITE` /
+`0xFFFFFFFF`, `cyan` = `(0, 1, 1)` / `0xFF00FFFF`) so a recolor fails with
+the values attached; anything unmapped fails the runner loudly instead of
+drifting. `bold` pins the weight decision.
+
+Deliberately NOT pinned here: rendered pixels (painting an iced `Text` or
+a `TextView` needs the UI framework — Robolectric is not an Android test
+dependency), the point sizes, and the gray ruby row. Those stay pinned in
+per-side unit tests (PC `viewer.rs`: `body_ruby_uses_body_typeface_not_term_display`,
+`term_ruby_keeps_full_size_term_display`; Android `RubyBaseStyleTest` pins
+the mapping and the parser fact that every definition ruby takes the body
+path).
+
+DELIBERATE DEPARTURE (ticket 06, 2026-09-21, maintainer decision, both
+codebases changed together): body ruby is white/regular BY DECISION, even
+though mobile historically painted mini ruby bold cyan. Do NOT "correct"
+body toward cyan+bold — that reintroduces the ticket-06 symptom by design
+on both sides.
+
 ## Adding a case (the parity-bug rule)
 
 A parity bug fix adds a conformance case: write the JSON, run

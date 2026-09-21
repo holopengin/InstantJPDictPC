@@ -1,0 +1,11 @@
+{
+  "id": "deinflection-03-adjective-past",
+  "kind": "deinflection",
+  "description": "Ticket 07: i-adjective past carries its group label too, not just verbs. 高かった reaches 高い with reasons [\"past\"] per the shipped deinflect.json rules.",
+  "mobile_mirror": "DeinflectionChainTest",
+  "case": {
+    "surface": "高かった",
+    "expect_term": "高い",
+    "expect_reasons": ["past"]
+  }
+}

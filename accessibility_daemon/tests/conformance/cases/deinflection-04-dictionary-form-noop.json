@@ -1,0 +1,11 @@
+{
+  "id": "deinflection-04-dictionary-form-noop",
+  "kind": "deinflection",
+  "description": "Ticket 07: a dictionary-form lookup is a no-op — the identity candidate carries no reasons, so the viewer builds no chain and renders no deinflection row. Pins that direct matches render exactly as before.",
+  "mobile_mirror": "DeinflectionChainTest",
+  "case": {
+    "surface": "食べる",
+    "expect_term": "食べる",
+    "expect_reasons": []
+  }
+}

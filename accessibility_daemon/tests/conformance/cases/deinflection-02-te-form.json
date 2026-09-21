@@ -1,0 +1,11 @@
+{
+  "id": "deinflection-02-te-form",
+  "kind": "deinflection",
+  "description": "Ticket 07: te-form verb carries the te-form group label. 食べて reaches 食べる with reasons [\"-te\"] per the shipped deinflect.json rules.",
+  "mobile_mirror": "DeinflectionChainTest",
+  "case": {
+    "surface": "食べて",
+    "expect_term": "食べる",
+    "expect_reasons": ["-te"]
+  }
+}

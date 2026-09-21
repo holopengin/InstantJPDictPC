@@ -17,6 +17,8 @@ use serde_json::Value;
 
 use crate::furigana::{is_ruby_horizontal, is_ruby_vertical};
 use crate::kana_size::{self};
+use crate::util::deinflector::Deinflector;
+use crate::viewer::OcrViewer;
 use crate::data::models::DictionaryEntry;
 use crate::models::{
     BoundingBox, FormattedEntry, LineResult, RotatedBox, TermMatch, GAP_CHAR,
@@ -218,6 +220,8 @@ fn every_case_has_a_runner() {
         "kana",
         "dictionary",
         "recognition",
+        "deinflection",
+        "ruby_style",
     ];
     for (name, v) in all_cases() {
         let id = case_id(&name, &v);
@@ -743,6 +747,105 @@ fn recognition_cases() {
                     "{id} line i={idx}: recognized/unrecognized flipped: {l:?} vs {t:?}"
                 ),
             }
+        }
+    }
+}
+
+fn deinflect_rules_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/deinflect.json")
+}
+
+/// Ticket 07: the shipped `deinflect.json` group keys ride each derivation
+/// as human-readable reason labels (mobile `Deinflector` fills `reason` from
+/// the map key at load; so does `Deinflector::from_json_file`). Each case
+/// pins one surface form reaching one dictionary term with an exact ordered
+/// reason list; the no-op case pins the identity candidate carrying no
+/// reasons (no chain, no viewer row). Terms are unique per surface (the
+/// engine dedupes by term, first derivation wins), so a find-by-term plus an
+/// exact reason match is a complete pin — no ranking to freeze.
+#[test]
+fn deinflection_cases() {
+    let rules = Deinflector::from_json_file(deinflect_rules_path())
+        .expect("shipped deinflect.json loads");
+    for (name, v) in kind_cases("deinflection") {
+        let id = case_id(&name, &v);
+        let c = &v["case"];
+        let surface = c["surface"].as_str().expect("surface");
+        let expect_term = c["expect_term"].as_str().expect("expect_term");
+        let expect_reasons: Vec<&str> = c["expect_reasons"]
+            .as_array()
+            .expect("expect_reasons")
+            .iter()
+            .map(|s| s.as_str().expect("reason str"))
+            .collect();
+        let got = rules.deinflect(surface);
+        if dump() {
+            println!("DUMP {id} {surface}: {} candidates", got.len());
+            for r in got.iter().take(25) {
+                println!("DUMP {id} term={} reasons={:?}", r.term, r.reasons);
+            }
+        }
+        match got.iter().find(|r| r.term == expect_term) {
+            Some(hit) => assert_eq!(
+                hit.reasons,
+                expect_reasons,
+                "{id}: reason labels drifted for {surface} → {expect_term}"
+            ),
+            None => panic!(
+                "{id}: no derivation of {surface} reaches {expect_term} ({} candidates)",
+                got.len()
+            ),
+        }
+    }
+}
+
+/// Ticket 06: body ruby vs term-display ruby, pinned at the unit-testable
+/// style-resolution seam (`OcrViewer::ruby_style(is_mini)`), not rendered
+/// pixels — painting an iced `Text` needs the UI framework, and sizes plus
+/// the gray ruby row stay pinned in the `viewer.rs` unit tests. `mode`
+/// selects the renderer input: `body` is `is_mini = true` (everything
+/// `inline_line` builds), `term` is `is_mini = false` (headword/term rows).
+/// `base` is a color label so a recolor fails with the values attached,
+/// never as a silent float drift: `white` is `Color::WHITE`, `cyan` is
+/// `(0, 1, 1)`.
+fn ruby_base_label(c: &iced::Color) -> &'static str {
+    if *c == iced::Color::WHITE {
+        "white"
+    } else if *c == iced::Color::from_rgb(0.0, 1.0, 1.0) {
+        "cyan"
+    } else {
+        panic!("unmapped ruby base color {c:?} — extend the label map, never widen a tolerance");
+    }
+}
+
+#[test]
+fn ruby_style_cases() {
+    for (name, v) in kind_cases("ruby_style") {
+        let id = case_id(&name, &v);
+        for m in v["case"]["modes"].as_array().expect("modes") {
+            let (mode, is_mini) = match m["mode"].as_str().expect("mode") {
+                "body" => ("body", true),
+                "term" => ("term", false),
+                o => panic!("{id}: bad mode {o} (body = is_mini, term = full-size display)"),
+            };
+            let style = OcrViewer::ruby_style(is_mini);
+            if dump() {
+                println!(
+                    "DUMP {id} {mode}: base={} bold={}",
+                    ruby_base_label(&style.base),
+                    style.bold
+                );
+            }
+            assert_eq!(
+                ruby_base_label(&style.base),
+                m["base"].as_str().expect("base"),
+                "{id} {mode}: base treatment drifted"
+            );
+            assert_eq!(
+                style.bold,
+                m["bold"].as_bool().expect("bold"),
+                "{id} {mode}: weight drifted"
+            );
         }
     }
 }

@@ -65,12 +65,12 @@ enum InlineCell {
 /// `InlineCell::Char` runs. The term display keeps bold cyan. Do NOT "fix"
 /// mini back to cyan+bold for parity: that would reintroduce the ticket-06
 /// symptom on both codebases by design.
-struct RubyStyle {
-    base_size: f32,
-    ruby_size: f32,
-    base: Color,
-    ruby: Color,
-    bold: bool,
+pub(crate) struct RubyStyle {
+    pub(crate) base_size: f32,
+    pub(crate) ruby_size: f32,
+    pub(crate) base: Color,
+    pub(crate) ruby: Color,
+    pub(crate) bold: bool,
 }
 
 /// Fontdue metrics for the same face iced renders the panel with, given once
@@ -2944,7 +2944,7 @@ impl OcrViewer {
     /// One shared palette for both ruby modes (see [`RubyStyle`]).
     /// Mini (body) is the deliberate departure: white regular base matching
     /// the surrounding body runs. Term keeps the bold-cyan display.
-    fn ruby_style(is_mini: bool) -> RubyStyle {
+    pub(crate) fn ruby_style(is_mini: bool) -> RubyStyle {
         let ruby = Color::from_rgb(0.75, 0.75, 0.75);
         if is_mini {
             RubyStyle { base_size: DEF_TEXT_SIZE, ruby_size: DEF_RUBY_SIZE, base: Color::WHITE, ruby, bold: false }
