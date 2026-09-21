@@ -28,11 +28,11 @@ them; if one does, the case is wrong, not the code.
    pixel→text cases exist as the PC-hosted `recognition` kind (vendored
    photos/screenshots, `CONFORMANCE_DUMP=1` regeneration); they stay
    Android-manual until the Android side can host inference in its tests.
-3. **Detection unclip default differs today: PC 0.7, mobile 1.2 (#97).**
-   Every `detection` case states its `det_unclip` explicitly and both runners
-   must use the case value, not their platform default. The default gap
-   itself is recorded here as accepted-for-now, not as drift — converging it
-   is a separate ticket.
+3. **Detection defaults are converged: PC 0.25 / 0.7, mobile 0.25 / 0.70
+   (#101, superseding #97's 0.65 / 1.2).** Every `detection` case still
+   states its `det_thresh`/`det_unclip` explicitly and both runners must
+   use the case values, not their platform defaults — so a future
+   re-tuning on either side fails loudly instead of drifting silently.
 4. **Synthetic images are pre-rendered PNGs.** No font, renderer, or OS text
    stack is involved in loading them; `image` (PC) and `BitmapFactory`
    (Android) must agree on pixels for these files, which they do for 8-bit
