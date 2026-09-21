@@ -54,14 +54,17 @@ enum InlineCell {
 /// (`ruby_view`) and the `full_ruby_view` fallback so both paint identically
 /// within a mode.
 ///
-/// Mobile parity (ticket 06 verification): Android `createRubyView` paints
-/// the base CYAN + bold in *both* modes — full-size (32sp base / 13sp ruby)
-/// for the headword/term display, mini (15sp / 9sp) for definition-flow ruby
-/// (`OcrOverlayStateController` builds every definition `Ruby` with
-/// `isMini = true`, rendered at `OcrOverlayView.kt:2316` through
-/// `createBaseTextView`; the ruby row is LTGRAY in both). Definition-body
-/// ruby is therefore intentionally bold cyan, not body white: the PC matches
-/// mobile exactly.
+/// INTENTIONAL DEPARTURE FROM MOBILE (2026-09-21, maintainer decision,
+/// ticket 06): Android `createRubyView` paints the base CYAN + bold in *both*
+/// modes — full-size (32sp base / 13sp ruby) for the headword/term display,
+/// mini (15sp / 9sp) for definition-flow ruby (`OcrOverlayView.kt:2115-2124`
+/// `createBaseTextView`; definition `Ruby` nodes are built with `isMini =
+/// true` and rendered at `OcrOverlayView.kt:2316`). The PC instead renders
+/// body (mini) ruby in the surrounding body typeface — WHITE regular base at
+/// body size, gray ruby row — so ruby-annotated spans match plain
+/// `InlineCell::Char` runs. The term display keeps bold cyan. Do NOT "fix"
+/// mini back to cyan+bold for parity: that would reintroduce the ticket-06
+/// symptom on both codebases by design.
 struct RubyStyle {
     base_size: f32,
     ruby_size: f32,
@@ -2939,13 +2942,14 @@ impl OcrViewer {
     }
 
     /// One shared palette for both ruby modes (see [`RubyStyle`]).
+    /// Mini (body) is the deliberate departure: white regular base matching
+    /// the surrounding body runs. Term keeps the bold-cyan display.
     fn ruby_style(is_mini: bool) -> RubyStyle {
-        let base = Color::from_rgb(0.0, 1.0, 1.0);
         let ruby = Color::from_rgb(0.75, 0.75, 0.75);
         if is_mini {
-            RubyStyle { base_size: DEF_TEXT_SIZE, ruby_size: DEF_RUBY_SIZE, base, ruby, bold: true }
+            RubyStyle { base_size: DEF_TEXT_SIZE, ruby_size: DEF_RUBY_SIZE, base: Color::WHITE, ruby, bold: false }
         } else {
-            RubyStyle { base_size: 32.0, ruby_size: 13.0, base, ruby, bold: true }
+            RubyStyle { base_size: 32.0, ruby_size: 13.0, base: Color::from_rgb(0.0, 1.0, 1.0), ruby, bold: true }
         }
     }
 
@@ -3237,7 +3241,8 @@ impl OcrViewer {
                 InlineCell::Char(c) => run.push(c),
                 InlineCell::Ruby { term, reading, .. } => {
                     row = flush_run(row, &mut run);
-                    // Body flow: mini ruby, mobile's definition-flow style (see RubyStyle).
+                    // Body flow: mini ruby in the body typeface (see RubyStyle —
+                    // deliberate departure from mobile's cyan+bold mini).
                     row = row.push(Self::ruby_view(&term, &reading, true, false));
                 }
                 InlineCell::Tag { text, .. } => {
@@ -4344,21 +4349,20 @@ mod tests {
         assert_eq!(second, "あ。", "。 rides with the previous character");
     }
 
-    /// Ticket 06 verification: definition/example body ruby matches mobile's
-    /// mini ruby rather than the surrounding body type — a bold CYAN base at
-    /// body size with a gray ruby row (`OcrOverlayView.createRubyView(...,
-    /// isMini = true)` via `createBaseTextView`; definition `Ruby` nodes are
-    /// built with `isMini = true` in `OcrOverlayStateController` and rendered
-    /// at `OcrOverlayView.kt:2316`). Clear names and pinned values so these
-    /// can graduate to the conformance spec later.
+    /// Ticket 06 design departure (2026-09-21): definition/example body ruby
+    /// uses the surrounding body typeface — a WHITE regular base at body
+    /// size with a gray ruby row — instead of mobile's bold-cyan mini ruby
+    /// (`OcrOverlayView.createRubyView(..., isMini = true)` via
+    /// `createBaseTextView`). Clear names and pinned values so these can
+    /// graduate to the conformance spec later.
     #[test]
-    fn body_ruby_matches_mobile_mini_ruby_style() {
+    fn body_ruby_uses_body_typeface_not_term_display() {
         let body = OcrViewer::ruby_style(true);
         assert_eq!(body.base_size, DEF_TEXT_SIZE, "mini base sits at body size");
         assert_eq!(body.ruby_size, DEF_RUBY_SIZE);
-        assert_eq!(body.base, Color::from_rgb(0.0, 1.0, 1.0), "mini base stays cyan");
-        assert_eq!(body.ruby, Color::from_rgb(0.75, 0.75, 0.75), "mini ruby stays gray");
-        assert!(body.bold, "mobile paints mini ruby bases bold");
+        assert_eq!(body.base, Color::WHITE, "body ruby base matches plain body runs");
+        assert_eq!(body.ruby, Color::from_rgb(0.75, 0.75, 0.75), "body ruby row stays gray");
+        assert!(!body.bold, "body ruby is regular weight, like the surrounding text");
     }
 
     /// The headword block and term rows keep the full-size bold-cyan term
