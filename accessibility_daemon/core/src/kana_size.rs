@@ -27,8 +27,10 @@
 //! recognizer's `alternatives` alone (it records the flip in the separate
 //! `overrides` map, a mobile-only provenance concept this port does not have).
 
+#[cfg(feature = "native")]
 use std::path::Path;
 
+#[cfg(feature = "native")]
 use anyhow::{bail, Context, Result};
 
 use crate::models::LineResult;
@@ -37,9 +39,12 @@ use crate::models::LineResult;
 pub const EPSILON: f32 = 0.01;
 
 // ---------------------------------------------------------------------------
-// Native model (nb_all), through the same pinned ncnn fork as the OCR nets
+// Native model (nb_all), through the same pinned ncnn fork as the OCR nets.
+// Only compiled with the `native` feature; the window encoder and the ε
+// policy below are pure Rust and always available.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "native")]
 #[allow(non_camel_case_types)]
 mod ffi {
     use std::os::raw::{c_char, c_int};
@@ -66,15 +71,20 @@ mod ffi {
 /// The `nb_all` kana size model, loaded once and shared by the recognition
 /// workers (ncnn `create_extractor()` gives every call its own extractor
 /// state, so one loaded net can serve several threads — same as `RecNet`).
+/// Requires the `native` feature.
+#[cfg(feature = "native")]
 pub struct KanaSizeNet {
     ptr: *mut ffi::kana_size_t,
 }
 
 // The C++ side owns an ncnn::Net, whose extractors are per-call; the handle is
 // immutable after load.
+#[cfg(feature = "native")]
 unsafe impl Send for KanaSizeNet {}
+#[cfg(feature = "native")]
 unsafe impl Sync for KanaSizeNet {}
 
+#[cfg(feature = "native")]
 impl KanaSizeNet {
     /// Load `param`/`bin`. Fails rather than degrading: callers treat an error
     /// as "correction unavailable" (mobile's `KanaSizeNcnn.load` returns null).
@@ -138,6 +148,7 @@ impl KanaSizeNet {
     }
 }
 
+#[cfg(feature = "native")]
 impl Drop for KanaSizeNet {
     fn drop(&mut self) {
         unsafe { ffi::kana_size_destroy(self.ptr) }
@@ -484,6 +495,7 @@ pub fn correct_lines(
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+    #[cfg(feature = "native")]
     use std::path::PathBuf;
 
     fn line(text: &str) -> LineResult {
@@ -971,12 +983,14 @@ mod tests {
         assert_eq!(out.flips[1].line, 1);
     }
 
-    // ——— The real model (the PC's own ncnn path) ———
+    // ——— The real model (the PC's own ncnn path, `native` feature only) ———
 
+    #[cfg(feature = "native")]
     struct Fixture {
         net: KanaSizeNet,
     }
 
+    #[cfg(feature = "native")]
     fn fixture() -> Fixture {
         let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).join("assets/kana_size");
         Fixture {
@@ -990,6 +1004,7 @@ mod tests {
     /// the whole path (asset bytes, param/bin load, FFI marshalling, float
     /// behaviour) with ten positions, and it is the numeric gate the mobile
     /// app runs through JNI.
+    #[cfg(feature = "native")]
     #[test]
     fn kana_model_self_check() {
         let f = fixture();
@@ -1024,6 +1039,7 @@ mod tests {
 
     /// End to end through the real model: each published target either flips
     /// or stays exactly as its published logit says it must.
+    #[cfg(feature = "native")]
     #[test]
     fn kana_model_end_to_end_keeps_or_flips_the_published_targets() {
         let f = fixture();

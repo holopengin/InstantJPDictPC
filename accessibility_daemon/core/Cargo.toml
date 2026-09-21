@@ -4,16 +4,28 @@ version = "0.1.0"
 edition = "2021"
 
 [build-dependencies]
-# Compiles the shared PP-OCRv6 ncnn core + C ABI (native/ppocr_ncnn)
+# Compiles the shared PP-OCRv6 ncnn core + C ABI (native/ppocr_ncnn).
+# Only invoked when the `native` feature is on (see build.rs); a nav-only
+# consumer (`--no-default-features`) never needs a C++ toolchain.
 cc = "1"
+
+[features]
+# Feature contract (see FEATURES.md for the module table):
+# - `default` is the full desktop stack: native inference + SQLite DB.
+# - `--no-default-features` is the pure-Rust algorithm surface only
+#   (`nav_graph` + its `models` surface, plus the other toolchain-free
+#   modules); it builds with no C++ toolchain, no ncnn sources, no prefix.
+default = ["native", "db"]
+native = ["dep:image", "dep:imageproc", "dep:ttf-parser"]
+db = ["dep:rusqlite", "dep:zip", "dep:ureq", "dep:sha2"]
 
 [dependencies]
 # Image processing (detection letterbox, recognition crops, test inputs)
-image = "0.25"
-imageproc = "0.25"
+image = { version = "0.25", optional = true }
+imageproc = { version = "0.25", optional = true }
 
 # Vertical font metrics (vmtx/vert) for character geometry.
-ttf-parser = { version = "0.21", default-features = false, features = ["opentype-layout"] }
+ttf-parser = { version = "0.21", default-features = false, features = ["opentype-layout"], optional = true }
 
 # Utilities
 serde = { version = "1.0", features = ["derive"] }
@@ -22,18 +34,18 @@ log = "0.4"
 anyhow = "1.0"
 
 # Database: SQLite for dictionary storage
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 
 # Dictionary import from Yomitan ZIP files.
 # Default features would pull bzip2/zstd/aes; Yomitan archives are plain
 # deflate ZIPs, and linking the system libbz2 makes the binary depend on a
 # soname that differs across distros (libbz2.so.1.0 on Arch, .so.1 on Fedora).
-zip = { version = "0.6", default-features = false, features = ["deflate"] }
+zip = { version = "0.6", default-features = false, features = ["deflate"], optional = true }
 
 # Catalog downloads (#71): a plain HTTPS GET with rustls + webpki roots, and
 # the SHA-256 the pinned catalog entries are verified against.
-ureq = { version = "2.12", default-features = false, features = ["tls"] }
-sha2 = "0.10"
+ureq = { version = "2.12", default-features = false, features = ["tls"], optional = true }
+sha2 = { version = "0.10", optional = true }
 
 # Lazy static initialization
 lazy_static = "1.4"
