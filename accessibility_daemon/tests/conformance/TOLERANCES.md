@@ -56,6 +56,8 @@ them; if one does, the case is wrong, not the code.
 Anything outside the above: changed box merge/sort order, changed ruby
 ratios or gap/overlap fractions, changed fallback class order, changed LM
 back-off chain, changed kana epsilon policy or window layout, changed
-example ja/en split or sense-group numbering. The perturbation proof for
+example ja/en split or sense-group numbering, changed deinflection reason
+labels (group-key mapping) or reachable derivations, changed ruby
+body/term base treatment or weight. The perturbation proof for
 each harness addition (flip one semantic, watch the case fail, revert) is
 recorded in the ticket comments when the corpus is extended.

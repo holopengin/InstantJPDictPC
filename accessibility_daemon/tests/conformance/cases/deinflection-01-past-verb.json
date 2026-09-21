@@ -1,0 +1,11 @@
+{
+  "id": "deinflection-01-past-verb",
+  "kind": "deinflection",
+  "description": "Ticket 07: deinflected lookups carry human-readable reason labels, not kana fragments. Past-tense godan/ichidan verb: 食べた reaches 食べる with reasons [\"past\"] (the shipped deinflect.json group key, filled in at load like mobile's Deinflector init).",
+  "mobile_mirror": "DeinflectionChainTest",
+  "case": {
+    "surface": "食べた",
+    "expect_term": "食べる",
+    "expect_reasons": ["past"]
+  }
+}

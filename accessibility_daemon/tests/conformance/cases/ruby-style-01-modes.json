@@ -1,0 +1,12 @@
+{
+  "id": "ruby-style-01-modes",
+  "kind": "ruby_style",
+  "description": "Ticket 06, DELIBERATE DEPARTURE 2026-09-21 (maintainer decision, both codebases changed together): definition/example body ruby renders in the surrounding body typeface — WHITE regular base — while the headword/term display keeps bold cyan. Pins the JVM/unit-testable style-resolution seam per mode (PC OcrViewer::ruby_style(is_mini), Android RubyBaseStyle::forMini), NOT rendered pixels: iced Text / TextView styling needs a UI framework, and sizes plus the gray ruby row stay pinned in per-side unit tests. Do NOT 'correct' body back to cyan+bold.",
+  "mobile_mirror": "RubyBaseStyleTest",
+  "case": {
+    "modes": [
+      { "mode": "body", "base": "white", "bold": false },
+      { "mode": "term", "base": "cyan", "bold": true }
+    ]
+  }
+}
