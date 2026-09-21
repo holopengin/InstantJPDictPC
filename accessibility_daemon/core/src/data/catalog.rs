@@ -56,6 +56,9 @@ pub fn entries() -> &'static [CatalogEntry] {
 /// matches, or whose `catalog_id` is this entry's id (which is how a
 /// previously bundled or catalog-installed copy is recognised). Mirrors
 /// mobile's `InstalledDictionary(name, catalogId)` match.
+///
+/// Requires the `db` feature (it matches against `db` title families).
+#[cfg(feature = "db")]
 pub fn is_installed(dicts: &[crate::data::models::DictionaryMeta], entry: &CatalogEntry) -> bool {
     dicts.iter().any(|d| {
         d.catalog_id.as_deref() == Some(entry.id.as_str())
@@ -91,6 +94,7 @@ mod tests {
 
     /// Installed-state matching: family with a revision suffix, exact family,
     /// or the catalog id on a differently named row.
+    #[cfg(feature = "db")]
     #[test]
     fn installed_state_matches_family_and_catalog_id() {
         use crate::data::models::DictionaryMeta;

@@ -3,6 +3,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    // Without the `native` feature there is nothing to compile, link, or
+    // copy for: return early so a consumer that only needs the pure-Rust
+    // modules (`--no-default-features`) builds with no C++ toolchain, no
+    // ncnn sources, and no install prefix — and never hits the panic below.
+    // (Cargo exposes features to build scripts as CARGO_FEATURE_<NAME>.)
+    if env::var("CARGO_FEATURE_NATIVE").is_err() {
+        return;
+    }
+
     // ------------------------------------------------------------------
     // Shared PP-OCRv6 ncnn backend (native/ppocr_ncnn + the pinned fork)
     // ------------------------------------------------------------------
