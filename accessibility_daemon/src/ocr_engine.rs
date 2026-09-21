@@ -12,11 +12,12 @@ const PPOCR_DET_MODEL_SIZE: u32 = 896;
 const PPOCR_DET_LONG_SIDE: u32 = 960;
 /// PC-tuned detection defaults, from a sweep over the desktop test set (game
 /// UIs with dark overlays, tategaki ebook pages, a camera photo, a ruby-dense
-/// newspaper). Mobile #97 ships 0.65 / 1.2, but at those values the hard game
+/// newspaper). Mobile #97 shipped 0.65 / 1.2, but at those values the hard game
 /// screen splits three memo lines into fragments that recognize as junk, and
 /// the set loses ~6-9 real lines overall; 0.25 / 0.7 keeps every memo line
-/// whole with the same junk count. The viewer's live keys, the CLI flags and
-/// the `DET_*` environment overrides still win.
+/// whole with the same junk count. Mobile #101 adopted these same values
+/// (0.25 / 0.70), so the defaults are converged; the viewer's live keys, the
+/// CLI flags and the `DET_*` environment overrides still win.
 const PPOCR_DET_THRESH: f32 = 0.25;
 const PPOCR_DET_BOX_THRESH: f32 = 0.8;
 const PPOCR_DET_UNCLIP_RATIO: f32 = 0.7;
@@ -46,7 +47,7 @@ pub struct OcrEngine {
     pub batch_size: usize,
     /// Live detection tuning from the viewer (`Message::TuneDet`). `None`
     /// falls back to the `DET_THRESH` / `DET_UNCLIP` environment, then to the
-    /// mobile defaults.
+    /// shared defaults (PC-tuned, adopted by mobile #101).
     pub det_thresh_override: Option<f32>,
     pub det_unclip_override: Option<f32>,
     /// #100: mobile's "Filter furigana in screenshots" switch, **off** by
@@ -58,7 +59,7 @@ pub struct OcrEngine {
 }
 
 /// Effective `DET_THRESH`: environment override, else the PC default 0.25
-/// (mobile #97 ships 0.65).
+/// (mobile #101, same).
 pub fn default_det_thresh() -> f32 {
     std::env::var("DET_THRESH")
         .ok()
@@ -67,7 +68,7 @@ pub fn default_det_thresh() -> f32 {
 }
 
 /// Effective `DET_UNCLIP`: environment override, else the PC default 0.7
-/// (mobile #97 ships 1.2).
+/// (mobile #101, same).
 pub fn default_det_unclip() -> f32 {
     std::env::var("DET_UNCLIP")
         .ok()
@@ -2229,8 +2230,9 @@ mod tests {
     /// PC post-processing must find each line's box (IoU against the mobile
     /// truth boxes), and every returned box must stay in image bounds. The
     /// truth boxes were captured with mobile's #97 tuning (0.65 / 1.2), so the
-    /// comparison pins those values instead of following the PC-tuned defaults
-    /// (a tighter unclip legitimately shrinks boxes below the truth padding).
+    /// comparison pins those values instead of following the converged defaults
+    /// (mobile #101 adopted 0.25 / 0.70, but the truth padding is unchanged; a
+    /// tighter unclip legitimately shrinks boxes below it).
     #[test]
     fn synth_det_finds_truth_line() {
         let mut eng = test_engine();
