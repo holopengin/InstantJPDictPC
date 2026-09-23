@@ -4,8 +4,12 @@
 use std::collections::HashMap;
 
 /// Normalize Japanese text: convert full-width to half-width, standardize kana, etc.
+///
+/// Stage order is part of the contract: width conversion first (so a mark sees
+/// the widened kana), then the lookup-variant fold, then combining-character
+/// normalization.
 pub fn normalize(text: &str) -> String {
-    normalize_combining_characters(&convert_width(text))
+    normalize_combining_characters(&fold_lookup_variants(&convert_width(text)))
 }
 
 /// Convert full-width characters to their standard equivalents.
@@ -46,6 +50,20 @@ fn convert_width(text: &str) -> String {
         // Full-width ASCII range (FF01-FF5E) to standard ASCII
         if ('\u{FF01}'..='\u{FF5E}').contains(&c) {
             result.push((c as u32 - 0xFEE0) as u8 as char);
+            i += 1;
+            continue;
+        }
+
+        // Vertical presentation forms fold back to the horizontal forms the
+        // recogniser emits, so lookup of a vertical line matches dictionary
+        // text. Outside the fullwidth-ASCII range, so they need explicit cases.
+        if c == '\u{FE19}' {
+            result.push('\u{2026}'); // ︙ -> …
+            i += 1;
+            continue;
+        }
+        if c == '\u{FE30}' {
+            result.push('\u{2025}'); // ︰ -> ‥
             i += 1;
             continue;
         }
@@ -91,6 +109,52 @@ fn normalize_combining_characters(text: &str) -> String {
         .replace("\u{3075}\u{309A}", "ぷ")
         .replace("\u{3078}\u{309A}", "ぺ")
         .replace("\u{307B}\u{309A}", "ぽ")
+}
+
+/// Fold the variant characters of [`LOOKUP_VARIANT_MAP`] and expand the
+/// iteration marks `ゝ`/`ゞ`/`ヽ`/`ヾ`, which repeat the preceding kana
+/// (`こゝろ` → `こころ`, `たゞ` → `ただ`); a query containing one of them
+/// matches nothing in a modern dictionary.
+///
+/// A voiced mark voices the repeat when the preceding kana has a voiced form
+/// and falls back to a plain repeat otherwise (`まゞ` → `まま`, which is also
+/// what an already-voiced kana needs: `がゞ` → `がが`). A mark whose preceding
+/// character is not kana of the matching script (line-initial, after a kanji
+/// or punctuation) is left as-is rather than folded into a guess, and marks do
+/// not cross scripts (`カゝ` and `あヽ` stay). The preceding character is the
+/// last one already emitted, so a run of marks repeats the expanded run
+/// (`こゝゝ` → `こここ`).
+///
+/// Query-side only: callers keep using the raw text for display and for the
+/// prefix lengths a match corresponds to, so a fold may change the query's
+/// length without affecting what is shown.
+pub fn fold_lookup_variants(text: &str) -> String {
+    if text.is_empty() {
+        return text.to_string();
+    }
+    let mut result = String::with_capacity(text.len());
+    for c in text.chars() {
+        let last = result.chars().last();
+        let is_hira = last.map_or(false, |l| ('\u{3041}'..='\u{3096}').contains(&l));
+        let is_kata = last.map_or(false, |l| ('\u{30A1}'..='\u{30F6}').contains(&l));
+        match c {
+            'ゝ' => result.push(if is_hira { last.unwrap() } else { c }),
+            'ゞ' => result.push(match last {
+                Some(l) if is_hira => HIRAGANA_VOICED.get(&l).copied().unwrap_or(l),
+                _ => c,
+            }),
+            'ヽ' => result.push(if is_kata { last.unwrap() } else { c }),
+            'ヾ' => result.push(match last {
+                Some(l) if is_kata => KATAKANA_VOICED.get(&l).copied().unwrap_or(l),
+                _ => c,
+            }),
+            _ => match LOOKUP_VARIANT_MAP.get(&c) {
+                Some(mapped) => result.push_str(mapped),
+                None => result.push(c),
+            },
+        }
+    }
+    result
 }
 
 /// Convert katakana to hiragana, handling prolonged sound marks (ー).
@@ -187,6 +251,111 @@ lazy_static::lazy_static! {
             ('ﾊ', 'パ'), ('ﾋ', 'ピ'), ('ﾌ', 'プ'), ('ﾍ', 'ペ'), ('ﾎ', 'ポ'),
         ];
         pairs.iter().copied().collect()
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Lookup-variant fold tables
+// ---------------------------------------------------------------------------
+
+lazy_static::lazy_static! {
+    /// Kana and their voiced counterparts, for the iteration marks `ゞ`/`ヾ`.
+    static ref HIRAGANA_VOICED: HashMap<char, char> = {
+        let pairs = [
+            ('か', 'が'), ('き', 'ぎ'), ('く', 'ぐ'), ('け', 'げ'), ('こ', 'ご'),
+            ('さ', 'ざ'), ('し', 'じ'), ('す', 'ず'), ('せ', 'ぜ'), ('そ', 'ぞ'),
+            ('た', 'だ'), ('ち', 'ぢ'), ('つ', 'づ'), ('て', 'で'), ('と', 'ど'),
+            ('は', 'ば'), ('ひ', 'び'), ('ふ', 'ぶ'), ('へ', 'べ'), ('ほ', 'ぼ'),
+            ('う', 'ゔ'),
+        ];
+        pairs.iter().copied().collect()
+    };
+
+    static ref KATAKANA_VOICED: HashMap<char, char> = {
+        let pairs = [
+            ('カ', 'ガ'), ('キ', 'ギ'), ('ク', 'グ'), ('ケ', 'ゲ'), ('コ', 'ゴ'),
+            ('サ', 'ザ'), ('シ', 'ジ'), ('ス', 'ズ'), ('セ', 'ゼ'), ('ソ', 'ゾ'),
+            ('タ', 'ダ'), ('チ', 'ヂ'), ('ツ', 'ヅ'), ('テ', 'デ'), ('ト', 'ド'),
+            ('ハ', 'バ'), ('ヒ', 'ビ'), ('フ', 'ブ'), ('ヘ', 'ベ'), ('ホ', 'ボ'),
+            ('ウ', 'ヴ'),
+        ];
+        pairs.iter().copied().collect()
+    };
+
+    /// Unihan variant forms that real Japanese text uses, folded onto the form
+    /// the shipped dictionary carries. Direction rule: canonical = the side the
+    /// recogniser's vocabulary can emit, variant = the side it cannot.
+    ///
+    /// Subset rule — measured, not guessed: a pair ships only if its variant
+    /// side actually occurs in real text, and only when its canonical side
+    /// occurs at least as often as its variant in the same corpus. Unihan's
+    /// `kSemanticVariant` is loose — it also lists pairs whose "canonical" side
+    /// is the rarer form — and a fold REPLACES the lookup key, so folding those
+    /// would rewrite a query that used to resolve into one that does not. No
+    /// canonical is itself a key, so the fold stays idempotent: one pass
+    /// reaches the terminal form. All pairs are single-character, so unlike the
+    /// Roman numerals they never change query length.
+    static ref MEASURED_VARIANT_FOLD: HashMap<char, &'static str> = {
+        let pairs = [
+            ('㕞', "刷"), ('㘅', "啣"), ('㝵', "碍"), ('䖟', "蝱"), ('䙝', "褻"),
+            ('䬒', "颼"), ('䯻', "髻"), ('䰗', "鬮"), ('乾', "干"), ('亻', "人"),
+            ('來', "来"), ('俠', "侠"), ('册', "冊"), ('冩', "写"), ('冫', "氷"),
+            ('准', "準"), ('凉', "涼"), ('凴', "憑"), ('凾', "函"), ('刋', "刊"),
+            ('剝', "剥"), ('劒', "劍"), ('勹', "包"), ('匳', "奩"), ('匵', "櫝"),
+            ('卭', "卬"), ('厶', "某"), ('后', "後"), ('噐', "器"), ('噓', "嘘"),
+            ('嚮', "向"), ('囑', "嘱"), ('囘', "回"), ('國', "国"), ('堭', "隍"),
+            ('壽', "寿"), ('娬', "嫵"), ('學', "学"), ('寫', "写"), ('寶', "宝"),
+            ('將', "将"), ('尸', "屍"), ('屆', "届"), ('屬', "属"), ('峽', "峡"),
+            ('巤', "鬣"), ('帋', "紙"), ('帒', "袋"), ('并', "併"), ('彌', "弥"),
+            ('悋', "吝"), ('慙', "慚"), ('懜', "懵"), ('戀', "恋"), ('挾', "挟"),
+            ('捬', "撫"), ('摑', "掴"), ('无', "無"), ('晝', "昼"), ('會', "会"),
+            ('朙', "明"), ('栖', "棲"), ('樓', "楼"), ('樷', "叢"), ('樸', "朴"),
+            ('欝', "鬱"), ('氵', "水"), ('涶', "唾"), ('渊', "淵"), ('潛', "潜"),
+            ('濵', "濱"), ('灑', "洒"), ('灣', "湾"), ('烟', "煙"), ('燈', "灯"),
+            ('犭', "犬"), ('甎', "磚"), ('甤', "蕤"), ('畄', "留"), ('畆', "畝"),
+            ('當', "当"), ('癢', "痒"), ('皃', "貌"), ('眎', "視"), ('瞹', "曖"),
+            ('碯', "瑙"), ('礟', "礮"), ('祿', "禄"), ('禀', "稟"), ('禦', "御"),
+            ('禪', "禅"), ('禮', "礼"), ('禱', "祷"), ('秇', "藝"), ('秌', "秋"),
+            ('穪', "稱"), ('竆', "窮"), ('竒', "奇"), ('笋', "筍"), ('簞', "箪"),
+            ('粮', "糧"), ('糓', "穀"), ('纎', "纖"), ('缻', "缶"), ('网', "網"),
+            ('羮', "羹"), ('耻', "恥"), ('耼', "聃"), ('聲', "声"), ('脉', "脈"),
+            ('膓', "腸"), ('舊', "旧"), ('艪', "櫓"), ('苢', "苡"), ('莖', "茎"),
+            ('萬', "万"), ('著', "着"), ('葢', "蓋"), ('薑', "姜"), ('蘯', "蕩"),
+            ('號', "号"), ('蚦', "蚺"), ('蜹', "蚋"), ('蟬', "蝉"), ('蟲', "虫"),
+            ('蠶', "蚕"), ('襍', "雜"), ('覔', "覓"), ('觧', "解"), ('註', "注"),
+            ('誐', "哦"), ('賍', "贓"), ('賷', "齎"), ('軆', "体"), ('輓', "挽"),
+            ('辶', "辵"), ('迯', "逃"), ('迹', "跡"), ('遉', "偵"), ('遙', "遥"),
+            ('釐', "厘"), ('鍫', "鍬"), ('鏁', "鎖"), ('閙', "鬧"), ('隂', "陰"),
+            ('隖', "塢"), ('雙', "双"), ('頣', "頤"), ('颱', "台"), ('飃', "飄"),
+            ('餘', "余"), ('駞', "駝"), ('髗', "顱"), ('髩', "鬢"), ('鬂', "鬢"),
+            ('鮧', "鯷"), ('鵶', "鴉"), ('鶽', "隼"), ('鸎', "鶯"), ('麄', "粗"),
+            ('麴', "麹"), ('麸', "麩"), ('點', "点"), ('齅', "嗅"), ('﨑', "崎"),
+        ];
+        pairs.iter().copied().collect()
+    };
+
+    /// The curated half of the fold table: characters the recogniser can emit
+    /// that dictionaries do not use — Roman numerals (NFKC behaviour), the
+    /// compatibility form `℃`, obsolete kana, and the Chinese-only forms it
+    /// emits in place of the Japanese ones — composed with
+    /// [`MEASURED_VARIANT_FOLD`], the Unihan-derived half.
+    static ref LOOKUP_VARIANT_MAP: HashMap<char, &'static str> = {
+        let curated = [
+            // Roman numerals (NFKC behaviour).
+            ('Ⅰ', "I"), ('Ⅱ', "II"), ('Ⅲ', "III"), ('Ⅳ', "IV"), ('Ⅴ', "V"), ('Ⅵ', "VI"),
+            ('Ⅶ', "VII"), ('Ⅷ', "VIII"), ('Ⅸ', "IX"), ('Ⅹ', "X"), ('Ⅺ', "XI"), ('Ⅻ', "XII"),
+            ('ⅰ', "i"), ('ⅱ', "ii"), ('ⅲ', "iii"), ('ⅳ', "iv"), ('ⅴ', "v"), ('ⅵ', "vi"),
+            ('ⅶ', "vii"), ('ⅷ', "viii"), ('ⅸ', "ix"), ('ⅹ', "x"),
+            // Compatibility form.
+            ('℃', "°C"),
+            // Obsolete kana the recogniser can emit.
+            ('ゑ', "え"), ('ヰ', "イ"),
+            // Chinese-only forms emitted in place of the Japanese one.
+            ('况', "況"), ('查', "査"),
+        ];
+        let mut map: HashMap<char, &'static str> = curated.iter().copied().collect();
+        map.extend(MEASURED_VARIANT_FOLD.iter().map(|(c, s)| (*c, *s)));
+        map
     };
 }
 
@@ -785,5 +954,292 @@ mod tests {
         ] {
             assert_eq!(normalise(modern), modern);
         }
+    }
+
+    // ── Lookup-variant fold (`JapaneseUtilVariantFoldTest`) ─────────────────
+
+    /// Mirrors mobile `expands_hiragana_iteration_mark`.
+    #[test]
+    fn fold_expands_hiragana_iteration_mark() {
+        assert_eq!(fold_lookup_variants("こゝろ"), "こころ");
+        assert_eq!(fold_lookup_variants("こゝ"), "ここ");
+        assert_eq!(fold_lookup_variants("あゝ"), "ああ");
+    }
+
+    /// Mirrors mobile `expands_voiced_iteration_mark`.
+    #[test]
+    fn fold_expands_voiced_iteration_mark() {
+        assert_eq!(fold_lookup_variants("たゞ"), "ただ");
+        assert_eq!(fold_lookup_variants("かゞ"), "かが");
+        assert_eq!(fold_lookup_variants("はゞ"), "はば");
+        // no voiced form (or already voiced): the mark is still a plain repeat
+        assert_eq!(fold_lookup_variants("まゞ"), "まま");
+        assert_eq!(fold_lookup_variants("がゞ"), "がが");
+        assert_eq!(fold_lookup_variants("ナヾ"), "ナナ");
+    }
+
+    /// Mirrors mobile `expands_katakana_iteration_marks`.
+    #[test]
+    fn fold_expands_katakana_iteration_marks() {
+        assert_eq!(fold_lookup_variants("カヽ"), "カカ");
+        assert_eq!(fold_lookup_variants("カヾ"), "カガ");
+        assert_eq!(fold_lookup_variants("ハヾ"), "ハバ");
+    }
+
+    /// Mirrors mobile `repeats_run_of_marks`.
+    #[test]
+    fn fold_repeats_run_of_marks() {
+        assert_eq!(fold_lookup_variants("こゝゝ"), "こここ");
+    }
+
+    /// Mirrors mobile `leaves_mark_that_cannot_be_repeated`.
+    #[test]
+    fn fold_leaves_mark_that_cannot_be_repeated() {
+        // line-initial, after a kanji, after punctuation
+        assert_eq!(fold_lookup_variants("ゝあ"), "ゝあ");
+        assert_eq!(fold_lookup_variants("日ゝ"), "日ゝ");
+        assert_eq!(fold_lookup_variants("、ゝ"), "、ゝ");
+        assert_eq!(fold_lookup_variants("。ヾ"), "。ヾ");
+        // iteration marks do not cross scripts
+        assert_eq!(fold_lookup_variants("カゝ"), "カゝ");
+        assert_eq!(fold_lookup_variants("あヽ"), "あヽ");
+    }
+
+    /// Mirrors mobile `folds_obsolete_kana_the_head_can_emit`.
+    #[test]
+    fn fold_folds_obsolete_kana() {
+        assert_eq!(fold_lookup_variants("こゑ"), "こえ");
+        assert_eq!(fold_lookup_variants("ヰロ"), "イロ");
+    }
+
+    /// Mirrors mobile `folds_roman_numerals`.
+    #[test]
+    fn fold_folds_roman_numerals() {
+        assert_eq!(fold_lookup_variants("Ⅶ"), "VII");
+        assert_eq!(fold_lookup_variants("Ⅷ"), "VIII");
+        assert_eq!(fold_lookup_variants("第Ⅻ章"), "第XII章");
+        assert_eq!(fold_lookup_variants("ⅸ"), "ix");
+    }
+
+    /// Mirrors mobile `folds_compatibility_and_chinese_only_forms`.
+    #[test]
+    fn fold_folds_compatibility_and_chinese_only_forms() {
+        assert_eq!(fold_lookup_variants("20℃"), "20°C");
+        assert_eq!(fold_lookup_variants("状况"), "状況");
+        // 查 folds (emittable) while 调 does not (pruned) — same word, and only
+        // the emittable half of the pair is worth an entry
+        assert_eq!(fold_lookup_variants("调查④"), "调査④");
+    }
+
+    /// Mirrors mobile `does_not_fold_characters_we_pruned_ourselves`.
+    #[test]
+    fn fold_leaves_pruned_characters_alone() {
+        // 调 has no Unihan Japanese reading, so the head cannot emit it, and an
+        // entry would be dead code. Emittability is checked against the pruned
+        // head's remap, never the unpruned vocabulary, which still lists the
+        // pruned classes.
+        assert_eq!(fold_lookup_variants("调"), "调");
+    }
+
+    /// Mirrors mobile `leaves_kanji_iteration_mark_alone`.
+    #[test]
+    fn fold_leaves_kanji_iteration_mark_alone() {
+        // dictionary headwords contain 々 (日々), so expanding would lose matches
+        assert_eq!(fold_lookup_variants("日々"), "日々");
+        assert_eq!(normalize("日々"), "日々");
+    }
+
+    /// Mirrors mobile `folds_measured_unihan_variants`.
+    #[test]
+    fn fold_folds_measured_unihan_variants() {
+        // the pair the direction rule was validated on, and the corpus's most
+        // frequent variant forms
+        assert_eq!(fold_lookup_variants("囘"), "回");
+        assert_eq!(fold_lookup_variants("欝"), "鬱");
+        // frequency guard: 壜 is the *commoner* side, so folding it would
+        // rewrite a resolvable query into a dead one
+        assert_eq!(fold_lookup_variants("壜"), "壜");
+        assert_eq!(fold_lookup_variants("劒"), "劍");
+        assert_eq!(fold_lookup_variants("慙"), "慚");
+        // and inside a word, which is how the fold is actually reached
+        assert_eq!(fold_lookup_variants("囘想"), "回想");
+        assert_eq!(fold_lookup_variants("欝々"), "鬱々");
+        assert_eq!(fold_lookup_variants("慙愧"), "慚愧");
+        assert_eq!(fold_lookup_variants("迯げる"), "逃げる");
+        assert_eq!(fold_lookup_variants("噐械"), "器械");
+        assert_eq!(fold_lookup_variants("迯"), "逃");
+    }
+
+    /// Mirrors mobile `unihan_fold_picks_the_corpus_dominant_canonical`.
+    #[test]
+    fn unihan_fold_picks_the_corpus_dominant_canonical() {
+        // several variants have multiple canonical candidates in Unihan; the
+        // fold takes the form that dominates the corpus, not an arbitrary first
+        // (葢 -> 蓋; 悋 -> 吝; 冫 -> 氷)
+        assert_eq!(fold_lookup_variants("葢"), "蓋");
+        assert_eq!(fold_lookup_variants("悋"), "吝");
+        assert_eq!(fold_lookup_variants("冫"), "氷");
+        assert_eq!(fold_lookup_variants("秇"), "藝");
+        assert_eq!(fold_lookup_variants("﨑"), "崎");
+    }
+
+    /// Mirrors mobile `unihan_fold_does_not_run_backwards`.
+    #[test]
+    fn unihan_fold_does_not_run_backwards() {
+        // the canonical side is what the dictionary already keys on: folding it
+        // would move the query to a form the recogniser cannot emit
+        assert_eq!(fold_lookup_variants("回"), "回");
+        assert_eq!(fold_lookup_variants("鬱"), "鬱");
+        assert_eq!(fold_lookup_variants("蓋"), "蓋");
+        assert_eq!(normalize("回想"), "回想");
+    }
+
+    /// Mirrors mobile `unihan_fold_is_idempotent_and_leaves_unknown_characters_alone`.
+    #[test]
+    fn unihan_fold_is_idempotent_and_leaves_unknown_characters_alone() {
+        let plain = "日本語のテキストです。";
+        assert_eq!(fold_lookup_variants(plain), plain);
+        for s in ["囘想", "欝々", "迯げる", "噐械", "壜", "﨑", "囘囘回"] {
+            let once = normalize(s);
+            assert_eq!(normalize(&once), once, "not idempotent for {s:?}");
+        }
+    }
+
+    /// Mirrors mobile `measured_variant_fold_matches_the_committed_asset`.
+    ///
+    /// Drift guard: every pair folded here must exist in
+    /// `assets/variants/kanji_variants.txt` in the same direction (and no
+    /// canonical may itself be a key, or the fold would not be idempotent).
+    /// Multi-candidate variants are checked against the asset's *whole*
+    /// candidate set, because the fold's choice among them is a corpus
+    /// measurement the asset does not carry.
+    #[test]
+    fn measured_variant_fold_matches_the_committed_asset() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../assets/variants/kanji_variants.txt"
+        );
+        let text = std::fs::read_to_string(path).expect("kanji_variants.txt reads");
+        let mut asset: HashMap<char, std::collections::HashSet<char>> = HashMap::new();
+        for line in text.lines() {
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() != 2
+                || parts[0].chars().count() != 1
+                || parts[1].chars().count() != 1
+            {
+                continue;
+            }
+            asset
+                .entry(parts[0].chars().next().unwrap())
+                .or_default()
+                .insert(parts[1].chars().next().unwrap());
+        }
+        assert_eq!(165, MEASURED_VARIANT_FOLD.len());
+        assert_eq!(600, asset.len());
+        let fold_keys: std::collections::HashSet<char> =
+            MEASURED_VARIANT_FOLD.keys().copied().collect();
+        for (variant, canonical) in MEASURED_VARIANT_FOLD.iter() {
+            let target = canonical
+                .chars()
+                .next()
+                .expect("fold targets are single characters");
+            assert_eq!(
+                canonical.chars().count(),
+                1,
+                "'{variant}' folds to a multi-character string"
+            );
+            let candidates = asset
+                .get(variant)
+                .unwrap_or_else(|| panic!("'{variant}' is not in kanji_variants.txt"));
+            assert!(
+                candidates.contains(&target),
+                "asset has '{variant}' -> {candidates:?}, not '{target}'"
+            );
+            // Idempotence is a property of the FOLD, not of the asset: what
+            // must not happen is a canonical that is itself a key *here*, which
+            // would leave the query one step short of the form dictionaries
+            // index.
+            assert!(
+                !fold_keys.contains(&target),
+                "canonical '{target}' is itself a fold key — fold would chain"
+            );
+        }
+    }
+
+    /// Mirrors mobile `folds_the_jmdict_half_and_leaves_modern_forms_alone`.
+    #[test]
+    fn fold_folds_the_jmdict_half_and_leaves_modern_forms_alone() {
+        // Old orthography the head can emit — both forms are in the vocabulary,
+        // which is exactly why the original direction rule dropped these pairs.
+        // The queried old form resolves to the headword a dictionary indexes.
+        assert_eq!(fold_lookup_variants("摑"), "掴");
+        assert_eq!(fold_lookup_variants("國"), "国");
+        assert_eq!(fold_lookup_variants("會"), "会");
+        assert_eq!(fold_lookup_variants("燈"), "灯");
+        // The modern side is a key for nothing, so it must resolve to itself:
+        // folding it would rewrite the form the dictionaries actually index.
+        assert_eq!(fold_lookup_variants("掴"), "掴");
+        assert_eq!(fold_lookup_variants("国"), "国");
+        // A chain (冩 -> 寫 -> 写) reaches the terminal form in one pass.
+        assert_eq!(fold_lookup_variants("冩"), "写");
+        // 坂 is NOT folded to 阪: the corpus prefers 坂 (大阪), so that pair
+        // failed the direction guard and stays out of the fold.
+        assert_eq!(fold_lookup_variants("坂"), "坂");
+    }
+
+    /// Mirrors mobile `normalize_applies_the_fold`.
+    #[test]
+    fn normalize_applies_the_fold() {
+        assert_eq!(normalize("こゝろ"), "こころ");
+        assert_eq!(normalize("たゞ"), "ただ");
+        assert_eq!(normalize("Ⅶ"), "VII");
+        assert_eq!(normalize("状况"), "状況");
+    }
+
+    /// Mirrors mobile `halfwidth_kana_is_widened_before_folding`.
+    #[test]
+    fn normalize_widens_halfwidth_kana_before_folding() {
+        // order matters: convert_width runs first, so the mark sees fullwidth カ
+        assert_eq!(normalize("ｶヽ"), "カカ");
+    }
+
+    /// Mirrors mobile `fold_is_idempotent_and_noop_on_plain_text`.
+    #[test]
+    fn fold_is_idempotent_and_noop_on_plain_text() {
+        let plain = "日本語のテキストです。";
+        assert_eq!(fold_lookup_variants(plain), plain);
+        assert_eq!(normalize(plain), plain);
+        for s in ["こゝろ", "たゞ", "Ⅶ", "状况", "カヾ"] {
+            assert_eq!(normalize(&normalize(s)), normalize(s));
+        }
+    }
+
+    /// Mirrors mobile `existing_normalize_behaviour_is_unchanged`.
+    #[test]
+    fn normalize_existing_behaviour_is_unchanged() {
+        // fullwidth ASCII folds to ASCII, ideographic space to space, vertical
+        // presentation forms back to their horizontal forms
+        assert_eq!(normalize("？"), "?");
+        assert_eq!(normalize("Ａ１"), "A1");
+        assert_eq!(normalize("あ︙"), "あ…");
+        assert_eq!(normalize("あ　い"), "あ い");
+    }
+
+    /// The composed stage order: width conversion → lookup-variant fold →
+    /// combining-character normalization.
+    #[test]
+    fn normalize_stages_run_in_pipeline_order() {
+        // Width conversion first: the mark sees the widened カ, not ｶ.
+        assert_eq!(normalize("ｶヽ"), "カカ");
+        assert_eq!(normalize("ｶﾞヾ"), "ガガ");
+        // Fold before combining normalization: the mark sees the combining
+        // dakuten, so it is left alone rather than voicing the repeat. Were
+        // combining normalized first, this would read がが.
+        assert_eq!(normalize("か\u{3099}ゞ"), "がゞ");
+        // Combining normalization runs last: the decomposed pair composes.
+        assert_eq!(normalize("は\u{309A}"), "ぱ");
     }
 }

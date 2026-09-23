@@ -30,6 +30,7 @@ use crate::ocr_engine::{
 use crate::overlay_state::OcrOverlayState;
 use crate::util::char_lm::CharLm;
 use crate::util::gap_candidates::{self, MAX as GAP_MAX};
+use crate::util::japanese;
 use crate::models::RecognitionMode;
 
 fn corpus_dir() -> PathBuf {
@@ -230,6 +231,7 @@ fn every_case_has_a_runner() {
         "deinflection",
         "ruby_style",
         "char_placement",
+        "normalize",
     ];
     for (name, v) in all_cases() {
         let id = case_id(&name, &v);
@@ -599,6 +601,28 @@ fn kana_cases() {
                 exp["to"].as_str().expect("to").chars().next().expect("char")
             );
         }
+        }
+    }
+}
+
+/// The lookup-normalization pipeline in stage order: width conversion →
+/// lookup-variant fold → combining-character normalization. Each entry is one
+/// input string and the exact composed output, so the case pins iteration-mark
+/// expansion (plain and voiced), the variant fold (Roman numerals, ℃, obsolete
+/// kana, Chinese-only forms, the measured Unihan pairs), width/halfwidth
+/// widening, and decomposed combining sequences in one place.
+#[test]
+fn normalize_cases() {
+    for (name, v) in kind_cases("normalize") {
+        let id = case_id(&name, &v);
+        for c in v["case"]["cases"].as_array().expect("cases") {
+            let input = c["input"].as_str().expect("input");
+            let expect = c["expect"].as_str().expect("expect");
+            let got = japanese::normalize(input);
+            if dump() {
+                println!("DUMP {id} {input:?} -> {got:?}");
+            }
+            assert_eq!(got, expect, "{id}: normalize drifted for {input:?}");
         }
     }
 }

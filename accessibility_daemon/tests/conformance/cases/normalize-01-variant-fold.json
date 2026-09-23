@@ -1,0 +1,423 @@
+{
+  "id": "normalize-01-variant-fold",
+  "kind": "normalize",
+  "description": "Lookup normalization runs three stages in a fixed order — width conversion, lookup-variant fold, combining-character normalization — and this case pins the composed result for each input. The fold expands the iteration marks ゝ/ゞ/ヽ/ヾ (a voiced mark voices the repeat when the preceding kana has a voiced form, otherwise it is a plain repeat; a mark whose preceding character is not kana of its script is left alone), expands Roman numerals, folds ℃ and obsolete kana, folds the Chinese-only forms and the measured Unihan variant pairs onto the dictionary form (never backwards, and never for pairs the direction guard rejects), while width conversion widens halfwidth/fullwidth forms and folds vertical presentation forms back to their horizontal forms. Decomposed combining sequences compose where the table covers them and stay decomposed otherwise: this is not a general NFC pass.",
+  "mobile_mirror": "JapaneseUtilVariantFoldTest",
+  "case": {
+    "cases": [
+      {
+        "input": "",
+        "expect": "",
+        "note": "empty input stays empty"
+      },
+      {
+        "input": "日本語のテキストです。",
+        "expect": "日本語のテキストです。",
+        "note": "plain text is the identity: no width, fold or combining character applies"
+      },
+      {
+        "input": "あいうえお",
+        "expect": "あいうえお"
+      },
+      {
+        "input": "ABC 123",
+        "expect": "ABC 123"
+      },
+      {
+        "input": "こゝろ",
+        "expect": "こころ",
+        "note": "ゝ repeats the preceding hiragana"
+      },
+      {
+        "input": "こゝ",
+        "expect": "ここ"
+      },
+      {
+        "input": "あゝ",
+        "expect": "ああ"
+      },
+      {
+        "input": "こゝゝ",
+        "expect": "こここ",
+        "note": "a run of marks repeats the expanded run"
+      },
+      {
+        "input": "んゝ",
+        "expect": "んん",
+        "note": "ゝ is a plain repeat; no voiced form is involved"
+      },
+      {
+        "input": "ゝあ",
+        "expect": "ゝあ",
+        "note": "a line-initial mark has nothing to repeat and stays"
+      },
+      {
+        "input": "日ゝ",
+        "expect": "日ゝ",
+        "note": "a mark after a kanji stays"
+      },
+      {
+        "input": "、ゝ",
+        "expect": "、ゝ",
+        "note": "a mark after punctuation stays"
+      },
+      {
+        "input": "たゞ",
+        "expect": "ただ",
+        "note": "ゞ repeats and voices when the preceding kana has a voiced form"
+      },
+      {
+        "input": "かゞ",
+        "expect": "かが"
+      },
+      {
+        "input": "はゞ",
+        "expect": "はば"
+      },
+      {
+        "input": "うゞ",
+        "expect": "うゔ",
+        "note": "the voiced counterpart of う is ゔ"
+      },
+      {
+        "input": "まゞ",
+        "expect": "まま",
+        "note": "no voiced form: the mark is a plain repeat"
+      },
+      {
+        "input": "ざゞ",
+        "expect": "ざざ",
+        "note": "an already-voiced kana repeats unvoiced"
+      },
+      {
+        "input": "がゞ",
+        "expect": "がが"
+      },
+      {
+        "input": "カヽ",
+        "expect": "カカ",
+        "note": "ヽ repeats the preceding katakana"
+      },
+      {
+        "input": "カヾ",
+        "expect": "カガ",
+        "note": "ヾ voices the repeat"
+      },
+      {
+        "input": "ハヾ",
+        "expect": "ハバ"
+      },
+      {
+        "input": "ウヾ",
+        "expect": "ウヴ",
+        "note": "the voiced counterpart of ウ is ヴ"
+      },
+      {
+        "input": "ナヾ",
+        "expect": "ナナ"
+      },
+      {
+        "input": "ンヽ",
+        "expect": "ンン"
+      },
+      {
+        "input": "カゝ",
+        "expect": "カゝ",
+        "note": "marks do not cross scripts: a hiragana mark after katakana stays"
+      },
+      {
+        "input": "あヽ",
+        "expect": "あヽ",
+        "note": "a katakana mark after hiragana stays"
+      },
+      {
+        "input": "。ヾ",
+        "expect": "。ヾ",
+        "note": "a mark after punctuation stays"
+      },
+      {
+        "input": "日々",
+        "expect": "日々",
+        "note": "々 is not expanded: dictionary headwords contain it"
+      },
+      {
+        "input": "こゑ",
+        "expect": "こえ",
+        "note": "obsolete kana fold onto the modern kana the dictionary keys on"
+      },
+      {
+        "input": "ヰロ",
+        "expect": "イロ"
+      },
+      {
+        "input": "ゑ",
+        "expect": "え"
+      },
+      {
+        "input": "ヰ",
+        "expect": "イ"
+      },
+      {
+        "input": "Ⅶ",
+        "expect": "VII",
+        "note": "Roman numerals expand to their ASCII spelling (NFKC behaviour)"
+      },
+      {
+        "input": "Ⅷ",
+        "expect": "VIII"
+      },
+      {
+        "input": "Ⅰ",
+        "expect": "I"
+      },
+      {
+        "input": "第Ⅻ章",
+        "expect": "第XII章",
+        "note": "the fold applies inside a word"
+      },
+      {
+        "input": "ⅸ",
+        "expect": "ix",
+        "note": "small Roman numerals fold too"
+      },
+      {
+        "input": "20℃",
+        "expect": "20°C",
+        "note": "the compatibility form ℃ folds to °C"
+      },
+      {
+        "input": "状况",
+        "expect": "状況",
+        "note": "Chinese-only forms fold onto the Japanese form"
+      },
+      {
+        "input": "调查④",
+        "expect": "调査④",
+        "note": "only the foldable half of the pair is in the table; 调 stays"
+      },
+      {
+        "input": "调",
+        "expect": "调"
+      },
+      {
+        "input": "囘",
+        "expect": "回",
+        "note": "measured Unihan variant pairs fold variant -> canonical"
+      },
+      {
+        "input": "欝",
+        "expect": "鬱"
+      },
+      {
+        "input": "劒",
+        "expect": "劍"
+      },
+      {
+        "input": "慙",
+        "expect": "慚"
+      },
+      {
+        "input": "囘想",
+        "expect": "回想",
+        "note": "the fold applies inside a word"
+      },
+      {
+        "input": "欝々",
+        "expect": "鬱々"
+      },
+      {
+        "input": "慙愧",
+        "expect": "慚愧"
+      },
+      {
+        "input": "迯げる",
+        "expect": "逃げる"
+      },
+      {
+        "input": "噐械",
+        "expect": "器械"
+      },
+      {
+        "input": "迯",
+        "expect": "逃"
+      },
+      {
+        "input": "壜",
+        "expect": "壜",
+        "note": "frequency guard: 壜 is the commoner side, so it must not fold"
+      },
+      {
+        "input": "葢",
+        "expect": "蓋",
+        "note": "where several canonicals exist, the corpus-dominant one wins"
+      },
+      {
+        "input": "悋",
+        "expect": "吝"
+      },
+      {
+        "input": "冫",
+        "expect": "氷"
+      },
+      {
+        "input": "秇",
+        "expect": "藝"
+      },
+      {
+        "input": "﨑",
+        "expect": "崎"
+      },
+      {
+        "input": "回",
+        "expect": "回",
+        "note": "the fold does not run backwards: canonical forms resolve to themselves"
+      },
+      {
+        "input": "鬱",
+        "expect": "鬱"
+      },
+      {
+        "input": "蓋",
+        "expect": "蓋"
+      },
+      {
+        "input": "摑",
+        "expect": "掴",
+        "note": "old orthography folds onto the modern form the dictionary indexes"
+      },
+      {
+        "input": "國",
+        "expect": "国"
+      },
+      {
+        "input": "會",
+        "expect": "会"
+      },
+      {
+        "input": "燈",
+        "expect": "灯"
+      },
+      {
+        "input": "掴",
+        "expect": "掴",
+        "note": "modern forms resolve to themselves"
+      },
+      {
+        "input": "国",
+        "expect": "国"
+      },
+      {
+        "input": "冩",
+        "expect": "写",
+        "note": "a chain reaches the terminal form in one pass"
+      },
+      {
+        "input": "坂",
+        "expect": "坂",
+        "note": "a pair that failed the direction guard stays out of the fold"
+      },
+      {
+        "input": "囘囘回",
+        "expect": "回回回",
+        "note": "the fold is idempotent over repeated variants"
+      },
+      {
+        "input": "？",
+        "expect": "?",
+        "note": "fullwidth ASCII folds to ASCII"
+      },
+      {
+        "input": "Ａ１",
+        "expect": "A1"
+      },
+      {
+        "input": "あ　い",
+        "expect": "あ い",
+        "note": "ideographic space folds to a space"
+      },
+      {
+        "input": "あ︙",
+        "expect": "あ…",
+        "note": "vertical presentation forms fold back to their horizontal forms"
+      },
+      {
+        "input": "あ︰",
+        "expect": "あ‥"
+      },
+      {
+        "input": "ｶﾞ",
+        "expect": "ガ",
+        "note": "halfwidth kana widen, including voiced and semi-voiced digraphs"
+      },
+      {
+        "input": "ﾊﾟ",
+        "expect": "パ"
+      },
+      {
+        "input": "ｳﾞ",
+        "expect": "ヴ"
+      },
+      {
+        "input": "ｱｲｳ",
+        "expect": "アイウ"
+      },
+      {
+        "input": "｡｢｣､･",
+        "expect": "。「」、・",
+        "note": "halfwidth punctuation widens to its fullwidth form"
+      },
+      {
+        "input": "ｰ",
+        "expect": "ー"
+      },
+      {
+        "input": "ｶヽ",
+        "expect": "カカ",
+        "note": "width conversion runs before the fold: the mark sees the widened カ"
+      },
+      {
+        "input": "ｶﾞヾ",
+        "expect": "ガガ",
+        "note": "a voiced halfwidth digraph widens, then the mark repeats it"
+      },
+      {
+        "input": "か\u3099",
+        "expect": "が",
+        "note": "decomposed dakuten sequences compose"
+      },
+      {
+        "input": "は\u3099",
+        "expect": "ば"
+      },
+      {
+        "input": "ふ\u3099",
+        "expect": "ぶ"
+      },
+      {
+        "input": "ほ\u309A",
+        "expect": "ぽ",
+        "note": "decomposed handakuten sequences compose"
+      },
+      {
+        "input": "が",
+        "expect": "が",
+        "note": "precomposed kana pass through unchanged"
+      },
+      {
+        "input": "カ\u3099",
+        "expect": "カ\u3099",
+        "note": "the combining table covers hiragana only: this stays decomposed"
+      },
+      {
+        "input": "う\u3099",
+        "expect": "う\u3099",
+        "note": "no う pair is in the combining table: this stays decomposed"
+      },
+      {
+        "input": "か\u3099ゞ",
+        "expect": "がゞ",
+        "note": "the fold runs before combining normalization: the mark sees the combining dakuten, not the composed が"
+      }
+    ]
+  }
+}

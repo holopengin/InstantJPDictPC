@@ -32,6 +32,8 @@ Pages:
   dedup, ruby, and the ticket-06 body-ruby departure.
 - [deinflection.md](deinflection.md) — chain plumbing and reason labels
   (ticket-07).
+- [normalize.md](normalize.md) — lookup normalization stage order, the
+  iteration-mark/variant fold, combining-character rules.
 
 Authority and tolerances: numeric tolerances and the accepted platform
 substitutions (Skia-vs-fontdue metrics, JNI-vs-Rust ncnn low bits, converged
