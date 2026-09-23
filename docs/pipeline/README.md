@@ -25,6 +25,8 @@ Pages:
   epsilon policy.
 - [ctc-decode.md](ctc-decode.md) — blank as ideographic space, raw cache,
   re-decode, alternatives panel + OOV assembly.
+- [char-placement.md](char-placement.md) — CTC-anchored per-character box
+  placement (CAP), the `BOX_PLACEMENT_CAP` switch, Tier-1/Tier-2 pins.
 - [reading-order.md](reading-order.md) — sort rules and the nav graph.
 - [dictionary.md](dictionary.md) — the #88 structured-content model, grouping,
   dedup, ruby, and the ticket-06 body-ruby departure.

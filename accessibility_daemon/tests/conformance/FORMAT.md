@@ -274,6 +274,35 @@ though mobile historically painted mini ruby bold cyan. Do NOT "correct"
 body toward cyan+bold — that reintroduces the ticket-06 symptom by design
 on both sides.
 
+### `char_placement` — recorded line inputs, per-character boxes out
+
+```json
+"case": {
+  "gray": "images/char_placement/<fixture>.gray",
+  "crop_w": 927, "crop_h": 56, "orientation": "h", "seq_len_total": 50,
+  "text": "…", "char_cols": [1.0, 3.0, "…"],
+  "steps": [[["　", 3.14]], "…"],
+  "gold": { "em_px": 36.0, "ink_boxes": [[l, t, r, b], "…"],
+            "decoded_to_true": [0, 1, "…"] },
+  "expect_boxes": [[l, t, r, b], "…"]
+}
+```
+
+Inputs are recorded decoder evidence (plain floats) plus raw luminance bytes —
+no inference, no rasterizer, no fonts. The runner calls the PC placement port
+with exactly these values (never platform defaults), then compares: box count
+exact, each edge within `box_px` (this kind overrides the default to 1.5;
+the Kotlin float32 mirror measures ≤1.5, float64 ≈0). Boxes span the full
+cross axis by contract. `gold` is optional for the pin and enables per-case
+metric reporting.
+
+The expectations come from the PYTHON reference (`tools/char_placement` in
+the Android checkout), never from the port — regenerating a case runs the
+reference over the fixture inputs; a DUMP mode on the PC side would be
+circular for this kind and must not bless port output. Spec, metric formulas
+and corpus gates: `docs/char-placement-conformance.md` (handoff doc in the
+Android checkout).
+
 ## Adding a case (the parity-bug rule)
 
 A parity bug fix adds a conformance case: write the JSON, run

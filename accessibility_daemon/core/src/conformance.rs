@@ -87,6 +87,13 @@ fn box_tol(v: &Value) -> i32 {
     v["tolerances"]["box_px"].as_i64().unwrap_or(2) as i32
 }
 
+/// Float-tight box tolerance: `box_px` may be fractional (the
+/// `char_placement` kind pins 1.5), which the integer helper would drop to
+/// the default and silently widen.
+fn box_tol_f(v: &Value) -> f64 {
+    v["tolerances"]["box_px"].as_f64().unwrap_or(2.0)
+}
+
 fn angle_tol_deg(v: &Value) -> f32 {
     v["tolerances"]["angle_deg"].as_f64().unwrap_or(1.0) as f32
 }
@@ -222,6 +229,7 @@ fn every_case_has_a_runner() {
         "recognition",
         "deinflection",
         "ruby_style",
+        "char_placement",
     ];
     for (name, v) in all_cases() {
         let id = case_id(&name, &v);
@@ -846,6 +854,200 @@ fn ruby_style_cases() {
                 m["bold"].as_bool().expect("bold"),
                 "{id} {mode}: weight drifted"
             );
+        }
+    }
+}
+
+/// Linear-interpolation percentile over an unsorted sample (numpy's default
+/// method — the spec's `mean/p90` metric rows use it).
+fn percentile_px(xs: &mut [f64], q: f64) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.sort_by(f64::total_cmp);
+    if xs.len() == 1 {
+        return xs[0];
+    }
+    let pos = q / 100.0 * (xs.len() - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let frac = pos - lo as f64;
+    xs[lo] * (1.0 - frac) + xs[hi] * frac
+}
+
+/// Tier-1 placement parity (`docs/char-placement-conformance.md` in the
+/// Android checkout): recorded decoder evidence + raw luminance bytes in,
+/// one full-cross-axis box per character out, compared against the PYTHON
+/// reference's `expect_boxes` — box count exact, each of l/t/r/b within the
+/// kind's 1.5 px override — plus the tap contract `CharPlacementTest.
+/// boxesContainTheirCharactersInkCentre` pins on Android (every gold ink
+/// centre lies on its own box's reading axis, 0.5 px slack).
+///
+/// `gold` also drives the per-case Tier-2-style metrics, printed under
+/// `CONFORMANCE_DUMP=1` as *reporting only*. The dump deliberately prints no
+/// rects: expectations for this kind are the reference's output, so a dump
+/// of the port's geometry would be circular (FORMAT.md, `char_placement`).
+#[test]
+fn char_placement_cases() {
+    for (name, v) in kind_cases("char_placement") {
+        let id = case_id(&name, &v);
+        let c = &v["case"];
+        let crop_w = c["crop_w"].as_i64().expect("crop_w") as u32;
+        let crop_h = c["crop_h"].as_i64().expect("crop_h") as u32;
+        let gray = std::fs::read(corpus_dir().join(c["gray"].as_str().expect("gray")))
+            .expect("gray fixture reads");
+        assert_eq!(
+            gray.len(),
+            crop_w as usize * crop_h as usize,
+            "{id}: .gray must hold exactly crop_w * crop_h luminance bytes"
+        );
+        let lum: Vec<f32> = gray.iter().map(|&b| b as f32).collect();
+        let vertical = match c["orientation"].as_str().expect("orientation") {
+            "v" => true,
+            "h" => false,
+            o => panic!("{id}: bad orientation {o:?} (h | v)"),
+        };
+        let seq_len_total = c["seq_len_total"].as_i64().expect("seq_len_total") as usize;
+        let text = c["text"].as_str().expect("text");
+        let char_cols: Vec<f32> = c["char_cols"]
+            .as_array()
+            .expect("char_cols")
+            .iter()
+            .map(|x| x.as_f64().expect("float") as f32)
+            .collect();
+        let steps: Vec<Vec<(char, f64)>> = c["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .map(|t| {
+                t.as_array()
+                    .expect("timestep")
+                    .iter()
+                    .map(|e| {
+                        (
+                            e[0].as_str().expect("ch").chars().next().expect("char"),
+                            e[1].as_f64().expect("score"),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Case values, never platform defaults (same rule as detection's
+        // det_thresh): the pin must not move when a default changes.
+        let got = crate::char_placement::place(
+            text,
+            &char_cols,
+            seq_len_total,
+            crop_w,
+            crop_h,
+            vertical,
+            Some((&lum, crop_w, crop_h)),
+            Some(&steps),
+        );
+        let expect = c["expect_boxes"].as_array().expect("expect_boxes");
+        assert_eq!(
+            got.len(),
+            expect.len(),
+            "{id}: box count drifted: got {}, expected {}",
+            got.len(),
+            expect.len()
+        );
+
+        let tol = box_tol_f(&v);
+        let mut errs: Vec<f64> = Vec::new();
+        let mut worst_delta = 0.0f64;
+        for (i, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+            let eb: Vec<f64> = e
+                .as_array()
+                .expect("box [l, t, r, b]")
+                .iter()
+                .map(|x| x.as_f64().expect("float"))
+                .collect();
+            assert_eq!(eb.len(), 4, "{id} char {i}: box must be [l, t, r, b]");
+            for (axis, gv, ev) in [
+                ("left", g[0], eb[0]),
+                ("top", g[1], eb[1]),
+                ("right", g[2], eb[2]),
+                ("bottom", g[3], eb[3]),
+            ] {
+                assert!(
+                    (gv - ev).abs() <= tol,
+                    "{id} char {i}: {axis} drifted: got {gv}, expected {ev} \
+                     (tol ±{tol}px)\n  got      {g:?}\n  expected {eb:?}"
+                );
+                worst_delta = worst_delta.max((gv - ev).abs());
+            }
+            if dump() {
+                errs.push((g[2] - g[0]) - (eb[2] - eb[0]));
+            }
+        }
+
+        // reporting only: how far the PORT sits from the reference (scalar, no
+        // rects — the dump must never be paste-able as expectations).
+        if dump() {
+            println!("DUMP {id} parity: worst edge delta {worst_delta:.4}px (tol ±{tol}px)");
+        }
+
+        // The tap contract (Android `boxesContainTheirCharactersInkCentre`):
+        // each character's gold ink centre sits on its own box's reading
+        // axis, 0.5 px slack. Also the honest gate for the `gold` metrics,
+        // which report the Tier-2-style rates per case (report-only: the pin
+        // is parity, above).
+        if let Some(gold) = c.get("gold") {
+            let axis = usize::from(vertical);
+            let ink_boxes = gold["ink_boxes"].as_array().expect("ink_boxes");
+            let d2t = gold["decoded_to_true"].as_array().expect("decoded_to_true");
+            let mut centre_errs: Vec<f64> = Vec::new();
+            let mut covered = 0usize;
+            let mut tap = 0usize;
+            let mut eligible = 0usize;
+            let mut first_bad: Option<(usize, f64, f64, f64, [f64; 4])> = None;
+            for (i, map) in d2t.iter().enumerate() {
+                let Some(true_idx) = map.as_i64() else { continue };
+                let Some(ink) = ink_boxes.get(true_idx as usize) else { continue };
+                let ink: Vec<f64> = ink
+                    .as_array()
+                    .expect("ink box")
+                    .iter()
+                    .map(|x| x.as_f64().expect("float"))
+                    .collect();
+                if ink[2] <= ink[0] || ink[3] <= ink[1] {
+                    continue;
+                }
+                let Some(got_box) = got.get(i) else { continue };
+                eligible += 1;
+                let centre = (ink[axis] + ink[axis + 2]) / 2.0;
+                let (lo, hi) = (got_box[axis], got_box[axis + 2]);
+                if centre >= lo - 0.5 && centre <= hi + 0.5 {
+                    covered += 1;
+                } else if first_bad.is_none() {
+                    first_bad = Some((i, centre, lo, hi, *got_box));
+                }
+                centre_errs.push((centre - 0.5 * (lo + hi)).abs());
+                let box_centre = 0.5 * (lo + hi);
+                if box_centre >= ink[axis] - 0.5 && box_centre <= ink[axis + 2] + 0.5 {
+                    tap += 1;
+                }
+            }
+            if dump() && eligible > 0 {
+                let n = eligible as f64;
+                let mean = centre_errs.iter().sum::<f64>() / n;
+                let p90 = percentile_px(&mut centre_errs, 90.0);
+                println!(
+                    "DUMP {id} metrics: n={eligible} centre_err mean={mean:.3}px \
+                     p90={p90:.3}px cover={:.3} tap={:.3} width_delta mean={:.3}px",
+                    covered as f64 / n,
+                    tap as f64 / n,
+                    errs.iter().sum::<f64>() / errs.len().max(1) as f64,
+                );
+            }
+            if let Some((i, centre, lo, hi, rect)) = first_bad {
+                panic!(
+                    "{id} char {i}: ink centre {centre} outside box [{lo}, {hi}] \
+                     (±0.5px, {covered}/{eligible} covered)\n  got {rect:?}"
+                );
+            }
         }
     }
 }

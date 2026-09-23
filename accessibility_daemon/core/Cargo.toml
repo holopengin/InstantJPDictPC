@@ -49,3 +49,10 @@ sha2 = { version = "0.10", optional = true }
 
 # Lazy static initialization
 lazy_static = "1.4"
+
+# Tier-2 scorer input for the char-placement spec (Android handoff doc
+# docs/char-placement-conformance.md): dump CAP boxes for a synthesize.py
+# corpus. Needs `image`, so gate it on `native` like the pipeline itself.
+[[example]]
+name = "cap_dump"
+required-features = ["native"]

@@ -5,6 +5,7 @@ Default per-case tolerances (overridable in the case's `tolerances` object):
 | quantity | default | means |
 |---|---|---|
 | `box_px` | 2 | each of x/y/w/h within ±2 px |
+| `char_placement` box edges | 1.5 px (kind override) | each of l/t/r/b within ±1.5 px of the Python reference; box count exact |
 | `angle_deg` | 1.0 | frame angle within ±1° |
 | text / labels / order | exact | no tolerance — strings and sequences match byte-for-byte |
 
@@ -50,6 +51,12 @@ them; if one does, the case is wrong, not the code.
    (JNI ncnn vs Rust ncnn) stay an accepted substitution, which is why the
    `recognition` kind is PC-hosted-only (`mobile_mirror: null`,
    Android-manual) until the Android side can host inference in its tests.
+6. **`char_placement` has no platform substitution.** Inputs are recorded
+   plain data and IEEE float ops; float32-vs-float64 placement noise is
+   inside the 1.5 px override (measured on the Kotlin mirror). The
+   tap-jitter *stream* is NumPy-PCG64-specific: ~±0.4 pp rate movement is the
+   RNG stream, not drift (gate 0.975 absorbs it); centre/cover are the
+   load-bearing rates.
 
 ## Real drift (fails the suite)
 
@@ -58,6 +65,11 @@ ratios or gap/overlap fractions, changed fallback class order, changed LM
 back-off chain, changed kana epsilon policy or window layout, changed
 example ja/en split or sense-group numbering, changed deinflection reason
 labels (group-key mapping) or reachable derivations, changed ruby
-body/term base treatment or weight. The perturbation proof for
+body/term base treatment or weight. For `char_placement` additionally:
+profile walks not clamped at the profile length (spec §1.3.1 of
+`docs/char-placement-conformance.md` — the blank-lines bug), a placement
+exception swallowed instead of propagated, guard-rail inputs (short text /
+empty pixels / crop < 8) throwing instead of falling back, box counts
+changing, any Tier-2 gate failing. The perturbation proof for
 each harness addition (flip one semantic, watch the case fail, revert) is
 recorded in the ticket comments when the corpus is extended.

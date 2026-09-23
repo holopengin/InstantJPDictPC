@@ -1117,6 +1117,91 @@ pub fn compute_char_boxes(
     }
 }
 
+/// CAP kill switch (mobile `PREF_BOX_PLACEMENT_CAP`): the improved
+/// CTC-anchored placement ([`crate::char_placement`]) is the default; set
+/// `BOX_PLACEMENT_CAP=0` to restore the shipped `legacyCells → snap →
+/// resolveInkCollisions → uniformCells` chain bit-for-bit (and the
+/// `BOX_LAYOUT_MODE` / `BOX_UNIFORM_SIZE` knobs to apply to it again).
+fn box_placement_cap() -> bool {
+    std::env::var("BOX_PLACEMENT_CAP").map(|v| v != "0").unwrap_or(true)
+}
+
+/// Char boxes for one line: CAP when enabled (default), the shipped chain
+/// otherwise. `pixels` is the RGB8 crop (CAP needs it for the ink pass;
+/// the shipped chain still gates its own snap stage on `BOX_LAYOUT_MODE`),
+/// `steps` the decode's per-timestep top-K (`LineResult::raw_alternatives`)
+/// — absent steps make CAP fall back to `char_cols` columns, exactly like
+/// the reference's safety net.
+///
+/// Output is rounded to integer [`BoundingBox`]es in the caller's frame with
+/// the same conventions as [`compute_char_boxes`] (horizontal: `(crop +
+/// edge).round()`, full `crop_h`; vertical: full `crop_w`).
+#[allow(clippy::too_many_arguments)] // mirrors compute_char_boxes' frame
+pub fn compute_char_boxes_line(
+    text: &str,
+    char_cols: &[f32],
+    seq_len_total: usize,
+    crop_x: i32,
+    crop_y: i32,
+    crop_w: u32,
+    crop_h: u32,
+    is_vertical: bool,
+    pixels: Option<(&[u8], u32, u32)>,
+    steps: Option<&[Vec<(char, f32)>]>,
+) -> Vec<BoundingBox> {
+    // Same degenerate-input shape as the shipped chain: nothing to place.
+    if char_cols.is_empty() || seq_len_total == 0 {
+        return Vec::new();
+    }
+    if !box_placement_cap() {
+        return compute_char_boxes(
+            text,
+            char_cols,
+            seq_len_total,
+            crop_x,
+            crop_y,
+            crop_w,
+            crop_h,
+            is_vertical,
+            pixels,
+        );
+    }
+    let lum: Option<(Vec<f32>, u32, u32)> = pixels
+        .map(|(p, w, h)| (crate::char_placement::luminance_from_rgb(p, w, h), w, h));
+    let steps64: Option<Vec<Vec<(char, f64)>>> = steps
+        .map(|s| {
+            s.iter()
+                .map(|alts| alts.iter().map(|&(c, sc)| (c, sc as f64)).collect())
+                .collect()
+        });
+    let boxes = crate::char_placement::place(
+        text,
+        char_cols,
+        seq_len_total,
+        crop_w,
+        crop_h,
+        is_vertical,
+        lum.as_ref().map(|(l, w, h)| (l.as_slice(), *w, *h)),
+        steps64.as_deref(),
+    );
+    boxes
+        .iter()
+        .map(|b| {
+            if !is_vertical {
+                let left = (crop_x as f32 + b[0] as f32).round() as i32;
+                let right = (crop_x as f32 + b[2] as f32).round() as i32;
+                BoundingBox::new(left, crop_y, (right - left).max(1), crop_h as i32, 1.0)
+            } else {
+                let yt = b[1] as f32;
+                let ch = (b[3] as f32 - yt).max(1.0);
+                let top = (crop_y as f32 + yt).round() as i32;
+                let bottom = (crop_y as f32 + yt + ch).round() as i32;
+                BoundingBox::new(crop_x, top, crop_w as i32, (bottom - top).max(1), 1.0)
+            }
+        })
+        .collect()
+}
+
 #[allow(dead_code)] // no live caller yet: mobile's consumer is the gap-detector fallback
 impl DetectedAnnotation {
     /// Mobile `OcrEngine.reDecodeLineResult`: rebuild a line's text, char
@@ -1144,23 +1229,26 @@ impl DetectedAnnotation {
         };
 
         let char_boxes = if seq_len_total > 0 {
+            // Re-decode has the same cached per-timestep top-K the live path
+            // passes; no pixels, so CAP runs on recorded evidence alone.
+            let steps = Some(line.raw_alternatives.as_slice());
             match self.quad.filter(|r| r.is_rotated()) {
                 Some(r) => {
                     let lw = r.w.round().max(4.0) as u32;
                     let lh = r.h.round().max(4.0) as u32;
-                    compute_char_boxes(
+                    compute_char_boxes_line(
                         &re.text, &re.char_cols, seq_len_total,
-                        0, 0, lw, lh, line.is_vertical, None,
+                        0, 0, lw, lh, line.is_vertical, None, steps,
                     )
                     .iter()
                     .map(|b| r.map_local_rect(b.x as f32, b.y as f32, b.w as f32, b.h as f32))
                     .collect()
                 }
-                None => compute_char_boxes(
+                None => compute_char_boxes_line(
                     &re.text, &re.char_cols, seq_len_total,
                     self.bbox.x, self.bbox.y,
                     self.bbox.w.max(0) as u32, self.bbox.h.max(0) as u32,
-                    line.is_vertical, None,
+                    line.is_vertical, None, steps,
                 ),
             }
         } else {
@@ -1989,12 +2077,15 @@ fn recognize_boxes_core(
                         // Dataset collection: save the line crop + detected text
                         let sample_txt = save_line_sample(&job.crop, &text);
 
-                        // Char boxes: mobile computeCharBoxes (#49). Rotated
-                        // lines compute in the upright local crop
+                        // Char boxes: CAP (mobile `PREF_BOX_PLACEMENT_CAP`,
+                        // the CTC-anchored placement) by default,
+                        // computeCharBoxes (#49) under `BOX_PLACEMENT_CAP=0`.
+                        // Rotated lines compute in the upright local crop
                         // (0,0,localW,localH) and map back through the frame;
                         // axis lines use the UNCLAMPED rect frame (the crop
                         // itself stays clamped, D6).
-                        let snap_pixels = if box_layout_snap()
+                        let need_pixels = box_placement_cap() || box_layout_snap();
+                        let snap_pixels = if need_pixels
                             && job.crop.width() >= 8
                             && job.crop.height() >= 8
                         {
@@ -2006,12 +2097,13 @@ fn recognize_boxes_core(
                         let pixels = snap_pixels
                             .as_ref()
                             .map(|(p, w, h)| (p.as_slice(), *w, *h));
+                        let steps = Some(raw_alternatives.as_slice());
                         let char_boxes = if let Some(r) = job.rot.filter(|r| r.is_rotated()) {
                             let lw = r.w.round().max(4.0) as u32;
                             let lh = r.h.round().max(4.0) as u32;
-                            let local = compute_char_boxes(
+                            let local = compute_char_boxes_line(
                                 &text, &char_cols, seq_len_total,
-                                0, 0, lw, lh, job.is_vertical, pixels,
+                                0, 0, lw, lh, job.is_vertical, pixels, steps,
                             );
                             local
                                 .iter()
@@ -2022,11 +2114,11 @@ fn recognize_boxes_core(
                                 })
                                 .collect()
                         } else {
-                            compute_char_boxes(
+                            compute_char_boxes_line(
                                 &text, &char_cols, seq_len_total,
                                 job.bbox.x, job.bbox.y,
                                 job.bbox.w.max(0) as u32, job.bbox.h.max(0) as u32,
-                                job.is_vertical, pixels,
+                                job.is_vertical, pixels, steps,
                             )
                         };
 
@@ -2572,10 +2664,14 @@ mod tests {
     }
 
     /// End-to-end: every char box the streaming path emits must follow the
-    /// mobile #49 uniform-em sizing, and plain-glyph lines must land on the
-    /// synth truth centres along the reading axis.
+    /// CAP placement contract — one box per character, full cross-axis span,
+    /// reading axis inside the line's frame — and plain-glyph lines must
+    /// land on the synth truth centres along the reading axis. The legacy
+    /// chain's uniform-em sizing (mobile #49) is superseded by CAP and stays
+    /// pinned by the direct `compute_char_boxes` / `uniform_cells` tests
+    /// above (reachable end-to-end via `BOX_PLACEMENT_CAP=0`).
     #[test]
-    fn synth_char_boxes_uniform_em_and_position() {
+    fn synth_char_boxes_cap_span_and_position() {
         let mut eng = test_engine();
         let truth: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(format!(
@@ -2646,39 +2742,55 @@ mod tests {
                 }
                 let chars: Vec<char> = line.text.chars().collect();
                 let vertical = line.is_vertical;
-                // Uniform-em regression (mobile #49): every emitted cell's
-                // along length is the line's estimated em (halfwidth: 0.5em),
-                // clamped at the frame edges.
-                let centers: Vec<f32> = line
-                    .char_boxes
-                    .iter()
-                    .map(|b| {
-                        if vertical {
-                            b.y as f32 + b.h as f32 / 2.0
-                        } else {
-                            b.x as f32 + b.w as f32 / 2.0
-                        }
-                    })
-                    .collect();
-                let em = crate::util::japanese::estimate_em(&line.text, &centers);
+                // CAP contract: one box per character (the viewer's
+                // char_boxes.zip(chars) walk assumes the count matches), each
+                // spanning the full cross axis of the line's bbox, non-empty
+                // and inside the frame on the reading axis. Placement *widths*
+                // are ink-measured under CAP, so uniform-em sizing is not
+                // asserted here — see the module's direct chain tests.
+                assert_eq!(
+                    line.char_boxes.len(),
+                    chars.len(),
+                    "{file}: one box per emitted character"
+                );
                 for (ci, b) in line.char_boxes.iter().enumerate() {
-                    let along = if vertical { b.h } else { b.w } as f32;
-                    assert!(along >= 1.0, "{file} char {ci}: empty box");
-                    if em > 0.0 {
-                        let expected = if chars
-                            .get(ci)
-                            .copied()
-                            .map(crate::util::japanese::is_half_width)
-                            .unwrap_or(false)
-                        {
-                            0.5 * em
-                        } else {
-                            em
-                        };
+                    let along = if vertical { b.h } else { b.w };
+                    assert!(along >= 1, "{file} char {ci}: empty box");
+                    if vertical {
+                        assert_eq!(
+                            (b.x, b.w),
+                            (ann.bbox.x, ann.bbox.w),
+                            "{file} char {ci}: cross span {}..{} != bbox {}..{}",
+                            b.x,
+                            b.right(),
+                            ann.bbox.x,
+                            ann.bbox.right()
+                        );
                         assert!(
-                            (along - expected).abs() <= expected * 0.3 + 3.0,
-                            "{file} char {ci} ({:?}): along {along} vs uniform {expected} (em {em})",
-                            chars.get(ci)
+                            b.y >= ann.bbox.y && b.bottom() <= ann.bbox.bottom(),
+                            "{file} char {ci}: y {}..{} outside bbox {}..{}",
+                            b.y,
+                            b.bottom(),
+                            ann.bbox.y,
+                            ann.bbox.bottom()
+                        );
+                    } else {
+                        assert_eq!(
+                            (b.y, b.h),
+                            (ann.bbox.y, ann.bbox.h),
+                            "{file} char {ci}: cross span {}..{} != bbox {}..{}",
+                            b.y,
+                            b.bottom(),
+                            ann.bbox.y,
+                            ann.bbox.bottom()
+                        );
+                        assert!(
+                            b.x >= ann.bbox.x && b.right() <= ann.bbox.right(),
+                            "{file} char {ci}: x {}..{} outside bbox {}..{}",
+                            b.x,
+                            b.right(),
+                            ann.bbox.x,
+                            ann.bbox.right()
                         );
                     }
                     checked += 1;
