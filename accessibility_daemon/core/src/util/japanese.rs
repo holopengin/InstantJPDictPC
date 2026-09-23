@@ -300,8 +300,7 @@ lazy_static::lazy_static! {
     /// canonical is itself a key, so the fold stays idempotent: one pass
     /// reaches the terminal form. All pairs are single-character, so unlike the
     /// Roman numerals they never change query length.
-    static ref MEASURED_VARIANT_FOLD: HashMap<char, &'static str> = {
-        let pairs = [
+    static ref MEASURED_VARIANT_FOLD: HashMap<char, &'static str> = {        let pairs = [
             ('㕞', "刷"), ('㘅', "啣"), ('㝵', "碍"), ('䖟', "蝱"), ('䙝', "褻"),
             ('䬒', "颼"), ('䯻', "髻"), ('䰗', "鬮"), ('乾', "干"), ('亻', "人"),
             ('來', "来"), ('俠', "侠"), ('册', "冊"), ('冩', "写"), ('冫', "氷"),
@@ -362,6 +361,19 @@ lazy_static::lazy_static! {
         map.extend(MEASURED_VARIANT_FOLD.iter().map(|(c, s)| (*c, *s)));
         map
     };
+}
+
+/// The Unihan-derived fold table as owned data, for hosts that need the table
+/// itself (a binding cannot carry a `HashMap`, and the mobile drift guard
+/// checks the table against the committed asset). All pairs are
+/// single-character. Ordered for a stable boundary; the table is read-only.
+pub fn measured_variant_fold() -> Vec<(char, &'static str)> {
+    let mut out: Vec<(char, &'static str)> = MEASURED_VARIANT_FOLD
+        .iter()
+        .map(|(c, s)| (*c, *s))
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 /// Mobile `JapaneseUtil.verticalPunctuation` (#56, #63): PP-OCR emits ASCII
@@ -1602,5 +1614,22 @@ mod tests {
         // Mixed scripts: only the katakana block folds.
         assert_eq!(katakana_to_hiragana("食べル"), "食べる");
         assert_eq!(katakana_to_hiragana("ABC"), "ABC");
+    }
+
+    /// The binding accessor exposes the exact table the fold reads, in a stable
+    /// order and with single-character targets — the mobile drift guard checks
+    /// this data against the committed asset instead of carrying its own copy.
+    #[test]
+    fn measured_variant_fold_accessor_matches_the_table() {
+        let pairs = measured_variant_fold();
+        assert_eq!(pairs.len(), 165);
+        assert_eq!(pairs.len(), MEASURED_VARIANT_FOLD.len());
+        for &(variant, canonical) in &pairs {
+            assert_eq!(MEASURED_VARIANT_FOLD.get(&variant), Some(&canonical));
+            assert_eq!(canonical.chars().count(), 1, "{variant} -> {canonical}");
+        }
+        let mut sorted = pairs.clone();
+        sorted.sort_unstable();
+        assert_eq!(pairs, sorted, "stable order for the boundary");
     }
 }
