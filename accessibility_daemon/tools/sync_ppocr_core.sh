@@ -3,7 +3,7 @@
 #
 # The Android app and this repo compile the same two files:
 #   InstantJPDict:      app/src/main/cpp/ppocr_ncnn_core.{h,cpp}
-#   InstantJPDictDecky: accessibility_daemon/native/ppocr_ncnn/ppocr_ncnn_core.{h,cpp}
+#   InstantJPDictPC: accessibility_daemon/native/ppocr_ncnn/ppocr_ncnn_core.{h,cpp}
 # The JNI wrapper (ncnn_jni.cpp) and the C ABI wrapper (ppocr_ncnn_capi.cpp)
 # are platform shells and are allowed to differ.
 #

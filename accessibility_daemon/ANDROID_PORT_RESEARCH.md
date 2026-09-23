@@ -1,4 +1,4 @@
-# Android Port Assessment — InstantJPDictDecky
+# Android Port Assessment — InstantJPDictPC
 
 ## Summary
 
