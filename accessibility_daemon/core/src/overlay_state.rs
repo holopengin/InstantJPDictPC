@@ -1192,35 +1192,19 @@ pub fn navigate(&mut self, action: GamepadAction) -> bool {
     /// Downstep positions from a stored pitch payload, or None when the entry
     /// is not pitch data. Detection is by payload shape
     /// (`{"reading":…, "pitches":[{"position":N},…]}`).
+    ///
+    /// Thin delegate: the implementation lives in the ungated
+    /// [`crate::util::pitch`] so nav-only builds can reach it.
     pub fn pitch_positions_of(definitions_json: &str) -> Option<Vec<i32>> {
-        let root: serde_json::Value = serde_json::from_str(definitions_json).ok()?;
-        let obj = root.as_object()?;
-        let pitches = obj.get("pitches")?;
-        let pitches = pitches.as_array()?;
-        obj.get("reading")?;
-        let mut out: Vec<i32> = Vec::new();
-        for p in pitches {
-            let Some(position) = p
-                .as_object()
-                .and_then(|m| m.get("position"))
-                .and_then(|v| v.as_i64())
-            else {
-                continue;
-            };
-            out.push(position as i32);
-        }
-        out.sort();
-        out.dedup();
-        Some(out)
+        crate::util::pitch::pitch_positions_of(definitions_json)
     }
 
     /// Reading of a stored pitch payload (None when absent).
+    ///
+    /// Thin delegate: the implementation lives in the ungated
+    /// [`crate::util::pitch`] so nav-only builds can reach it.
     pub fn pitch_reading_of(definitions_json: &str) -> Option<String> {
-        let root: serde_json::Value = serde_json::from_str(definitions_json).ok()?;
-        root.as_object()?
-            .get("reading")?
-            .as_str()
-            .map(|s| s.to_string())
+        crate::util::pitch::pitch_reading_of(definitions_json)
     }
 }
 

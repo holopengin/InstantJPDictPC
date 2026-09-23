@@ -6,3 +6,4 @@ pub mod japanese;
 pub mod kanji_variants;
 pub mod oov_candidates;
 pub mod oov_suggestions;
+pub mod pitch;
