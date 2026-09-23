@@ -7,6 +7,7 @@ Default per-case tolerances (overridable in the case's `tolerances` object):
 | `box_px` | 2 | each of x/y/w/h within ±2 px |
 | `char_placement` box edges | 1.5 px (kind override) | each of l/t/r/b within ±1.5 px of the Python reference; box count exact |
 | `angle_deg` | 1.0 | frame angle within ±1° |
+| `gap_ratio`, `gap_span_px` | 1e-4 relative (kind override) | detector ratio / span within 1e-4 of the expected value; `insert_at` and gap count are exact |
 | text / labels / order | exact | no tolerance — strings and sequences match byte-for-byte |
 
 ## Known-acceptable platform substitutions (NOT drift)
@@ -65,7 +66,8 @@ ratios or gap/overlap fractions, changed fallback class order, changed LM
 back-off chain, changed kana epsilon policy or window layout, changed
 example ja/en split or sense-group numbering, changed deinflection reason
 labels (group-key mapping) or reachable derivations, changed ruby
-body/term base treatment or weight. For `char_placement` additionally:
+body/term base treatment or weight, changed gap-detection thresholds,
+geometry-source priority or span conversion. For `char_placement` additionally:
 profile walks not clamped at the profile length (spec §1.3.1 of
 `docs/char-placement-conformance.md` — the blank-lines bug), a placement
 exception swallowed instead of propagated, guard-rail inputs (short text /

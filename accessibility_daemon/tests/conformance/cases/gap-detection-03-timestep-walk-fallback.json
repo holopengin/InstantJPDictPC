@@ -1,0 +1,55 @@
+{
+  "id": "gap-detection-03-timestep-walk-fallback",
+  "kind": "gap_detection",
+  "description": "The last geometry resort: walk the raw per-timestep top-K lists. The emitted character for a timestep is the list's first entry; a blank timestep resets the repeat state so a repeated character after a blank is emitted again; a space is always emitted; any other character collapses only against the immediately preceding emitted one. The derived column count must equal the text length or there is no geometry — a line that already carries a placeholder derives fewer columns than its text, which is the expected mismatch.",
+  "mobile_mirror": "GapDetectorTest",
+  "tolerances": { "gap_ratio": 0.0001, "gap_span_px": 0.0001 },
+  "case": {
+    "lines": [
+      {
+        "text": "あいうえお",
+        "is_vertical": true,
+        "raw_alternatives": [
+          [["あ", 1.0]], [["\u3000", 0.99]], [["い", 1.0]], [["\u3000", 0.99]], [["う", 1.0]],
+          [["\u3000", 0.99]], [["\u3000", 0.99]], [["\u3000", 0.99]], [["え", 1.0]], [["\u3000", 0.99]],
+          [["お", 1.0]]
+        ],
+        "crop_h": 55,
+        "seq_len_total": 11,
+        "expect": [{ "insert_at": 3, "ratio": 2.0, "span_px": 20 }]
+      },
+      {
+        "text": "あいうえお",
+        "is_vertical": true,
+        "raw_alternatives": [
+          [["あ", 1.0]], [["\u3000", 0.99]], [["い", 1.0]], [["\u3000", 0.99]], [["う", 1.0]],
+          [["\u3000", 0.99]], [["\u3000", 0.99]], [["\u3000", 0.99]], [["え", 1.0]], [["\u3000", 0.99]],
+          [["お", 1.0]]
+        ],
+        "expect": [{ "insert_at": 3, "ratio": 2.0, "span_px": 32 }]
+      },
+      {
+        "text": "あい",
+        "is_vertical": true,
+        "raw_alternatives": [
+          [["あ", 1.0]], [["\u3000", 0.99]], [["い", 1.0]], [["\u3000", 0.99]], [["う", 1.0]],
+          [["\u3000", 0.99]], [["\u3000", 0.99]], [["\u3000", 0.99]], [["え", 1.0]], [["\u3000", 0.99]],
+          [["お", 1.0]]
+        ],
+        "expect": []
+      },
+      {
+        "text": "ああいうえお",
+        "is_vertical": true,
+        "raw_alternatives": [
+          [["あ", 0.9]], [["\u3000", 0.99]], [["あ", 0.9]], [["\u3000", 0.99]], [["い", 0.9]],
+          [["\u3000", 0.99]], [["\u3000", 0.99]], [["う", 0.9]], [["\u3000", 0.99]], [["\u3000", 0.99]],
+          [["\u3000", 0.99]], [["え", 0.9]], [["\u3000", 0.99]], [["お", 0.9]]
+        ],
+        "crop_h": 28,
+        "seq_len_total": 14,
+        "expect": [{ "insert_at": 4, "ratio": 2.0, "span_px": 8 }]
+      }
+    ]
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "id": "gap-detection-04-degenerate-and-contaminated",
+  "kind": "gap_detection",
+  "description": "Detection refuses to invent a gap from unusable geometry. A short line's own median is contaminated by the very gap being looked for, so a three-character line reports nothing even with a doubled interval. Every character on one pixel has a median spacing of zero. A line below the minimum emitted-character count cannot form a spacing pair at all. Char boxes that do not cover the text are not geometry, and boxes beyond the text are ignored rather than mismatched.",
+  "mobile_mirror": "GapDetectorTest",
+  "tolerances": { "gap_ratio": 0.0001, "gap_span_px": 0.0001 },
+  "case": {
+    "lines": [
+      {
+        "text": "あいう",
+        "is_vertical": true,
+        "char_boxes": [[0, 0, 40, 20], [0, 20, 40, 20], [0, 60, 40, 20]],
+        "expect": []
+      },
+      {
+        "text": "あいうえお",
+        "is_vertical": true,
+        "char_boxes": [[0, 40, 40, 20], [0, 40, 40, 20], [0, 40, 40, 20], [0, 40, 40, 20], [0, 40, 40, 20]],
+        "expect": []
+      },
+      {
+        "text": "あ",
+        "is_vertical": true,
+        "expect": []
+      },
+      {
+        "text": "あいうえお",
+        "is_vertical": true,
+        "char_boxes": [[0, 0, 40, 20], [0, 20, 40, 20]],
+        "expect": []
+      },
+      {
+        "text": "あい",
+        "is_vertical": true,
+        "char_boxes": [[0, 0, 40, 20], [0, 20, 40, 20], [0, 40, 40, 20], [0, 92, 40, 20], [0, 112, 40, 20]],
+        "expect": []
+      }
+    ]
+  }
+}

@@ -1227,6 +1227,15 @@ impl DetectedAnnotation {
                 sample_txt: line.sample_txt.clone(),
                 is_vertical: line.is_vertical,
                 chunk_boxes: line.chunk_boxes.clone(),
+                // Mobile `reDecodeLineResult` recomputes the columns and
+                // carries the crop facts and overrides forward.
+                char_cols: re.char_cols,
+                overrides: line.overrides.clone(),
+                crop_w: line.crop_w,
+                crop_h: line.crop_h,
+                crop_x: line.crop_x,
+                crop_y: line.crop_y,
+                seq_len_total: line.seq_len_total,
             }),
         }
     }
@@ -1996,6 +2005,7 @@ fn recognize_boxes_core(
                                 sample_txt: None,
                                 is_vertical: job.is_vertical,
                                 chunk_boxes: Vec::new(),
+                                ..Default::default()
                             };
                             let correction = crate::kana_size::correct_lines(
                                 std::slice::from_ref(&probe),
@@ -2099,6 +2109,16 @@ fn recognize_boxes_core(
                                     job.crop_x as i32, job.crop_y as i32,
                                     job.crop_w as i32, job.crop_h as i32, 1.0,
                                 )],
+                                // Mobile `LineResult`: the CTC columns and the
+                                // crop facts the gap detector converts
+                                // timestep spacings to pixels with.
+                                char_cols,
+                                crop_x: job.crop_x as i32,
+                                crop_y: job.crop_y as i32,
+                                crop_w: job.crop_w as i32,
+                                crop_h: job.crop_h as i32,
+                                seq_len_total: seq_len_total as i32,
+                                ..Default::default()
                             }),
                         };
                         if !emit(job.idx, annotation) { return; }
@@ -2788,6 +2808,7 @@ mod tests {
             sample_txt: Some("/tmp/sample.txt".into()),
             is_vertical: false,
             chunk_boxes: vec![BoundingBox::new(0, 0, 160, 40, 1.0)],
+            ..Default::default()
         };
         let ann = DetectedAnnotation {
             bbox: BoundingBox::new(10, 20, 120, 40, 1.0),

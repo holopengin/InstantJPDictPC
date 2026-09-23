@@ -1,0 +1,39 @@
+{
+  "id": "gap-detection-02-char-cols-fallback",
+  "kind": "gap_detection",
+  "description": "When the char boxes are missing, the cached CTC timestep column per emitted character is the next geometry source. Spacings there are in timesteps, so the reported span converts them with the crop's reading-axis length divided by the timestep count; with no crop length cached the model's own stride is the conversion. The ratio is scale-invariant either way. A column row that does not describe the text is not geometry.",
+  "mobile_mirror": "GapDetectorTest",
+  "tolerances": { "gap_ratio": 0.0001, "gap_span_px": 0.0001 },
+  "case": {
+    "lines": [
+      {
+        "text": "あいうえお",
+        "is_vertical": true,
+        "char_cols": [0, 2, 4, 8, 10],
+        "crop_h": 55,
+        "seq_len_total": 11,
+        "expect": [{ "insert_at": 3, "ratio": 2.0, "span_px": 20 }]
+      },
+      {
+        "text": "あいうえお",
+        "is_vertical": false,
+        "char_cols": [0, 2, 4, 8, 10],
+        "crop_w": 110,
+        "seq_len_total": 11,
+        "expect": [{ "insert_at": 3, "ratio": 2.0, "span_px": 40 }]
+      },
+      {
+        "text": "あいうえお",
+        "is_vertical": true,
+        "char_cols": [0, 2, 4, 8, 10],
+        "expect": [{ "insert_at": 3, "ratio": 2.0, "span_px": 32 }]
+      },
+      {
+        "text": "あい",
+        "is_vertical": true,
+        "char_cols": [0, 2, 4, 8, 10],
+        "expect": []
+      }
+    ]
+  }
+}
