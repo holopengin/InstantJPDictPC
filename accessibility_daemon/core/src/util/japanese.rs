@@ -165,7 +165,11 @@ pub fn katakana_to_hiragana(text: &str) -> String {
 
     for (i, &c) in chars.iter().enumerate() {
         if ('\u{30A1}'..='\u{30F6}').contains(&c) {
-            result.push((c as u32 - 0x60) as u8 as char);
+            // The hiragana block sits exactly 0x60 below the katakana block;
+            // never narrow through u8 (that truncated ア to 'B').
+            result.push(
+                char::from_u32(c as u32 - 0x60).expect("katakana offset stays in the hiragana block"),
+            );
         } else if c == 'ー' && i > 0 {
             result.push(get_prolonged_hiragana(chars[i - 1]));
         } else {
@@ -1580,5 +1584,23 @@ mod tests {
         assert_eq!(normalize("か\u{3099}ゞ"), "がゞ");
         // Combining normalization runs last: the decomposed pair composes.
         assert_eq!(normalize("は\u{309A}"), "ぱ");
+    }
+
+    /// Mobile parity (`FuriganaAlignerTest.katakanaReading_normalized`): the
+    /// katakana block folds exactly 0x60 down onto hiragana. The earlier port
+    /// narrowed the code point through `u8`, which turned every conversion
+    /// into garbage (ア → 'B') and silently broke the lookup's katakana
+    /// variants.
+    #[test]
+    fn katakana_to_hiragana_folds_the_block() {
+        assert_eq!(katakana_to_hiragana("タベル"), "たべる");
+        assert_eq!(katakana_to_hiragana("カタカナ"), "かたかな");
+        assert_eq!(katakana_to_hiragana("ヴァイオリン"), "ゔぁいおりん");
+        // ー takes the preceding kana's vowel; a leading ー is left alone.
+        assert_eq!(katakana_to_hiragana("コーヒー"), "こうひい");
+        assert_eq!(katakana_to_hiragana("ー"), "ー");
+        // Mixed scripts: only the katakana block folds.
+        assert_eq!(katakana_to_hiragana("食べル"), "食べる");
+        assert_eq!(katakana_to_hiragana("ABC"), "ABC");
     }
 }
