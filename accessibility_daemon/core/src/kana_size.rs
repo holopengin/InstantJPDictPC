@@ -210,30 +210,37 @@ fn base_position(ch: char) -> Option<usize> {
 /// Small form -> big form. The app's own copy; the model's table is the
 /// authority (mobile `KanaSizeEncoder.SMALL_TO_BIG`).
 fn small_to_big(ch: char) -> Option<char> {
-    Some(match ch {
-        'ぁ' => 'あ',
-        'ぃ' => 'い',
-        'ぅ' => 'う',
-        'ぇ' => 'え',
-        'ぉ' => 'お',
-        'ゎ' => 'わ',
-        'っ' => 'つ',
-        'ゃ' => 'や',
-        'ゅ' => 'ゆ',
-        'ょ' => 'よ',
-        'ァ' => 'ア',
-        'ィ' => 'イ',
-        'ゥ' => 'ウ',
-        'ェ' => 'エ',
-        'ォ' => 'オ',
-        'ヮ' => 'ワ',
-        'ッ' => 'ツ',
-        'ャ' => 'ヤ',
-        'ュ' => 'ユ',
-        'ョ' => 'ヨ',
-        _ => return None,
-    })
+    SMALL_TO_BIG_PAIRS
+        .iter()
+        .find(|(small, _)| *small == ch)
+        .map(|(_, big)| *big)
 }
+
+/// The small → big pairs, in table order: the exact content of [`small_to_big`]
+/// as data, for binding hosts that need the table (UniFFI cannot carry a map).
+/// Kept as the one definition; the lookup above reads it.
+pub const SMALL_TO_BIG_PAIRS: [(char, char); 20] = [
+    ('ぁ', 'あ'),
+    ('ぃ', 'い'),
+    ('ぅ', 'う'),
+    ('ぇ', 'え'),
+    ('ぉ', 'お'),
+    ('ゎ', 'わ'),
+    ('っ', 'つ'),
+    ('ゃ', 'や'),
+    ('ゅ', 'ゆ'),
+    ('ょ', 'よ'),
+    ('ァ', 'ア'),
+    ('ィ', 'イ'),
+    ('ゥ', 'ウ'),
+    ('ェ', 'エ'),
+    ('ォ', 'オ'),
+    ('ヮ', 'ワ'),
+    ('ッ', 'ツ'),
+    ('ャ', 'ヤ'),
+    ('ュ', 'ユ'),
+    ('ョ', 'ヨ'),
+];
 
 /// Big form -> small form, inverted from [`small_to_big`].
 fn small_of(ch: char) -> Option<char> {
@@ -696,6 +703,23 @@ mod tests {
         assert_eq!(base_index_of('ツ'), base_index_of('ッ'));
         assert!(is_small('っ'));
         assert!(!is_small('つ'));
+    }
+
+    /// The pair table is data (binding hosts cannot carry a map) and must stay
+    /// the one definition the lookups read: every pair resolves both ways, and
+    /// nothing outside it is a small form.
+    #[test]
+    fn pair_table_matches_the_lookups() {
+        assert_eq!(SMALL_TO_BIG_PAIRS.len(), 20);
+        for (small, big) in SMALL_TO_BIG_PAIRS {
+            assert_eq!(small_to_big(small), Some(big), "{small} -> {big}");
+            assert_eq!(big_form_of(small), Some(big));
+            assert!(is_small(small));
+            assert!(!is_small(big));
+            assert_eq!(base_index_of(small), base_index_of(big));
+        }
+        assert!(!is_small('か'));
+        assert_eq!(big_form_of('か'), None);
     }
 
     #[test]
