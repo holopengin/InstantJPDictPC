@@ -209,6 +209,7 @@ fn kana_line(text: &str) -> LineResult {
         sample_txt: None,
         is_vertical: false,
         chunk_boxes: Vec::new(),
+        ..Default::default()
     }
 }
 

@@ -4,7 +4,7 @@
 // Geometry
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundingBox {
     pub x: i32,
     pub y: i32,
@@ -384,7 +384,7 @@ pub struct DetectionResult {
 /// panel offers the line's own per-timestep evidence for what went there.
 pub const GAP_CHAR: char = '\u{25CC}';
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LineResult {
     pub text: String,
     pub char_boxes: Vec<BoundingBox>,
@@ -392,8 +392,8 @@ pub struct LineResult {
     /// Top-K alternatives for EVERY CTC timestep, blanks included, descending
     /// by score — mobile `LineResult.rawAlternatives`, the cache a re-decode
     /// walks without re-running the model (see
-    /// [`DetectedAnnotation::re_decode_line`]).
-    #[allow(dead_code)] // populated at emit; the mobile consumer (gap fallback) is not ported yet
+    /// [`DetectedAnnotation::re_decode_line`]). Also the gap detector's last
+    /// geometry resort (mobile `GapDetector.timestepColumns`).
     pub raw_alternatives: Vec<Vec<(char, f32)>>,
     /// Path to the crop's `.txt` sidecar in /tmp (dataset collection).
     /// The viewer rewrites it when the user picks an alternative, so the
@@ -401,6 +401,26 @@ pub struct LineResult {
     pub sample_txt: Option<std::path::PathBuf>,
     pub is_vertical: bool,
     pub chunk_boxes: Vec<BoundingBox>,
+
+    // ── mobile geometry (#44 gap detection / #49 box recomputation) ──────────
+    /// CTC timestep column per emitted char (#49) — mobile
+    /// `LineResult.charCols`. The detector's second geometry source, used when
+    /// char boxes are missing; spacings are in timesteps, not pixels.
+    pub char_cols: Vec<f32>,
+    /// Manual character overrides (index → `(char, score)`), mobile
+    /// `LineResult.overrides`. A filled blank lives here, so gap insertion
+    /// shifts the keys to keep every override on its own character.
+    pub overrides: std::collections::BTreeMap<i32, (char, f32)>,
+    /// The recognition crop's geometry (mobile `LineResult.crop*`). The
+    /// detector converts timestep spacings to pixels with the reading-axis
+    /// length (`crop_h` vertical, `crop_w` horizontal); 0 means "unknown" and
+    /// falls back to the model's own stride.
+    pub crop_w: i32,
+    pub crop_h: i32,
+    pub crop_x: i32,
+    pub crop_y: i32,
+    /// Number of CTC timesteps in the crop (mobile `LineResult.seqLenTotal`).
+    pub seq_len_total: i32,
 }
 
 #[derive(Debug, Clone)]

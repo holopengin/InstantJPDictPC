@@ -197,6 +197,7 @@ mod tests {
             sample_txt: None,
             is_vertical,
             chunk_boxes: vec![],
+            ..Default::default()
         }
     }
 

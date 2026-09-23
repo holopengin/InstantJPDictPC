@@ -1870,6 +1870,7 @@ mod tests {
             sample_txt: None,
             is_vertical: false,
             chunk_boxes: vec![],
+            ..Default::default()
         })];
         state.update_global_data();
 
@@ -1964,6 +1965,7 @@ mod tests {
             sample_txt: None,
             is_vertical: true,
             chunk_boxes: vec![],
+            ..Default::default()
         }
     }
 
