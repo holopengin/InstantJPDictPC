@@ -5,22 +5,27 @@
 Detection (vertical lines only):
 
 - A gap is a char spacing ≥ 1.6× the line's median spacing
-  (`BLANK_GAP_RATIO`, `src/viewer.rs:835`; mobile
+  (`BLANK_GAP_RATIO`, `core/src/blank_gaps.rs:19`; mobile
   `GapDetector.DEFAULT_VERTICAL_RATIO = 1.6f`,
   `util/GapDetector.kt:156`). Median averages the two middles for even
-  counts (`median_of`, `src/viewer.rs:839`; mobile `medianOf`,
+  counts (`median_of`, `core/src/blank_gaps.rs:22`; mobile `medianOf`,
   `util/GapDetector.kt:224`).
 - **Horizontal lines are never eligible** — `BlankGaps.apply` returns early
   on them (mobile `util/BlankGaps.kt:56`; PC `blank_gap_positions`,
-  `src/viewer.rs:853`). Note mobile's detector also carries a horizontal
+  `core/src/blank_gaps.rs:38`). Note mobile's detector also carries a horizontal
   threshold (`DEFAULT_HORIZONTAL_RATIO = 1.8f`); the PC never asks for it.
+  The mobile detector's other geometry sources (`charCols`, the
+  `rawAlternatives` timestep walk, crop-length `spanPx`) are not ported to the
+  PC core yet — the PC detects from char boxes only.
 - Each gap materialises as a `◌` (`GAP_CHAR`, U+25CC, `core/src/models.rs:385`;
   mobile `OcrEngine.GAP_CHAR`) placeholder inserted right-to-left so
   detector indices stay valid, growing text/char-boxes/alternatives together
-  (`with_gap_char` `:925`, `apply_blank_gaps` `:963`; mobile
+  (`with_gap_char` `core/src/blank_gaps.rs:110`, `apply_blank_gaps`
+  `core/src/blank_gaps.rs:148`; mobile
   `LineResult.withGapCharAt`, `util/LineResultGap.kt:55`). Idempotent: a line
   already containing the placeholder is unchanged. The placeholder box is
-  interpolated between its neighbours (`interpolate_gap_box` `:886`; mobile
+  interpolated between its neighbours (`interpolate_gap_box`
+  `core/src/blank_gaps.rs:71`; mobile
   `interpolateGapBox`, `util/LineResultGap.kt:127`).
 
 Candidates for a blank:
@@ -63,7 +68,9 @@ Candidates for a blank:
 ## Pinning tests
 
 - PC unit: `blank_gaps_detect_wide_vertical_spacing`
-  (`src/viewer.rs:3800`); `gap_candidates.rs` tests
+  (`src/viewer.rs:3658`); `blank_gaps.rs` tests
+  (`blank_gaps_detect_wide_vertical_spacing` and the 28 materialisation /
+  geometry cases); `gap_candidates.rs` tests
   (`the_pool_comes_from_every_timestep_in_discovery_order`,
   `the_model_reorders_the_pool_by_context`,
   `an_empty_pool_falls_back_to_punctuation_then_kana`,
