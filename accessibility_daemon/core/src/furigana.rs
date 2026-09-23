@@ -5,8 +5,9 @@
 //! fabricates overlap for stacked fragments); only the gap and short-side
 //! tests use UNCLIPPED boxes (raw gutters are real pixels, unclip closes them
 //! to ruby distance). Orientation gating (vertical vs horizontal, near-square
-//! counts as both) stays with the caller: `ocr_engine`'s `filter_furigana`
-//! owns the index-aligned pass.
+//! counts as both) lives here too: [`filter_furigana`] is the index-aligned
+//! pass over a page, shared by the desktop engine and the Android binding (one
+//! call instead of one per box pair).
 //!
 //! Both rules require a significant size difference in BOTH dimensions:
 //! vertical needs a much shorter height AND a narrower width; horizontal
@@ -14,7 +15,7 @@
 //! be enough horizontally, and it ate real short lines on a receipt — detail
 //! text under a heading, same-ish width — as if they were ruby.
 
-use crate::models::BoundingBox;
+use crate::models::{BoundingBox, VERTICAL_MIN_ASPECT};
 
 /// Vertical: small long-side < 30% of large long-side.
 const SIZE_RATIO: f32 = 0.3;
@@ -140,6 +141,46 @@ fn overlap_len(a1: i32, a2: i32, b1: i32, b2: i32) -> i32 {
 
 fn gap_len(a1: i32, a2: i32, b1: i32, b2: i32) -> i32 {
     (a1.max(b1) - a2.min(b2)).max(0)
+}
+
+/// Mobile shared orientation rule (#28): near-square boxes count as vertical
+/// for the ruby checks, so lone upright characters are tested against both
+/// rules.
+pub fn is_vertical_box(b: &BoundingBox) -> bool {
+    b.h as f32 >= b.w as f32 * VERTICAL_MIN_ASPECT
+}
+
+/// Near-square (single-kanji-like) box: checked against both furigana rules.
+pub fn is_square_box(b: &BoundingBox) -> bool {
+    let (w, h) = (b.w as f32, b.h as f32);
+    w.min(h) >= w.max(h) / VERTICAL_MIN_ASPECT
+}
+
+/// Mobile `filterFurigana` (#28): keep-flags for likely-furigana boxes.
+/// `raw`/`uncl` are index-aligned (raw contour AABBs vs unclipped boxes).
+///
+/// One call for the whole page: the O(n²) pair walk runs here, so a binding
+/// crosses the FFI once instead of once per pair.
+pub fn filter_furigana(raw: &[BoundingBox], uncl: &[BoundingBox], img_w: i32, img_h: i32) -> Vec<bool> {
+    if raw.len() < 2 {
+        return vec![true; raw.len()];
+    }
+    (0..raw.len())
+        .map(|i| {
+            let small = &raw[i];
+            let check_vert = is_vertical_box(small) || is_square_box(small);
+            let check_horiz = !is_vertical_box(small) || is_square_box(small);
+            !raw.iter().enumerate().any(|(j, big)| {
+                j != i
+                    && ((check_vert
+                        && is_vertical_box(big)
+                        && is_ruby_vertical(&raw[i], big, &uncl[i], &uncl[j], img_h))
+                        || (check_horiz
+                            && !is_vertical_box(big)
+                            && is_ruby_horizontal(&raw[i], big, &uncl[i], &uncl[j], img_w, img_h)))
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

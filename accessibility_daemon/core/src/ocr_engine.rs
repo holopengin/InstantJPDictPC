@@ -5,6 +5,8 @@ use std::path::Path;
 use crate::models::*;
 use crate::ppocr_ncnn::{DetNet, RecNet};
 
+use crate::furigana::{filter_furigana, is_vertical_box};
+
 // PP-OCRv6 detection constants. The ncnn det model runs on a square
 // letterboxed input (mobile #51 default 896); its output map is thresholded
 // and turned into rotated boxes by the PC pipeline below.
@@ -451,47 +453,6 @@ pub(crate) fn filter_fitted_quads(
             } else {
                 *q
             }
-        })
-        .collect()
-}
-
-/// Mobile shared orientation rule (#28): near-square boxes count as vertical
-/// for the ruby checks, so lone upright characters are tested against both
-/// rules.
-fn is_vertical_box(b: &BoundingBox) -> bool {
-    b.h as f32 >= b.w as f32 * VERTICAL_MIN_ASPECT
-}
-
-fn is_square_box(b: &BoundingBox) -> bool {
-    let (w, h) = (b.w as f32, b.h as f32);
-    w.min(h) >= w.max(h) / VERTICAL_MIN_ASPECT
-}
-
-/// Mobile `filterFurigana` (#28): keep-flags for likely-furigana boxes.
-/// `raw`/`uncl` are index-aligned (raw contour AABBs vs unclipped boxes).
-/// The geometry rules themselves live in [`crate::furigana`].
-fn filter_furigana(raw: &[BoundingBox], uncl: &[BoundingBox], img_w: i32, img_h: i32) -> Vec<bool> {
-    if raw.len() < 2 {
-        return vec![true; raw.len()];
-    }
-    (0..raw.len())
-        .map(|i| {
-            let small = &raw[i];
-            let check_vert = is_vertical_box(small) || is_square_box(small);
-            let check_horiz = !is_vertical_box(small) || is_square_box(small);
-            !raw.iter().enumerate().any(|(j, big)| {
-                j != i
-                    && ((check_vert
-                        && is_vertical_box(big)
-                        && crate::furigana::is_ruby_vertical(
-                            &raw[i], big, &uncl[i], &uncl[j], img_h,
-                        ))
-                        || (check_horiz
-                            && !is_vertical_box(big)
-                            && crate::furigana::is_ruby_horizontal(
-                                &raw[i], big, &uncl[i], &uncl[j], img_w, img_h,
-                            )))
-            })
         })
         .collect()
 }
