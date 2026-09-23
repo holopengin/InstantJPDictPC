@@ -92,7 +92,11 @@ impl Deinflector {
         let mut i = 0;
         while i < results.len() {
             let current = results[i].clone();
-            if current.term.len() < 2 {
+            // Single-character terms are never deinflected (mobile
+            // `Deinflector.kt` guards on `term.length < 2`, UTF-16 units).
+            // Counting chars, not bytes: a byte count lets any single
+            // non-ASCII character through, and then 「た」 derives 「る」.
+            if current.term.chars().count() < 2 {
                 i += 1;
                 continue;
             }
@@ -189,5 +193,28 @@ mod tests {
         str_rules.sort_by_key(key);
         assert_eq!(file_rules, str_rules);
         assert_eq!(from_file.rule_count(), from_str.rule_count());
+    }
+
+    /// The length guard is a **character** count, not a byte count (mobile
+    /// `Deinflector.kt` guards on `term.length < 2`, UTF-16 units). A byte
+    /// count lets any single non-ASCII character through: 「た」 derives 「る」
+    /// with reason `past`, and lookups deinflect prefixes down to one
+    /// character, so the spurious candidate would reach the dictionary.
+    #[test]
+    fn single_character_terms_are_not_deinflected() {
+        let deinflector = Deinflector::from_json_file(concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/deinflect.json")).unwrap();
+        for surface in ["た", "て", "な", "あ"] {
+            let results = deinflector.deinflect(surface);
+            assert_eq!(
+                results.len(),
+                1,
+                "{surface} must stay the identity only, got {:?}",
+                results.iter().map(|r| r.term.as_str()).collect::<Vec<_>>()
+            );
+            assert_eq!(results[0].term, surface);
+            assert!(results[0].reasons.is_empty());
+        }
+        // Two characters is enough to deinflect (たべ → たべる).
+        assert!(deinflector.deinflect("たべ").iter().any(|r| r.term == "たべる"));
     }
 }

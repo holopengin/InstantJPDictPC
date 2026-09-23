@@ -1,0 +1,12 @@
+{
+  "id": "deinflection-05-single-char-noop",
+  "kind": "deinflection",
+  "description": "A single-character surface is never deinflected: the derivation guard is a character count, so た yields the identity candidate only and never reaches る. Lookups deinflect prefixes down to one character, so a guard that counts bytes instead of characters would feed spurious one-character candidates into the dictionary.",
+  "mobile_mirror": "DeinflectionChainTest",
+  "case": {
+    "surface": "た",
+    "expect_term": "た",
+    "expect_reasons": [],
+    "expect_absent": ["る"]
+  }
+}

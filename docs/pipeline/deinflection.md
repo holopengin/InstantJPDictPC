@@ -12,6 +12,12 @@ Chain plumbing and labels, graduated to the corpus by `c7dc78b`:
 - Derivation BFS from the surface form, identity candidate first with no
   reasons; derivations dedupe by term, first wins (`deinflect`, `:75`;
   mobile `deinflect`, `util/Deinflector.kt:55`).
+- The derivation guard is a **character** count: a term shorter than two
+  characters is never deinflected (`deinflect`, `core/src/util/deinflector.rs`;
+  mobile `term.length < 2`, `util/Deinflector.kt:62`). A byte count lets every
+  single non-ASCII character through — 「た」 would derive 「る」, and lookups
+  deinflect prefixes down to one character, so the spurious candidate would
+  reach the dictionary.
 - Each step appends the human-readable group label — never the kana
   fragment — outermost step first (`reasons = current.reasons + rule.reason`,
   `util/Deinflector.kt:74`; PC `:75-125`). An empty reason (bare-array JSON
@@ -40,12 +46,14 @@ Chain plumbing and labels, graduated to the corpus by `c7dc78b`:
 ## Pinning tests
 
 - PC unit (`src/util/deinflector.rs` tests): `reasons_carry_rule_names`,
-  `identity_result_has_no_reasons`; viewer
+  `identity_result_has_no_reasons`, `single_character_terms_are_not_deinflected`;
+  viewer
   (`deinflected_entry_carries_reasons_for_the_chain_row`,
   `src/viewer.rs:4461`).
 - Conformance: `deinflection-01-past-verb`, `deinflection-02-te-form`,
   `deinflection-03-adjective-past`, `deinflection-04-dictionary-form-noop`
-  (identity carries no reasons), via `deinflection_cases`
+  (identity carries no reasons), `deinflection-05-single-char-noop`
+  (`expect_absent` pins the one-character guard), via `deinflection_cases`
   (`core/src/conformance.rs:767`) against the shipped `assets/deinflect.json`
   (byte-identical to the Android asset copy at graduation).
 - Mobile: `DeinflectionChainTest` (`reasons_carryRuleNames`,

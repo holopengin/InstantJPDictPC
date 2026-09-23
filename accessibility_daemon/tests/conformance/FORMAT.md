@@ -219,7 +219,8 @@ keep the dump-then-verify-one-case pattern from the parity-bug rule below.
 "case": {
   "surface": "食べた",
   "expect_term": "食べる",
-  "expect_reasons": ["past"]
+  "expect_reasons": ["past"],
+  "expect_absent": ["る"]
 }
 ```
 
@@ -228,12 +229,15 @@ app and the Android asset copy use — verified byte-identical at graduation)
 and runs the real `Deinflector::deinflect`. Derivations are deduplicated by
 term (first derivation wins), so terms are unique per surface: the runner
 finds `expect_term` and compares its reasons exactly against
-`expect_reasons` (ordered, outermost step first). The group key IS the
-reason (`past`, `-te`, …), filled in at load from the map key on both sides
-— a loader that drops the keys yields kana fragments or empty lists and
-fails these cases. The no-op case pins a dictionary-form surface whose
-identity candidate carries no reasons (no chain, no viewer row), so direct
-matches render exactly as before.
+`expect_reasons` (ordered, outermost step first). The optional
+`expect_absent` list pins derivations that must **not** exist — for
+requirements a find-by-term assertion cannot see, such as the length guard:
+a single-character surface is never deinflected, so it yields the identity
+candidate only. The group key IS the reason (`past`, `-te`, …), filled in
+at load from the map key on both sides — a loader that drops the keys
+yields kana fragments or empty lists and fails these cases. The no-op case
+pins a dictionary-form surface whose identity candidate carries no reasons
+(no chain, no viewer row), so direct matches render exactly as before.
 
 Regenerating: `CONFORMANCE_DUMP=1 cargo test deinflection_cases` prints the
 candidate list per surface (`DUMP <id> term=… reasons=…`, first 25) — paste
@@ -302,6 +306,32 @@ reference over the fixture inputs; a DUMP mode on the PC side would be
 circular for this kind and must not bless port output. Spec, metric formulas
 and corpus gates: `docs/char-placement-conformance.md` (handoff doc in the
 Android checkout).
+### `normalize` — lookup-normalization stages, composed
+
+```json
+"case": {
+  "cases": [
+    { "input": "こゝろ", "expect": "こころ",
+      "note": "optional: the rule this input pins" },
+    { "input": "か\u3099", "expect": "が" }
+  ]
+}
+```
+
+Each entry runs the real `normalize` — width conversion → lookup-variant fold →
+combining-character normalization, in that order — and compares the composed
+output exactly (no tolerance). `input` and `expect` are strings; `note` is an
+optional annotation the runner ignores. Inputs cover plain pass-through,
+iteration marks (plain and voiced, both scripts, including marks that must be
+left alone), Roman numerals, `℃`, obsolete kana, Chinese-only forms, the
+measured Unihan variant pairs (including pairs that must not fold), width and
+halfwidth forms, and decomposed combining sequences — combining marks are
+written with the escapes `\u3099`/`\u309A` so the corpus stays readable.
+Expectations are exact strings taken from the rule (the fold tables and the
+combining table), never NFC and never regenerated from one runner's dump:
+`CONFORMANCE_DUMP=1 cargo test normalize_cases` prints `input -> output` per
+entry for review, but a value is pasted only after checking it against the
+rule.
 
 ## Adding a case (the parity-bug rule)
 

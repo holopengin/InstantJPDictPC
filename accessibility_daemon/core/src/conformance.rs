@@ -804,6 +804,19 @@ fn deinflection_cases() {
                 got.len()
             ),
         }
+        // Optional negative pin: derivations that must NOT exist. Needed
+        // where the requirement is a guard (e.g. single-character terms are
+        // never deinflected) that a find-by-term assertion cannot see.
+        if let Some(absent) = c["expect_absent"].as_array() {
+            for term in absent {
+                let term = term.as_str().expect("expect_absent entry is a string");
+                assert!(
+                    !got.iter().any(|r| r.term == term),
+                    "{id}: {surface} must not derive {term} ({} candidates)",
+                    got.len()
+                );
+            }
+        }
     }
 }
 
