@@ -27,7 +27,7 @@ Always available (pure Rust, no toolchain / prefix / network beyond crates.io):
   The `KanaSizeNet` native handle needs `native`.
 - `app_settings`, `overlay_font` — settings + font-face resolution.
 - `util` — `char_lm`, `component_table`, `deinflector`, `gap_candidates`,
-  `japanese`, `kanji_variants`, `oov_candidates`, `oov_suggestions`.
+  `japanese`, `kanji_variants`, `oov_candidates`, `oov_suggestions`, `pitch`.
 - `data::{catalog, models}` — pinned catalog (embedded JSON) + DB row types.
 
 `native` only:

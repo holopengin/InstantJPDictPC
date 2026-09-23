@@ -22,7 +22,7 @@ pub fn pitch_positions_of(definitions_json: &str) -> Option<Vec<i32>> {
         let Some(position) = p
             .as_object()
             .and_then(|m| m.get("position"))
-            .and_then(|v| v.as_i64())
+            .and_then(gson_int)
         else {
             continue;
         };
@@ -31,6 +31,20 @@ pub fn pitch_positions_of(definitions_json: &str) -> Option<Vec<i32>> {
     out.sort();
     out.dedup();
     Some(out)
+}
+
+/// Gson `JsonPrimitive.asInt` semantics, which mobile's parser uses: a JSON
+/// number truncates toward zero (`{"position":1.0}` → 1 — a pinned payload
+/// shape in `PitchAccentTest`), and a numeric string parses. Booleans,
+/// objects and arrays are skipped as before.
+fn gson_int(v: &serde_json::Value) -> Option<i64> {
+    if let Some(i) = v.as_i64() {
+        return Some(i);
+    }
+    if let Some(f) = v.as_f64() {
+        return Some(f as i64);
+    }
+    v.as_str()?.parse::<i64>().ok()
 }
 
 /// Reading of a stored pitch payload (None when absent).
@@ -64,6 +78,30 @@ mod tests {
                 r#"{"reading":"あ","pitches":[{"position":3},{"position":0},{"position":3}]}"#
             ),
             Some(vec![0, 3])
+        );
+    }
+
+    // Mirrors Android `PitchAccentTest.positions_parsed_from_kanjium_payload`'s
+    // float row: Gson's `asInt` truncates a JSON number, so `1.0` is a real
+    // position. A strict integer parse would silently drop it.
+    #[test]
+    fn float_positions_truncate_like_gson() {
+        assert_eq!(
+            pitch_positions_of(r#"{"reading":"きみ","pitches":[{"position":1.0}]}"#),
+            Some(vec![1])
+        );
+        assert_eq!(
+            pitch_positions_of(r#"{"reading":"きみ","pitches":[{"position":2.0},{"position":1.9}]}"#),
+            Some(vec![1, 2])
+        );
+        // A numeric string parses too; a boolean/object/array position is skipped.
+        assert_eq!(
+            pitch_positions_of(r#"{"reading":"きみ","pitches":[{"position":"3"}]}"#),
+            Some(vec![3])
+        );
+        assert_eq!(
+            pitch_positions_of(r#"{"reading":"きみ","pitches":[{"position":true},{"position":1}]}"#),
+            Some(vec![1])
         );
     }
 
