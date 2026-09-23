@@ -17,13 +17,22 @@
 //! only, and the caller adds whatever LM it has.
 
 use crate::util::component_table::ComponentTable;
+use std::sync::Arc;
 
 pub struct OovCandidates {
-    table: ComponentTable,
+    /// Shared, not owned: a binding host holds the table as its own object and
+    /// must not duplicate the 12k-entry indexes per consumer.
+    table: Arc<ComponentTable>,
 }
 
 impl OovCandidates {
     pub fn new(table: ComponentTable) -> Self {
+        Self { table: Arc::new(table) }
+    }
+
+    /// Share an existing table handle instead of taking ownership (binding
+    /// hosts, where the table is already an object of its own).
+    pub fn from_arc(table: Arc<ComponentTable>) -> Self {
         Self { table }
     }
 
@@ -211,6 +220,29 @@ mod tests {
 
     /// The measured top-5 the recogniser emitted at the deleted `呟`.
     const MEASURED_TOP5: [char; 5] = ['咳', '咬', '啦', '哮', '眩'];
+
+    /// The binding-host path: `from_arc` shares the caller's table instead of
+    /// cloning it, and answers exactly like the owned constructor.
+    #[test]
+    fn from_arc_shares_the_table_and_answers_identically() {
+        let Some(text) = std::fs::read_to_string(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+                .join("assets/components/krad_components.txt"),
+        )
+        .ok() else {
+            eprintln!("skipping: components asset not present");
+            return;
+        };
+        let table = Arc::new(ComponentTable::parse(&text));
+        let shared = OovCandidates::from_arc(Arc::clone(&table));
+        let owned = OovCandidates::new(ComponentTable::parse(&text));
+        assert!(std::ptr::eq(shared.table(), table.as_ref()), "shares, does not clone");
+        assert_eq!(
+            shared.majority_components(&MEASURED_TOP5, 0.5),
+            owned.majority_components(&MEASURED_TOP5, 0.5)
+        );
+        assert_eq!(shared.neighbours_of('曇').len(), owned.neighbours_of('曇').len());
+    }
 
     #[test]
     fn majority_components_of_the_measured_top5_matches_fukan() {
