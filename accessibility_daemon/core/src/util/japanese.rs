@@ -2,6 +2,7 @@
 //! Mirrors `JapaneseUtil` from the Kotlin implementation.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Normalize Japanese text: convert full-width to half-width, standardize kana, etc.
 ///
@@ -591,12 +592,115 @@ const KANA_VARIANT_PAIRS: &[(char, char)] = &[
     ('や', 'ゃ'), ('ゆ', 'ゅ'), ('よ', 'ょ'), ('ヤ', 'ャ'), ('ユ', 'ュ'), ('ヨ', 'ョ'),
 ];
 
-fn kana_orthography_canonical(variant: char) -> char {
-    KANA_VARIANT_PAIRS
-        .iter()
-        .find(|(v, _)| *v == variant)
-        .map(|(_, c)| *c)
-        .unwrap_or(variant)
+/// A field that must be exactly one character, mirroring Kotlin
+/// `singleOrNull()` — an empty or multi-character field is dropped, not
+/// truncated. The unit is Kotlin's: UTF-16 code units, so a supplementary-plane
+/// character counts as two and is rejected here too.
+fn single_char_field(field: &str) -> Option<char> {
+    if field.encode_utf16().count() != 1 {
+        return None;
+    }
+    field.chars().next()
+}
+
+/// Parsed pre-reform kana orthography table (#75): the `variant<TAB>canonical`
+/// pairs, in the file format of the shipped `variants/kana_variants.txt`.
+///
+/// The desktop uses [`KanaOrthographyTable::builtin`] (the committed
+/// [`KANA_VARIANT_PAIRS`]); the binding host parses the same text at runtime so
+/// the asset stays the source of truth. Parsing mirrors the Kotlin
+/// `KanaOrthography.Table.parse`: lines are trimmed, blank and `#` lines
+/// skipped, the line split on tabs, malformed lines (wrong field count, a side
+/// that is not a single character) dropped, a pair whose sides are equal
+/// skipped, and the first mapping for a variant wins.
+#[derive(Debug, Clone)]
+pub struct KanaOrthographyTable {
+    canonical_by_variant: HashMap<char, char>,
+}
+
+impl KanaOrthographyTable {
+    /// The committed table (the shipped `variants/kana_variants.txt` rows).
+    pub fn builtin() -> Self {
+        Self {
+            canonical_by_variant: KANA_VARIANT_PAIRS.iter().copied().collect(),
+        }
+    }
+
+    /// The identity table: [`canonical`](Self::canonical) returns its input.
+    pub fn empty() -> Self {
+        Self {
+            canonical_by_variant: HashMap::new(),
+        }
+    }
+
+    /// Parse the committed text format (see the type docs).
+    pub fn parse(text: &str) -> Self {
+        let mut canonical_by_variant = HashMap::new();
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let (Some(variant), Some(canonical)) =
+                (single_char_field(parts[0]), single_char_field(parts[1]))
+            else {
+                continue;
+            };
+            if variant == canonical {
+                continue;
+            }
+            canonical_by_variant.entry(variant).or_insert(canonical);
+        }
+        Self {
+            canonical_by_variant,
+        }
+    }
+
+    /// Number of distinct variants in this table.
+    pub fn entry_count(&self) -> usize {
+        self.canonical_by_variant.len()
+    }
+
+    /// The modern form of `variant`, or `variant` itself when the table has no
+    /// entry for it.
+    pub fn canonical(&self, variant: char) -> char {
+        self.canonical_by_variant
+            .get(&variant)
+            .copied()
+            .unwrap_or(variant)
+    }
+
+    /// #75: rewrite a lookup query from pre-reform orthography (旧仮名遣い) onto
+    /// the modern form the dictionary keys on. Identity when nothing is a
+    /// variant. Mirrors `KanaOrthography.modernise`; the context rules are
+    /// [`orthography_applies`].
+    pub fn modernise(&self, query: &str) -> String {
+        if query.is_empty() {
+            return query.to_string();
+        }
+        let chars: Vec<char> = query.chars().collect();
+        let mut out = String::with_capacity(query.len());
+        for i in 0..chars.len() {
+            let c = chars[i];
+            let mapped = self.canonical(c);
+            if mapped == c {
+                out.push(c);
+                continue;
+            }
+            let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+            let next = chars.get(i + 1).copied();
+            out.push(if orthography_applies(c, prev, next) {
+                mapped
+            } else {
+                c
+            });
+        }
+        out
+    }
 }
 
 /// Whether a table pair applies in context (see `KanaOrthography.applies`).
@@ -626,28 +730,17 @@ fn orthography_applies(variant: char, prev: Option<char>, next: Option<char>) ->
 /// #75: rewrite a lookup query from pre-reform orthography (旧仮名遣い) onto
 /// the modern form the dictionary keys on. Identity when nothing is a variant.
 /// Mirrors `KanaOrthography.modernise`.
+///
+/// Delegates to the builtin table, built once; the binding host uses
+/// [`KanaOrthographyTable`] directly.
 pub fn kana_orthography_modernise(query: &str) -> String {
-    if query.is_empty() {
-        return query.to_string();
-    }
-    let chars: Vec<char> = query.chars().collect();
-    let mut out = String::with_capacity(query.len());
-    for i in 0..chars.len() {
-        let c = chars[i];
-        let mapped = kana_orthography_canonical(c);
-        if mapped == c {
-            out.push(c);
-            continue;
-        }
-        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
-        let next = chars.get(i + 1).copied();
-        out.push(if orthography_applies(c, prev, next) {
-            mapped
-        } else {
-            c
-        });
-    }
-    out
+    builtin_orthography_table().modernise(query)
+}
+
+/// The builtin orthography table, built once for the free-function callers.
+fn builtin_orthography_table() -> &'static KanaOrthographyTable {
+    static BUILTIN: OnceLock<KanaOrthographyTable> = OnceLock::new();
+    BUILTIN.get_or_init(KanaOrthographyTable::builtin)
 }
 
 /// The committed `variants/kana_sound_changes.txt` rows.
@@ -662,6 +755,175 @@ const KANA_EU: &[(char, &str)] = &[
     ('て', "ちょ"), ('で', "じょ"), ('ね', "にょ"), ('へ', "ひょ"), ('べ', "びょ"),
     ('ぺ', "ぴょ"), ('め', "みょ"), ('れ', "りょ"),
 ];
+
+/// Parsed historical kana sound-change table (#81): rows `ha` (ハ行転呼),
+/// `au` (アウ->オウ) and `eu` (エウ->ヨウ), in the file format of the shipped
+/// `variants/kana_sound_changes.txt`.
+///
+/// The desktop uses [`KanaSoundTable::builtin`] (the committed [`KANA_HA`] /
+/// [`KANA_AU`] / [`KANA_EU`] rows); the binding host parses the same text at
+/// runtime so the asset stays the source of truth. Parsing mirrors the Kotlin
+/// `KanaSoundChanges.Table.parse`: lines are trimmed, blank and `#` lines
+/// skipped, the line split on tabs, malformed lines (wrong field count, a
+/// variant that is not a single character, an empty or unchanged modern form, a
+/// modern form of the wrong length for its row) dropped, unknown rows ignored,
+/// and the first mapping for a variant wins.
+#[derive(Debug, Clone)]
+pub struct KanaSoundTable {
+    ha: HashMap<char, char>,
+    au: HashMap<char, char>,
+    eu: HashMap<char, String>,
+}
+
+impl KanaSoundTable {
+    /// The committed table (the shipped `variants/kana_sound_changes.txt`
+    /// rows).
+    pub fn builtin() -> Self {
+        Self {
+            ha: KANA_HA.iter().copied().collect(),
+            au: KANA_AU.iter().copied().collect(),
+            eu: KANA_EU
+                .iter()
+                .map(|(variant, modern)| (*variant, (*modern).to_string()))
+                .collect(),
+        }
+    }
+
+    /// The identity table: every lookup misses and
+    /// [`modernise`](Self::modernise) returns its input.
+    pub fn empty() -> Self {
+        Self {
+            ha: HashMap::new(),
+            au: HashMap::new(),
+            eu: HashMap::new(),
+        }
+    }
+
+    /// Parse the committed text format (see the type docs).
+    pub fn parse(text: &str) -> Self {
+        let mut ha = HashMap::new();
+        let mut au = HashMap::new();
+        let mut eu = HashMap::new();
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() != 3 {
+                continue;
+            }
+            let Some(variant) = single_char_field(parts[0]) else {
+                continue;
+            };
+            let modern = parts[1];
+            if modern.is_empty() || modern == variant.to_string() {
+                continue;
+            }
+            match parts[2] {
+                "ha" => {
+                    if let Some(c) = single_char_field(modern) {
+                        ha.entry(variant).or_insert(c);
+                    }
+                }
+                "au" => {
+                    if let Some(c) = single_char_field(modern) {
+                        au.entry(variant).or_insert(c);
+                    }
+                }
+                "eu" => {
+                    if (1..=2).contains(&modern.encode_utf16().count()) {
+                        eu.entry(variant).or_insert_with(|| modern.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self { ha, au, eu }
+    }
+
+    /// Number of distinct pairs in this table.
+    pub fn entry_count(&self) -> usize {
+        self.ha.len() + self.au.len() + self.eu.len()
+    }
+
+    /// The ハ行転呼 modern form of `variant`, when the table carries the pair.
+    pub fn ha(&self, variant: char) -> Option<char> {
+        self.ha.get(&variant).copied()
+    }
+
+    /// The アウ->オウ modern form of `variant`, when the table carries the pair.
+    pub fn au(&self, variant: char) -> Option<char> {
+        self.au.get(&variant).copied()
+    }
+
+    /// The エウ->ヨウ modern form of `variant` (1–2 characters), when the table
+    /// carries the pair.
+    pub fn eu(&self, variant: char) -> Option<String> {
+        self.eu.get(&variant).cloned()
+    }
+
+    /// #81: the two passes over this table, in the 告示's order — ハ行転呼,
+    /// then the vowel changes before `う`. Identity when nothing is a rule's
+    /// input. Mirrors `KanaSoundChanges.modernise`.
+    pub fn modernise(&self, query: &str) -> String {
+        if query.is_empty() {
+            return query.to_string();
+        }
+        self.vowel_changes(&self.ha_gyouten(query))
+    }
+
+    /// Pass 1: 語中・語尾のハ行 -> ワ行, under each character's ending condition.
+    fn ha_gyouten(&self, query: &str) -> String {
+        let chars: Vec<char> = query.chars().collect();
+        let mut out = String::with_capacity(query.len());
+        for i in 0..chars.len() {
+            let c = chars[i];
+            let Some(mapped) = self.ha(c) else {
+                out.push(c);
+                continue;
+            };
+            let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+            let next = chars.get(i + 1).copied();
+            out.push(if ha_gyouten_applies(c, prev, next) {
+                mapped
+            } else {
+                c
+            });
+        }
+        out
+    }
+
+    /// Pass 2: 母音の変化 before `う` — `au` replaces one character, `eu`
+    /// replaces the エ段 character with its イ段 counterpart + small ょ and
+    /// keeps the `う` (`け` + `う` -> `きょ` + `う`).
+    fn vowel_changes(&self, query: &str) -> String {
+        let chars: Vec<char> = query.chars().collect();
+        let mut out = String::with_capacity(query.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            if next == Some('う') {
+                if let Some(mapped) = self.au(c) {
+                    out.push(mapped);
+                    out.push('う');
+                    i += 2;
+                    continue;
+                }
+                if let Some(mapped) = self.eu(c) {
+                    out.push_str(&mapped);
+                    out.push('う');
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+}
 
 fn is_kana_char(c: char) -> bool {
     ('\u{3041}'..='\u{3096}').contains(&c) || ('\u{30A1}'..='\u{30F6}').contains(&c)
@@ -690,63 +952,20 @@ fn ha_gyouten_applies(variant: char, prev: Option<char>, next: Option<char>) -> 
     }
 }
 
-fn ha_gyouten(query: &str) -> String {
-    let chars: Vec<char> = query.chars().collect();
-    let mut out = String::with_capacity(query.len());
-    for i in 0..chars.len() {
-        let c = chars[i];
-        let mapped = KANA_HA.iter().find(|(v, _)| *v == c).map(|(_, m)| *m);
-        let Some(mapped) = mapped else {
-            out.push(c);
-            continue;
-        };
-        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
-        let next = chars.get(i + 1).copied();
-        out.push(if ha_gyouten_applies(c, prev, next) {
-            mapped
-        } else {
-            c
-        });
-    }
-    out
-}
-
-/// 母音の変化 before `う`: アウ→オウ and エウ→ヨウ (`けう` -> `きょう`).
-fn vowel_changes(query: &str) -> String {
-    let chars: Vec<char> = query.chars().collect();
-    let mut out = String::with_capacity(query.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        if next == Some('う') {
-            if let Some((_, mapped)) = KANA_AU.iter().find(|(v, _)| *v == c) {
-                out.push(*mapped);
-                out.push('う');
-                i += 2;
-                continue;
-            }
-            if let Some((_, mapped)) = KANA_EU.iter().find(|(v, _)| *v == c) {
-                out.push_str(mapped);
-                out.push('う');
-                i += 2;
-                continue;
-            }
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
 /// #81: the historical sound changes JMdict's entry-local variants cannot
 /// reach (やう→よう, けふ→きょう, 思ふ→思う). Compose after
 /// [kana_orthography_modernise]. Mirrors `KanaSoundChanges.modernise`.
+///
+/// Delegates to the builtin table, built once; the binding host uses
+/// [`KanaSoundTable`] directly.
 pub fn kana_sound_changes_modernise(query: &str) -> String {
-    if query.is_empty() {
-        return query.to_string();
-    }
-    vowel_changes(&ha_gyouten(query))
+    builtin_sound_table().modernise(query)
+}
+
+/// The builtin sound table, built once for the free-function callers.
+fn builtin_sound_table() -> &'static KanaSoundTable {
+    static BUILTIN: OnceLock<KanaSoundTable> = OnceLock::new();
+    BUILTIN.get_or_init(KanaSoundTable::builtin)
 }
 
 /// Small kana (拗音) fuse with the preceding kana into one mora.
@@ -954,6 +1173,126 @@ mod tests {
         ] {
             assert_eq!(normalise(modern), modern);
         }
+    }
+
+    // ── Kana tables (the parsed forms the binding host installs) ────────────
+
+    /// Mirrors mobile
+    /// `KanaOrthographyTest.parse_skips_malformed_lines_and_keeps_the_first_canonical`:
+    /// comments/blanks, wrong field counts, non-single-character sides and
+    /// equal pairs are dropped, and the first mapping for a variant wins.
+    #[test]
+    fn kana_orthography_parse_skips_malformed_lines_and_keeps_the_first_canonical() {
+        let table = KanaOrthographyTable::parse(
+            "# a comment\n\
+             ゐ\tい\n\
+             ゐ\tゑ\n\
+             ゐい\n\
+             い\tい\n\
+             ゐ\tい\textra\n\
+             𝄞\tう\n",
+        );
+        assert_eq!(1, table.entry_count());
+        assert_eq!('い', table.canonical('ゐ'));
+    }
+
+    /// Mirrors mobile `KanaOrthographyTest.empty_table_is_the_identity`.
+    #[test]
+    fn kana_orthography_empty_table_is_the_identity() {
+        let table = KanaOrthographyTable::empty();
+        assert_eq!(0, table.entry_count());
+        assert_eq!('ゐ', table.canonical('ゐ'));
+        assert_eq!("ゐる", table.modernise("ゐる"));
+    }
+
+    /// The builtin table is the committed [`KANA_VARIANT_PAIRS`], and a table
+    /// parsed from their text format reproduces it row for row. A custom table
+    /// drives the fold: only pairs the table carries can fold.
+    #[test]
+    fn kana_orthography_builtin_and_parsed_tables_agree() {
+        let builtin = KanaOrthographyTable::builtin();
+        assert_eq!(16, builtin.entry_count());
+        let text: String = KANA_VARIANT_PAIRS
+            .iter()
+            .map(|(variant, canonical)| format!("{variant}\t{canonical}\n"))
+            .collect();
+        let parsed = KanaOrthographyTable::parse(&text);
+        assert_eq!(builtin.entry_count(), parsed.entry_count());
+        for (variant, canonical) in KANA_VARIANT_PAIRS {
+            assert_eq!(*canonical, builtin.canonical(*variant));
+            assert_eq!(*canonical, parsed.canonical(*variant));
+        }
+        let custom = KanaOrthographyTable::parse("ゐ\tゑ\n");
+        assert_eq!(1, custom.entry_count());
+        assert_eq!("ゑる", custom.modernise("ゐる"));
+    }
+
+    /// Mirrors mobile
+    /// `KanaSoundChangesTest.parse_skips_malformed_lines_and_keeps_the_first_mapping`:
+    /// comments/blanks, wrong field counts, non-single-character variants,
+    /// equal pairs, wrong-length modern forms and unknown rows are dropped, and
+    /// the first mapping for a variant wins.
+    #[test]
+    fn kana_sound_parse_skips_malformed_lines_and_keeps_the_first_mapping() {
+        let table = KanaSoundTable::parse(
+            "# a comment\n\
+             ふ\tう\tha\n\
+             ふ\tひ\tha\n\
+             ふう\n\
+             う\tう\tha\n\
+             ふ\tう\tha\textra\n\
+             ふう\tう\tha\n\
+             け\tきょ\teu\n\
+             け\tきょう\teu\n\
+             け\tきょ\tunknown-row\n",
+        );
+        assert_eq!(2, table.entry_count());
+        assert_eq!(Some('う'), table.ha('ふ'));
+        assert_eq!(Some("きょ".to_string()), table.eu('け'));
+    }
+
+    /// Mirrors mobile `KanaSoundChangesTest.empty_table_is_the_identity`.
+    #[test]
+    fn kana_sound_empty_table_is_the_identity() {
+        let table = KanaSoundTable::empty();
+        assert_eq!(0, table.entry_count());
+        assert_eq!("けふ", table.modernise("けふ"));
+    }
+
+    /// The builtin table is the committed rows, and a table parsed from their
+    /// text format reproduces them. The withheld rows stay absent, and a custom
+    /// table drives both passes.
+    #[test]
+    fn kana_sound_builtin_and_parsed_tables_agree() {
+        let builtin = KanaSoundTable::builtin();
+        assert_eq!(31, builtin.entry_count());
+        assert_eq!(None, builtin.ha('ほ'));
+        assert_eq!(None, builtin.au('あ'));
+        assert_eq!(None, builtin.au('ま'));
+        let mut text = String::new();
+        for (variant, modern) in KANA_HA {
+            text.push_str(&format!("{variant}\t{modern}\tha\n"));
+        }
+        for (variant, modern) in KANA_AU {
+            text.push_str(&format!("{variant}\t{modern}\tau\n"));
+        }
+        for (variant, modern) in KANA_EU {
+            text.push_str(&format!("{variant}\t{modern}\teu\n"));
+        }
+        let parsed = KanaSoundTable::parse(&text);
+        assert_eq!(builtin.entry_count(), parsed.entry_count());
+        for (variant, modern) in KANA_HA {
+            assert_eq!(Some(*modern), parsed.ha(*variant));
+        }
+        for (variant, modern) in KANA_AU {
+            assert_eq!(Some(*modern), parsed.au(*variant));
+        }
+        for (variant, modern) in KANA_EU {
+            assert_eq!(Some((*modern).to_string()), parsed.eu(*variant));
+        }
+        let custom = KanaSoundTable::parse("い\tよ\teu\n");
+        assert_eq!("よう", custom.modernise("いう"));
+        assert_eq!("いう", builtin.modernise("いう"));
     }
 
     // ── Lookup-variant fold (`JapaneseUtilVariantFoldTest`) ─────────────────
