@@ -59,6 +59,7 @@
 //! with no C++ toolchain, no ncnn sources, and no install prefix.
 
 pub mod app_settings;
+pub mod blank_gaps;
 pub mod char_placement;
 pub mod data;
 pub mod furigana;

@@ -825,151 +825,12 @@ fn glyph_fit_scale(is_vertical: bool, is_half: bool, cell: (f32, f32), ink: (f32
 // Blank gaps — mobile `BlankGaps` / `GapDetector` (#44 Feature 2)
 // ---------------------------------------------------------------------------
 
-/// Mobile `GapDetector.DEFAULT_VERTICAL_RATIO`: measured recall 1.00 and no
-/// false positives on the vertical bench; horizontal lines are never
-/// eligible (`BlankGaps.apply` returns early on them).
-const BLANK_GAP_RATIO: f32 = 1.6;
-
-/// Mobile `medianOf`: even counts average the two middles.
-fn median_of(values: &mut [f32]) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.sort_by(f32::total_cmp);
-    let mid = values.len() / 2;
-    if values.len() % 2 == 1 {
-        values[mid]
-    } else {
-        (values[mid - 1] + values[mid]) / 2.0
-    }
-}
-
-/// Mobile `GapDetector.detect` on the char-box geometry: character indices
-/// where the spacing to the next character is at least [BLANK_GAP_RATIO]×
-/// the median spacing of the line. Vertical lines only.
-fn blank_gap_positions(line: &LineResult) -> Vec<usize> {
-    if !line.is_vertical {
-        return Vec::new();
-    }
-    let n = line.text.chars().count();
-    if n < 2 || line.char_boxes.len() < n {
-        return Vec::new();
-    }
-    let centres: Vec<f32> = line
-        .char_boxes
-        .iter()
-        .take(n)
-        .map(|b| b.y as f32 + b.h as f32 / 2.0)
-        .collect();
-    let spacings: Vec<f32> = centres
-        .windows(2)
-        .map(|w| (w[1] - w[0]).abs())
-        .collect();
-    let pitch = median_of(&mut spacings.clone());
-    if pitch <= 0.0 {
-        return Vec::new();
-    }
-    spacings
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| **s / pitch >= BLANK_GAP_RATIO)
-        .map(|(k, _)| k + 1)
-        .collect()
-}
-
-/// Mobile `interpolateGapBox`: a placeholder box centred between the two
-/// neighbours it was dropped from, sized as the mean of their extents along
-/// the reading axis.
-fn interpolate_gap_box(boxes: &[BoundingBox], index: usize, is_vertical: bool) -> BoundingBox {
-    let before = index.checked_sub(1).and_then(|i| boxes.get(i));
-    let after = boxes.get(index);
-    let (Some(before), Some(after)) = (before, after) else {
-        return before
-            .or(after)
-            .cloned()
-            .unwrap_or_else(|| BoundingBox::new(0, 0, 0, 0, 1.0));
-    };
-    // Integer maths, matching the mobile `JpDictRect` arithmetic exactly.
-    let (bl, bt, br, bb) = (before.left(), before.top(), before.right(), before.bottom());
-    let (al, at, ar, ab) = (after.left(), after.top(), after.right(), after.bottom());
-    if is_vertical {
-        let centre_y = ((bt + bb) / 2 + (at + ab) / 2) / 2;
-        let height = ((bb - bt + (ab - at)) / 2).max(1);
-        BoundingBox::new(
-            bl.min(al),
-            centre_y - height / 2,
-            br.max(ar) - bl.min(al),
-            height,
-            before.confidence,
-        )
-    } else {
-        let centre_x = ((bl + br) / 2 + (al + ar) / 2) / 2;
-        let width = ((br - bl + (ar - al)) / 2).max(1);
-        BoundingBox::new(
-            centre_x - width / 2,
-            bt.min(at),
-            width,
-            bb.max(ab) - bt.min(at),
-            before.confidence,
-        )
-    }
-}
-
-/// Mobile `LineResult.withGapCharAt`: insert the placeholder at `index`,
-/// growing text, char boxes and alternatives together so every parallel list
-/// still describes the same characters at the same indices. PC lines carry
-/// no CTC columns or overrides, so those mobile-list steps have no analogue.
-fn with_gap_char(line: &LineResult, index: usize) -> LineResult {
-    let chars: Vec<char> = line.text.chars().collect();
-    if index > chars.len() {
-        return line.clone();
-    }
-    let mut text: String = chars[..index].iter().collect();
-    text.push(GAP_CHAR);
-    text.extend(chars[index..].iter());
-
-    let char_boxes = if line.char_boxes.len() == chars.len() && !line.char_boxes.is_empty() {
-        let mut out = line.char_boxes.clone();
-        out.insert(
-            index,
-            interpolate_gap_box(&line.char_boxes, index, line.is_vertical),
-        );
-        out
-    } else {
-        line.char_boxes.clone()
-    };
-    let alternatives = if line.alternatives.len() == chars.len() && !line.alternatives.is_empty() {
-        let mut out = line.alternatives.clone();
-        out.insert(index, vec![(GAP_CHAR, 0.0)]);
-        out
-    } else {
-        line.alternatives.clone()
-    };
-    LineResult {
-        text,
-        char_boxes,
-        alternatives,
-        is_vertical: line.is_vertical,
-        ..line.clone()
-    }
-}
-
 /// Mobile `BlankGaps.apply`: materialise every measured gap as a placeholder.
-/// Vertical lines only, idempotent, insertions right-to-left so the
-/// detector's indices (computed against the original text) stay valid.
+/// Thin delegate: the detector and materialiser live in the ungated
+/// [`jpdict_core::blank_gaps`] so the mobile conversion can reach them; the
+/// desktop pipeline keeps its call site unchanged.
 fn apply_blank_gaps(line: &LineResult) -> LineResult {
-    if !line.is_vertical || line.text.contains(GAP_CHAR) {
-        return line.clone();
-    }
-    let gaps = blank_gap_positions(line);
-    if gaps.is_empty() {
-        return line.clone();
-    }
-    let mut out = line.clone();
-    for &index in gaps.iter().rev() {
-        out = with_gap_char(&out, index);
-    }
-    out
+    jpdict_core::blank_gaps::apply_blank_gaps(line)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3771,6 +3632,7 @@ impl<'a, Message: Clone + 'static> From<TapOrDrag<'a, Message>> for Element<'a, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jpdict_core::blank_gaps::blank_gap_positions;
 
     /// If the glyph is its own reference, both axes land exactly on the box
     /// centre (this is what the old ink-fit path did for every glyph).

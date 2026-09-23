@@ -19,6 +19,8 @@ Always available (pure Rust, no toolchain / prefix / network beyond crates.io):
 
 - `models` — shared geometry + result types (the `nav_graph` surface).
 - `nav_graph` — D-pad navigation graph over detection boxes.
+- `blank_gaps` — blank-gap detection and placeholder materialisation
+  (`BlankGaps` / `GapDetector`).
 - `furigana`, `ruby_style` — ruby filtering rules and overlay styling.
 - `char_placement` — CTC-anchored per-character box placement (CAP; the
   `BOX_PLACEMENT_CAP` switch in `ocr_engine` picks it over the legacy chain).
