@@ -2667,7 +2667,15 @@ impl OcrViewer {
                 entry_col = entry_col.push(Self::deinflection_row(chain, &entry.term));
             }
             entry_col = entry_col.push(Self::headword_block(entry, self.show_pitch));
-            for group in &entry.reading_groups {
+            // The rule after the final reading group would only separate the
+            // entry from its own source caption, so drop it when the caption
+            // follows. Reading-group rules inside the entry stay.
+            let last_rendered = entry
+                .reading_groups
+                .iter()
+                .rposition(|g| g.render_senses)
+                .filter(|_| entry.dictionary_name.is_some());
+            for (i, group) in entry.reading_groups.iter().enumerate() {
                 // A reading that repeats an already-rendered glossary shows its
                 // headword but not a second copy of the senses (and examples).
                 if !group.render_senses {
@@ -2675,6 +2683,9 @@ impl OcrViewer {
                 }
                 for sg in &group.sense_groups {
                     entry_col = entry_col.push(Self::sense_group(sg.clone(), DICT_TEXT_WIDTH));
+                }
+                if Some(i) == last_rendered {
+                    continue;
                 }
                 // 1px divider per reading group (Android: DKGRAY, alpha 0.3).
                 // The background must wrap only the line: padding on the
