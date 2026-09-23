@@ -17,7 +17,8 @@ Pages:
 - [rotated-geometry.md](rotated-geometry.md) — frame angle convention, glyph
   tilt, axis-aligned band + quantization, unclip, detection defaults.
 - [furigana.md](furigana.md) — ruby drop rules, raw vs unclipped geometry.
-- [blank-gaps.md](blank-gaps.md) — vertical-only gap detection, placeholder
+- [blank-gaps.md](blank-gaps.md) — spacing-ratio gap detection (per-orientation
+  thresholds, three geometry sources, timestep walk), vertical-only placeholder
   insertion, candidate pool, LM ranking, fallback order, list retention.
 - [glyph-sizing.md](glyph-sizing.md) — cross-axis sizing, `glyphSizePx`, ink
   centring, halfwidth handling.

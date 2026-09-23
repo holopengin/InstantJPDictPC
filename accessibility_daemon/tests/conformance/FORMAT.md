@@ -128,6 +128,48 @@ Rects are `[left, top, right, bottom]`. `raw` = contour geometry,
 candidate list. `expect_fallback_first` optionally pins the punctuation-first
 fallback class order.
 
+### `gap_detection` — spacing-ratio gap detection over a line
+
+```json
+"case": {
+  "lines": [
+    { "text": "あいうえお", "is_vertical": true,
+      "char_boxes": [[x, y, w, h], "…"],
+      "char_cols": [0, 2, 4, 8, 10],
+      "raw_alternatives": [[["あ", 1.0]], "…"],
+      "crop_w": 0, "crop_h": 55, "seq_len_total": 11,
+      "threshold": 1.6,
+      "expect": [{ "insert_at": 3, "ratio": 2.0, "span_px": 20 }] }
+  ]
+}
+```
+
+Each entry is one recognised line. `char_boxes` (`[x, y, w, h]`), `char_cols`
+and `raw_alternatives` are the three geometry sources in priority order and
+are all optional, so a probe can exercise one in isolation; `crop_w` /
+`crop_h` / `seq_len_total` convert timestep spacings to pixels and default to
+0 ("unknown", which falls back to the model's own stride). `threshold`
+optionally overrides the line's orientation threshold — omit it to run the
+per-orientation default (vertical 1.6, horizontal 1.8), which is how a case
+pins the pair.
+
+`expect` is the detected gap list in ascending `insert_at` order: the
+character index the placeholder belongs at (the gap sits between
+`text[insert_at - 1]` and `text[insert_at]`), the pair's spacing divided by
+the line's own median spacing, and the spacing in pixels. `insert_at` is
+exact; `ratio` and `span_px` compare within `gap_ratio` / `gap_span_px`
+(default 1e-4 relative). An empty `expect` pins that the line reports
+nothing.
+
+A pair fires when `spacing / median >= threshold` — inclusive, so a ratio of
+exactly 1.6 is a gap. Detection refuses unusable geometry rather than
+inventing one: fewer than two emitted characters, a median spacing of zero,
+geometry that does not describe the text, and the contaminated median of a
+three-character line all report nothing. In the `raw_alternatives` walk the
+emitted character for a timestep is the list's first entry, a blank timestep
+is `"\u3000"` and resets the repeat state, a space never collapses, and any
+other character collapses only against the immediately preceding emitted one.
+
 ### `char_lm` — the text prior itself
 
 ```json

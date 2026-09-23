@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::furigana::{is_ruby_horizontal, is_ruby_vertical};
+use crate::blank_gaps::GapDetector;
 use crate::kana_size::{self};
 use crate::util::deinflector::Deinflector;
 use crate::ruby_style::ruby_style;
@@ -225,6 +226,7 @@ fn every_case_has_a_runner() {
         "reading_order",
         "furigana",
         "gap",
+        "gap_detection",
         "char_lm",
         "kana",
         "dictionary",
@@ -467,6 +469,111 @@ fn gap_cases() {
             let fb = gap_candidates::fallback(limit, lm.as_ref(), &context);
             let f0 = first.as_str().expect("ch").chars().next().expect("char");
             assert_eq!(fb[0], f0, "{id}: fallback class order drifted: {fb:?}");
+        }
+    }
+}
+
+/// Build the [`LineResult`] a `gap_detection` probe describes. `char_boxes`,
+/// `char_cols` and `raw_alternatives` are optional so a case can exercise any
+/// of the three geometry sources in isolation.
+fn gap_detection_line(c: &Value) -> LineResult {
+    let text = c["text"].as_str().expect("text");
+    let mut line = LineResult {
+        text: text.to_string(),
+        alternatives: text.chars().map(|ch| vec![(ch, 1.0)]).collect(),
+        is_vertical: c["is_vertical"].as_bool().expect("is_vertical"),
+        crop_w: c["crop_w"].as_i64().unwrap_or(0) as i32,
+        crop_h: c["crop_h"].as_i64().unwrap_or(0) as i32,
+        seq_len_total: c["seq_len_total"].as_i64().unwrap_or(0) as i32,
+        ..Default::default()
+    };
+    if let Some(boxes) = c.get("char_boxes") {
+        line.char_boxes = boxes
+            .as_array()
+            .expect("char_boxes")
+            .iter()
+            .map(|b| {
+                BoundingBox::new(
+                    b[0].as_i64().expect("x") as i32,
+                    b[1].as_i64().expect("y") as i32,
+                    b[2].as_i64().expect("w") as i32,
+                    b[3].as_i64().expect("h") as i32,
+                    1.0,
+                )
+            })
+            .collect();
+    }
+    if let Some(cols) = c.get("char_cols") {
+        line.char_cols = cols
+            .as_array()
+            .expect("char_cols")
+            .iter()
+            .map(|x| x.as_f64().expect("col") as f32)
+            .collect();
+    }
+    if let Some(raw) = c.get("raw_alternatives") {
+        line.raw_alternatives = raw
+            .as_array()
+            .expect("raw_alternatives")
+            .iter()
+            .map(|step| {
+                step.as_array()
+                    .expect("step")
+                    .iter()
+                    .map(|e| {
+                        (
+                            e[0].as_str().expect("ch").chars().next().expect("char"),
+                            e[1].as_f64().expect("score") as f32,
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+    }
+    line
+}
+
+#[test]
+fn gap_detection_cases() {
+    for (name, v) in kind_cases("gap_detection") {
+        let id = case_id(&name, &v);
+        let c = &v["case"];
+        for (i, probe) in c["lines"].as_array().expect("lines").iter().enumerate() {
+            let line = gap_detection_line(probe);
+            let detector = GapDetector::default();
+            let got = match probe.get("threshold").and_then(|t| t.as_f64()) {
+                Some(t) => detector.detect_with(&line, t as f32),
+                None => detector.detect(&line),
+            };
+            let expect = probe["expect"].as_array().expect("expect");
+            if dump() {
+                let s: Vec<String> = got
+                    .iter()
+                    .map(|g| format!("{}@{:.4}/{:.2}", g.insert_at, g.ratio, g.span_px))
+                    .collect();
+                println!("DUMP {id} line {i}: {}", s.join(", "));
+            }
+            assert_eq!(
+                got.len(),
+                expect.len(),
+                "{id} line {i}: gap count drifted: {got:?}"
+            );
+            for (k, e) in expect.iter().enumerate() {
+                let g = &got[k];
+                assert_eq!(
+                    g.insert_at,
+                    e["insert_at"].as_i64().expect("insert_at") as usize,
+                    "{id} line {i} gap {k}: insert_at drifted"
+                );
+                for (field, value) in [("ratio", g.ratio), ("span_px", g.span_px)] {
+                    let want = e[field].as_f64().expect(field) as f32;
+                    let tol = want.abs() * 1e-4 + 1e-6;
+                    assert!(
+                        (value - want).abs() <= tol,
+                        "{id} line {i} gap {k}: {field} drifted: got {value}, want {want}"
+                    );
+                }
+            }
         }
     }
 }
