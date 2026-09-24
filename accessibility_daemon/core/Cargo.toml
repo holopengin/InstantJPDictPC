@@ -16,7 +16,7 @@ cc = "1"
 #   (`nav_graph` + its `models` surface, plus the other toolchain-free
 #   modules); it builds with no C++ toolchain, no ncnn sources, no prefix.
 default = ["native", "db"]
-native = ["dep:image", "dep:imageproc", "dep:ttf-parser"]
+native = ["dep:image", "dep:imageproc"]
 db = ["dep:rusqlite", "dep:zip", "dep:ureq", "dep:sha2"]
 
 [dependencies]
@@ -24,8 +24,11 @@ db = ["dep:rusqlite", "dep:zip", "dep:ureq", "dep:sha2"]
 image = { version = "0.25", optional = true }
 imageproc = { version = "0.25", optional = true }
 
-# Vertical font metrics (vmtx/vert) for character geometry.
-ttf-parser = { version = "0.21", default-features = false, features = ["opentype-layout"], optional = true }
+# Vertical font metrics (vmtx/vert) for character geometry. Pure Rust, so this
+# stays on in every configuration: the ungated `char_boxes` module measures
+# glyph ink from the bundled font while the native pipeline keeps its image
+# stack behind the `native` feature.
+ttf-parser = { version = "0.21", default-features = false, features = ["opentype-layout"] }
 
 # Utilities
 serde = { version = "1.0", features = ["derive"] }
