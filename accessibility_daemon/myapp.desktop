@@ -1,5 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=My Application
-Exec=./target/release/accessibility_daemon
-Icon=utilities
+Name=InstantJPDict
+Comment=Japanese OCR overlay with dictionary lookup
+Exec=accessibility_daemon
+Icon=myapp
+Terminal=false
+Categories=Utility;Accessibility;
