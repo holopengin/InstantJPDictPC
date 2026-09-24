@@ -60,6 +60,7 @@
 
 pub mod app_settings;
 pub mod blank_gaps;
+pub mod char_boxes;
 pub mod char_placement;
 pub mod data;
 pub mod furigana;

@@ -7,7 +7,7 @@ crate with default features, so default behaviour is unchanged.
 
 | Feature | Default | What it pulls in |
 |---------|---------|------------------|
-| `native` | on | C++ inference stack: pinned ncnn fork + `ppocr_ncnn` core + `kana_size` C ABI (compiled in `build.rs`), plus the `image` / `imageproc` / `ttf-parser` crates. |
+| `native` | on | C++ inference stack: pinned ncnn fork + `ppocr_ncnn` core + `kana_size` C ABI (compiled in `build.rs`), plus the `image` / `imageproc` crates. (`ttf-parser` is pure Rust, so it is unconditional: the ungated `char_boxes` module measures glyph ink from the bundled font.) |
 | `db` | on | Dictionary stack: `rusqlite` (bundled SQLite), `zip` (Yomitan import), `ureq` + `sha2` (verified catalog downloads). |
 
 `default = ["native", "db"]`. Either can be enabled alone
@@ -23,7 +23,10 @@ Always available (pure Rust, no toolchain / prefix / network beyond crates.io):
   (`BlankGaps` / `GapDetector`).
 - `furigana`, `ruby_style` — ruby filtering rules and overlay styling.
 - `char_placement` — CTC-anchored per-character box placement (CAP; the
-  `BOX_PLACEMENT_CAP` switch in `ocr_engine` picks it over the legacy chain).
+  `BOX_PLACEMENT_CAP` switch in `char_boxes` picks it over the legacy chain).
+- `char_boxes` — the legacy char-box chain (columns, ink snap, punctuation
+  rules), the re-decode walk and the reading-order permutation: the pure
+  `OcrEngine` stages the mobile UniFFI shim shares.
 - `kana_size` (pure half) — window encoder (`window`), ε policy
   (`correct_lines`, `prob_big`, `BASE_ORDER`, `Flip`/`Declined`/`Correction`).
   The `KanaSizeNet` native handle needs `native`.

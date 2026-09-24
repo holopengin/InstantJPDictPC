@@ -13,6 +13,9 @@ use anyhow::{bail, Result};
 use image::{DynamicImage, GenericImageView};
 use std::borrow::Cow;
 
+use crate::char_boxes::peak_offset;
+#[cfg(test)]
+use crate::char_boxes::{re_decode_raw_alternatives, ReDecodedLine};
 use crate::ppocr_ncnn::{top_k, RecNet};
 
 pub const REC_TARGET_H: u32 = 48;
@@ -124,20 +127,6 @@ fn decode_char(vocab: &[String], class_idx: i32) -> char {
     } else {
         '\u{3000}'
     }
-}
-
-/// Sub-column peak offset (#49): parabolic interpolation of the winning
-/// class value across neighbouring timesteps. Returns 0 when the peak is
-/// flat, at a boundary, or prominence is below the mobile gate.
-fn peak_offset(v0: f32, v1: f32, v2: f32) -> f32 {
-    let denom = v0 - 2.0f32 * v1 + v2;
-    if denom >= -1e-6f32 {
-        return 0.0f32;
-    }
-    if (v1 - v0).min(v1 - v2) <= 1.0f32 {
-        return 0.0f32;
-    }
-    (0.5f32 * (v0 - v2) / denom).clamp(-0.5, 0.5)
 }
 
 /// Mobile `OcrEngine.top15Alternatives`' heap order: a Java `PriorityQueue`
@@ -914,101 +903,6 @@ pub fn recognize_ppocr_batch(
         results.push(recognize_crop(rec, crop, vocab, remap)?);
     }
     Ok(results)
-}
-
-// ——— Re-decode from cached raw alternatives (no model) ———
-
-/// Model-free re-decode output: text, per-emitted-character alternatives and
-/// fractional CTC columns, ready to rebuild a `LineResult`.
-#[allow(dead_code)] // only reached through `DetectedAnnotation::re_decode_line` (unwired yet)
-#[derive(Debug, Clone)]
-pub struct ReDecodedLine {
-    pub text: String,
-    pub alternatives: Vec<Vec<(char, f32)>>,
-    pub char_cols: Vec<f32>,
-}
-
-/// Mobile `OcrEngine.reDecodeLineResult`'s walk, without the `LineResult`
-/// plumbing: greedy CTC over the cached
-/// [`raw_alternatives`](PpocrResult::raw_alternatives) — entry 0 is the
-/// argmax, `'\u{3000}'` is the blank marker (so blank resets the collapse
-/// state), a space never collapses, any other character collapses only
-/// against the immediately preceding emitted character. Emits at most one
-/// character per timestep; `alternatives` stays index-aligned with `text`.
-/// Columns carry the winner's own score at the neighbouring timesteps
-/// (matched by character, absent → integer column), like the live decode —
-/// except that the live full-logits decode reads the neighbour's whole row,
-/// so it can interpolate from a class outside the neighbour's top-K while
-/// this walk cannot (mobile's `ctcDecode.wval` vs `reDecodeLineResult.wval`).
-/// Vertical lines get the emit path's punctuation normalisation applied to
-/// the text and to every alternative entry, so cached pre-fix raw data cannot
-/// reintroduce ASCII `?`/horizontal `…`.
-///
-/// `None` when nothing is cached (mobile returns the line unchanged).
-#[allow(dead_code)] // only reached through `DetectedAnnotation::re_decode_line` (unwired yet)
-pub fn re_decode_raw_alternatives(
-    raw: &[Vec<(char, f32)>],
-    is_vertical: bool,
-) -> Option<ReDecodedLine> {
-    if raw.is_empty() {
-        return None;
-    }
-    let mut text = String::new();
-    let mut new_alts: Vec<Vec<(char, f32)>> = Vec::new();
-    let mut char_cols: Vec<f32> = Vec::new();
-    let mut prev_char: Option<char> = None;
-
-    // Winner score at a neighbouring timestep, matched by character
-    // (mobile `wval`; first match wins).
-    let wval = |t: usize, ch: char| -> Option<f32> {
-        raw.get(t)?
-            .iter()
-            .find(|(c, _)| *c == ch)
-            .map(|(_, s)| *s)
-    };
-    let frac_for = |t: usize, ch: char, v1: f32| -> f32 {
-        let w0 = if t > 0 { wval(t - 1, ch) } else { None };
-        match (w0, wval(t + 1, ch)) {
-            (Some(w0), Some(w2)) => peak_offset(w0, v1, w2),
-            _ => 0.0,
-        }
-    };
-
-    for (t, alts) in raw.iter().enumerate() {
-        let Some(&(top_char, top_score)) = alts.first() else {
-            continue;
-        };
-        if top_char == '\u{3000}' {
-            // Blank: resets the repeat state but is never emitted.
-            prev_char = None;
-        } else if top_char == ' ' {
-            text.push(' ');
-            prev_char = Some(' ');
-            char_cols.push(t as f32 + frac_for(t, ' ', top_score));
-            new_alts.push(alts.clone());
-        } else if prev_char == Some(top_char) {
-            // collapse repeat
-        } else {
-            text.push(top_char);
-            char_cols.push(t as f32 + frac_for(t, top_char, top_score));
-            new_alts.push(alts.clone());
-            prev_char = Some(top_char);
-        }
-    }
-
-    if is_vertical {
-        text = crate::util::japanese::vertical_punctuation(&text);
-        for alts in new_alts.iter_mut() {
-            for (c, _) in alts.iter_mut() {
-                *c = crate::util::japanese::vertical_punctuation_char(*c);
-            }
-        }
-    }
-    Some(ReDecodedLine {
-        text,
-        alternatives: new_alts,
-        char_cols,
-    })
 }
 
 #[cfg(test)]
