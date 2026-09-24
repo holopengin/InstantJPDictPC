@@ -32,7 +32,7 @@ ttf-parser = { version = "0.21", default-features = false, features = ["opentype
 
 # Utilities
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 log = "0.4"
 anyhow = "1.0"
 
