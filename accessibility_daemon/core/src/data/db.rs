@@ -8,6 +8,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::data::models::{DictionaryEntry, DictionaryMeta, DictionaryTag};
 
+// Compatibility path for the bundled-dictionary module; the implementation
+// and its single source of truth live in `data::catalog`.
+pub(crate) use crate::data::catalog::name_matches_family;
+
 /// Thread-safe SQLite database handle.
 /// Equivalent to `AppDatabase` in Kotlin.
 pub struct DictionaryDatabase {
@@ -393,20 +397,6 @@ impl DictionaryDatabase {
 
 }
 
-/// Whether `name` is the stable title `family` itself or a bracketed revision
-/// of it (`family [2026-08-11]`) — the catalog's "already installed" match,
-/// which does not care which upstream revision a row carries. Mirrors the
-/// family rule mobile's `InstalledDictionary` uses.
-///
-/// The comparison is done in Rust rather than SQL `LIKE`: `_` and `%` in a
-/// title family would otherwise be wildcard characters.
-pub fn name_matches_family(name: &str, family: &str) -> bool {
-    name == family
-        || name
-            .strip_prefix(family)
-            .is_some_and(|rest| rest.starts_with(" ["))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,19 +503,5 @@ mod tests {
         let built = |id: i64| metas.iter().find(|d| d.id == id).unwrap().built_in;
         assert!(!built(jitendex), "Jitendex is a deletable catalog row now");
         assert!(built(pitch), "the shipped pitch asset stays built in");
-    }
-
-    #[test]
-    fn family_match_accepts_exact_title_and_bracketed_revision() {
-        assert!(name_matches_family("Jitendex.org [2026-08-11]", "Jitendex.org"));
-        assert!(name_matches_family("Jitendex.org", "Jitendex.org"));
-        assert!(name_matches_family("KANJIDIC", "KANJIDIC"));
-        assert!(name_matches_family("KANJIDIC [2026-258]", "KANJIDIC"));
-
-        // A different family, and a longer title that only shares the prefix,
-        // are not revisions of "Jitendex.org".
-        assert!(!name_matches_family("Jitendex", "Jitendex.org"));
-        assert!(!name_matches_family("Jitendex.org Extra", "Jitendex.org"));
-        assert!(!name_matches_family("Jitendex.org[old]", "Jitendex.org"));
     }
 }
