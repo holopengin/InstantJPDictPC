@@ -13,9 +13,9 @@ use anyhow::{bail, Result};
 use image::{DynamicImage, GenericImageView};
 use std::borrow::Cow;
 
-use crate::char_boxes::peak_offset;
 #[cfg(test)]
 use crate::char_boxes::{re_decode_raw_alternatives, ReDecodedLine};
+use crate::ctc_decode::{ctc_decode_full, ctc_decode_topk, CtcDecodeResult};
 use crate::ppocr_ncnn::{top_k, RecNet};
 
 pub const REC_TARGET_H: u32 = 48;
@@ -32,10 +32,6 @@ const STITCH_MAX_DIST_PX: f32 = 30.0;
 const STITCH_MIN_PRED: f32 = 0.4;
 /// Stitch append rule: chars past last center + this gap start a new tail.
 const STITCH_APPEND_GAP_PX: f32 = 10.0;
-/// Softmax row of the head: 0 = blank, 1..=18708 = chars, 18709 = space.
-const SPACE_CLASS: i32 = 18709;
-const FULLWIDTH_SPACE_CLASS: i32 = 18708;
-
 /// One recognized line: text, per-character top-15 alternatives, CTC
 /// timestep columns (fractional), and the model's timestep count.
 #[derive(Debug, Clone)]
@@ -65,6 +61,19 @@ impl PpocrResult {
             seq_len_total: 0,
             step_px: 0.0,
             raw_alternatives: Vec::new(),
+        }
+    }
+}
+
+impl From<CtcDecodeResult> for PpocrResult {
+    fn from(decoded: CtcDecodeResult) -> Self {
+        Self {
+            text: decoded.text,
+            alternatives: decoded.alternatives,
+            char_cols: decoded.char_cols,
+            seq_len_total: decoded.seq_len_total,
+            step_px: 0.0,
+            raw_alternatives: decoded.raw_alternatives,
         }
     }
 }
@@ -106,268 +115,6 @@ fn build_rec_input(pixels: &[u8], content_w: u32, target_h: u32, model_w: u32) -
         }
     }
     input
-}
-
-/// Pruned-out id -> orig class id (#39); identity fallback if remap failed.
-fn remap_class(remap: &[i32], pruned_idx: i32) -> i32 {
-    remap.get(pruned_idx as usize).copied().unwrap_or(pruned_idx)
-}
-
-/// Orig class id -> char, mobile `decodeChar`.
-fn decode_char(vocab: &[String], class_idx: i32) -> char {
-    if class_idx == SPACE_CLASS {
-        ' '
-    } else if class_idx == FULLWIDTH_SPACE_CLASS {
-        '\u{3000}'
-    } else if (1..=FULLWIDTH_SPACE_CLASS).contains(&class_idx) {
-        vocab
-            .get((class_idx - 1) as usize)
-            .and_then(|s| s.chars().next())
-            .unwrap_or('\u{FFFD}')
-    } else {
-        '\u{3000}'
-    }
-}
-
-/// Mobile `OcrEngine.top15Alternatives`' heap order: a Java `PriorityQueue`
-/// (binary min-heap by score, lowest index not privileged) fed every class id
-/// and polled whenever it exceeds TOP_K, then read in backing-array order.
-/// Reproduced here because the final stable sort's tie order depends on it.
-struct JavaMinHeap<'a> {
-    data: Vec<usize>,
-    score: &'a [f32],
-}
-
-impl JavaMinHeap<'_> {
-    fn add(&mut self, k: usize) {
-        self.data.push(k);
-        let mut child = self.data.len() - 1;
-        while child > 0 {
-            let parent = (child - 1) / 2;
-            // Java siftUp breaks on compare(key, parent) >= 0.
-            if self.score[self.data[child]] >= self.score[self.data[parent]] {
-                break;
-            }
-            self.data.swap(child, parent);
-            child = parent;
-        }
-    }
-
-    fn poll(&mut self) -> Option<usize> {
-        let n = self.data.len();
-        if n == 0 {
-            return None;
-        }
-        let result = self.data[0];
-        let last = self.data.pop().unwrap();
-        if n > 1 {
-            self.data[0] = last;
-            let mut parent = 0usize;
-            loop {
-                let left = 2 * parent + 1;
-                if left >= self.data.len() {
-                    break;
-                }
-                let mut child = left;
-                let right = left + 1;
-                if right < self.data.len()
-                    && self.score[self.data[right]] < self.score[self.data[left]]
-                {
-                    child = right;
-                }
-                // Java siftDown breaks on compare(key, child) <= 0.
-                if self.score[self.data[parent]] <= self.score[self.data[child]] {
-                    break;
-                }
-                self.data.swap(parent, child);
-                parent = child;
-            }
-        }
-        Some(result)
-    }
-}
-
-/// Mobile `top15Alternatives` index order: heap selection + stable
-/// descending sort (see `JavaMinHeap`).
-fn java_topk_order(slice: &[f32], k: usize) -> Vec<usize> {
-    let mut heap = JavaMinHeap { data: Vec::new(), score: slice };
-    for i in 0..slice.len() {
-        heap.add(i);
-        if heap.data.len() > k {
-            heap.poll();
-        }
-    }
-    let mut order = heap.data;
-    order.sort_by(|&a, &b| {
-        slice[b]
-            .partial_cmp(&slice[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    order.truncate(k);
-    order
-}
-
-/// Top-15 char alternatives for one timestep from full logits, in mobile's
-/// exact order: heap selection, then a stable descending sort — so equal
-/// scores keep the Java heap's backing-array order (D6.1).
-fn top15_alternatives(vocab: &[String], remap: &[i32], slice: &[f32]) -> Vec<(char, f32)> {
-    java_topk_order(slice, top_k())
-        .into_iter()
-        .map(|idx| (decode_char(vocab, remap_class(remap, idx as i32)), slice[idx]))
-        .collect()
-}
-
-/// Greedy CTC decode from native top-15 lists (#42): entry 0 is the argmax
-/// (native emits descending, lowest-id wins ties); blank/space tests use the
-/// remapped pruned indices. Mirrors mobile `ctcDecodeTopK` with
-/// blankThreshold 0 (pure greedy). `top_chars` is kept as the result's
-/// `raw_alternatives` (mobile passes the same lists to `ctcDecodeTopK` and
-/// copies them onto the result), so it is taken by value.
-fn ctc_decode_topk(
-    vocab: &[String],
-    remap: &[i32],
-    top_pruned: &[Vec<i32>],
-    top_chars: Vec<Vec<(char, f32)>>,
-    seq_len: usize,
-) -> PpocrResult {
-    let mut text = String::new();
-    let mut alts: Vec<Vec<(char, f32)>> = Vec::new();
-    let mut char_cols: Vec<f32> = Vec::new();
-    let mut prev_class: i32 = 0;
-
-    // Winner (entry 0) score at a neighbouring timestep, matched by pruned
-    // class id; absent from top-15 → no interpolation for that side.
-    let wval = |tt: usize, cls: i32| -> Option<f32> {
-        let p = top_pruned.get(tt)?;
-        let c = top_chars.get(tt)?;
-        let k = p.iter().position(|&x| x == cls)?;
-        c.get(k).map(|(_, s)| *s)
-    };
-
-    for t in 0..seq_len {
-        let (Some(pruned), Some(indexed)) = (top_pruned.get(t), top_chars.get(t)) else {
-            continue;
-        };
-        if pruned.is_empty() || indexed.is_empty() {
-            continue;
-        }
-        let max_val = indexed[0].1;
-        let class_idx = remap_class(remap, pruned[0]);
-        let w0 = if t > 0 { wval(t - 1, pruned[0]) } else { None };
-        let w2 = wval(t + 1, pruned[0]);
-        let t_frac = if let (Some(w0), Some(w2)) = (w0, w2) {
-            t as f32 + peak_offset(w0, max_val, w2)
-        } else {
-            t as f32
-        };
-
-        if class_idx == 0 {
-            // blankThreshold is 0 on the single-pass path: stay pure greedy.
-            prev_class = 0;
-        } else if class_idx == SPACE_CLASS {
-            text.push(' ');
-            prev_class = SPACE_CLASS;
-            char_cols.push(t_frac);
-            alts.push(indexed.to_vec());
-        } else if class_idx == prev_class {
-            // collapse repeat
-        } else {
-            let ch = decode_char(vocab, class_idx);
-            if ch != '\u{FFFD}' {
-                text.push(ch);
-                char_cols.push(t_frac);
-                alts.push(indexed.to_vec());
-                prev_class = class_idx;
-            }
-        }
-    }
-
-    PpocrResult {
-        text,
-        alternatives: alts,
-        char_cols,
-        seq_len_total: seq_len,
-        step_px: 0.0,
-        raw_alternatives: top_chars,
-    }
-}
-
-/// Greedy CTC decode from full logits, mobile `ctcDecode` with
-/// blankThreshold 0. Builds `raw_alternatives` per timestep exactly like the
-/// mobile fallback (`top15Alternatives(cropLogits[t])`), so a re-decode works
-/// the same on both paths.
-fn ctc_decode_full(
-    vocab: &[String],
-    remap: &[i32],
-    logits: &[Vec<f32>],
-    num_classes: usize,
-    seq_len: usize,
-) -> PpocrResult {
-    let mut text = String::new();
-    let mut alts: Vec<Vec<(char, f32)>> = Vec::new();
-    let mut char_cols: Vec<f32> = Vec::new();
-    let mut raw_alternatives: Vec<Vec<(char, f32)>> = Vec::with_capacity(seq_len);
-    let mut prev_class: i32 = 0;
-
-    let wval = |tt: usize, cls: i32| -> Option<f32> {
-        let slice = logits.get(tt)?;
-        slice.get(cls as usize).copied()
-    };
-
-    for t in 0..seq_len {
-        let Some(slice) = logits.get(t) else {
-            raw_alternatives.push(Vec::new());
-            continue;
-        };
-        if slice.len() < num_classes {
-            raw_alternatives.push(Vec::new());
-            continue;
-        }
-        let (max_idx, &max_val) = slice
-            .iter()
-            .enumerate()
-            .fold((0usize, &f32::NEG_INFINITY), |(bi, bv), (i, v)| {
-                if v > bv { (i, v) } else { (bi, bv) }
-            });
-        let w0 = if t > 0 { wval(t - 1, max_idx as i32) } else { None };
-        let w2 = wval(t + 1, max_idx as i32);
-        let t_frac = if let (Some(w0), Some(w2)) = (w0, w2) {
-            t as f32 + peak_offset(w0, max_val, w2)
-        } else {
-            t as f32
-        };
-        let class_idx = remap_class(remap, max_idx as i32);
-        let indexed = top15_alternatives(vocab, remap, slice);
-        raw_alternatives.push(indexed.clone());
-
-        if class_idx == 0 {
-            prev_class = 0;
-        } else if class_idx == SPACE_CLASS {
-            text.push(' ');
-            prev_class = SPACE_CLASS;
-            char_cols.push(t_frac);
-            alts.push(indexed);
-        } else if class_idx == prev_class {
-            // collapse repeat
-        } else {
-            let ch = decode_char(vocab, class_idx);
-            if ch != '\u{FFFD}' {
-                text.push(ch);
-                char_cols.push(t_frac);
-                alts.push(indexed);
-                prev_class = class_idx;
-            }
-        }
-    }
-
-    PpocrResult {
-        text,
-        alternatives: alts,
-        char_cols,
-        seq_len_total: seq_len,
-        step_px: 0.0,
-        raw_alternatives,
-    }
 }
 
 /// Recognizer output for one line crop. Mirrors mobile `recognizePpocrBatch`:
@@ -510,27 +257,14 @@ fn infer_resized_with_topk(
         let logits: Vec<Vec<f32>> = (0..seq_len)
             .map(|t| flat[t * num_out..(t + 1) * num_out].to_vec())
             .collect();
-        let mut decoded = ctc_decode_full(vocab, remap, &logits, num_out, seq_len);
+        let mut decoded: PpocrResult =
+            ctc_decode_full(vocab, remap, &logits, num_out, seq_len).into();
         decoded.step_px = step_px;
         return Ok(decoded);
     }
 
     let packed = packed.expect("packed_ok checked above");
-    let mut top_pruned: Vec<Vec<i32>> = Vec::with_capacity(seq_len);
-    let mut top_chars: Vec<Vec<(char, f32)>> = Vec::with_capacity(seq_len);
-    for t in 0..seq_len {
-        let mut ids = Vec::with_capacity(k);
-        let mut chars = Vec::with_capacity(k);
-        for j in 0..k {
-            let id = packed[(t * k + j) * 2] as i32;
-            let val = packed[(t * k + j) * 2 + 1];
-            ids.push(id);
-            chars.push((decode_char(vocab, remap_class(remap, id)), val));
-        }
-        top_pruned.push(ids);
-        top_chars.push(chars);
-    }
-    let mut decoded = ctc_decode_topk(vocab, remap, &top_pruned, top_chars, seq_len);
+    let mut decoded: PpocrResult = ctc_decode_topk(vocab, remap, &packed, seq_len, k).into();
     decoded.step_px = step_px;
     Ok(decoded)
 }
@@ -908,6 +642,8 @@ pub fn recognize_ppocr_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::char_boxes::peak_offset;
+    use crate::ctc_decode::java_topk_order;
     use std::path::PathBuf;
 
     fn repo_path(rel: &str) -> PathBuf {
@@ -1280,9 +1016,17 @@ mod tests {
     fn decode_topk(steps: &[(Vec<i32>, Vec<(char, f32)>)]) -> PpocrResult {
         let vocab: Vec<String> = TEST_VOCAB.iter().map(|s| s.to_string()).collect();
         let remap: Vec<i32> = (0..=TEST_VOCAB.len() as i32).collect();
-        let top_pruned: Vec<Vec<i32>> = steps.iter().map(|(p, _)| p.clone()).collect();
-        let top_chars: Vec<Vec<(char, f32)>> = steps.iter().map(|(_, c)| c.clone()).collect();
-        ctc_decode_topk(&vocab, &remap, &top_pruned, top_chars, steps.len())
+        let top_k = steps.first().map_or(0, |(ids, _)| ids.len());
+        let mut packed = Vec::with_capacity(steps.len() * top_k * 2);
+        for (ids, cells) in steps {
+            assert_eq!(ids.len(), top_k);
+            assert_eq!(ids.len(), cells.len());
+            for (&id, &(_, score)) in ids.iter().zip(cells) {
+                packed.push(id as f32);
+                packed.push(score);
+            }
+        }
+        ctc_decode_topk(&vocab, &remap, &packed, steps.len(), top_k).into()
     }
 
     fn re_decode(steps: &[(Vec<i32>, Vec<(char, f32)>)], is_vertical: bool) -> ReDecodedLine {
