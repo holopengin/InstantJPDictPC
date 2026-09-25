@@ -59,6 +59,9 @@
 //! with no C++ toolchain, no ncnn sources, and no install prefix.
 
 pub mod app_settings;
+pub mod merge_boxes;
+pub mod gutter_trim;
+pub mod ctc_decode;
 pub mod blank_gaps;
 pub mod char_boxes;
 pub mod char_placement;
