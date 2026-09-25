@@ -12,6 +12,10 @@ use crate::char_boxes::{
     uniform_cells,
 };
 use crate::furigana::{filter_furigana, is_vertical_box};
+/// The pure straight-box overlap merge moved to the ungated
+/// [`crate::merge_boxes`] module so the mobile shim can share it; the engine
+/// calls [`crate::merge_boxes::merge_straight_boxes`] here (re-exported so
+/// `crate::conformance` keeps resolving it through this module).
 
 // PP-OCRv6 detection constants. The ncnn det model runs on a square
 // letterboxed input (mobile #51 default 896); its output map is thresholded
@@ -29,9 +33,6 @@ const PPOCR_DET_LONG_SIDE: u32 = 960;
 const PPOCR_DET_THRESH: f32 = 0.25;
 const PPOCR_DET_BOX_THRESH: f32 = 0.8;
 const PPOCR_DET_UNCLIP_RATIO: f32 = 0.7;
-/// Mobile `xOverlapThresh` pref default: union two straight boxes when their
-/// intersection covers at least this fraction of the smaller box.
-const X_OVERLAP_THRESHOLD: f32 = 0.40;
 
 
 
@@ -1025,87 +1026,11 @@ impl OcrEngine {
     }
 }
 
-/// Mobile `OcrEngine.shouldMerge`: the intersection must cover at least
-/// `X_OVERLAP_THRESHOLD` of the smaller box and the centres must sit within
-/// one average height of each other.
-fn should_merge_straight(a: &BoundingBox, b: &BoundingBox) -> bool {
-    let (ax1, ay1, ax2, ay2) = (a.x, a.y, a.x + a.w, a.y + a.h);
-    let (bx1, by1, bx2, by2) = (b.x, b.y, b.x + b.w, b.y + b.h);
-    let (ix1, iy1) = (ax1.max(bx1), ay1.max(by1));
-    let (ix2, iy2) = (ax2.min(bx2), ay2.min(by2));
-    if ix1 >= ix2 || iy1 >= iy2 {
-        return false;
-    }
-    let inter = (ix2 - ix1) as f32 * (iy2 - iy1) as f32;
-    let min_area = (a.w * a.h).min(b.w * b.h) as f32;
-    if min_area <= 0.0 {
-        return false;
-    }
-    if inter / min_area < X_OVERLAP_THRESHOLD {
-        return false;
-    }
-    let y_diff = ((ay1 + ay2) as f32 / 2.0 - (by1 + by2) as f32 / 2.0).abs();
-    let avg_h = (a.h + b.h) as f32 / 2.0;
-    y_diff <= avg_h
-}
-
-/// Union of two AABBs, keeping the stronger confidence.
-fn union_boxes(a: &BoundingBox, b: &BoundingBox) -> BoundingBox {
-    let x1 = a.x.min(b.x);
-    let y1 = a.y.min(b.y);
-    let x2 = (a.x + a.w).max(b.x + b.w);
-    let y2 = (a.y + a.h).max(b.y + b.h);
-    BoundingBox::new(x1, y1, x2 - x1, y2 - y1, a.confidence.max(b.confidence))
-}
-
-/// Mobile `OcrEngine.mergeOverlappingBoxes`, restricted to straight frames
-/// (no quad): the rotated path has no merge on mobile, so only boxes that
-/// would have been axis-aligned there take part. A merged box becomes a
-/// plain axis-aligned frame (angle 0).
-/// Visible to the conformance corpus runner (`crate::conformance`): these are
-/// pipeline stages both sides share, pinned by cases in
-/// `tests/conformance/cases/`.
-pub(crate) fn merge_straight_boxes(pairs: Vec<(BoundingBox, RotatedBox)>) -> Vec<(BoundingBox, RotatedBox)> {
-    if pairs.len() < 2 {
-        return pairs;
-    }
-    let straight: Vec<bool> = pairs.iter().map(|(_, r)| !r.is_rotated()).collect();
-    let mut order: Vec<usize> = (0..pairs.len()).collect();
-    // Largest box first, like mobile (`sortedByDescending { area }`).
-    order.sort_by_key(|&i| std::cmp::Reverse(pairs[i].0.w as i64 * pairs[i].0.h as i64));
-    let mut handled = vec![false; pairs.len()];
-    let mut out = Vec::with_capacity(pairs.len());
-    for &i in &order {
-        if handled[i] {
-            continue;
-        }
-        handled[i] = true;
-        if !straight[i] {
-            out.push(pairs[i].clone());
-            continue;
-        }
-        let mut cur = pairs[i].0.clone();
-        for &j in &order {
-            if handled[j] || !straight[j] {
-                continue;
-            }
-            if should_merge_straight(&cur, &pairs[j].0) {
-                cur = union_boxes(&cur, &pairs[j].0);
-                handled[j] = true;
-            }
-        }
-        let frame = RotatedBox::new(
-            cur.x as f32 + cur.w as f32 / 2.0,
-            cur.y as f32 + cur.h as f32 / 2.0,
-            cur.w as f32,
-            cur.h as f32,
-            0.0,
-            cur.confidence,
-        );
-        out.push((cur, frame));
-    }
-    out
-}
+/// The pure straight-box overlap merge lives in the ungated
+/// [`crate::merge_boxes`] module so the mobile shim can share it; re-exported
+/// here so `detect_lines`, the unit tests below and `crate::conformance` keep
+/// resolving it through this module.
+pub(crate) use crate::merge_boxes::merge_straight_boxes;
 
 
 // ---------------------------------------------------------------------------
