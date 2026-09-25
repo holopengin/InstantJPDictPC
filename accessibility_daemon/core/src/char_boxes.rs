@@ -750,7 +750,7 @@ impl DetectedAnnotation {
 /// Sub-column peak offset (#49): parabolic interpolation of the winning
 /// class value across neighbouring timesteps. Returns 0 when the peak is
 /// flat, at a boundary, or prominence is below the mobile gate.
-pub(crate) fn peak_offset(v0: f32, v1: f32, v2: f32) -> f32 {
+pub fn peak_offset(v0: f32, v1: f32, v2: f32) -> f32 {
     let denom = v0 - 2.0f32 * v1 + v2;
     if denom >= -1e-6f32 {
         return 0.0f32;
