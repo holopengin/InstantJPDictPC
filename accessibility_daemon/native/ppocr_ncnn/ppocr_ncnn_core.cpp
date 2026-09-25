@@ -239,14 +239,15 @@ bool rec_infer_topk(RecNet* rec, const float* data, size_t dataFloats, int w, in
 DetNet* det_create(const char* paramPath, const char* binPath) {
     DetNet* det = new DetNet();
     ncnn::Option opt;
-    // 1 thread + fp16 throughout (#25 det tune): min-of-3 same-session —
-    // jpg 1522→892ms, screenshot 1396→855ms vs 4-thread fp32; box IoU ≥0.95
-    // holds (mean 0.99+, worst single-box 0.63). Det bin is fp16-storage already.
-    opt.num_threads = 1;
+    // 2 threads + fp16 throughout. Pixel 7a / Android 17, 1080x2400 bookpage,
+    // alternating load-time sweep: t1 medians 379/377/419/427ms, t2 237/265ms,
+    // t4 522ms. Every t2 cell kept the same 18 boxes and decoded all 18 lines.
+    // The earlier #25 tune compared t1 against 4-thread fp32, not t2 fp16.
+    opt.num_threads = 2;
     opt.use_fp16_packed = true;
     opt.use_fp16_storage = true;
     opt.use_fp16_arithmetic = true;
-    PPOCR_LOGI("DetNet threads=1 fp16=1");
+    PPOCR_LOGI("DetNet threads=2 fp16=1");
     opt.use_packing_layout = true;
     det->net.opt = opt;
     ncnn::set_cpu_powersave(0);
@@ -273,16 +274,32 @@ void det_destroy(DetNet* det) {
     }
 }
 
-bool det_infer(DetNet* det, const float* data, size_t dataFloats, int w, int h, std::vector<float>& out) {
-    if (!det) return false;
+bool det_fill_input(const float* data, size_t dataFloats, int w, int h, ncnn::Mat& in) {
+    if (!data) return false;
     long expectedFloats = 1L * 3 * h * w;
     if ((long)dataFloats < expectedFloats) {
         PPOCR_LOGE("Det buffer too small %ld vs %ld", (long)dataFloats, expectedFloats);
         return false;
     }
-    ncnn::Mat in(w, h, 3);
+    if (in.w != w || in.h != h || in.c != 3 || in.dims != 3) {
+        in.create(w, h, 3);
+    }
     fill_input(in, data, w, h);
+    return true;
+}
+
+bool det_infer(DetNet* det, const float* data, size_t dataFloats, int w, int h, std::vector<float>& out) {
+    if (!det) return false;
+    ncnn::Mat in;
+    if (!det_fill_input(data, dataFloats, w, h, in)) return false;
     PPOCR_LOGI("Det input in0 w=%d h=%d c=3 total=%d mean0=%.3f", w, h, (int)in.total(), in.channel(0)[0]);
+    return det_run(det, in, out);
+}
+
+bool det_run(DetNet* det, const ncnn::Mat& in, std::vector<float>& out) {
+    if (!det) return false;
+    const int w = in.w;
+    const int h = in.h;
 
     ncnn::Extractor ex = det->net.create_extractor();
     ex.set_light_mode(true);
@@ -330,6 +347,104 @@ bool det_infer(DetNet* det, const float* data, size_t dataFloats, int w, int h, 
     out.assign(outData, outData + total);
     PPOCR_LOGI("Det infer ok w=%d h=%d outTotal=%d", w, h, total);
     return true;
+}
+
+// ── Letterbox + normalise, the pixel-side half of the det input ──
+//
+// One pass over the source: every destination slot is written exactly once
+// (padding gets the normalisation of pixel 128), so the tensor costs
+// 3*modelSize² stores and nothing else — no intermediate Mat, no second copy,
+// no 9.6 MB staging buffer on the way to a direct ByteBuffer.
+
+namespace {
+
+// Per-channel ImageNet normalisation, (v/255 - mean) / std.
+// MUST stay bit-identical to OcrEngine.DET_NORM_LUT (Kotlin, float32): same
+// expressions, same evaluation order, and no rearrangement into
+// (v - mean*255) * 1/(255*std) — that form is mathematically equal and
+// numerically different in the last bits, and "the boxes came out the same" is
+// not the parity bar. It is written as arithmetic rather than as a 768-entry
+// lookup table on purpose: NEON has no gather, so the table version scalarises
+// the whole inner loop, while this expression auto-vectorises to `fdiv v.4s` —
+// and a vector fdiv is as correctly rounded as the scalar one the JVM used, so
+// the vectorised form stays bit-exact (measured: 0 of 2,408,448 floats differ).
+inline float det_norm(int channel, int v) {
+    const float f = (float)v / 255.0f;
+    return (f - (channel == 0 ? 0.485f : channel == 1 ? 0.456f : 0.406f))
+        / (channel == 0 ? 0.229f : channel == 1 ? 0.224f : 0.225f);
+}
+
+void fill_const(float* p, int n, float v) {
+    for (int i = 0; i < n; i++) p[i] = v;
+}
+
+} // namespace
+
+bool det_build_input(const int* argb, int resizeW, int resizeH, int modelSize, int padX, int padY, ncnn::Mat& out) {
+    if (!argb) {
+        PPOCR_LOGE("det_build_input: null pixels");
+        return false;
+    }
+    if (resizeW <= 0 || resizeH <= 0 || modelSize <= 0 || padX < 0 || padY < 0
+        || padX + resizeW > modelSize || padY + resizeH > modelSize) {
+        PPOCR_LOGE("det_build_input: bad geometry content=%dx%d pad=(%d,%d) model=%d",
+                   resizeW, resizeH, padX, padY, modelSize);
+        return false;
+    }
+    // The padding is gray 128 BEFORE normalisation, so it is DET_NORM_LUT[128]
+    // per channel — not one constant shared by R/G/B, whose means and stds
+    // differ. Every destination slot is written exactly once, below: content
+    // from the source value, padding from pixel 128.
+    if (out.w != modelSize || out.h != modelSize || out.c != 3 || out.dims != 3) {
+        out.create(modelSize, modelSize, 3);
+    }
+    const int padV[3] = {128, 128, 128};
+    float* __restrict pr = out.channel(0);
+    float* __restrict pg = out.channel(1);
+    float* __restrict pb = out.channel(2);
+    const int padL = padX;
+    const int padR = modelSize - padX - resizeW;
+    const int padTop = padY;
+    for (int y = 0; y < modelSize; y++) {
+        float* r = pr + (size_t)y * modelSize;
+        float* g = pg + (size_t)y * modelSize;
+        float* b = pb + (size_t)y * modelSize;
+        if (y < padTop || y >= padTop + resizeH) {
+            fill_const(r, modelSize, det_norm(0, padV[0]));
+            fill_const(g, modelSize, det_norm(1, padV[1]));
+            fill_const(b, modelSize, det_norm(2, padV[2]));
+            continue;
+        }
+        const int* src = argb + (size_t)(y - padTop) * resizeW;
+        fill_const(r, padL, det_norm(0, padV[0]));
+        fill_const(g, padL, det_norm(1, padV[1]));
+        fill_const(b, padL, det_norm(2, padV[2]));
+        float* __restrict rc = r + padL;
+        float* __restrict gc = g + padL;
+        float* __restrict bc = b + padL;
+        for (int x = 0; x < resizeW; x++) {
+            const int px = src[x];
+            rc[x] = det_norm(0, (px >> 16) & 0xFF);
+            gc[x] = det_norm(1, (px >> 8) & 0xFF);
+            bc[x] = det_norm(2, px & 0xFF);
+        }
+        fill_const(r + padL + resizeW, padR, det_norm(0, padV[0]));
+        fill_const(g + padL + resizeW, padR, det_norm(1, padV[1]));
+        fill_const(b + padL + resizeW, padR, det_norm(2, padV[2]));
+    }
+    return true;
+}
+
+// The one-call form, for callers that have no reason to hold the build and the
+// run apart. The Android JNI deliberately does NOT use it: it pins a Java
+// IntArray for the build and releases it before inference, so the GC is not
+// blocked across the ~250 ms extract, which needs the two halves separately.
+bool det_infer_letterboxed(DetNet* det, const int* argb, int resizeW, int resizeH, int modelSize, int padX, int padY, std::vector<float>& out) {
+    if (!det) return false;
+    ncnn::Mat in;
+    const bool built = det_build_input(argb, resizeW, resizeH, modelSize, padX, padY, in);
+    if (!built) return false;
+    return det_run(det, in, out);
 }
 
 } // namespace ppocr_ncnn

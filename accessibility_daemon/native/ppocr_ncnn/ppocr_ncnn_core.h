@@ -62,4 +62,40 @@ void det_destroy(DetNet* det);
 /// failure.
 bool det_infer(DetNet* det, const float* data, size_t dataFloats, int w, int h, std::vector<float>& out);
 
+/// det_infer's input half: copy [1,3,h,w] NCHW floats into a Mat. Split out so
+/// the cost of that copy (a 2.4 M float memcpy the letterbox path never pays)
+/// can be measured without the net's variance swamping it. Returns false on a
+/// short buffer. `in` is created or refilled in place.
+bool det_fill_input(const float* data, size_t dataFloats, int w, int h, ncnn::Mat& in);
+
+/// Build the [1,3,modelSize,modelSize] NCHW det input straight from pixels:
+/// letterbox `resizeW x resizeH` ARGB8888 content into a modelSize² canvas
+/// whose padding is pixel-128 gray, then apply the per-channel ImageNet
+/// normalisation. `argb` is resizeW*resizeH 0xAARRGGBB pixels, row-major, as
+/// Bitmap.getPixels delivers them.
+///
+/// Bit-identical to the Kotlin DET_NORM_LUT + letterbox it replaces: the
+/// normalisation is the same expression in the same order, and the padding goes
+/// through it at v=128, so no constant is assumed. The caller supplies the
+/// resize, because Android's Skia filter is the reference and must not be
+/// second-guessed — and it must also supply `padX`/`padY`, because where Skia
+/// actually lands a `(modelSize - content) / 2f` translate is a rounding
+/// convention, not a formula (it rounds the half pixel away from zero, so the
+/// content starts at `(modelSize - content + 1) / 2`).
+///
+/// `out` is created, or refilled in place when it already has the right shape —
+/// callers keep one per thread, because 9.6 MB is above glibc's mmap threshold
+/// and a fresh Mat per detect is ~2,400 first-touch page faults.
+/// Returns false on bad geometry.
+bool det_build_input(const int* argb, int resizeW, int resizeH, int modelSize, int padX, int padY, ncnn::Mat& out);
+
+/// Run the DB net on a Mat built by det_build_input (or any other prepared
+/// [1,3,modelSize,modelSize] input). Split out of det_infer so the letterbox
+/// path and the float path share one extract: the cached output name, the
+/// name-fallback list and the output guard must not exist twice.
+bool det_run(DetNet* det, const ncnn::Mat& in, std::vector<float>& out);
+
+/// det_build_input + det_run. `out` gets the raw probability map.
+bool det_infer_letterboxed(DetNet* det, const int* argb, int resizeW, int resizeH, int modelSize, int padX, int padY, std::vector<float>& out);
+
 } // namespace ppocr_ncnn
