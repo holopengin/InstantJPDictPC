@@ -291,22 +291,33 @@ fn weighted_median(xs: &[f64], ws: &[f64]) -> f64 {
 // Luminance / ink profile (shared by the whole stage)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The reference's channel mean in float32 for one run of RGB8 samples; a
+/// trailing partial sample is dropped. Published so a boundary reading a
+/// *border sample* uses the crate's own arithmetic (it is the per-pixel form
+/// of what [`luminance_from_rgb`] does to a whole crop).
+pub fn luminance_from_rgb_samples(rgb: &[u8]) -> Vec<f32> {
+    rgb.chunks_exact(3)
+        .map(|px| (px[0] as f32 + px[1] as f32 + px[2] as f32) / 3.0)
+        .collect()
+}
+
 /// RGB8 → luminance, the reference's `luminance_from_argb` uint8 path
 /// (channel mean in float32). Row-major, `w * h` samples.
 pub fn luminance_from_rgb(pixels: &[u8], w: u32, h: u32) -> Vec<f32> {
     let n = (w as usize).saturating_mul(h as usize);
     let mut out = vec![0.0f32; n];
     // zip stops at the shorter side: n samples, or whatever the buffer holds.
-    for (o, px) in out.iter_mut().zip(pixels.chunks_exact(3)) {
-        *o = (px[0] as f32 + px[1] as f32 + px[2] as f32) / 3.0;
+    for (o, v) in out.iter_mut().zip(luminance_from_rgb_samples(pixels)) {
+        *o = v;
     }
     out
 }
 
-/// Ink mask + background polarity: the border sample decides light-on-dark
-/// vs dark-on-light, then a fixed threshold pair builds the mask.
-/// Returns `(mask, background_is_light)`.
-fn ink_mask(lum: &[f32], w: usize, h: usize) -> (Vec<bool>, bool) {
+/// The border sample, at stride 7: the top/bottom row pairs first, then the
+/// left/right column pairs. The order is the median's only input, so it cannot
+/// change the result — but a boundary that measures the evidence samples the
+/// same pixels in the same order.
+pub fn ink_border_lum(lum: &[f32], w: usize, h: usize) -> Vec<f32> {
     let mut border: Vec<f32> = Vec::new();
     if h > 0 && w > 0 {
         let mut j = 0usize;
@@ -322,9 +333,26 @@ fn ink_mask(lum: &[f32], w: usize, h: usize) -> (Vec<bool>, bool) {
             i += 7;
         }
     }
-    let mut sorted = border.clone();
+    border
+}
+
+/// Background polarity from a border sample: the *true* median (the mean of
+/// the two middle values on an even count) against 128.0 — CAP's own rule,
+/// which differs from `char_boxes::snap_polarity`'s upper median; the two
+/// stages are independent, so they keep their own. Published so a boundary
+/// measuring the evidence does not restate the median.
+pub fn ink_polarity(border_lum: &[f32]) -> bool {
+    let mut sorted = border_lum.to_vec();
     sorted.sort_by(f32::total_cmp);
-    let bg_light = median(&sorted.iter().map(|&v| v as f64).collect::<Vec<_>>()) > 128.0;
+    median(&sorted.iter().map(|&v| v as f64).collect::<Vec<_>>()) > 128.0
+}
+
+/// Ink mask + background polarity: the border sample decides light-on-dark
+/// vs dark-on-light, then a fixed threshold pair builds the mask.
+/// Returns `(mask, background_is_light)`.
+fn ink_mask(lum: &[f32], w: usize, h: usize) -> (Vec<bool>, bool) {
+    let border = ink_border_lum(lum, w, h);
+    let bg_light = ink_polarity(&border);
     let mask: Vec<bool> = lum
         .iter()
         .map(|&v| if bg_light { v < 110.0 } else { v > 145.0 })
@@ -332,20 +360,197 @@ fn ink_mask(lum: &[f32], w: usize, h: usize) -> (Vec<bool>, bool) {
     (mask, bg_light)
 }
 
+/// The ink mask CAP's ink pass reduces, in whichever form the caller has it.
+///
+/// Both consumers of the mask ([`dominant_cross_band`] and [`ink_profile`])
+/// only ever *read* it, and both read the same pixels the luminance path would
+/// have thresholded, so the two forms are interchangeable by construction: the
+/// owned one is what [`ink_mask`] builds from a crop, the packed one is the
+/// 1-bit-per-pixel form a boundary can ship (8x smaller than the ARGB crop and
+/// cheaper to marshal than a single boxed float list of the same length).
+#[derive(Clone, Debug)]
+pub enum InkMask {
+    /// One `bool` per pixel, row-major.
+    Owned { mask: Vec<bool>, w: usize, h: usize },
+    /// One bit per pixel over the **global** row-major pixel index
+    /// `i = y * w + x`, **MSB-first within each byte**: pixel `i` is bit
+    /// `0x80 >> (i % 8)` of byte `i / 8`. A byte can straddle a row boundary
+    /// (when `w` is not a multiple of 8), so the bit comes from `i % 8`, never
+    /// from `x % 8` — the rows are contiguous, not byte-aligned.
+    Packed { bits: Vec<u8>, w: usize, h: usize },
+}
+
+impl InkMask {
+    /// Bytes a packed mask of `w × h` needs: one per 8 pixels, last byte
+    /// partially used. A short buffer is refused rather than read past.
+    pub fn packed_len(w: usize, h: usize) -> usize {
+        w.saturating_mul(h).div_ceil(8)
+    }
+
+    fn get(&self, x: usize, y: usize) -> bool {
+        match self {
+            InkMask::Owned { mask, w, .. } => mask[y * w + x],
+            InkMask::Packed { bits, w, .. } => {
+                let i = y * w + x;
+                bits[i / 8] & (0x80u8 >> (i % 8)) != 0
+            }
+        }
+    }
+}
+
+/// CAP's ink evidence as a boundary ships it: the background polarity plus the
+/// ink mask at 1 bit per pixel.
+///
+/// This is the *whole* image input of the ink pass — `dominant_cross_band` and
+/// `ink_profile` read nothing else — so a packed mask is not an approximation
+/// of the crop, it is the crop's ink reduced losslessly. The minimum further
+/// reduction is [`InkProfile`] (polarity + the band-restricted profile), which
+/// costs one extra crossing because the band is derived from the crop.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InkEvidence {
+    /// `true` when the border sample's median says the background is light.
+    pub bg_light: bool,
+    /// The mask, [`InkMask::Packed`]'s layout: one bit per pixel over the
+    /// global row-major index, MSB-first in each byte.
+    pub bits: Vec<u8>,
+    pub w: usize,
+    pub h: usize,
+}
+
+impl InkEvidence {
+    /// An evidence record, or `None` when `bits` is too short for `w × h`
+    /// (the spec §1.3.3 "short array skips the ink pass" rule, on the packed
+    /// form) or the frame is degenerate.
+    pub fn from_packed(bg_light: bool, bits: &[u8], w: u32, h: u32) -> Option<Self> {
+        let (w, h) = (w as usize, h as usize);
+        if w == 0 || h == 0 || bits.len() < InkMask::packed_len(w, h) {
+            return None;
+        }
+        Some(InkEvidence {
+            bg_light,
+            bits: bits.to_vec(),
+            w,
+            h,
+        })
+    }
+
+    fn mask(&self) -> InkMask {
+        InkMask::Packed {
+            bits: self.bits.clone(),
+            w: self.w,
+            h: self.h,
+        }
+    }
+}
+
+/// CAP's ink evidence reduced to its minimum: the background polarity and the
+/// **band-restricted, un-smoothed** reading-axis ink profile. The blur, the
+/// mid-quartile walks, the extents and the boundary pass are all unchanged, so
+/// a correct profile gives identical boxes to the crop path.
+///
+/// The band is *not* part of the record because the crop path does not use it
+/// after [`ink_profile`] either — it only decides which rows the counts came
+/// from. Callers that cannot afford the second crossing want
+/// [`InkEvidence`] instead.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InkProfile {
+    /// `true` when the border sample's median says the background is light.
+    pub bg_light: bool,
+    /// Ink count per reading-axis position, inside the band, un-smoothed.
+    /// Length: `crop_w` horizontal, `crop_h` vertical.
+    pub band: Vec<f32>,
+}
+
+/// The constants the evidence measurement is defined against, so a caller that
+/// reduces the crop itself (the mobile FFI boundary) reads them from here
+/// instead of hardcoding them: the two ink thresholds, the polarity threshold,
+/// the border stride and the band's minimum cross fraction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InkSpec {
+    pub ink_below: f32,
+    pub ink_above: f32,
+    pub bg_median_above: f32,
+    pub border_stride: usize,
+    /// The band's minimum cross fraction (`dominant_cross_band`'s `min_frac`).
+    pub band_min_frac: f64,
+    /// The profile box-blur radius.
+    pub profile_smooth: i32,
+    /// The largest count a count series can carry.
+    pub max_count: usize,
+    /// The exclusive upper bound of the ink channel sums on a light
+    /// background: ink is `channel sum < ink_below_sum`, so a caller can count
+    /// with an integer compare instead of a float division per pixel.
+    pub ink_below_sum: i32,
+    /// The inclusive lower bound of the ink channel sums on a dark background.
+    pub ink_above_sum: i32,
+}
+
+/// The largest count a count series can carry. A cross axis thicker than this
+/// cannot be reduced to counts and must ship the mask instead.
+pub const INK_MAX_COUNT: usize = 255;
+
+/// The shipped [`InkSpec`].
+pub fn ink_spec() -> InkSpec {
+    InkSpec {
+        ink_below: 110.0,
+        ink_above: 145.0,
+        bg_median_above: 128.0,
+        border_stride: 7,
+        band_min_frac: 0.35,
+        profile_smooth: 2,
+        max_count: INK_MAX_COUNT,
+        ink_below_sum: (110.0f32 * 3.0) as i32,
+        ink_above_sum: (145.0f32 * 3.0) as i32 + 1,
+    }
+}
+
+/// The integer ink test this crate's own float test is equivalent to, as one
+/// predicate, so a caller can share it verbatim. Pinned over every possible
+/// channel sum by `ink_spec_integer_agrees_with_float`.
+pub fn is_ink_sum(sum: i32, bg_light: bool) -> bool {
+    if bg_light {
+        sum < ink_spec().ink_below_sum
+    } else {
+        sum >= ink_spec().ink_above_sum
+    }
+}
+
+/// The band [`dominant_cross_band`] picks from these cross-axis ink counts:
+/// row indices (horizontal) or column indices (vertical), `[lo, hi)` in the
+/// same half-open convention [`ink_profile`] slices with. Published so a caller
+/// that measures the profile itself measures it in the band the algorithm will
+/// use — one crossing to ask, one to place.
+pub fn cross_band(cross: &[f64], min_frac: f64) -> (usize, usize) {
+    let n = cross.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let (lo_f, hi_f) = dominant_cross_band_from_counts(cross, min_frac);
+    // The same truncation (and the same non-empty floor) `ink_profile` applies.
+    let lo = (n as f64 * lo_f) as usize;
+    let hi = (n as f64 * hi_f) as usize;
+    (lo, hi.max(lo + 1))
+}
+
 /// Fractions `[lo, hi]` of the cross axis that hold the body text: the
 /// dominant ink run (the one containing the ink-mass median), widened until
 /// it covers `min_frac` of the cross so a sparse row is not mistaken for a
 /// thin strip. Dodges ruby and neighbouring-line ink before it can
 /// contaminate the reading-axis profile.
-fn dominant_cross_band(lum: &[f32], w: usize, h: usize, vertical: bool, min_frac: f64) -> (f64, f64) {
-    let (mask, _) = ink_mask(lum, w, h);
-    let (cross, n) = if vertical {
+fn dominant_cross_band(
+    mask: &InkMask,
+    w: usize,
+    h: usize,
+    vertical: bool,
+    min_frac: f64,
+) -> (f64, f64) {
+    let (cross, _n) = if vertical {
         // per column
         let mut c = vec![0.0f64; w];
         for x in 0..w {
             let mut m = 0.0;
             for y in 0..h {
-                if mask[y * w + x] {
+                if mask.get(x, y) {
                     m += 1.0;
                 }
             }
@@ -358,7 +563,7 @@ fn dominant_cross_band(lum: &[f32], w: usize, h: usize, vertical: bool, min_frac
         for y in 0..h {
             let mut m = 0.0;
             for x in 0..w {
-                if mask[y * w + x] {
+                if mask.get(x, y) {
                     m += 1.0;
                 }
             }
@@ -366,6 +571,15 @@ fn dominant_cross_band(lum: &[f32], w: usize, h: usize, vertical: bool, min_frac
         }
         (c, h)
     };
+    dominant_cross_band_from_counts(&cross, min_frac)
+}
+
+/// [`dominant_cross_band`] on ink counts the caller measured, split out so the
+/// band is a pure function of the cross-axis reduction. That is what lets a
+/// boundary ask for the band in one crossing ([`cross_band`]) and measure the
+/// profile in the band the answer names.
+fn dominant_cross_band_from_counts(cross: &[f64], min_frac: f64) -> (f64, f64) {
+    let n = cross.len();
     if n == 0 {
         return (0.0, 1.0);
     }
@@ -393,7 +607,7 @@ fn dominant_cross_band(lum: &[f32], w: usize, h: usize, vertical: bool, min_frac
     let total: f64 = cross.iter().sum();
     let mut cum = Vec::with_capacity(n);
     let mut acc = 0.0;
-    for &v in &cross {
+    for &v in cross {
         acc += v;
         cum.push(acc);
     }
@@ -437,14 +651,13 @@ fn dominant_cross_band(lum: &[f32], w: usize, h: usize, vertical: bool, min_frac
 /// the edges (clamping would change the profile at the line ends, where the
 /// last glyph's window lives).
 fn ink_profile(
-    lum: &[f32],
+    mask: &InkMask,
     w: usize,
     h: usize,
     vertical: bool,
     band: (f64, f64),
     smooth: i32,
 ) -> Vec<f32> {
-    let (mask, _) = ink_mask(lum, w, h);
     let (lo_f, hi_f) = band;
     let (a, mut b) = if vertical {
         let a = (w as f64 * lo_f) as usize;
@@ -465,7 +678,7 @@ fn ink_profile(
         for y in 0..h {
             let mut m = 0.0f32;
             for x in a..b {
-                if mask[y * w + x] {
+                if mask.get(x, y) {
                     m += 1.0;
                 }
             }
@@ -475,13 +688,21 @@ fn ink_profile(
         for x in 0..w {
             let mut m = 0.0f32;
             for y in a..b {
-                if mask[y * w + x] {
+                if mask.get(x, y) {
                     m += 1.0;
                 }
             }
             prof[x] = m;
         }
     }
+    smooth_profile(prof, smooth)
+}
+
+/// The profile's *zero-padded* box blur, split out because [`InkProfile`]
+/// ships a band-restricted, un-smoothed series that has to be blurred exactly
+/// the same way (the profile is the only thing downstream reads).
+fn smooth_profile(mut prof: Vec<f32>, smooth: i32) -> Vec<f32> {
+    let len = prof.len();
     if smooth > 0 {
         let m = (2 * smooth + 1) as usize;
         let half = smooth as usize;
@@ -1036,6 +1257,156 @@ pub fn place_with(
     steps: Option<&[Vec<(char, f64)>]>,
     opts: &Options,
 ) -> Vec<[f64; 4]> {
+    // Guard rails (spec §1.3.3): wrong-shaped or short pixels skip the ink
+    // pass; so does a crop too small for a meaningful profile.
+    let prof = lum.and_then(|(p, w, h)| {
+        if w != crop_w || h != crop_h || w < 8 || h < 8 {
+            return None;
+        }
+        let (w, h) = (w as usize, h as usize);
+        if p.len() != w.saturating_mul(h) {
+            return None;
+        }
+        let (mask, _bg_light) = ink_mask(p, w, h);
+        let mask = InkMask::Owned { mask, w, h };
+        let band = dominant_cross_band(&mask, w, h, vertical, 0.35);
+        Some(ink_profile(
+            &mask,
+            w,
+            h,
+            vertical,
+            band,
+            opts.profile_smooth,
+        ))
+    });
+    place_core(
+        text,
+        char_cols,
+        seq_len_total,
+        crop_w,
+        crop_h,
+        vertical,
+        prof,
+        steps,
+        opts,
+    )
+}
+
+/// [`place_with`] on an [`InkEvidence`]: the packed ink mask instead of the
+/// crop's luminance. One crossing instead of `crop_w * crop_h` ARGB ints (the
+/// mask is 1 bit per pixel and the image is the ink pass's *only* input, so
+/// the boxes are identical — the same claim
+/// `ink_profile`+`dominant_cross_band` already rest on), which is what the
+/// mobile boundary ships. `steps` and every knob behave as in [`place_with`].
+#[allow(clippy::too_many_arguments)]
+pub fn place_with_evidence(
+    text: &str,
+    char_cols: &[f32],
+    seq_len_total: usize,
+    crop_w: u32,
+    crop_h: u32,
+    vertical: bool,
+    evidence: Option<&InkEvidence>,
+    steps: Option<&[Vec<(char, f64)>]>,
+    opts: &Options,
+) -> Vec<[f64; 4]> {
+    // The same guard rails: a missing record, a frame mismatch, a sub-8px crop
+    // or a short mask buffer all skip the ink pass instead of reading past.
+    let prof = evidence.and_then(|ev| {
+        if ev.w != crop_w as usize
+            || ev.h != crop_h as usize
+            || crop_w < 8
+            || crop_h < 8
+            || ev.bits.len() < InkMask::packed_len(ev.w, ev.h)
+        {
+            return None;
+        }
+        let mask = ev.mask();
+        let band = dominant_cross_band(&mask, ev.w, ev.h, vertical, 0.35);
+        Some(ink_profile(
+            &mask,
+            ev.w,
+            ev.h,
+            vertical,
+            band,
+            opts.profile_smooth,
+        ))
+    });
+    place_core(
+        text,
+        char_cols,
+        seq_len_total,
+        crop_w,
+        crop_h,
+        vertical,
+        prof,
+        steps,
+        opts,
+    )
+}
+
+/// [`place_with`] on an [`InkProfile`] — the ink evidence reduced all the way
+/// to what the stage reads: the background polarity and the band-restricted,
+/// un-smoothed reading-axis counts. The blur, the anchor refinement, the
+/// measured extents and the boundary pass are [`place_with`]'s own.
+///
+/// A correct profile gives identical boxes; the profile's length must be the
+/// reading axis (`crop_w` horizontal, `crop_h` vertical) and a sub-8px crop
+/// skips the ink pass, exactly as above.
+#[allow(clippy::too_many_arguments)]
+pub fn place_with_profile(
+    text: &str,
+    char_cols: &[f32],
+    seq_len_total: usize,
+    crop_w: u32,
+    crop_h: u32,
+    vertical: bool,
+    profile: Option<&InkProfile>,
+    steps: Option<&[Vec<(char, f64)>]>,
+    opts: &Options,
+) -> Vec<[f64; 4]> {
+    let prof_len = if vertical { crop_h } else { crop_w } as usize;
+    let prof = profile.and_then(|p| {
+        if crop_w < 8 || crop_h < 8 || p.band.len() != prof_len {
+            return None;
+        }
+        if p.band.iter().any(|&c| c >= INK_MAX_COUNT as f32) {
+            // A saturated count means the band was too thick to reduce; the
+            // crop path would have used real pixels, so refuse rather than
+            // place on wrong counts.
+            return None;
+        }
+        Some(smooth_profile(p.band.clone(), opts.profile_smooth))
+    });
+    place_core(
+        text,
+        char_cols,
+        seq_len_total,
+        crop_w,
+        crop_h,
+        vertical,
+        prof,
+        steps,
+        opts,
+    )
+}
+
+/// The stage body, with the ink pass already resolved into `prof` (the
+/// smoothed reading-axis profile, or `None` for the no-ink pass). This is the
+/// reference `proposed_char_boxes` from step 1 on; every entry above differs
+/// only in how it produced `prof`.
+#[allow(clippy::too_many_arguments)]
+fn place_core(
+    text: &str,
+    char_cols: &[f32],
+    seq_len_total: usize,
+    crop_w: u32,
+    crop_h: u32,
+    vertical: bool,
+    prof: Option<Vec<f32>>,
+    steps: Option<&[Vec<(char, f64)>]>,
+    opts: &Options,
+) -> Vec<[f64; 4]> {
     let text_chars: Vec<char> = text.chars().collect();
     let n = text_chars.len();
     if n == 0 || seq_len_total == 0 {
@@ -1101,27 +1472,8 @@ pub fn place_with(
         })
         .collect();
 
-    // 3. Ink evidence --------------------------------------------------------
-    let prof: Option<Vec<f32>> = lum.and_then(|(p, w, h)| {
-        // Guard rails (spec §1.3.3): wrong-shaped or short pixels skip the
-        // ink pass; so does a crop too small for a meaningful profile.
-        if w != crop_w || h != crop_h || w < 8 || h < 8 {
-            return None;
-        }
-        if p.len() != (w as usize).saturating_mul(h as usize) {
-            return None;
-        }
-        let band = dominant_cross_band(p, w as usize, h as usize, vertical, 0.35);
-        Some(ink_profile(
-            p,
-            w as usize,
-            h as usize,
-            vertical,
-            band,
-            opts.profile_smooth,
-        ))
-    });
-
+    // 3. Ink evidence is already resolved into `prof` (step 3 of the
+    //    reference, run by the entry point) -------------------------------
     let mut centers = anchors.clone();
     if let Some(prof) = &prof {
         // Voronoi window masses (before refinement) for the mass gate.
@@ -1475,5 +1827,366 @@ mod tests {
         assert!(h.iter().all(|b| b[1] == 0.0 && b[3] == 120.0));
         let v = place("あい", &[0.0, 1.0], 2, 40, 120, true, Some((&lum, 40, 120)), None);
         assert!(v.iter().all(|b| b[0] == 0.0 && b[2] == 40.0));
+    }
+
+    // ─── ink evidence: crop luminance vs. the packed mask vs. the profile ────
+
+    /// A line crop's luminance: paper background, one ink blob per glyph, plus
+    /// a ruby-ish strip outside the body band so the band's choice is
+    /// load-bearing. `invert` gives the light-on-dark polarity.
+    fn cap_crop(w: usize, h: usize, glyphs: &[(usize, usize)], height: usize, invert: bool) -> Vec<f32> {
+        let mut lum = vec![255.0f32; w * h];
+        let paint = |lum: &mut Vec<f32>, x: usize, y: usize, v: f32| lum[y * w + x] = v;
+        for &(c0, c1) in glyphs {
+            for x in c0..(c1 + 3).min(w) {
+                for y in 2..(2 + height).min(h) {
+                    paint(&mut lum, x, y, 32.0);
+                }
+            }
+        }
+        // Ink in the extreme edges (ruby / the neighbouring line): the band has
+        // to exclude it, so a wrong band shows up as different boxes.
+        for x in 0..w {
+            paint(&mut lum, x, 0, 32.0);
+            paint(&mut lum, x, h - 1, 32.0);
+        }
+        if invert {
+            for v in lum.iter_mut() {
+                *v = 255.0 - *v;
+            }
+        }
+        lum
+    }
+
+    /// What a boundary measures: the border sample's polarity and the mask at
+    /// 1 bit per pixel. Deliberately written as the *caller's* job (luminance
+    /// in, packed bits out) rather than by calling the crate's own helpers, so
+    /// the test pins the reduction itself and not a tautology.
+    fn measure_evidence(lum: &[f32], w: usize, h: usize) -> (bool, Vec<u8>) {
+        let spec = ink_spec();
+        let mut border: Vec<f32> = Vec::new();
+        let mut j = 0usize;
+        while j < w {
+            border.push(lum[j]);
+            border.push(lum[(h - 1) * w + j]);
+            j += spec.border_stride;
+        }
+        let mut i = 0usize;
+        while i < h {
+            border.push(lum[i * w]);
+            border.push(lum[i * w + w - 1]);
+            i += spec.border_stride;
+        }
+        let mut sorted = border.clone();
+        sorted.sort_by(f32::total_cmp);
+        // The crate's median: the mean of the two middle values on an even count.
+        let n = sorted.len();
+        let med = if n % 2 == 1 {
+            sorted[n / 2] as f64
+        } else {
+            0.5 * (sorted[n / 2 - 1] as f64 + sorted[n / 2] as f64)
+        };
+        let bg_light = med > spec.bg_median_above as f64;
+        let mut bits = vec![0u8; InkMask::packed_len(w, h)];
+        for y in 0..h {
+            for x in 0..w {
+                let v = lum[y * w + x];
+                let ink = if bg_light {
+                    v < spec.ink_below
+                } else {
+                    v > spec.ink_above
+                };
+                if ink {
+                    let i = y * w + x;
+                    bits[i / 8] |= 0x80u8 >> (i % 8);
+                }
+            }
+        }
+        (bg_light, bits)
+    }
+
+    /// And the minimum reduction: the same polarity, the cross-axis counts, and
+    /// (in the band the crate's own `cross_band` names) the reading-axis
+    /// counts. Two crossings on a real boundary, one function here.
+    fn measure_profile(
+        lum: &[f32],
+        w: usize,
+        h: usize,
+        vertical: bool,
+    ) -> (InkProfile, (usize, usize)) {
+        let (bg_light, bits) = measure_evidence(lum, w, h);
+        let mask = InkMask::Packed { bits, w, h };
+        let (cross_len, read_len) = if vertical { (w, h) } else { (h, w) };
+        let mut cross = vec![0.0f64; cross_len];
+        for k in 0..cross_len {
+            let mut m = 0.0f64;
+            for j in 0..read_len {
+                let ink = if vertical {
+                    mask.get(k, j)
+                } else {
+                    mask.get(j, k)
+                };
+                if ink {
+                    m += 1.0;
+                }
+            }
+            cross[k] = m;
+        }
+        let (lo, hi) = cross_band(&cross, ink_spec().band_min_frac);
+        let mut band = vec![0.0f32; read_len];
+        for r in 0..read_len {
+            let mut m = 0.0f32;
+            for c in lo..hi.min(cross_len) {
+                let ink = if vertical {
+                    mask.get(c, r)
+                } else {
+                    mask.get(r, c)
+                };
+                if ink {
+                    m += 1.0;
+                }
+            }
+            band[r] = m;
+        }
+        (InkProfile { bg_light, band }, (lo, hi))
+    }
+
+    /// The evidence entries are pure re-plumbing of the crop entry: a packed
+    /// mask measured from the crop must place *identical* boxes, and so must
+    /// the minimum profile. The sweep covers both orientations, both
+    /// polarities, edge ink that forces a real band, crop shapes from
+    /// single-glyph to many, with and without `steps`.
+    #[test]
+    fn evidence_and_profile_entries_match_the_crop_entry_bit_for_bit() {
+        let mut state = 0xc0ffee_1234u64;
+        let lcg = move |n: &mut u64| -> u32 {
+            *n = n.wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*n >> 33) as u32
+        };
+        let mut checked = 0;
+        for case in 0..64usize {
+            let vertical = case % 4 == 0;
+            let (read, cross) = if vertical {
+                (40 + (lcg(&mut state) as usize % 200), 16 + (lcg(&mut state) as usize % 60))
+            } else {
+                (40 + (lcg(&mut state) as usize % 200), 16 + (lcg(&mut state) as usize % 60))
+            };
+            let (w, h) = if vertical { (cross, read) } else { (read, cross) };
+            let n = 2 + (lcg(&mut state) as usize % 9);
+            let pitch = (read / n).max(6);
+            let glyphs: Vec<(usize, usize)> = (0..n)
+                .map(|i| (i * pitch + 1 + (lcg(&mut state) as usize % 3), i * pitch + pitch / 2))
+                .collect();
+            let lum = cap_crop(read, cross, &glyphs, (cross * 2 / 3).max(3), case % 2 == 1);
+            let text: String = "あいうえおかきくけこさしすせそ".chars().take(n).collect();
+            let cols: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            let steps: Option<Vec<Vec<(char, f64)>>> = if case % 3 == 0 {
+                None
+            } else {
+                Some(
+                    (0..(n + 2))
+                        .map(|t| {
+                            let ch = if t % 3 == 2 {
+                                BLANK
+                            } else {
+                                text.chars().nth(t % n).unwrap_or(BLANK)
+                            };
+                            vec![(ch, 4.0 - (t % 3) as f64 * 0.5), ('あ', 1.0)]
+                        })
+                        .collect(),
+                )
+            };
+            let seq = n + 2;
+            let opts = Options::default();
+            let (bg_light, bits) = measure_evidence(&lum, w, h);
+            let ev = InkEvidence::from_packed(bg_light, &bits, w as u32, h as u32)
+                .expect("a full frame yields evidence");
+            let (prof, band) = measure_profile(&lum, w, h, vertical);
+            let via_crop = place_with(
+                &text, &cols, seq, w as u32, h as u32, vertical,
+                Some((&lum, w as u32, h as u32)), steps.as_deref(), &opts,
+            );
+            let via_mask = place_with_evidence(
+                &text, &cols, seq, w as u32, h as u32, vertical,
+                Some(&ev), steps.as_deref(), &opts,
+            );
+            assert_eq!(
+                via_crop, via_mask,
+                "packed mask diverged: case {case} w={w} h={h} n={n} vert={vertical} band={band:?}"
+            );
+            let via_prof = place_with_profile(
+                &text, &cols, seq, w as u32, h as u32, vertical,
+                Some(&prof), steps.as_deref(), &opts,
+            );
+            assert_eq!(
+                via_crop, via_prof,
+                "minimum profile diverged: case {case} w={w} h={h} n={n} vert={vertical} band={band:?}"
+            );
+            // The fixture must actually be exercising the ink pass, or the
+            // equality above is vacuous.
+            let no_ink = place_with(
+                &text, &cols, seq, w as u32, h as u32, vertical, None, steps.as_deref(), &opts,
+            );
+            if via_crop != no_ink {
+                checked += 1;
+            }
+        }
+        assert!(checked >= 16, "only {checked} cases moved boxes; sweep too weak");
+    }
+
+    /// The guards: a missing record, a short mask buffer, a wrong-shaped
+    /// profile and a sub-8px crop all skip the ink pass (the template-only
+    /// boxes), never read past the buffer and never panic.
+    #[test]
+    fn evidence_entries_keep_the_crop_guards() {
+        let (w, h) = (200usize, 44usize);
+        let glyphs = vec![(10usize, 14usize), (50, 54), (90, 94), (130, 134), (170, 174)];
+        let lum = cap_crop(w, h, &glyphs, 24, false);
+        let text = "あいうえお";
+        let cols = [0.0f32, 1.0, 2.0, 3.0, 4.0];
+        let opts = Options::default();
+        let inked = place_with(
+            text, &cols, 6, w as u32, h as u32, false,
+            Some((&lum, w as u32, h as u32)), None, &opts,
+        );
+        let bare = place_with(text, &cols, 6, w as u32, h as u32, false, None, None, &opts);
+        assert_ne!(inked, bare, "the fixture must move boxes");
+        let (bg_light, bits) = measure_evidence(&lum, w, h);
+        let good = InkEvidence::from_packed(bg_light, &bits, w as u32, h as u32).unwrap();
+        // A short buffer: no ink pass.
+        let short = InkEvidence::from_packed(bg_light, &bits[..bits.len() - 1], w as u32, h as u32);
+        assert!(short.is_none(), "a short mask is refused outright");
+        // A frame mismatch: no ink pass (the record is for another crop).
+        assert_eq!(
+            place_with_evidence(
+                text, &cols, 6, w as u32, h as u32, false,
+                Some(&good), None, &opts,
+            ),
+            inked
+        );
+        // (The comparison frame has to be the *wider* one: the box geometry
+        // reads `crop_w` through the CTC stride, so the template-only boxes of
+        // a 202px frame are not the template-only boxes of a 200px one.)
+        let bare_wide =
+            place_with(text, &cols, 6, (w + 2) as u32, h as u32, false, None, None, &opts);
+        assert_eq!(
+            place_with_evidence(
+                text, &cols, 6, (w + 2) as u32, h as u32, false,
+                Some(&good), None, &opts,
+            ),
+            bare_wide,
+            "an evidence record for another frame skips the ink pass"
+        );
+        // A wrong-shaped profile: no ink pass. A saturated count: refused.
+        let mut p = InkProfile {
+            bg_light,
+            band: vec![1.0; w],
+        };
+        p.band.pop();
+        assert_eq!(
+            place_with_profile(text, &cols, 6, w as u32, h as u32, false, Some(&p), None, &opts),
+            bare
+        );
+        let mut sat = InkProfile {
+            bg_light,
+            band: vec![1.0; w],
+        };
+        sat.band[3] = INK_MAX_COUNT as f32;
+        assert_eq!(
+            place_with_profile(text, &cols, 6, w as u32, h as u32, false, Some(&sat), None, &opts),
+            bare,
+            "a saturated count is refused rather than placed on"
+        );
+        // Sub-8px crops skip the ink pass on every entry.
+        let tiny = vec![0.0f32; 4 * 4];
+        let tiny_ev = InkEvidence::from_packed(true, &[0u8; 2], 4, 4);
+        assert!(tiny_ev.is_some(), "packing still describes a 4x4 frame");
+        assert_eq!(
+            place_with("あい", &[0.0, 1.0], 2, 4, 4, false, Some((&tiny, 4, 4)), None, &opts),
+            place_with_evidence(
+                "あい", &[0.0, 1.0], 2, 4, 4, false, tiny_ev.as_ref(), None, &Options::default(),
+            )
+        );
+        assert_eq!(
+            place_with("あい", &[0.0, 1.0], 2, 4, 4, false, Some((&tiny, 4, 4)), None, &opts),
+            place_with_profile(
+                "あい", &[0.0, 1.0], 2, 4, 4, false,
+                Some(&InkProfile { bg_light: true, band: vec![0.0; 4] }), None, &Options::default(),
+            )
+        );
+    }
+
+    /// The published integer ink test is the float one, exactly, for every
+    /// possible channel sum: the facade can pack the mask with integer
+    /// compares and still place the same boxes.
+    #[test]
+    fn ink_spec_integer_agrees_with_float() {
+        let spec = ink_spec();
+        assert_eq!(spec.ink_below_sum, 330);
+        assert_eq!(spec.ink_above_sum, 436);
+        for sum in 0..=765i32 {
+            let lum = sum as f32 / 3.0;
+            assert_eq!(
+                is_ink_sum(sum, true),
+                lum < spec.ink_below,
+                "light background, sum {sum}"
+            );
+            assert_eq!(
+                is_ink_sum(sum, false),
+                lum > spec.ink_above,
+                "dark background, sum {sum}"
+            );
+        }
+    }
+
+    /// The published measurement constants, the packed-mask length arithmetic
+    /// and the band probe — the numbers a boundary reads instead of hardcoding.
+    #[test]
+    fn ink_spec_and_band_probe_are_the_documented_reduction() {
+        let spec = ink_spec();
+        assert_eq!(spec.ink_below, 110.0);
+        assert_eq!(spec.ink_above, 145.0);
+        assert_eq!(spec.bg_median_above, 128.0);
+        assert_eq!(spec.border_stride, 7);
+        assert_eq!(spec.band_min_frac, 0.35);
+        assert_eq!(spec.profile_smooth, 2);
+        assert_eq!(spec.max_count, INK_MAX_COUNT);
+        assert_eq!(InkMask::packed_len(0, 0), 0);
+        assert_eq!(InkMask::packed_len(1, 1), 1);
+        assert_eq!(InkMask::packed_len(8, 1), 1);
+        assert_eq!(InkMask::packed_len(9, 1), 2);
+        assert_eq!(InkMask::packed_len(568, 60), 4260);
+        // A mask with an even number of pixels still gets a final partial byte.
+        let mut bits = vec![0u8; InkMask::packed_len(3, 1)];
+        bits[0] = 0b1010_0000;
+        let ev = InkEvidence::from_packed(false, &bits, 3, 1).unwrap();
+        let m = ev.mask();
+        assert!(m.get(0, 0) && !m.get(1, 0) && m.get(2, 0), "MSB-first per pixel");
+        // A byte straddles a row boundary when w is not a multiple of 8, so the
+        // bit comes from the *global* index, not from x: 10-wide rows put row 1's
+        // first pixels in the same byte as row 0's last ones.
+        let bits = {
+            let mut b = vec![0u8; InkMask::packed_len(10, 2)];
+            b[0] |= 0x80u8 >> 0; // (0,0)
+            b[1] |= 0x80u8 >> 2; // i = 10 -> byte 1, bit 2
+            b
+        };
+        let m = InkEvidence::from_packed(false, &bits, 10, 2).unwrap().mask();
+        assert!(m.get(0, 0) && !m.get(9, 0) && m.get(0, 1) && !m.get(9, 1));
+        // The band probe: a full cross axis has no ink anywhere → the whole
+        // axis (the crate's own "no runs" bail), and a centred blob gives the
+        // band the mask's own ink occupies.
+        assert_eq!(cross_band(&[], 0.35), (0, 0));
+        assert_eq!(cross_band(&[0.0; 40], 0.35), (0, 40));
+        assert_eq!(
+            cross_band(&[0.0, 0.0, 8.0, 9.0, 0.0], 0.35),
+            (2, 4),
+            "the band is the blob's own run, widened only until min_frac is met"
+        );
+        // Two runs and a gap narrower than the minimum: they merge, so the
+        // band spans the gap (the ruby/Neighbouring-line dodge is a *merge*,
+        // never a trim of the dominant run).
+        assert_eq!(cross_band(&[9.0, 0.0, 0.0, 0.0, 8.0], 0.35), (0, 5));
     }
 }
