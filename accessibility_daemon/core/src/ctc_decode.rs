@@ -32,6 +32,16 @@ pub struct CtcDecodeResult {
     pub seq_len_total: usize,
     /// Top-K alternatives for every timestep, including blanks.
     pub raw_alternatives: Vec<Vec<(char, f32)>>,
+    /// The timestep each emitted character's alternatives came from, so
+    /// `alternatives[j] == raw_alternatives[alt_rows[j]]`.
+    ///
+    /// The greedy walk pushes the row it just built into both lists in the
+    /// same iteration, so the indices are recorded as it goes: strictly
+    /// ascending, in range, and exact for any input (including the malformed
+    /// ones that push an empty raw row). They let a boundary carry the emitted
+    /// list as one integer per character instead of re-crossing `top_k` cells
+    /// it already received — see the Android shim's flat result record.
+    pub alt_rows: Vec<usize>,
 }
 
 impl CtcDecodeResult {
@@ -42,6 +52,34 @@ impl CtcDecodeResult {
             char_cols: Vec::new(),
             seq_len_total,
             raw_alternatives: Vec::new(),
+            alt_rows: Vec::new(),
+        }
+    }
+
+    /// Vertical-line punctuation at emit time (#56, #63).
+    ///
+    /// PP-OCR emits ASCII `?` where Japanese text wants fullwidth `？`, and the
+    /// horizontal `…`/`‥` where vertical text wants `︙`/`︰`; all three lack a
+    /// `vert` alternate and mis-centre in the vertical em box. Dictionary lookup
+    /// folds them back ([`crate::util::japanese::normalize`]), so the
+    /// substitution is lookup-safe.
+    ///
+    /// The rule is a fixed **1:1** character substitution, so folding it in
+    /// here is byte-identical to mapping the rows on the host after the decode
+    /// and needs no second pass: `char_cols`, `seq_len_total`, `alt_rows` and
+    /// every list's shape are untouched, and the mapping is idempotent (a
+    /// vertical line whose rows are already normalised is left alone).
+    /// Horizontal lines do not ask for this — a horizontal `?` stays `?`.
+    pub fn apply_vertical_punctuation(&mut self) {
+        self.text = crate::util::japanese::vertical_punctuation(&self.text);
+        for row in self
+            .alternatives
+            .iter_mut()
+            .chain(self.raw_alternatives.iter_mut())
+        {
+            for (c, _) in row.iter_mut() {
+                *c = crate::util::japanese::vertical_punctuation_char(*c);
+            }
         }
     }
 }
@@ -186,6 +224,7 @@ where
     let mut alternatives: Vec<Vec<(char, f32)>> = Vec::new();
     let mut char_cols: Vec<f32> = Vec::new();
     let mut raw_alternatives: Vec<Vec<(char, f32)>> = Vec::with_capacity(seq_len);
+    let mut alt_rows: Vec<usize> = Vec::new();
     let mut prev_class = BLANK_CLASS;
 
     for t in 0..seq_len {
@@ -213,6 +252,7 @@ where
             prev_class = SPACE_CLASS;
             char_cols.push(t_frac);
             alternatives.push(indexed);
+            alt_rows.push(t);
         } else if class_idx == prev_class {
             // Collapse a repeated non-blank class.
         } else {
@@ -221,6 +261,7 @@ where
                 text.push(ch);
                 char_cols.push(t_frac);
                 alternatives.push(indexed);
+                alt_rows.push(t);
                 prev_class = class_idx;
             }
         }
@@ -232,6 +273,7 @@ where
         char_cols,
         seq_len_total: seq_len,
         raw_alternatives,
+        alt_rows,
     }
 }
 
@@ -514,6 +556,128 @@ mod tests {
         assert_eq!(res.raw_alternatives.len(), steps.len());
         assert!(res.raw_alternatives.iter().all(|row| row.len() == 3));
         assert_eq!(res.raw_alternatives[2][0], ('\u{3000}', 0.95));
+    }
+
+    /// The recorded `alt_rows` is exactly the identity a boundary relies on:
+    /// `alternatives[j] == raw_alternatives[alt_rows[j]]`, ascending and in
+    /// range, including for the collapsed repeats, the blanks and the emitted
+    /// spaces. This is what lets the Android result carry the emitted list as
+    /// one integer per character.
+    #[test]
+    fn alt_rows_index_back_into_the_raw_rows_exactly() {
+        let steps: &[&[(i32, f32)]] = &[
+            &[(1, 0.9), (2, 0.5), (0, 0.1)],
+            &[(1, 0.8), (2, 0.3), (0, 0.2)], // repeat: collapsed, no row recorded
+            &[(0, 0.95), (1, 0.4), (2, 0.2)], // blank: no row recorded
+            &[(1, 0.7), (3, 0.6), (0, 0.1)],
+            &[(18709, 0.6), (1, 0.5), (0, 0.1)], // space: recorded
+            &[(18709, 0.5), (2, 0.4), (0, 0.1)], // space again: recorded
+            &[(2, 0.9), (0, 0.3), (1, 0.1)],
+        ];
+        let v = vocab();
+        let remap: Vec<i32> = (0..=TEST_VOCAB.len() as i32).collect();
+        let res = ctc_decode_topk(&v, &remap, &packed_steps(steps, 3), steps.len(), 3);
+        assert_eq!(res.alt_rows, vec![0, 3, 4, 5, 6]);
+        assert_eq!(res.alt_rows.len(), res.alternatives.len());
+        assert_eq!(res.alt_rows.len(), res.char_cols.len());
+        for (j, &t) in res.alt_rows.iter().enumerate() {
+            assert!(t < res.raw_alternatives.len());
+            assert_eq!(res.alternatives[j], res.raw_alternatives[t]);
+        }
+        // Strictly ascending: an emitted row can never be recorded twice.
+        assert!(res.alt_rows.windows(2).all(|w| w[0] < w[1]));
+        // A failed-closed decode records nothing and stays self-consistent.
+        let bad = ctc_decode_topk(&v, &remap, &[], 3, 3);
+        assert!(bad.alt_rows.is_empty());
+        assert_eq!(bad, ctc_decode_topk(&v, &remap, &[], 3, 3));
+    }
+
+    /// Folding the vertical punctuation into the decode is byte-identical to
+    /// mapping the rows on the host afterwards, on every field the boundary
+    /// carries: the text, both alternative lists, the columns and the length.
+    /// The three substitutions are 1:1, so nothing shifts.
+    #[test]
+    fn vertical_punctuation_folds_into_the_rows_without_moving_anything() {
+        // A vocabulary carrying all three source characters plus one that is
+        // not substituted, so the no-op case is in the same fixture.
+        let v: Vec<String> = ['?', '…', '‥', 'a', 'あ']
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        // class i+1 -> v[i]: 1='?', 2='…', 3='‥', 4='a', 5='あ'.
+        let remap: Vec<i32> = (0..=5).collect();
+        let steps: &[&[(i32, f32)]] = &[
+            &[(1, 0.9), (4, 0.4), (0, 0.1)], // '?'
+            &[(2, 0.8), (1, 0.3), (0, 0.2)], // '…'
+            &[(3, 0.7), (2, 0.2), (0, 0.1)], // '‥'
+            &[(4, 0.6), (3, 0.2), (0, 0.1)], // 'a' — not a substitution
+            &[(5, 0.5), (4, 0.2), (0, 0.1)], // 'あ'
+        ];
+        let packed = packed_steps(steps, 3);
+        let horizontal = ctc_decode_topk(&v, &remap, &packed, steps.len(), 3);
+        assert_eq!(horizontal.text, "?…‥aあ");
+
+        let mut vertical = horizontal.clone();
+        vertical.apply_vertical_punctuation();
+        assert_eq!(vertical.text, "？︙︰aあ");
+        // Only the characters moved: columns, length and row bookkeeping.
+        assert_eq!(vertical.char_cols, horizontal.char_cols);
+        assert_eq!(vertical.seq_len_total, horizontal.seq_len_total);
+        assert_eq!(vertical.alt_rows, horizontal.alt_rows);
+        assert_eq!(vertical.alternatives.len(), horizontal.alternatives.len());
+        assert_eq!(
+            vertical.raw_alternatives.len(),
+            horizontal.raw_alternatives.len()
+        );
+        // Every cell in both lists went through the same character map, and the
+        // scores were left alone.
+        let map = |r: &Vec<Vec<(char, f32)>>| -> Vec<Vec<char>> {
+            r.iter().map(|row| row.iter().map(|(c, _)| *c).collect()).collect()
+        };
+        assert_eq!(
+            map(&vertical.alternatives),
+            vec![
+                vec!['？', 'a', '\u{3000}'],
+                vec!['︙', '？', '\u{3000}'],
+                vec!['︰', '︙', '\u{3000}'],
+                vec!['a', '︰', '\u{3000}'],
+                vec!['あ', 'a', '\u{3000}'],
+            ]
+        );
+        assert_eq!(
+            map(&vertical.raw_alternatives),
+            vec![
+                vec!['？', 'a', '\u{3000}'],
+                vec!['︙', '？', '\u{3000}'],
+                vec!['︰', '︙', '\u{3000}'],
+                vec!['a', '︰', '\u{3000}'],
+                vec!['あ', 'a', '\u{3000}'],
+            ]
+        );
+        for (row, orig) in vertical.raw_alternatives.iter().zip(&horizontal.raw_alternatives) {
+            for ((c, s), (oc, os)) in row.iter().zip(orig) {
+                assert_eq!(s, os, "a score must never move");
+                assert_eq!(
+                    *c,
+                    crate::util::japanese::vertical_punctuation_char(*oc),
+                    "each cell is its own source character mapped once"
+                );
+            }
+        }
+
+        // Idempotent, and identical to mapping the horizontal result by hand —
+        // the exact operation the host used to run after the decode.
+        let mut twice = vertical.clone();
+        twice.apply_vertical_punctuation();
+        assert_eq!(twice, vertical);
+        let mut by_hand = horizontal.clone();
+        by_hand.text = crate::util::japanese::vertical_punctuation(&by_hand.text);
+        for row in by_hand.alternatives.iter_mut().chain(by_hand.raw_alternatives.iter_mut()) {
+            for (c, _) in row.iter_mut() {
+                *c = crate::util::japanese::vertical_punctuation_char(*c);
+            }
+        }
+        assert_eq!(by_hand, vertical);
     }
 
     #[test]

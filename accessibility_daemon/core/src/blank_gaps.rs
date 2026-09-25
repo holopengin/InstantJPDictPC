@@ -183,11 +183,34 @@ fn geometry_of(line: &LineResult) -> Option<(Vec<f32>, f32)> {
         return Some((line.char_cols.clone(), px_per_timestep));
     }
 
-    let derived = timestep_columns(&line.raw_alternatives);
-    if derived.len() != n {
-        return None;
+    // Last resort: walk the raw per-timestep lists. Reached only under
+    // [`needs_raw_alternatives`], which is the same predicate a host asks
+    // before handing those lists over.
+    if needs_raw_alternatives(&line.text, line.char_boxes.len(), line.char_cols.len()) {
+        let derived = timestep_columns(&line.raw_alternatives);
+        if derived.len() == n {
+            return Some((derived, px_per_timestep));
+        }
     }
-    Some((derived, px_per_timestep))
+    None
+}
+
+/// Whether the detector's geometry reaches the `raw_alternatives` walk: the
+/// char boxes do not cover the text and the CTC columns do not either, so the
+/// per-timestep top-K lists are the only source left.
+///
+/// This is the detector's source *precedence*, not its threshold: a host that
+/// wants to know whether it must hand those lists over (they are the largest
+/// per-line payload a recognised line carries) can ask first and skip building
+/// them when the answer is `false` — which is every line whose char boxes the
+/// layout stage already produced.
+pub fn needs_raw_alternatives(
+    text: &str,
+    char_boxes_len: usize,
+    char_cols_len: usize,
+) -> bool {
+    let n = text.chars().count();
+    n > 0 && char_boxes_len < n && char_cols_len != n
 }
 
 /// Mobile `GapDetector.pixelPerTimestep`: pixels per CTC timestep along the
@@ -344,55 +367,21 @@ pub fn with_gap_char_at(
     if index > chars.len() {
         return line.clone();
     }
-
-    let mut text: String = chars[..index].iter().collect();
-    text.push(GAP_CHAR);
-    text.extend(chars[index..].iter());
-
-    let char_boxes = if line.char_boxes.len() == chars.len() && !line.char_boxes.is_empty() {
-        let mut out = line.char_boxes.clone();
-        out.insert(
-            index,
-            interpolate_gap_box(&line.char_boxes, index, line.is_vertical),
-        );
-        out
-    } else {
-        line.char_boxes.clone()
-    };
-
-    let alternatives = if line.alternatives.len() == chars.len() && !line.alternatives.is_empty() {
-        let mut out = line.alternatives.clone();
-        out.insert(
-            index,
-            gap_alternatives.unwrap_or_else(|| vec![(GAP_CHAR, 0.0)]),
-        );
-        out
-    } else {
-        line.alternatives.clone()
-    };
-
-    let char_cols = if !line.char_cols.is_empty() && line.char_cols.len() == chars.len() {
-        let mut out = line.char_cols.clone();
-        out.insert(index, column);
-        out
-    } else {
-        line.char_cols.clone()
-    };
-
-    let mut overrides: BTreeMap<i32, (char, f32)> = BTreeMap::new();
-    for (key, value) in &line.overrides {
-        let key = if *key >= index as i32 { *key + 1 } else { *key };
-        overrides.insert(key, *value);
-    }
-
-    LineResult {
-        text,
-        char_boxes,
-        alternatives,
-        char_cols,
-        overrides,
-        ..line.clone()
-    }
+    materialise_gap_plan(
+        line,
+        &single_gap_plan(
+            line,
+            chars.len(),
+            GapInsertion {
+                index,
+                column,
+                placeholder_box: interpolate_gap_box(&line.char_boxes, index, line.is_vertical),
+                ratio: 0.0,
+                span_px: 0.0,
+                gap_alternatives,
+            },
+        ),
+    )
 }
 
 /// Mobile `LineResult.withGapAt`: alias for [`with_gap_char_at`] under the
@@ -407,23 +396,175 @@ pub fn with_gap_char(line: &LineResult, index: usize) -> LineResult {
     with_gap_char_at(line, index, 0.0, None)
 }
 
+/// One placeholder [`materialise_gap_plan`] will insert, carrying everything a
+/// host needs so it can grow its own parallel lists without the line coming
+/// back over the boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GapInsertion {
+    /// Character index in the **original** [`LineResult::text`] the
+    /// placeholder belongs at, as [`Gap::insert_at`] reports it.
+    pub index: usize,
+    /// The CTC timestep column the placeholder takes ([`column_for`]).
+    pub column: f32,
+    /// The interpolated placeholder box ([`interpolate_gap_box`]), read only
+    /// when [`GapPlan::grows_char_boxes`].
+    pub placeholder_box: BoundingBox,
+    /// This pair's spacing over the line's median, and the spacing in pixels —
+    /// the [`Gap`] diagnostics, carried so a plan is self-describing. Neither
+    /// affects the insertion.
+    pub ratio: f32,
+    pub span_px: f32,
+    /// The synthetic alternatives entry, or `None` for the placeholder
+    /// convention. Read only when [`GapPlan::grows_alternatives`].
+    pub gap_alternatives: Option<Vec<(char, f32)>>,
+}
+
+/// The measured gaps on one line, plus which of its parallel per-character
+/// lists a materialisation grows.
+///
+/// The flags are the "was this list full-length and non-empty?" guards
+/// [`with_gap_char_at`] applied per insertion, hoisted so a host can make the
+/// same decision from one crossing instead of recomputing lengths in its own
+/// character units (Kotlin counts UTF-16 units, Rust code points, and they
+/// differ on the supplementary-plane vocabulary entries).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GapPlan {
+    /// Ascending by `index`; materialise right-to-left.
+    pub insertions: Vec<GapInsertion>,
+    pub grows_char_boxes: bool,
+    pub grows_alternatives: bool,
+    pub grows_char_cols: bool,
+}
+
+impl GapPlan {
+    /// The plan of a line that gets no placeholder.
+    pub fn none() -> Self {
+        Self {
+            insertions: Vec::new(),
+            grows_char_boxes: false,
+            grows_alternatives: false,
+            grows_char_cols: false,
+        }
+    }
+}
+
+/// The one-insertion plan behind [`with_gap_char_at`]: the same three
+/// full-length guards, evaluated against the line as it stands.
+fn single_gap_plan(line: &LineResult, n: usize, insertion: GapInsertion) -> GapPlan {
+    GapPlan {
+        insertions: vec![insertion],
+        grows_char_boxes: line.char_boxes.len() == n && !line.char_boxes.is_empty(),
+        grows_alternatives: line.alternatives.len() == n && !line.alternatives.is_empty(),
+        grows_char_cols: !line.char_cols.is_empty() && line.char_cols.len() == n,
+    }
+}
+
+/// Mobile `BlankGaps.apply` split in two: [`blank_gap_plan`] decides *where*
+/// the placeholders go and [`materialise_gap_plan`] performs the insertion.
+///
+/// The plan is a handful of integers per line, where a full `LineResult` round
+/// trip is every cell of every per-character list: the alternatives and the raw
+/// per-timestep lists come back only to be cloned and grown by one entry, and
+/// the geometry the detector read is already the answer. A host that keeps its
+/// own lists can therefore ask for the plan and insert into them directly.
+pub fn blank_gap_plan(line: &LineResult) -> GapPlan {
+    blank_gap_plan_against(line, line.alternatives.len())
+}
+
+/// [`blank_gap_plan`] for a host that keeps its own lists, so only their
+/// **lengths** cross.
+///
+/// `alternatives_len` is the only thing read about the per-character
+/// alternatives, and it is read solely to decide whether inserting a
+/// placeholder would keep that list index-aligned — never as content.
+pub fn blank_gap_plan_against(line: &LineResult, alternatives_len: usize) -> GapPlan {
+    if !line.is_vertical || line.text.contains(GAP_CHAR) {
+        return GapPlan::none();
+    }
+    let gaps = GapDetector::default().detect(line);
+    if gaps.is_empty() {
+        return GapPlan::none();
+    }
+    let n = line.text.chars().count();
+    let insertions = gaps
+        .iter()
+        .map(|g| GapInsertion {
+            index: g.insert_at,
+            // Every gap's column is the midpoint of two *original* columns, so
+            // computing them all against the line as it stands gives the same
+            // values the right-to-left materialisation computes against the
+            // progressively grown one.
+            column: column_for(line, g.insert_at),
+            placeholder_box: interpolate_gap_box(&line.char_boxes, g.insert_at, line.is_vertical),
+            ratio: g.ratio,
+            span_px: g.span_px,
+            gap_alternatives: None,
+        })
+        .collect();
+    GapPlan {
+        insertions,
+        grows_char_boxes: line.char_boxes.len() == n && !line.char_boxes.is_empty(),
+        grows_alternatives: alternatives_len == n && alternatives_len > 0,
+        grows_char_cols: !line.char_cols.is_empty() && line.char_cols.len() == n,
+    }
+}
+
+/// Apply a [`GapPlan`] to `line`, growing every list the plan says grows.
+///
+/// The one implementation of the insertion, shared by [`apply_blank_gaps`] and
+/// [`with_gap_char_at`], so the two cannot drift: right-to-left, so the plan's
+/// indices — computed against the original text — stay valid as the text grows.
+pub fn materialise_gap_plan(line: &LineResult, plan: &GapPlan) -> LineResult {
+    if plan.insertions.is_empty() {
+        return line.clone();
+    }
+    let mut out = line.clone();
+    for insertion in plan.insertions.iter().rev() {
+        // A plan built by `blank_gap_plan` can never be out of range; a
+        // hand-built one is clamped rather than panicking at the boundary.
+        let index = insertion.index.min(out.text.chars().count());
+        let chars: Vec<char> = out.text.chars().collect();
+        let mut text: String = chars[..index].iter().collect();
+        text.push(GAP_CHAR);
+        text.extend(chars[index..].iter());
+        out.text = text;
+
+        if plan.grows_char_boxes {
+            let mut boxes = out.char_boxes.clone();
+            boxes.insert(index, insertion.placeholder_box.clone());
+            out.char_boxes = boxes;
+        }
+        if plan.grows_alternatives {
+            let mut alts = out.alternatives.clone();
+            alts.insert(
+                index,
+                insertion
+                    .gap_alternatives
+                    .clone()
+                    .unwrap_or_else(|| vec![(GAP_CHAR, 0.0)]),
+            );
+            out.alternatives = alts;
+        }
+        if plan.grows_char_cols {
+            let mut cols = out.char_cols.clone();
+            cols.insert(index, insertion.column);
+            out.char_cols = cols;
+        }
+        let mut overrides: BTreeMap<i32, (char, f32)> = BTreeMap::new();
+        for (key, value) in &out.overrides {
+            let key = if *key >= index as i32 { *key + 1 } else { *key };
+            overrides.insert(key, *value);
+        }
+        out.overrides = overrides;
+    }
+    out
+}
+
 /// Mobile `BlankGaps.apply`: materialise every measured gap as a placeholder.
 /// Vertical lines only, idempotent, insertions right-to-left so the
 /// detector's indices (computed against the original text) stay valid.
 pub fn apply_blank_gaps(line: &LineResult) -> LineResult {
-    if !line.is_vertical || line.text.contains(GAP_CHAR) {
-        return line.clone();
-    }
-    let gaps = GapDetector::default().detect(line);
-    if gaps.is_empty() {
-        return line.clone();
-    }
-    let mut out = line.clone();
-    for gap in gaps.iter().rev() {
-        let column = column_for(&out, gap.insert_at);
-        out = with_gap_char_at(&out, gap.insert_at, column, None);
-    }
-    out
+    materialise_gap_plan(line, &blank_gap_plan(line))
 }
 
 /// The insertion indices of [`apply_blank_gaps`] without materialising them.
@@ -514,6 +655,26 @@ mod tests {
 
     fn geom(b: &BoundingBox) -> (i32, i32, i32, i32) {
         (b.x, b.y, b.w, b.h)
+    }
+
+    /// Field-for-field line equality: `models::LineResult` is deliberately not
+    /// `PartialEq` (it carries a `PathBuf` and a `ChunkBox` list), so the plan
+    /// parity rows compare the fields the gap pipeline can move.
+    fn same_line(a: &LineResult, b: &LineResult) -> bool {
+        a.text == b.text
+            && a.is_vertical == b.is_vertical
+            && a.char_cols == b.char_cols
+            && a.crop_w == b.crop_w
+            && a.crop_h == b.crop_h
+            && a.crop_x == b.crop_x
+            && a.crop_y == b.crop_y
+            && a.seq_len_total == b.seq_len_total
+            && a.raw_alternatives == b.raw_alternatives
+            && a.overrides == b.overrides
+            && a.alternatives == b.alternatives
+            && a.char_boxes.len() == b.char_boxes.len()
+            && a.char_boxes.iter().zip(&b.char_boxes).all(|(x, y)| geom(x) == geom(y))
+            && a.char_boxes.iter().zip(&b.char_boxes).all(|(x, y)| x.confidence == y.confidence)
     }
 
     /// One timestep's top-N list; entry 0 is the head's emitted character.
@@ -1162,5 +1323,178 @@ mod tests {
         assert_eq!(out.text, format!("あいう{GAP_CHAR}えお"));
         assert_eq!(out.alternatives[3], vec![(GAP_CHAR, 0.0)]);
         assert_eq!(out.char_cols[3], 0.0); // no column supplied
+    }
+
+    // ── the plan/materialise split (a boundary keeps its own lists) ─────────
+
+    /// The plan carries exactly what the materialised line gained: the index,
+    /// the column and the box, plus which lists grew. Applying the plan through
+    /// [`materialise_gap_plan`] is the same line [`apply_blank_gaps`] builds,
+    /// which is what lets a host insert into its own lists instead of crossing
+    /// the line back and forth.
+    #[test]
+    fn the_plan_reproduces_the_materialised_line_exactly() {
+        // Two gaps, every list full-length, an override on each side of them.
+        let mut line = make_line(
+            "あいうえおかき",
+            vertical_boxes(&[10, 30, 50, 90, 110, 150, 170]),
+            true,
+        );
+        line.char_cols = (0..7).map(|i| i as f32).collect();
+        line.overrides.insert(0, ('Z', 1.0));
+        line.overrides.insert(6, ('X', 1.0));
+        line.crop_w = 40;
+        line.crop_h = 200;
+        line.seq_len_total = 25;
+
+        let plan = blank_gap_plan(&line);
+        assert_eq!(
+            plan.insertions.iter().map(|i| i.index).collect::<Vec<_>>(),
+            vec![3, 5],
+            "ascending, so a host can insert right-to-left"
+        );
+        assert_eq!(plan.insertions[0].ratio, 2.0);
+        assert!(approx(plan.insertions[0].span_px, 40.0));
+        assert!(plan.grows_char_boxes && plan.grows_alternatives && plan.grows_char_cols);
+        assert!(plan.insertions.iter().all(|i| i.gap_alternatives.is_none()));
+
+        let applied = materialise_gap_plan(&line, &plan);
+        assert!(same_line(&applied, &apply_blank_gaps(&line)));
+        assert_eq!(applied.text, format!("あいう{GAP_CHAR}えお{GAP_CHAR}かき"));
+        // The plan's own numbers are the line's numbers. `index` addresses the
+        // *original* text, so the position a placeholder ends up at is that
+        // index plus one per earlier insertion — which is why the insertions
+        // run right-to-left.
+        for (j, insertion) in plan.insertions.iter().enumerate() {
+            let at = [3, 6][j];
+            assert_eq!(insertion.index, [3, 5][j]);
+            assert_eq!(applied.text.chars().nth(at), Some(GAP_CHAR));
+            assert_eq!(applied.char_boxes[at], insertion.placeholder_box);
+            assert_eq!(applied.char_cols[at], insertion.column);
+            assert_eq!(applied.alternatives[at], vec![(GAP_CHAR, 0.0)]);
+        }
+        // Midpoint columns, right-to-left safe: gap 3 sits between cols 2 and 3,
+        // gap 5 between cols 4 and 5 — both original columns, so computing them
+        // all up front is the same as growing the line one insertion at a time.
+        assert!(approx(plan.insertions[0].column, 2.5));
+        assert!(approx(plan.insertions[1].column, 4.5));
+        // Overrides follow their characters: the one before both gaps is
+        // untouched, the one after both moved by two, and neither placeholder
+        // carries one.
+        assert_eq!(applied.overrides.get(&0).map(|v| v.0), Some('Z'));
+        assert_eq!(applied.overrides.get(&8).map(|v| v.0), Some('X'));
+        assert_eq!(applied.overrides.get(&7), None);
+        assert_eq!(applied.overrides.len(), 2);
+        // Untouched fields carry over.
+        assert_eq!(applied.crop_h, 200);
+        assert_eq!(applied.seq_len_total, 25);
+    }
+
+    /// An empty plan is the whole answer for every line the policy declines:
+    /// horizontal, already carrying a placeholder, no measured gap, and
+    /// unusable geometry.
+    #[test]
+    fn a_declined_line_has_an_empty_plan() {
+        let mut horizontal = make_line(TEXT5, vertical_boxes(&gapped_centres()), false);
+        assert!(blank_gap_plan(&horizontal).insertions.is_empty());
+        horizontal.is_vertical = true;
+
+        let once = apply_blank_gaps(&horizontal);
+        assert!(!once.text.contains(GAP_CHAR) == false); // it did insert
+        assert!(
+            blank_gap_plan(&once).insertions.is_empty(),
+            "idempotent: a line that already has a placeholder gets no plan"
+        );
+
+        let even = make_line(TEXT5, vertical_boxes(&[10, 30, 50, 70, 90]), true);
+        assert!(blank_gap_plan(&even).insertions.is_empty());
+
+        let mut degenerate = even.clone();
+        degenerate.char_boxes = (0..5).map(|_| BoundingBox::new(0, 50, 40, 20, 1.0)).collect();
+        assert!(blank_gap_plan(&degenerate).insertions.is_empty());
+        assert!(same_line(&apply_blank_gaps(&degenerate), &degenerate));
+    }
+
+    /// The three growth flags are the "full-length and non-empty" guards,
+    /// hoisted out of the materialiser so a host applies the same decision
+    /// instead of recomputing lengths in its own character units.
+    #[test]
+    fn the_growth_flags_mirror_the_full_length_guards() {
+        // Boxes only, no alternatives, no columns: only the boxes grow.
+        let mut line = make_line(TEXT5, vertical_boxes(&gapped_centres()), true);
+        line.alternatives = Vec::new();
+        line.char_cols = Vec::new();
+        let plan = blank_gap_plan(&line);
+        assert!(plan.grows_char_boxes);
+        assert!(!plan.grows_alternatives);
+        assert!(!plan.grows_char_cols);
+        let applied = materialise_gap_plan(&line, &plan);
+        assert_eq!(applied.alternatives, line.alternatives);
+        assert!(applied.char_cols.is_empty());
+        assert_eq!(applied.char_boxes.len(), 6);
+        // The host-supplied length is the only thing read about the
+        // alternatives, and it is the host's own count: a host with no
+        // alternatives list (or a short one) gets a plan that does not grow
+        // it, from the same measured gaps.
+        let full = make_line(TEXT5, vertical_boxes(&gapped_centres()), true);
+        assert!(blank_gap_plan(&full).grows_alternatives);
+        let claimed_short = blank_gap_plan_against(&full, 2);
+        assert!(!claimed_short.grows_alternatives);
+        assert_eq!(claimed_short.insertions, blank_gap_plan(&full).insertions);
+        assert_eq!(claimed_short.grows_char_boxes, blank_gap_plan(&full).grows_char_boxes);
+        assert_eq!(claimed_short.grows_char_cols, blank_gap_plan(&full).grows_char_cols);
+
+        // The single-insertion entry point reads the same flags.
+        let synth = with_gap_char_at(&line, 2, 7.0, None);
+        assert_eq!(synth.char_boxes.len(), 6);
+        assert!(synth.alternatives.is_empty());
+        assert!(synth.char_cols.is_empty());
+        assert_eq!(synth.char_cols.len(), 0);
+        // and the custom-alternatives path still only shows up when the
+        // alternatives list was full-length to begin with
+        let with_alts = make_line(TEXT5, vertical_boxes(&[10, 30, 50, 70, 90]), true);
+        let custom = with_gap_char_at(&with_alts, 2, 1.0, Some(vec![('X', 0.5)]));
+        assert_eq!(custom.alternatives[2], vec![('X', 0.5)]);
+    }
+
+    /// The detector's source *precedence*, as a predicate a host can ask before
+    /// handing over the raw per-timestep lists. Only the last-resort walk reads
+    /// them, so every line whose char boxes (or columns) describe the text can
+    /// skip building them.
+    #[test]
+    fn needs_raw_alternatives_is_the_detector_source_precedence() {
+        let text = TEXT5; // 5 characters
+        // Boxes cover the text: the walk is unreachable.
+        assert!(!needs_raw_alternatives(text, 5, 0));
+        assert!(!needs_raw_alternatives(text, 9, 5));
+        // No boxes, columns cover the text.
+        assert!(!needs_raw_alternatives(text, 0, 5));
+        // Neither: the walk is the only source left.
+        assert!(needs_raw_alternatives(text, 0, 0));
+        assert!(needs_raw_alternatives(text, 3, 4));
+        // An empty line needs nothing at all.
+        assert!(!needs_raw_alternatives("", 0, 0));
+        assert!(!needs_raw_alternatives("", 5, 5));
+
+        // Cross-check against the detector itself: the predicate is exactly the
+        // set of shapes whose gaps only the raw walk can find.
+        let from_raw = raw_line(TEXT5, raw_with_deletion(), true, 0, 0, 0);
+        assert!(needs_raw_alternatives(TEXT5, 0, 0));
+        assert_eq!(GapDetector::default().detect(&from_raw).len(), 1);
+        // The same geometry with the boxes filled in is read from the boxes, so
+        // the predicate is false and no plan needs the raw lists.
+        let mut from_boxes = from_raw.clone();
+        from_boxes.char_boxes = vertical_boxes(&[0, 20, 40, 80, 100]);
+        assert!(!needs_raw_alternatives(TEXT5, 5, 0));
+        assert_eq!(
+            GapDetector::default().detect(&from_boxes).len(),
+            1,
+            "and the box geometry finds the same gap"
+        );
+        // The plan is unchanged when the raw lists are withheld, because the
+        // walk is not read.
+        let mut without_raw = from_boxes.clone();
+        without_raw.raw_alternatives = Vec::new();
+        assert_eq!(blank_gap_plan(&without_raw), blank_gap_plan(&from_boxes));
     }
 }
