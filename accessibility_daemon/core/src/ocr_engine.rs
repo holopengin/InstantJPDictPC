@@ -464,152 +464,44 @@ pub(crate) fn filter_fitted_quads(
         .collect()
 }
 
-/// Mobile `findRubyGutterCut` (#48): cut x (image coords) for a ruby-widened
-/// vertical box, or None to keep. Per-column ink profile over the full box
-/// height; the leftmost clean gutter (>= 3 near-empty columns) with ink
-/// following it inside [L+0.40W, L+0.80W] is the main/ruby gutter — cut at
-/// its start. Touching ruby with no clean gutter but a thin spot falls back
-/// to half width. Polarity/thresholds shared with the recognizer.
-fn find_ruby_gutter_cut(b: &BoundingBox, image: &DynamicImage) -> Option<i32> {
-    let (iw, ih) = (image.width() as i32, image.height() as i32);
-    let x0 = b.x.clamp(0, iw - 1);
-    let x1 = (b.x + b.w).clamp(1, iw);
-    let y0 = b.y.clamp(0, ih - 1);
-    let y1 = (b.y + b.h).clamp(1, ih);
-    let bw = (x1 - x0) as u32;
-    let bh = (y1 - y0) as u32;
-    if bw < 24 || bh < 64 {
-        return None;
-    }
-    let (bw, bh) = (bw as usize, bh as usize);
-    let crop = image.crop_imm(x0 as u32, y0 as u32, bw as u32, bh as u32).to_rgb8();
-    let lum: Vec<f32> = crop
-        .pixels()
-        .map(|p| (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0)
-        .collect();
-    // Background polarity from border samples (shared with snapping).
-    let mut border: Vec<f32> = Vec::new();
-    let mut bi = 0usize;
-    while bi < bw {
-        border.push(lum[bi]);
-        border.push(lum[(bh - 1) * bw + bi]);
-        bi += 7;
-    }
-    bi = 0;
-    while bi < bh {
-        border.push(lum[bi * bw]);
-        border.push(lum[bi * bw + bw - 1]);
-        bi += 7;
-    }
-    if border.is_empty() {
-        return None;
-    }
-    border.sort_by(f32::total_cmp);
-    let bg_light = border[border.len() / 2] > 128.0;
-    let is_ink = |v: f32| if bg_light { v < 110.0 } else { v > 145.0 };
-    // Per-column ink fraction over the full box height.
-    let frac: Vec<f32> = (0..bw)
-        .map(|x| {
-            let mut m = 0usize;
-            for y in 0..bh {
-                if is_ink(lum[y * bw + x]) {
-                    m += 1;
-                }
-            }
-            m as f32 / bh as f32
-        })
-        .collect();
-    let lo = ((bw as f32 * 0.40) as usize).min(bw - 1);
-    let hi = (((bw as f32 * 0.80) as usize).max(lo + 1)).min(bw);
-    // Leftmost clean gutter with ink following it (not trailing padding).
-    let mut x = lo;
-    while x + 2 < hi {
-        if frac[x] < 0.04 && frac[x + 1] < 0.04 && frac[x + 2] < 0.04 {
-            let mut follows = false;
-            for k in x + 3..(x + 11).min(bw) {
-                if frac[k] >= 0.04 {
-                    follows = true;
-                    break;
-                }
-            }
-            if follows {
-                return Some(x0 + x as i32);
-            }
-            x += 3;
-        } else {
-            x += 1;
-        }
-    }
-    // Touching-ruby fallback: thin spot → half width ("remove the right half").
-    let mut min_f = f32::MAX;
-    for k in lo..hi {
-        min_f = min_f.min(frac[k]);
-    }
-    if min_f < 0.06 {
-        return Some(x0 + (bw / 2) as i32);
-    }
-    None
+/// The desktop image adapter for the pure ruby-gutter stage.  Keep the
+/// feature/env gate at the detect call site; only pixel conversion belongs in
+/// this native-only layer.
+fn gutter_luminance(image: &DynamicImage) -> (Vec<f32>, u32, u32) {
+    let (width, height) = (image.width(), image.height());
+    let rgb = image.to_rgb8();
+    (
+        crate::gutter_trim::luminance_from_rgb(rgb.as_raw(), width, height),
+        width,
+        height,
+    )
 }
 
-/// Mobile `trimRubyGutterVertical` (#48): furigana-widened vertical boxes are
-/// cut back to the main column here. A vertical box is a candidate when wider
-/// than 1.35x the median vertical width with a removable strip >= 12px; the
-/// cut must keep the left 40% and leave 8px on the right. Rotated quads are
-/// left alone (mobile has no rotated boxes; AABB-space cuts would desync).
-/// Returns the number of boxes trimmed.
+/// Mobile `findRubyGutterCut` (#48), native adapter for the shared pure
+/// implementation.  The desktop crop conversion used to live here; it is now
+/// represented by the row-major luminance buffer passed to
+/// [`crate::gutter_trim::find_ruby_gutter_cut`].
+#[allow(dead_code)] // retained as the native single-box adapter; trim is the production caller
+fn find_ruby_gutter_cut(b: &BoundingBox, image: &DynamicImage) -> Option<i32> {
+    let (luminance, width, height) = gutter_luminance(image);
+    crate::gutter_trim::find_ruby_gutter_cut(b, &luminance, width, height)
+}
+
+/// Mobile `trimRubyGutterVertical` (#48), native adapter for the shared pure
+/// implementation.  `RUBY_TRIM_VERTICAL` remains an opt-in experiment at
+/// the detect call site; this function only supplies image-derived input and
+/// delegates the algorithm.
 fn trim_ruby_gutter_vertical(
     pairs: &mut Vec<(BoundingBox, RotatedBox)>,
     image: &DynamicImage,
 ) -> usize {
-    let mut vert_w: Vec<i32> = pairs
-        .iter()
-        .filter(|(b, _)| is_vertical_box(b))
-        .map(|(b, _)| b.w)
-        .collect();
-    if vert_w.len() < 2 {
-        return 0;
-    }
-    vert_w.sort_unstable();
-    let med_w = vert_w[vert_w.len() / 2];
-    if med_w <= 0 {
-        return 0;
-    }
-    let mut trimmed = 0usize;
-    for (b, r) in pairs.iter_mut() {
-        if r.is_rotated() || !is_vertical_box(b) {
-            continue;
-        }
-        let w = b.w;
-        if (w as f32) <= med_w as f32 * 1.35 || w - med_w < 12 {
-            continue;
-        }
-        let Some(cut) = find_ruby_gutter_cut(b, image) else {
-            continue;
-        };
-        if cut <= b.x + 20 || cut >= b.x + b.w - 8 {
-            continue;
-        }
-        if ((cut - b.x) as f32) < (w as f32 * 0.4).round() {
-            continue;
-        }
-        eprintln!(
-            "[PP-OCR DET] rubyTrim {}x{}@({},{}) -> w={} (medW={})",
-            w,
-            b.h,
-            b.x,
-            b.y,
-            cut - b.x,
-            med_w
-        );
-        let delta = (b.x + b.w - cut) as f32;
-        b.w = cut - b.x;
-        // Non-rotated vertical: the cross axis is the frame's local x; keep
-        // the quad in sync so crops/char boxes follow the trim.
-        r.w -= delta;
-        r.cx -= delta / 2.0;
-        trimmed += 1;
-    }
-    trimmed
+    let (luminance, width, height) = gutter_luminance(image);
+    crate::gutter_trim::trim_ruby_gutter_vertical(
+        pairs,
+        &luminance,
+        width,
+        height,
+    )
 }
 
 // The pure char-box stages (legacy columns, ink snap, punctuation rules,
