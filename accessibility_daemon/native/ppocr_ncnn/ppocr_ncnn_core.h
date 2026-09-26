@@ -19,6 +19,35 @@
 
 namespace ppocr_ncnn {
 
+/// Process-global switch for this core's *informational* logging (the
+/// PPOCR_LOGI sites). OFF by default, deliberately: a release run must not pay
+/// for diagnostics nobody reads, and `__android_log_print` formats and writes
+/// the whole line on the calling thread — inside exactly the window the "net
+/// time" numbers are taken from, so a diagnostic was inflating the number it
+/// was reporting. The lines are what you need to diagnose a model/width
+/// mismatch, so they stay: this is a switch, not a deletion.
+///
+/// Measured on a Pixel 7a (Android 17, `benchmark` build, warm, interleaved
+/// A/B, 60 paired repeats — see NcnnVerboseBenchTest): **one line costs
+/// ~0.05-0.15 ms** whatever the logcat load, and the det path prints 2 of them
+/// on the letterbox route, so a detect gives back ~0.1-0.3 ms. That is small,
+/// and it is also smaller than a det wall's own run-to-run spread (±0.7-1.3 ms
+/// of standard error on a ~240 ms call), so it is only visible because the two
+/// arms are interleaved and differenced per repeat.
+///
+/// Process-global, not per-Net: it is a debugging mode, not a tuning knob, and
+/// there is exactly one ncnn library per process. A relaxed atomic read is
+/// enough — a caller that reads it one call late loses or gains one log line,
+/// and a log line cannot change a tensor.
+///
+/// Errors (PPOCR_LOGE) are NEVER gated. A failed load, a short buffer or an
+/// unusable output tensor has to surface with no preference consulted.
+bool verbose();
+
+/// Turn informational logging on/off for the whole process. Idempotent, safe
+/// from any thread, and it takes effect at the next log site reached.
+void set_verbose(bool on);
+
 struct RecNet {
     ncnn::Net net;
     int targetW;

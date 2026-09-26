@@ -3,6 +3,7 @@
 // InstantJPDictDecky/accessibility_daemon/native/ppocr_ncnn/.
 #include "ppocr_ncnn_core.h"
 
+#include <atomic>
 #include <cfloat>
 #include <cstring>
 
@@ -30,7 +31,30 @@
     } while (0)
 #endif
 
+// The gated form of PPOCR_LOGI: everything a normal run does not need, and
+// nothing that diagnoses a failure. The guard is a relaxed atomic load on the
+// caller's thread — one predictable branch, and nothing else is evaluated.
+// PPOCR_LOGE has no such wrapper on purpose; see verbose() in the header.
+#define PPOCR_LOGV(...)                     \
+    do {                                    \
+        if (ppocr_ncnn::verbose())          \
+        PPOCR_LOGI(__VA_ARGS__);            \
+    } while (0)
+
 namespace ppocr_ncnn {
+
+namespace {
+
+// Process-global, so a plain relaxed atomic: the reader is a debugging aid and
+// a racing write can only move one log line by one call. Default false, and
+// nothing but set_verbose() ever writes it.
+std::atomic<bool> g_verbose{false};
+
+} // namespace
+
+bool verbose() { return g_verbose.load(std::memory_order_relaxed); }
+
+void set_verbose(bool on) { g_verbose.store(on, std::memory_order_relaxed); }
 
 namespace {
 
@@ -108,7 +132,7 @@ RecNet* rec_create(const char* paramPath, const char* binPath, int targetW, int 
         return nullptr;
     }
 
-    PPOCR_LOGI("RecNet created W=%d seq=%d threads=%d param=%s", targetW, rec->seqLen, opt.num_threads, paramPath);
+    PPOCR_LOGV("RecNet created W=%d seq=%d threads=%d param=%s", targetW, rec->seqLen, opt.num_threads, paramPath);
     return rec;
 }
 
@@ -150,7 +174,7 @@ bool rec_infer(RecNet* rec, const float* data, size_t dataFloats, int w, int h, 
     // out shape: [w=numClasses, h=seqLen], w innermost. Never assume the width: the head is
     // re-pruned from the keep list (#44 moved it 13193 -> 13353) and this file is not part of
     // that regeneration. Log the dims and take the width off the tensor.
-    PPOCR_LOGI("ncnn out dims=%d w=%d h=%d c=%d total=%d", outMat.dims, outMat.w, outMat.h, outMat.c, (int)outMat.total());
+    PPOCR_LOGV("ncnn out dims=%d w=%d h=%d c=%d total=%d", outMat.dims, outMat.w, outMat.h, outMat.c, (int)outMat.total());
     // Dynamic width (#23): sequence length comes from the ACTUAL input width, not the
     // create-time targetW. Kotlin always passes a multiple of 8 (zero-padded exact width).
     int seqLen = w / 8;
@@ -230,7 +254,7 @@ bool rec_infer_topk(RecNet* rec, const float* data, size_t dataFloats, int w, in
         }
     }
     int64_t t2 = (int64_t)(ncnn::get_current_time() * 1000);
-    PPOCR_LOGI("recTopK w=%d seq=%d extract=%.1fms topk=%.1fms out=%d floats (full would be %d)",
+    PPOCR_LOGV("recTopK w=%d seq=%d extract=%.1fms topk=%.1fms out=%d floats (full would be %d)",
                w, seqLen, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0,
                (int)out.size(), seqLen * numClasses);
     return true;
@@ -247,7 +271,7 @@ DetNet* det_create(const char* paramPath, const char* binPath) {
     opt.use_fp16_packed = true;
     opt.use_fp16_storage = true;
     opt.use_fp16_arithmetic = true;
-    PPOCR_LOGI("DetNet threads=2 fp16=1");
+    PPOCR_LOGV("DetNet threads=2 fp16=1");
     opt.use_packing_layout = true;
     det->net.opt = opt;
     ncnn::set_cpu_powersave(0);
@@ -263,7 +287,7 @@ DetNet* det_create(const char* paramPath, const char* binPath) {
         delete det;
         return nullptr;
     }
-    PPOCR_LOGI("DetNet created param=%s", paramPath);
+    PPOCR_LOGV("DetNet created param=%s", paramPath);
     return det;
 }
 
@@ -292,7 +316,7 @@ bool det_infer(DetNet* det, const float* data, size_t dataFloats, int w, int h, 
     if (!det) return false;
     ncnn::Mat in;
     if (!det_fill_input(data, dataFloats, w, h, in)) return false;
-    PPOCR_LOGI("Det input in0 w=%d h=%d c=3 total=%d mean0=%.3f", w, h, (int)in.total(), in.channel(0)[0]);
+    PPOCR_LOGV("Det input in0 w=%d h=%d c=3 total=%d mean0=%.3f", w, h, (int)in.total(), in.channel(0)[0]);
     return det_run(det, in, out);
 }
 
@@ -314,7 +338,7 @@ bool det_run(DetNet* det, const ncnn::Mat& in, std::vector<float>& out) {
     if (!det->cachedOutName.empty()) {
         ret = ex.extract(det->cachedOutName.c_str(), outMat);
         if (ret == 0) {
-            PPOCR_LOGI("Det extract cached %s ok dims=%d w=%d h=%d c=%d total=%d", det->cachedOutName.c_str(), outMat.dims, outMat.w, outMat.h, outMat.c, (int)outMat.total());
+            PPOCR_LOGV("Det extract cached %s ok dims=%d w=%d h=%d c=%d total=%d", det->cachedOutName.c_str(), outMat.dims, outMat.w, outMat.h, outMat.c, (int)outMat.total());
         } else {
             PPOCR_LOGE("Det cached extract %s failed %d, trying others", det->cachedOutName.c_str(), ret);
             ret = -1;
@@ -324,10 +348,10 @@ bool det_run(DetNet* det, const ncnn::Mat& in, std::vector<float>& out) {
         const char* tryNames[] = {"out0", "sigmoid_0", "sigmoid", "sigmoid_62", "602", "603", "601", nullptr};
         for (int i = 0; tryNames[i]; i++) {
             ret = ex.extract(tryNames[i], outMat);
-            PPOCR_LOGI("Det try %s ret=%d", tryNames[i], ret);
+            PPOCR_LOGV("Det try %s ret=%d", tryNames[i], ret);
             if (ret == 0) {
                 det->cachedOutName = tryNames[i];
-                PPOCR_LOGI("Det extract %s ok dims=%d w=%d h=%d c=%d total=%d (cached)", tryNames[i], outMat.dims, outMat.w, outMat.h, outMat.c, (int)outMat.total());
+                PPOCR_LOGV("Det extract %s ok dims=%d w=%d h=%d c=%d total=%d (cached)", tryNames[i], outMat.dims, outMat.w, outMat.h, outMat.c, (int)outMat.total());
                 break;
             }
         }
@@ -345,7 +369,7 @@ bool det_run(DetNet* det, const ncnn::Mat& in, std::vector<float>& out) {
     // DB outputs 1 channel, but may be w*h*1
     const float* outData = (const float*)outMat.data;
     out.assign(outData, outData + total);
-    PPOCR_LOGI("Det infer ok w=%d h=%d outTotal=%d", w, h, total);
+    PPOCR_LOGV("Det infer ok w=%d h=%d outTotal=%d", w, h, total);
     return true;
 }
 
