@@ -75,6 +75,7 @@ pub mod kana_size;
 pub mod lookup;
 pub mod models;
 pub mod nav_graph;
+mod nav_graph_index;
 #[cfg(feature = "native")]
 pub mod ocr_engine;
 pub mod overlay_font;

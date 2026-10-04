@@ -1,15 +1,26 @@
 use crate::models::BoundingBox;
+use crate::nav_graph_index::NavIndex;
 
-/// Torus-wrapped horizontal distance.
+/// Torus-wrapped horizontal distance (used by the differential oracle).
+#[cfg(test)]
 fn torus_dx(x1: f32, x2: f32) -> f32 {
     let raw = (x1 - x2).abs();
     raw.min(1.0 - raw)
 }
-/// Torus-wrapped vertical distance.
+/// Torus-wrapped vertical distance (used by the differential oracle).
+#[cfg(test)]
 fn torus_dy(y1: f32, y2: f32) -> f32 {
     let raw = (y1 - y2).abs();
     raw.min(1.0 - raw)
 }
+
+/// Number of candidates any single consumer can need from one sorted list.
+/// At the moment a walker scans a list it holds at most four distinct
+/// used/occupied targets, so among any five distinct candidates one is free;
+/// when the list is shorter a five-candidate read *is* the whole list, so an
+/// empty answer means the list is genuinely exhausted (which reproduces the
+/// old `for j in 0..n` fallback without scanning).
+const TOP_K: usize = 5;
 
 /// For each node (global char index): [north, south, east, west] target indices.
 #[derive(Clone, Debug)]
@@ -22,6 +33,50 @@ pub struct NavGraph {
 
 impl NavGraph {
     pub fn build(boxes: &[BoundingBox]) -> Self {
+        let n = boxes.len();
+        if n < 5 { return Self::fallback(n); }
+
+        let mut positions = Vec::with_capacity(n);
+        let (max_x, max_y) = if n > 0 {
+            let mx = boxes.iter().map(|b| b.right() as f32).fold(0f32, f32::max);
+            let my = boxes.iter().map(|b| b.bottom() as f32).fold(0f32, f32::max);
+            (mx.max(1.0), my.max(1.0))
+        } else {
+            (1.0, 1.0)
+        };
+        for b in boxes {
+            let cx = (b.left() as f32 + (b.w as f32) / 2.0) / max_x;
+            let cy = (b.top() as f32 + (b.h as f32) / 2.0) / max_y;
+            positions.push((cx, cy));
+        }
+
+        // One k-d tree answers every phase's candidate enumeration and count.
+        // Each phase keeps its own predicate and cost (see nav_graph_index),
+        // so the output is byte-identical to the old materialised-list build.
+        let index = NavIndex::new(&positions);
+
+        // Phase 1: greedy local assignment.
+        let mut edges = vec![[n; 4]; n];
+        for i in 0..n {
+            edges[i] = greedy_assignment_indexed(i, n, &index);
+        }
+        let initial_edges = edges.clone();
+
+        // Phase 2: SCC-aware fill + connectivity enforcement.
+        fill_phase(&mut edges, n, &index, 2);
+        enforce_connectivity(&mut edges, n);
+
+        // Phase 3: wrap fill.
+        fill_phase(&mut edges, n, &index, 3);
+
+        Self { edges, initial_edges, positions, n }
+    }
+
+    /// The pre-#107 implementation, kept verbatim as a differential oracle
+    /// for the enumerator/index tests. Materialises the sorted candidate
+    /// lists; never compiled outside `cfg(test)`.
+    #[cfg(test)]
+    pub fn build_oracle(boxes: &[BoundingBox]) -> Self {
         let n = boxes.len();
         if n < 5 { return Self::fallback(n); }
 
@@ -167,7 +222,7 @@ impl NavGraph {
         }
 
         // Enforce strong connectivity using Phase 2 candidate lists
-        enforce_connectivity(&mut edges, n, &positions, &t_north, &t_south, &t_east, &t_west);
+        enforce_connectivity_oracle(&mut edges, n, &positions, &t_north, &t_south, &t_east, &t_west);
 
         // Phase 3: wrapping-only candidates (opposite half-plane)
         let mut w3_north: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
@@ -270,8 +325,8 @@ impl NavGraph {
     }
 }
 
-/// Pick best candidate per direction greedily, resolving conflicts
-/// by keeping the direction whose cost increase is smallest.
+/// Oracle: the pre-#107 greedy assignment over materialised lists.
+#[cfg(test)]
 fn greedy_assignment_all(
     n: usize,
     north_lists: &[Vec<(usize, f32)>],
@@ -286,6 +341,8 @@ fn greedy_assignment_all(
     edges
 }
 
+/// Oracle: the pre-#107 greedy assignment for one node.
+#[cfg(test)]
 fn greedy_assignment(
     _i: usize, n: usize,
     north: &[(usize, f32)],
@@ -355,6 +412,234 @@ fn greedy_assignment(
     result
 }
 
+/// Phase 1 greedy assignment against the exact enumerator. Mirrors
+/// [greedy_assignment] step for step; the only change is that a direction's
+/// "first candidate not already used" is the top of an exact top-[TOP_K]
+/// query excluding the used set. Five candidates always suffice: at the scan
+/// point the used set holds at most four distinct targets, so one of the five
+/// is free, and a shorter list is fully enumerated.
+fn greedy_assignment_indexed(i: usize, n: usize, index: &NavIndex) -> [usize; 4] {
+    let mut result = [n; 4];
+    for d in 0..4 {
+        result[d] = index
+            .top_k(i, 1, d as u8, &[], TOP_K)
+            .first()
+            .copied()
+            .unwrap_or(n);
+    }
+
+    let mut has_conflict = true;
+    while has_conflict {
+        has_conflict = false;
+        let mut used = std::collections::HashSet::new();
+        let mut clean = true;
+        for d in 0..4 {
+            if result[d] == n || !used.insert(result[d]) {
+                clean = false;
+            }
+        }
+        if clean { break; }
+
+        used.clear();
+        for d in 0..4 {
+            if result[d] == n || !used.insert(result[d]) {
+                let original = result[d];
+                let used_vec: Vec<usize> = used.iter().copied().collect();
+                let alt = index
+                    .top_k(i, 1, d as u8, &used_vec, TOP_K)
+                    .first()
+                    .copied();
+                if let Some(alt) = alt {
+                    result[d] = alt;
+                    used.insert(alt);
+                    has_conflict = true;
+                } else if original != n {
+                    // The list had no free candidate: reproduce the old
+                    // "for j in 0..n" fallback verbatim.
+                    for j in 0..n {
+                        if !used.contains(&j) {
+                            result[d] = j;
+                            used.insert(j);
+                            has_conflict = true;
+                            break;
+                        }
+                    }
+                }
+                break; // fix one conflict per iteration
+            }
+        }
+    }
+
+    result
+}
+
+/// Phase 2 / Phase 3 fill against the exact enumerator. Mirrors the old fill:
+/// unfilled directions are ordered by how many candidates remain (fewest
+/// first, then direction), and each is filled with its first free candidate.
+fn fill_phase(edges: &mut [[usize; 4]], n: usize, index: &NavIndex, phase: u8) {
+    for i in 0..n {
+        let occupied0 = edges[i];
+
+        // Unique real targets already occupied (sentinel n is not a target).
+        let mut occ_set: Vec<usize> = Vec::new();
+        for &v in &occupied0 {
+            if v < n && !occ_set.contains(&v) {
+                occ_set.push(v);
+            }
+        }
+
+        let mut unfilled: Vec<usize> = (0..4).filter(|&d| occupied0[d] >= n).collect();
+
+        // Exact full-list counts, minus the occupied targets that appear in
+        // the list (the old ".filter(!occupied.contains(v)).count()").
+        let mut counts = [0usize; 4];
+        for &d in &unfilled {
+            let mut c = index.count(i, phase, d as u8);
+            let (xi, yi) = index.position(i);
+            for &v in &occ_set {
+                let (xj, yj) = index.position(v);
+                let xd = (xi - xj).abs();
+                let yd = (yi - yj).abs();
+                let euc = (xd * xd + yd * yd).sqrt();
+                if crate::nav_graph_index::in_region(phase, d as u8, xi, yi, xj, yj, euc) {
+                    c = c.saturating_sub(1);
+                }
+            }
+            counts[d] = c;
+        }
+
+        unfilled.sort_by(|&a, &b| counts[a].cmp(&counts[b]).then_with(|| a.cmp(&b)));
+
+        let mut occupied = occupied0;
+        for &d in &unfilled {
+            let excl: Vec<usize> = occupied.iter().copied().filter(|&v| v < n).collect();
+            if let Some(&v) = index.top_k(i, phase, d as u8, &excl, TOP_K).first() {
+                occupied[d] = v;
+                edges[i][d] = v;
+            }
+        }
+    }
+}
+
+/// Oracle: the pre-#107 per-phase candidate-list construction, over the raw
+/// normalised positions. Used only to prove the k-d tree enumerators exact.
+#[cfg(test)]
+fn build_lists_oracle(
+    positions: &[(f32, f32)],
+    phase: u8,
+) -> Vec<[Vec<(usize, f32)>; 4]> {
+    let n = positions.len();
+    const W: f32 = 10.0;
+    const W2: f32 = 1.5;
+    const LOCAL_DIST: f32 = 0.05;
+    const CONE45: f32 = 1.0;
+
+    let mut out: Vec<[Vec<(usize, f32)>; 4]> = Vec::with_capacity(n);
+    for i in 0..n {
+        let (xi, yi) = positions[i];
+        let mut north: Vec<(usize, f32)> = Vec::new();
+        let mut south: Vec<(usize, f32)> = Vec::new();
+        let mut east: Vec<(usize, f32)> = Vec::new();
+        let mut west: Vec<(usize, f32)> = Vec::new();
+
+        for j in 0..n {
+            if i == j { continue; }
+            let (xj, yj) = positions[j];
+            let xd = (xi - xj).abs();
+            let yd = (yi - yj).abs();
+            match phase {
+                1 => {
+                    let euc = (xd * xd + yd * yd).sqrt();
+                    if euc > LOCAL_DIST { continue; }
+                    let dy_n = yi - yj;
+                    if yj < yi && xd <= CONE45 * dy_n { north.push((j, dy_n + W * xd)); }
+                    let dy_s = yj - yi;
+                    if yj > yi && xd <= CONE45 * dy_s { south.push((j, dy_s + W * xd)); }
+                    let dx_e = xj - xi;
+                    if xj > xi && yd <= CONE45 * dx_e { east.push((j, dx_e + W * yd)); }
+                    let dx_w = xi - xj;
+                    if xj < xi && yd <= CONE45 * dx_w { west.push((j, dx_w + W * yd)); }
+                }
+                2 => {
+                    let dy_n = yi - yj;
+                    if yj < yi && xd <= CONE45 * dy_n { north.push((j, dy_n + W2 * xd)); }
+                    let dy_s = yj - yi;
+                    if yj > yi && xd <= CONE45 * dy_s { south.push((j, dy_s + W2 * xd)); }
+                    let dx_e = xj - xi;
+                    if xj > xi && yd <= CONE45 * dx_e { east.push((j, dx_e + W2 * yd)); }
+                    let dx_w = xi - xj;
+                    if xj < xi && yd <= CONE45 * dx_w { west.push((j, dx_w + W2 * yd)); }
+                }
+                _ => {
+                    let tx = torus_dx(xi, xj);
+                    let ty = torus_dy(yi, yj);
+                    if yj > yi {
+                        let dy_n = (yi - yj + 1.0) % 1.0;
+                        if xd <= CONE45 * dy_n { north.push((j, dy_n + W2 * tx)); }
+                    }
+                    if yj < yi {
+                        let dy_s = (yj - yi + 1.0) % 1.0;
+                        if xd <= CONE45 * dy_s { south.push((j, dy_s + W2 * tx)); }
+                    }
+                    if xj < xi {
+                        let dx_e = (xj - xi + 1.0) % 1.0;
+                        if yd <= CONE45 * dx_e { east.push((j, dx_e + W2 * ty)); }
+                    }
+                    if xj > xi {
+                        let dx_w = (xi - xj + 1.0) % 1.0;
+                        if yd <= CONE45 * dx_w { west.push((j, dx_w + W2 * ty)); }
+                    }
+                }
+            }
+        }
+
+        match phase {
+            1 => {
+                let sort_fn = |a: &(usize, f32), b: &(usize, f32)| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            let (xa, ya) = positions[a.0];
+                            let (xb, yb) = positions[b.0];
+                            let da = ((xi - xa).powi(2) + (yi - ya).powi(2)).sqrt();
+                            let db = ((xi - xb).powi(2) + (yi - yb).powi(2)).sqrt();
+                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .then_with(|| a.0.cmp(&b.0))
+                };
+                for list in [&mut north, &mut south, &mut east, &mut west] {
+                    list.sort_by(sort_fn);
+                }
+            }
+            _ => {
+                let sort_fn = |a: &(usize, f32), b: &(usize, f32)| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
+                };
+                for list in [&mut north, &mut south, &mut east, &mut west] {
+                    list.sort_by(sort_fn);
+                }
+            }
+        }
+
+        out.push([north, south, east, west]);
+    }
+    out
+}
+
+fn reverse_adjacency(edges: &[[usize; 4]], n: usize) -> Vec<Vec<usize>> {
+    let mut radj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for u in 0..n {
+        for d in 0..4 {
+            let v = edges[u][d];
+            if v < n {
+                // At most four outgoing edges per node; a duplicate target in
+                // two directions is harmless for reachability.
+                radj[v].push(u);
+            }
+        }
+    }
+    radj
+}
+
 fn is_strongly_connected(edges: &[[usize; 4]], n: usize) -> bool {
     if n == 0 { return true; }
     let mut visited = vec![false; n];
@@ -368,16 +653,16 @@ fn is_strongly_connected(edges: &[[usize; 4]], n: usize) -> bool {
     }
     if visited.iter().any(|&v| !v) { return false; }
 
+    // Reverse reachability from 0 via reverse adjacency — O(n + E), and the
+    // reachable set is order-independent, so this is identical to the old
+    // O(n²) scan.
+    let radj = reverse_adjacency(edges, n);
     let mut rev_visited = vec![false; n];
     let mut rev_stack = vec![0usize];
     rev_visited[0] = true;
     while let Some(v) = rev_stack.pop() {
-        for u in 0..n {
-            if !rev_visited[u] {
-                for d in 0..4 {
-                    if edges[u][d] == v { rev_visited[u] = true; rev_stack.push(u); break; }
-                }
-            }
+        for &u in &radj[v] {
+            if !rev_visited[u] { rev_visited[u] = true; rev_stack.push(u); }
         }
     }
     rev_visited.iter().all(|&v| v)
@@ -397,23 +682,22 @@ fn compute_reachable(edges: &[[usize; 4]], n: usize, start: usize) -> Vec<bool> 
 }
 
 fn compute_reverse_reachable(edges: &[[usize; 4]], n: usize, target: usize) -> Vec<bool> {
+    let radj = reverse_adjacency(edges, n);
     let mut can_reach = vec![false; n];
+    let mut stack = vec![target];
     can_reach[target] = true;
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for u in 0..n {
-            if can_reach[u] { continue; }
-            for d in 0..4 {
-                if edges[u][d] < n && can_reach[edges[u][d]] {
-                    can_reach[u] = true; changed = true; break;
-                }
-            }
+    while let Some(v) = stack.pop() {
+        for &u in &radj[v] {
+            if !can_reach[u] { can_reach[u] = true; stack.push(u); }
         }
     }
     can_reach
 }
 
+/// Oracle: the pre-#107 candidate_cost. Its return value never mattered -
+/// [enforce_connectivity_oracle] only tests "cost < f32::MAX", which the L1
+/// fallback always satisfies - so the non-oracle rewrite drops it.
+#[cfg(test)]
 fn candidate_cost(
     u: usize, v: usize,
     positions: &[(f32, f32)],
@@ -427,7 +711,9 @@ fn candidate_cost(
     (xu - xv).abs() + (yu - yv).abs()
 }
 
-fn enforce_connectivity(
+/// Oracle: the pre-#107 connectivity enforcement, kept verbatim.
+#[cfg(test)]
+fn enforce_connectivity_oracle(
     edges: &mut Vec<[usize; 4]>,
     n: usize,
     positions: &[(f32, f32)],
@@ -488,6 +774,66 @@ fn enforce_connectivity(
                                 if cost < f32::MAX {
                                     edges[u][d] = v; improved = true; break;
                                 }
+                            }
+                        }
+                        if improved { break; }
+                    }
+                }
+                if improved { break; }
+            }
+            if !improved { break; }
+            continue;
+        }
+        break;
+    }
+}
+
+/// Connectivity enforcement. Behaviourally identical to
+/// [enforce_connectivity_oracle]: the candidate-list argument was only ever
+/// used to compute a cost that was then compared with "f32::MAX", a test the
+/// L1 fallback always passes, so the lists never influenced which swap was
+/// made. Dropping them removes the last consumer of the Phase-2 lists.
+fn enforce_connectivity(edges: &mut [[usize; 4]], n: usize) {
+    for _iteration in 0..n {
+        if is_strongly_connected(edges, n) { return; }
+
+        let reachable = compute_reachable(edges, n, 0);
+        let unreachable: Vec<usize> = (0..n).filter(|&i| !reachable[i]).collect();
+        if !unreachable.is_empty() {
+            let mut improved = false;
+            for u in 0..n {
+                if !reachable[u] { continue; }
+                for d in 0..4 {
+                    let old_v = edges[u][d];
+                    if old_v >= n || !reachable[old_v] { continue; }
+                    for &v in &unreachable {
+                        if v == u || edges[u].contains(&v) { continue; }
+                        edges[u][d] = v;
+                        improved = true;
+                        break;
+                    }
+                    if improved { break; }
+                }
+                if improved { break; }
+            }
+            if !improved { break; }
+            continue;
+        }
+
+        let can_reach_root = compute_reverse_reachable(edges, n, 0);
+        let cannot_reach: Vec<usize> = (0..n).filter(|&i| !can_reach_root[i]).collect();
+        if !cannot_reach.is_empty() {
+            let mut improved = false;
+            for &u in &cannot_reach {
+                let all_cant = (0..4).all(|d| !can_reach_root[edges[u][d]]);
+                if all_cant {
+                    for d in 0..4 {
+                        for v in 0..n {
+                            if v == u || edges[u].contains(&v) { continue; }
+                            if can_reach_root[v] {
+                                edges[u][d] = v;
+                                improved = true;
+                                break;
                             }
                         }
                         if improved { break; }
@@ -913,5 +1259,187 @@ mod tests {
         // Empty graph: everything is out of range.
         let empty = NavGraph::build(&[]);
         assert_eq!(empty.navigate(0, N), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #107 differential oracle: the k-d tree enumerators must return
+    // exactly the prefixes of the old materialised lists, and the whole build
+    // must reproduce `build_oracle` byte for byte.
+    // ------------------------------------------------------------------
+
+    /// Deterministic LCG so the scatter layouts are reproducible.
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Self { Lcg(seed.wrapping_mul(6364136223846793005).wrapping_add(1)) }
+        fn next_f(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (((self.0 >> 33) as u32) as f32) / (u32::MAX as f32)
+        }
+    }
+
+    fn norm_positions(boxes: &[BoundingBox]) -> Vec<(f32, f32)> {
+        let mx = boxes.iter().map(|b| b.right() as f32).fold(0f32, f32::max).max(1.0);
+        let my = boxes.iter().map(|b| b.bottom() as f32).fold(0f32, f32::max).max(1.0);
+        boxes.iter().map(|b| {
+            ((b.left() as f32 + b.w as f32 / 2.0) / mx, (b.top() as f32 + b.h as f32 / 2.0) / my)
+        }).collect()
+    }
+
+    /// Canonical layouts plus seeded random scatter and a few adversarial ones.
+    fn oracle_layouts() -> Vec<(&'static str, Vec<BoundingBox>)> {
+        let mut out: Vec<(&'static str, Vec<BoundingBox>)> = Vec::new();
+        out.push(("h_lines_2x6", h_lines_2x6()));
+        out.push(("v_cols_2x6", v_cols_2x6()));
+        out.push(("single_row", (0..6).map(|c| bb(100 + c * 32, 100, 24, 24)).collect()));
+        out.push(("long_row", (0..25).map(|c| bb(100 + c * 32, 100, 24, 24)).collect()));
+        out.push(("mixed", {
+            let mut v = Vec::new();
+            for c in 0..3 { v.push(bb(100 + c * 32, 100, 24, 24)); }
+            for r in 0..3 { v.push(bb(400, 100 + r * 32, 24, 24)); }
+            v
+        }));
+        out.push(("corpus", vec![
+            bb(10, 10, 200, 30), bb(10, 100, 200, 30), bb(10, 200, 40, 40),
+            bb(300, 10, 30, 200), bb(100, 10, 30, 200),
+        ]));
+        out.push(("grid_7x7", (0..49).map(|k| bb(50 + (k % 7) * 30, 50 + (k / 7) * 30, 24, 24)).collect()));
+        out.push(("row_100", (0..100).map(|c| bb(10 + c * 8, 100, 6, 6)).collect()));
+        out.push(("col_100", (0..100).map(|r| bb(100, 10 + r * 8, 6, 6)).collect()));
+        // Coincident points: every Phase-1 list is O(n).
+        out.push(("dupes_40", (0..40).map(|_| bb(100, 100, 24, 24)).collect()));
+        // Tight clusters (the layout the old top-1 truncation got wrong).
+        out.push(("clusters", {
+            let mut v = Vec::new();
+            for c in 0..8 {
+                for k in 0..6 {
+                    v.push(bb(100 + c * 400 + k, 100 + (k % 3) * 30, 24, 24));
+                }
+            }
+            v
+        }));
+        // Single diagonal.
+        out.push(("diag", (0..30).map(|k| bb(50 + k * 40, 50 + k * 40, 20, 20)).collect()));
+        // Seeded random scatters.
+        for &(seed, n) in &[(7u64, 40usize), (11, 80), (23, 200), (101, 512), (555, 137)] {
+            let mut rng = Lcg::new(seed);
+            let v: Vec<_> = (0..n).map(|_| {
+                bb((rng.next_f() * 1800.0) as i32, (rng.next_f() * 1200.0) as i32, 24, 24)
+            }).collect();
+            out.push(("scatter", v));
+        }
+        // Random scatter with many duplicates: forces O(n) Phase-1 lists.
+        out.push(("scatter_dupes", {
+            let mut rng = Lcg::new(31337);
+            (0..120).map(|_| {
+                let x = 100 + ((rng.next_f() * 4.0) as i32) * 10;
+                let y = 100 + ((rng.next_f() * 4.0) as i32) * 10;
+                bb(x, y, 24, 24)
+            }).collect()
+        }));
+        // Points hugging the page edge (torus wrap stress).
+        out.push(("near_edge", {
+            let mut rng = Lcg::new(99);
+            (0..60).map(|k| {
+                if k % 2 == 0 {
+                    bb((rng.next_f() * 30.0) as i32, (rng.next_f() * 1200.0) as i32, 24, 24)
+                } else {
+                    bb(1770 + (rng.next_f() * 30.0) as i32, (rng.next_f() * 1200.0) as i32, 24, 24)
+                }
+            }).collect()
+        }));
+        out
+    }
+
+    /// The enumerator must return exactly the old list's first `TOP_K`, and
+    /// the count must equal the old list length, for every phase/direction and
+    /// every layout.
+    #[test]
+    fn nav_graph_09_enumerators_match_the_oracle_lists() {
+        for (name, boxes) in oracle_layouts() {
+            let pos = norm_positions(&boxes);
+            let index = NavIndex::new(&pos);
+            for phase in [1u8, 2, 3] {
+                let lists = build_lists_oracle(&pos, phase);
+                for i in 0..pos.len() {
+                    for dir in 0..4usize {
+                        let full = &lists[i][dir];
+                        let want_prefix: Vec<usize> =
+                            full.iter().take(TOP_K).map(|(v, _)| *v).collect();
+                        let got = index.top_k(i, phase, dir as u8, &[], TOP_K);
+                        assert_eq!(
+                            got, want_prefix,
+                            "{name} phase {phase} node {i} dir {dir}: top-{TOP_K} mismatch"
+                        );
+                        if phase != 1 {
+                            assert_eq!(
+                                index.count(i, phase, dir as u8),
+                                full.len(),
+                                "{name} phase {phase} node {i} dir {dir}: count mismatch"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Exclusion must behave like "skip already-used candidates", matching the
+    /// old walkers' first-free-pick exactly.
+    #[test]
+    fn nav_graph_10_enumerators_honour_exclusions() {
+        let mut rng = Lcg::new(4242);
+        for (name, boxes) in oracle_layouts() {
+            let pos = norm_positions(&boxes);
+            let index = NavIndex::new(&pos);
+            for phase in [1u8, 2, 3] {
+                let lists = build_lists_oracle(&pos, phase);
+                for i in 0..pos.len() {
+                    for dir in 0..4usize {
+                        let full: Vec<usize> = lists[i][dir].iter().map(|(v, _)| *v).collect();
+                        // A few exclusion shapes: prefix, suffix, and random.
+                        let shapes: Vec<Vec<usize>> = vec![
+                            full.iter().take(2).copied().collect(),
+                            full.iter().rev().take(3).copied().collect(),
+                            {
+                                let mut e = Vec::new();
+                                for _ in 0..4 {
+                                    if !full.is_empty() {
+                                        let k = (rng.next_f() * full.len() as f32) as usize;
+                                        e.push(full[k.min(full.len() - 1)]);
+                                    }
+                                }
+                                e
+                            },
+                        ];
+                        for excl in shapes {
+                            let want: Vec<usize> = full.iter()
+                                .filter(|v| !excl.contains(v))
+                                .take(TOP_K)
+                                .copied()
+                                .collect();
+                            let got = index.top_k(i, phase, dir as u8, &excl, TOP_K);
+                            assert_eq!(
+                                got, want,
+                                "{name} phase {phase} node {i} dir {dir}: exclusion {excl:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole `build` must equal the pre-#107 `build_oracle` on every
+    /// layout, byte for byte, with the old enforcement in place.
+    #[test]
+    fn nav_graph_11_build_matches_oracle_byte_for_byte() {
+        for (name, boxes) in oracle_layouts() {
+            let fast = NavGraph::build(&boxes);
+            let slow = NavGraph::build_oracle(&boxes);
+            assert_eq!(fast.n, slow.n, "{name}: n");
+            assert_eq!(fast.edges, slow.edges, "{name}: edges");
+            assert_eq!(fast.initial_edges, slow.initial_edges, "{name}: initial_edges");
+            assert_eq!(fast.positions, slow.positions, "{name}: positions");
+        }
     }
 }
