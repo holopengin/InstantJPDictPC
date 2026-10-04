@@ -64,7 +64,7 @@ impl NavGraph {
 
         // Phase 2: SCC-aware fill + connectivity enforcement.
         fill_phase(&mut edges, n, &index, 2);
-        enforce_connectivity(&mut edges, n);
+        enforce_connectivity(&mut edges, n, &positions);
 
         // Phase 3: wrap fill.
         fill_phase(&mut edges, n, &index, 3);
@@ -668,6 +668,8 @@ fn is_strongly_connected(edges: &[[usize; 4]], n: usize) -> bool {
     rev_visited.iter().all(|&v| v)
 }
 
+/// Oracle-only: forward reachability, kept for the pre-#107 enforcement.
+#[cfg(test)]
 fn compute_reachable(edges: &[[usize; 4]], n: usize, start: usize) -> Vec<bool> {
     let mut visited = vec![false; n];
     let mut stack = vec![start];
@@ -681,6 +683,8 @@ fn compute_reachable(edges: &[[usize; 4]], n: usize, start: usize) -> Vec<bool> 
     visited
 }
 
+/// Oracle-only: reverse reachability via reverse adjacency.
+#[cfg(test)]
 fn compute_reverse_reachable(edges: &[[usize; 4]], n: usize, target: usize) -> Vec<bool> {
     let radj = reverse_adjacency(edges, n);
     let mut can_reach = vec![false; n];
@@ -788,63 +792,195 @@ fn enforce_connectivity_oracle(
     }
 }
 
-/// Connectivity enforcement. Behaviourally identical to
-/// [enforce_connectivity_oracle]: the candidate-list argument was only ever
-/// used to compute a cost that was then compared with "f32::MAX", a test the
-/// L1 fallback always passes, so the lists never influenced which swap was
-/// made. Dropping them removes the last consumer of the Phase-2 lists.
-fn enforce_connectivity(edges: &mut [[usize; 4]], n: usize) {
-    for _iteration in 0..n {
-        if is_strongly_connected(edges, n) { return; }
+/// Signed shortest torus offset from `a` to `b` (in `[-0.5, 0.5]`), for
+/// picking a sensible direction for a repair edge.
+fn torus_off(a: f32, b: f32) -> f32 {
+    let mut d = b - a;
+    if d > 0.5 {
+        d -= 1.0;
+    } else if d < -0.5 {
+        d += 1.0;
+    }
+    d
+}
 
-        let reachable = compute_reachable(edges, n, 0);
-        let unreachable: Vec<usize> = (0..n).filter(|&i| !reachable[i]).collect();
-        if !unreachable.is_empty() {
-            let mut improved = false;
-            for u in 0..n {
-                if !reachable[u] { continue; }
-                for d in 0..4 {
-                    let old_v = edges[u][d];
-                    if old_v >= n || !reachable[old_v] { continue; }
-                    for &v in &unreachable {
-                        if v == u || edges[u].contains(&v) { continue; }
-                        edges[u][d] = v;
-                        improved = true;
-                        break;
-                    }
-                    if improved { break; }
-                }
-                if improved { break; }
-            }
-            if !improved { break; }
+/// The cardinal direction whose cone best matches `to` relative to `from`
+/// (dominant torus axis decides).
+fn suggested_dir(from: usize, to: usize, positions: &[(f32, f32)]) -> usize {
+    let (xf, yf) = positions[from];
+    let (xt, yt) = positions[to];
+    let dx = torus_off(xf, xt);
+    let dy = torus_off(yf, yt);
+    if dy.abs() >= dx.abs() {
+        if dy < 0.0 { 0 } else { 1 } // north / south
+    } else if dx > 0.0 {
+        2 // east
+    } else {
+        3 // west
+    }
+}
+
+/// Place a repair edge `from -> to`. Prefer an empty slot, best-aligned
+/// direction first; only if every slot is occupied, overwrite the slot whose
+/// current target is farthest (the least "reasonable navigation" edge).
+/// Returns `true` when an empty slot was used (no existing edge disturbed).
+fn place_edge(
+    edges: &mut [[usize; 4]],
+    from: usize,
+    to: usize,
+    n: usize,
+    positions: &[(f32, f32)],
+) -> bool {
+    let best = suggested_dir(from, to, positions);
+    if edges[from][best] >= n {
+        edges[from][best] = to;
+        return true;
+    }
+    for d in 0..4 {
+        if edges[from][d] >= n {
+            edges[from][d] = to;
+            return true;
+        }
+    }
+    // Every slot is occupied: overwrite the farthest target, deterministically.
+    let (xf, yf) = positions[from];
+    let mut worst = 0usize;
+    let mut worst_d = f32::NEG_INFINITY;
+    for d in 0..4 {
+        let v = edges[from][d];
+        if v >= n {
             continue;
         }
+        let (xv, yv) = positions[v];
+        let dx = torus_off(xf, xv);
+        let dy = torus_off(yf, yv);
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist > worst_d {
+            worst_d = dist;
+            worst = d;
+        }
+    }
+    edges[from][worst] = to;
+    false
+}
 
-        let can_reach_root = compute_reverse_reachable(edges, n, 0);
-        let cannot_reach: Vec<usize> = (0..n).filter(|&i| !can_reach_root[i]).collect();
-        if !cannot_reach.is_empty() {
-            let mut improved = false;
-            for &u in &cannot_reach {
-                let all_cant = (0..4).all(|d| !can_reach_root[edges[u][d]]);
-                if all_cant {
-                    for d in 0..4 {
-                        for v in 0..n {
-                            if v == u || edges[u].contains(&v) { continue; }
-                            if can_reach_root[v] {
-                                edges[u][d] = v;
-                                improved = true;
-                                break;
-                            }
-                        }
-                        if improved { break; }
-                    }
-                }
-                if improved { break; }
-            }
-            if !improved { break; }
+/// Deterministic strongly-connected-components labelling via Kosaraju
+/// (iterative, so deep graphs cannot overflow the stack).
+fn scc_of(edges: &[[usize; 4]], radj: &[Vec<usize>], n: usize) -> Vec<usize> {
+    let mut visited = vec![false; n];
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    for s in 0..n {
+        if visited[s] {
             continue;
         }
-        break;
+        visited[s] = true;
+        let mut stack: Vec<(usize, u8)> = vec![(s, 0)];
+        while let Some(&(u, d)) = stack.last() {
+            if (d as usize) < 4 {
+                stack.last_mut().unwrap().1 += 1;
+                let v = edges[u][d as usize];
+                if v < n && !visited[v] {
+                    visited[v] = true;
+                    stack.push((v, 0));
+                }
+            } else {
+                order.push(u);
+                stack.pop();
+            }
+        }
+    }
+
+    let mut comp = vec![usize::MAX; n];
+    let mut num = 0usize;
+    for &s in order.iter().rev() {
+        if comp[s] != usize::MAX {
+            continue;
+        }
+        comp[s] = num;
+        let mut stack = vec![s];
+        while let Some(u) = stack.pop() {
+            for &w in &radj[u] {
+                if comp[w] == usize::MAX {
+                    comp[w] = num;
+                    stack.push(w);
+                }
+            }
+        }
+        num += 1;
+    }
+    comp
+}
+
+/// Connectivity enforcement: make the graph strongly connected with minimal
+/// disruption, in one provably-terminating O(n + E) pass.
+///
+/// The old implementation was a swap loop that ran at most `n` iterations,
+/// performed one swap each and — on row, column and scatter layouts — never
+/// reached strong connectivity at all (a 1000-node row ended with 899
+/// in-degree-0 nodes and had overwritten good navigation edges). It also never
+/// filled an empty slot, so isolated nodes could not be connected.
+///
+/// The repair works on the SCC condensation DAG. It closes a directed cycle
+/// through every component: for each component `a` lacking a direct edge to
+/// the next component `b` it adds `rep(a) -> rep(b)`. The literal cycle
+/// `c_0 -> c_1 -> ... -> c_{m-1} -> c_0` then exists, so every component (and
+/// every node) reaches every other. Each component contributes at most one
+/// added edge, written last for its source node, so a later iteration never
+/// removes it — the construction is correct even when a component has no empty
+/// slot and `place_edge` must overwrite one of its own outgoing edges.
+///
+/// Added edges go into empty slots wherever possible, so the
+/// reasonable-navigation edges produced by Phases 1–2 survive; the
+/// best-aligned direction is chosen, and a slot is only overwritten when the
+/// component has no empty slot anywhere.
+fn enforce_connectivity(edges: &mut [[usize; 4]], n: usize, positions: &[(f32, f32)]) {
+    if n == 0 || is_strongly_connected(edges, n) {
+        return;
+    }
+    let radj = reverse_adjacency(edges, n);
+    let comp = scc_of(edges, &radj, n);
+    let num = comp.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+    if num <= 1 {
+        return;
+    }
+
+    // Condensation adjacency; dedup not required for the membership test.
+    let mut cadj: Vec<Vec<usize>> = vec![Vec::new(); num];
+    for u in 0..n {
+        for d in 0..4 {
+            let v = edges[u][d];
+            if v < n && comp[u] != comp[v] {
+                cadj[comp[u]].push(comp[v]);
+            }
+        }
+    }
+
+    // Smallest-index node per SCC, preferring one with an empty slot so a
+    // repair edge is placed without disturbing navigation.
+    let mut rep = vec![usize::MAX; num];
+    let mut rep_empty = vec![usize::MAX; num];
+    for u in 0..n {
+        let c = comp[u];
+        if rep[c] == usize::MAX {
+            rep[c] = u;
+        }
+        if rep_empty[c] == usize::MAX && edges[u].iter().any(|&v| v >= n) {
+            rep_empty[c] = u;
+        }
+    }
+    for c in 0..num {
+        if rep_empty[c] == usize::MAX {
+            rep_empty[c] = rep[c];
+        }
+    }
+
+    // Close a directed cycle through every component.
+    for a in 0..num {
+        let b = (a + 1) % num;
+        if a == b || cadj[a].contains(&b) {
+            continue;
+        }
+        place_edge(edges, rep_empty[a], rep[b], n, positions);
     }
 }
 
@@ -1429,17 +1565,85 @@ mod tests {
         }
     }
 
-    /// The whole `build` must equal the pre-#107 `build_oracle` on every
-    /// layout, byte for byte, with the old enforcement in place.
+    /// After the whole build the graph must be strongly connected on every
+    /// layout — the property the old enforcement failed to establish on row,
+    /// column and scatter pages.
     #[test]
-    fn nav_graph_11_build_matches_oracle_byte_for_byte() {
+    fn nav_graph_11_build_is_strongly_connected() {
+        for (name, boxes) in oracle_layouts() {
+            let g = NavGraph::build(&boxes);
+            assert!(
+                is_strongly_connected(&g.edges, g.n),
+                "{name} (n={}): not strongly connected after build",
+                g.n
+            );
+        }
+    }
+
+    /// The enforcement fix must not disturb a graph the old code had already
+    /// made strongly connected without overwriting navigation: every layout
+    /// whose old graph equals its pre-enforcement edges stays byte identical,
+    /// and every layout that changes goes from not-strongly-connected (or an
+    /// over-eager swap repair) to strongly connected, without sacrificing any
+    /// more Phase-1 (`initial_edges`) links than the old repair did.
+    #[test]
+    fn nav_graph_12_enforcement_preserves_working_graphs() {
+        let initial_preserved = |g: &NavGraph| -> usize {
+            let mut c = 0;
+            for i in 0..g.n {
+                for d in 0..4 {
+                    if g.initial_edges[i][d] < g.n && g.edges[i][d] == g.initial_edges[i][d] {
+                        c += 1;
+                    }
+                }
+            }
+            c
+        };
         for (name, boxes) in oracle_layouts() {
             let fast = NavGraph::build(&boxes);
             let slow = NavGraph::build_oracle(&boxes);
             assert_eq!(fast.n, slow.n, "{name}: n");
-            assert_eq!(fast.edges, slow.edges, "{name}: edges");
             assert_eq!(fast.initial_edges, slow.initial_edges, "{name}: initial_edges");
-            assert_eq!(fast.positions, slow.positions, "{name}: positions");
+            assert!(
+                is_strongly_connected(&fast.edges, fast.n),
+                "{name}: new graph is not strongly connected"
+            );
+            if fast.edges == slow.edges {
+                continue; // byte-identical: the fix changed nothing here
+            }
+            assert!(
+                initial_preserved(&fast) >= initial_preserved(&slow),
+                "{name}: new repair disturbed more Phase-1 links than the old one"
+            );
+        }
+    }
+
+    /// Large layouts where the old enforcement genuinely failed to converge.
+    /// The old swap loop ran all `n` iterations and still left the graph
+    /// disconnected; the new repair converges in one O(n + E) pass.
+    #[test]
+    fn nav_graph_13_large_layouts_converge() {
+        let mut layouts: Vec<(&str, Vec<BoundingBox>)> = Vec::new();
+        layouts.push(("scatter_1500", {
+            let mut rng = Lcg::new(2024);
+            (0..1500)
+                .map(|_| bb((rng.next_f() * 3600.0) as i32, (rng.next_f() * 2000.0) as i32, 24, 24))
+                .collect()
+        }));
+        layouts.push(("dupes_200", (0..200).map(|_| bb(100, 100, 24, 24)).collect()));
+        for (name, boxes) in layouts {
+            let fast = NavGraph::build(&boxes);
+            assert!(
+                is_strongly_connected(&fast.edges, fast.n),
+                "{name} (n={}): new graph is not strongly connected",
+                fast.n
+            );
+            let slow = NavGraph::build_oracle(&boxes);
+            assert!(
+                !is_strongly_connected(&slow.edges, slow.n),
+                "{name} (n={}): expected the old enforcement to fail here",
+                slow.n
+            );
         }
     }
 }

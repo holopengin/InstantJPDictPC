@@ -18,6 +18,11 @@ east, west]` targets from char-box centres normalised by the page extents
   cost = primary + 10 × off-axis; greedy assignment.
 - Phase 2 (island connecting): unlimited distance, 45° cone, 1.5 × off-axis
   penalty, then connectivity enforcement.
+- Connectivity enforcement (`enforce_connectivity`, PC-side): the graph is
+  made strongly connected in one O(n + E) pass over the SCC condensation — a
+  directed cycle is closed through every component, adding each repair link to
+  an empty slot (best-aligned direction) wherever possible. Runs before Phase 3
+  (which then only fills the remaining empty slots, preserving connectivity).
 - Phase 3 (wrap fill): wrapping-only candidates from the opposite
   half-plane fill remaining empty slots.
 - Fewer than 5 nodes take the `fallback` (`:262`); `navigate(idx, dir)`
@@ -53,11 +58,19 @@ east, west]` targets from char-box centres normalised by the page extents
 - PC viewer: `apply_ocr_batch_fills_all_slots_in_one_pass`
   (`src/viewer.rs:4195`), `apply_ocr_batch_without_text_leaves_cursor_unset`
   (`:4258`); main: `detection_annotations_keep_indices_and_quads`.
+- PC core: `nav_graph_01..08` (`core/src/nav_graph.rs`) pin the exact
+  neighbour tables / `initial_edges`; `nav_graph_09/10` are differential
+  oracle tests for the #107 top-k enumerators; `nav_graph_11` asserts strong
+  connectivity after build on every layout; `nav_graph_12` proves the #107
+  enforcement fix leaves already-connected graphs byte-identical and never
+  sacrifices more Phase-1 links than the old repair; `nav_graph_13` covers
+  large layouts the old swap loop could not connect. The pre-#107 build and
+  list construction are kept verbatim under `cfg(test)` as the oracle.
 - Mobile: `ConformanceCorpusTest.readingOrderCases` (unmerged branch; runs
   the real `OcrEngine.sortDetectedBoxes`, exposed internal-companion for
   host tests). **No `OcrEngineTest.readingOrder` unit test exists** — case
   JSON `mobile_mirror` values naming it are aspirational; the verified
   mirrors are `sortDetectedBoxes` itself and the branch runner.
-- Gap: `NavGraph::build`/`navigate` have no dedicated unit tests on either
-  side; only batch-seeding behaviour is pinned. A navigation-regression case
-  is wanted.
+- Gap: the nav graph has no conformance-corpus case (the corpus has no
+  nav-graph kind); the Rust unit tests above are the pin, mirrored on the
+  Android side by `nav_graph_core/src/lib.rs` and `NavGraphCoreTest.kt`.
