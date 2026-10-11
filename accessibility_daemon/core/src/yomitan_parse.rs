@@ -106,6 +106,28 @@ pub fn value_to_string(value: &Value) -> String {
     }
 }
 
+/// Split a Yomitan tag or rule field into its members.
+///
+/// Both fields are documented as *space*-separated, and the separator really is
+/// `U+0020`. The trap is that an individual **tag name may contain `U+00A0`
+/// NBSP internally**. Jitendex relies on that: 7 of the 8 canonical names in
+/// its `tag_bank_1.json` are `old<NBSP>kanji<NBSP>form`-shaped, and its term
+/// rows repeat those names verbatim in field 2, so `old<NBSP>kanji<NBSP>form`
+/// is **one** tag, not three.
+///
+/// `str::split_whitespace` classifies NBSP as whitespace (Unicode
+/// `White_Space`), so it shreds every such name into `old` / `kanji` / `form`
+/// and the name can never be matched against the tag table that
+/// [`parse_tag_bank`] loads intact. Split on the ASCII space only.
+///
+/// Measured over jitendex-yomitan rev `2026.02.05`: field 2 is ASCII-joined,
+/// with NBSP inside the names — 147,808 rows carry a single NBSP-separated
+/// name, 8,329 carry several joined by a real space, and 0 use NBSP as the
+/// separator.
+pub fn split_space_separated(field: &str) -> impl Iterator<Item = &str> {
+    field.split(' ').filter(|s| !s.is_empty())
+}
+
 /// Parse a term bank into shared dictionary-entry rows.
 ///
 /// A malformed top-level document is an error.  Individual rows that do not

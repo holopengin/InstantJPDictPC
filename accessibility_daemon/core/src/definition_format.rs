@@ -67,6 +67,45 @@ fn content_class(node: &serde_json::Value) -> Option<String> {
 }
 
 /// Parse a stored definition payload into displayable nodes.
+/// Whether `value` is a Yomitan deinflection pair from a definitions array.
+///
+/// The v3 schema allows a definitions array to carry, alongside structured
+/// content, a two-element pair `[uninflectedTerm, [inflectionRule, ...]]`
+/// recording which chain of rules produces the inflected surface. Jitendex
+/// emits it on redirects (`["Ｎ響", ["redirected from Ｎ響"]]`), 131,789 times
+/// in rev `2026.02.05`.
+///
+/// It is metadata, not a definition. Stored verbatim in
+/// `entry.definitions` by [`crate::yomitan_parse::parse_term_bank`], a generic
+/// walker therefore recursed straight into it and rendered the raw metadata as
+/// if it were a gloss — a redirect entry came out as
+/// `⟶ Ｎ響  Ｎ響, redirected from Ｎ響`.
+///
+/// The predicate is deliberately tight, and it was checked against the whole
+/// archive before being relied on: exactly 131,789 occurrences, **all** at the
+/// top level of a definitions array, and **zero** nested anywhere inside
+/// structured content. A looser "looks like an array" test would have matched
+/// real nodes such as `ruby`'s `["字", {…}]`.
+fn is_deinflection_pair(value: &serde_json::Value) -> bool {
+    let serde_json::Value::Array(items) = value else {
+        return false;
+    };
+    items.len() == 2
+        && matches!(items[0], serde_json::Value::String(_))
+        && matches!(&items[1], serde_json::Value::Array(rules)
+            if rules.iter().all(|r| matches!(r, serde_json::Value::String(_))))
+}
+
+/// The renderable entries of a definitions array: the definitions themselves,
+/// minus any deinflection pairs. See [`is_deinflection_pair`].
+fn without_deinflection_pairs(items: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    items
+        .iter()
+        .filter(|item| !is_deinflection_pair(item))
+        .cloned()
+        .collect()
+}
+
 pub fn parse_definition(data: &serde_json::Value, separator: &str) -> Vec<DefinitionNode> {
     let mut nodes = Vec::new();
     parse_definition_into(data, separator, &mut nodes);
@@ -93,6 +132,10 @@ fn parse_definition_into(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
+                // A deinflection pair is row metadata, never a definition.
+                if is_deinflection_pair(item) {
+                    continue;
+                }
                 let mut item_nodes = Vec::new();
                 parse_definition_into(item, separator, &mut item_nodes);
                 if item_nodes.is_empty() {
@@ -343,6 +386,10 @@ pub(crate) fn parse_glossary(data: &[serde_json::Value]) -> ParsedGlossary {
         match node {
             serde_json::Value::Array(arr) => {
                 for item in arr {
+                    // A deinflection pair is row metadata, not a node.
+                    if is_deinflection_pair(item) {
+                        continue;
+                    }
                     walk(item, groups, trailing);
                 }
             }
@@ -372,6 +419,9 @@ pub(crate) fn parse_glossary(data: &[serde_json::Value]) -> ParsedGlossary {
         }
     }
 
+    // Drop deinflection pairs up front so the group walk and the plain-text
+    // fallback see the same definitions the renderer will.
+    let data = without_deinflection_pairs(data);
     walk(
         &serde_json::Value::Array(data.to_vec()),
         &mut groups,
@@ -732,6 +782,9 @@ fn render_plain(el: &serde_json::Value) -> Option<String> {
         serde_json::Value::Array(arr) => {
             let joined = arr
                 .iter()
+                // Deinflection pairs are metadata; keep them out of exported
+                // text as well as rendered senses.
+                .filter(|item| !is_deinflection_pair(item))
                 .filter_map(render_plain)
                 .filter(|s| !s.trim().is_empty())
                 .collect::<Vec<_>>()

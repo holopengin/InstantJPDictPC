@@ -1237,13 +1237,27 @@ fn dictionary_cases() {
         let c = &v["case"];
         let term = c["term"].as_str().expect("term");
         let reading = c["reading"].as_str().expect("reading");
-        let defs = jitendex_definitions(term, reading);
+        // Payloads normally come from the pinned fixture, so the Android side
+        // runs byte-identical inputs. A case that pins a *synthetic* edge
+        // case -- one the pinned release happens not to contain, or one that
+        // is not structured content at all -- may carry `definitions` inline
+        // instead. Exactly one of the two must be present.
+        if c.get("definitions").is_some() && c.get("definitions_ref").is_some() {
+            panic!("{id}: set `definitions` or `definitions_ref`, not both");
+        }
+        let defs = match c.get("definitions") {
+            Some(inline) => inline.clone(),
+            None => jitendex_definitions(term, reading),
+        };
+        // Optional: the `|`-joined tag/rule field exactly as `parse_term_bank`
+        // builds it. Needed to pin tag handling; absent means "no tags".
+        let rules = c["rules"].as_str().unwrap_or("").to_string();
         let entry = DictionaryEntry {
             id: 1,
             kanji: term.to_string(),
             reading: reading.to_string(),
             definitions: serde_json::to_string(&defs).expect("defs serialize"),
-            rules: String::new(),
+            rules,
             popularity: 0,
             dictionary_id: 1,
             onyomi: None,
@@ -1303,6 +1317,35 @@ fn dictionary_cases() {
                     blob.contains(want),
                     "{id}: {key} {want:?} missing from formatted senses:\n{blob}"
                 );
+            }
+        }
+        // Exact tag list per sense group, flattened in order. Tags reach
+        // `FormattedSenseGroup::tags` only on the non-structured path (a
+        // structured payload carries its own POS chips instead), so this
+        // pins the tag split used by plain-text Yomitan dictionaries.
+        if let Some(want) = exp["tags"].as_array() {
+            let got: Vec<String> = groups
+                .iter()
+                .flat_map(|g| g.sense_groups.iter())
+                .flat_map(|sg| sg.tags.iter().cloned())
+                .collect();
+            let want: Vec<String> = want
+                .iter()
+                .map(|s| s.as_str().expect("tag str").to_string())
+                .collect();
+            assert_eq!(got, want, "{id}: rendered tags drifted");
+        }
+        // Text that must not appear anywhere in the rendered senses. Used to
+        // pin that row metadata stays out of the definition body.
+        for key in ["forbid_text"] {
+            if let Some(forbidden) = exp[key].as_array() {
+                for f in forbidden {
+                    let needle = f.as_str().expect("forbid str");
+                    assert!(
+                        !blob.contains(needle),
+                        "{id}: {needle:?} leaked into the rendered senses:\n{blob}"
+                    );
+                }
             }
         }
         if dump() {

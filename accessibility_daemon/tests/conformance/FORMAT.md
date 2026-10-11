@@ -216,6 +216,39 @@ duplicated. Expectations pin the formatted DOM shape: headword/reading lists
 exact, sense-group counts as lower bounds (dictionaries grow), example
 Japanese/English split as substring match.
 
+**Two optional fields exist for synthetic cases.** A case may pin something the
+pinned release does not contain, or something that is not Jitendex structured
+content at all — a plain-text glossary, or a row whose interesting part is its
+metadata. Those carry `definitions` inline and set `mobile_mirror` to `null`
+with the reason in `description`. Setting both `definitions` and
+`definitions_ref` fails the harness.
+
+```json
+"case": {
+  "term": "凡百", "reading": "ぼんびゃく",
+  "definitions": ["a hundred; a myriad"],
+  "rules": "old\u00a0kanji\u00a0form priority\u00a0form | v5 | common",
+  "expect": {
+    "headwords": ["凡百"], "readings": ["ぼんびゃく"],
+    "min_sense_groups": 1,
+    "tags": ["old\u00a0kanji\u00a0form", "priority\u00a0form", "common"]
+  }
+}
+```
+
+* `rules` — the `|`-joined tag/rule field exactly as `parse_term_bank` builds
+  it (segment 0 = term-bank tags, 1 = inflection rules, 2 = term tags). Absent
+  means "no tags". Note the two spaces in this example are *different
+  characters*: the tag field is ASCII-space-joined, but a tag name carries NBSP
+  internally, so the JSON must use `\u00a0` escapes — a raw NBSP is invisible
+  and a future editor would silently break the case by typing a space.
+* `expect.tags` — the flattened `FormattedSenseGroup::tags` list, exact and
+  ordered. Reached only on the non-structured path: a structured payload
+  carries its own POS chips, so a structured case exercises this field as empty.
+* `expect.forbid_text` — substrings that must **not** appear anywhere in the
+  rendered senses. Used to pin that row metadata stays out of the definition
+  body.
+
 ### `recognition` — vendored photo/screenshot in, line texts out
 
 ```json

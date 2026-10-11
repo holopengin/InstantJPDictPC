@@ -47,6 +47,18 @@ reason.
 - Dropping unknown tags/nodes instead of rendering their content (blanks a
   whole sense on dictionary updates).
 - Painting body ruby from the term display style (the ticket-06 symptom).
+- **Splitting a tag field with `str::split_whitespace`.** The field is ASCII
+  space-joined, but an individual tag *name* carries NBSP internally —
+  `old kanji form` is one tag, per Jitendex's `tag_bank_1.json`, where 7 of
+  8 canonical names are shaped that way. NBSP is Unicode whitespace, so
+  generic splitting shreds the name into `old` / `kanji` / `form` and it can
+  never match the tag table. Use `yomitan_parse::split_space_separated`.
+- **Rendering a deinflection pair.** A definitions array may carry
+  `[uninflectedTerm, [inflectionRule, …]]` beside its definitions — 131,789
+  such rows in Jitendex rev `2026.02.05`, all on redirects. It is stored
+  verbatim, so a generic walker renders the raw metadata (`redirected from X`)
+  as if it were a gloss. Filter it with `definition_format`'s
+  `is_deinflection_pair`.
 
 ## Pinning tests
 
@@ -66,7 +78,8 @@ reason.
   `term_ruby_keeps_full_size_term_display` `:4371`,
   `pitch_line_renders_only_when_the_switch_is_on`,
   `pitch_line_ships_off`).
-- Conformance: `dictionary-01-jitendex` via `dictionary_cases`
+- Conformance: `dictionary-01-jitendex`, `dictionary-02-tag-names-with-nbsp`,
+  `dictionary-03-redirect-deinflection-pair` via `dictionary_cases`
   (`core/src/conformance.rs:887`); `ruby-style-01-modes` via `ruby_style_cases`
   (`:822`).
 - Mobile: `JitendexStructuredContentTest`, `FormatPerDictTest`,

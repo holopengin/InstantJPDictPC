@@ -1,0 +1,28 @@
+{
+    "id": "dictionary-02-tag-names-with-nbsp",
+    "kind": "dictionary",
+    "description": "A Jitendex definition-tag field is ASCII-space-joined, but an individual tag NAME carries NBSP internally: `old\u00a0kanji\u00a0form` is ONE tag. Seven of the eight canonical names in Jitendex's tag_bank_1.json are shaped that way (`priority\u00a0form`, `irregular\u00a0form`, `rarely\u00a0used\u00a0form`, ...). Splitting the field with generic whitespace classifies NBSP as whitespace (Unicode White_Space) and shreds the name into three chips `old` / `kanji` / `form`, so the name can never be matched against the tag table that parse_tag_bank loads intact. This pins the ASCII-space-only split. The payload is a plain-text (non-structured) glossary on purpose: a structured payload carries its own POS chips and never renders the entry-level tag field, so only this shape exercises the split. mobile_mirror is null -- PC-hosted formatting defect, not a mobile parity surface.",
+    "mobile_mirror": null,
+    "case": {
+        "term": "\u51e1\u767e",
+        "reading": "\u307c\u3093\u3073\u3083\u304f",
+        "definitions": [
+            "a hundred; a myriad"
+        ],
+        "rules": "old\u00a0kanji\u00a0form priority\u00a0form | v5 | common",
+        "expect": {
+            "headwords": [
+                "\u51e1\u767e"
+            ],
+            "readings": [
+                "\u307c\u3093\u3073\u3083\u304f"
+            ],
+            "min_sense_groups": 1,
+            "tags": [
+                "old\u00a0kanji\u00a0form",
+                "priority\u00a0form",
+                "common"
+            ]
+        }
+    }
+}

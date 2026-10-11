@@ -1,0 +1,70 @@
+{
+    "id": "dictionary-03-redirect-deinflection-pair",
+    "kind": "dictionary",
+    "description": "The v3 schema lets a definitions array carry, beside structured content, a two-element pair [uninflectedTerm, [inflectionRule, ...]] recording the rule chain that produces an inflected surface. Jitendex emits it on redirects -- [\"\uff2e\u97ff\", [\"redirected from \uff2e\u97ff\"]] -- 131789 times in rev 2026.02.05. parse_term_bank stores the whole definitions array verbatim, so a generic walker recursed into the pair and rendered raw row metadata as if it were a gloss; the entry came out as a redirect plus the literal text 'redirected from \uff2e\u97ff'. This pins that the pair is metadata and never reaches the rendered senses. Payload is trimmed from a real Jitendex redirect row (term_bank_1, seq -1000130). mobile_mirror is null -- PC-hosted formatting defect, not a mobile parity surface.",
+    "mobile_mirror": null,
+    "case": {
+        "term": "\uff2e\u97ff",
+        "reading": "\u30a8\u30cc\u304d\u3087\u3046",
+        "definitions": [
+            {
+                "type": "structured-content",
+                "content": {
+                    "tag": "div",
+                    "lang": "ja",
+                    "data": {
+                        "content": "redirect-glossary"
+                    },
+                    "content": [
+                        "\u27f6",
+                        {
+                            "tag": "a",
+                            "lang": "ja",
+                            "href": "?query=%EF%BC%AE%E9%9F%BF&wildcards=off&primary_reading=%E3%82%A8%E3%83%AC%E3%81%8D%E3%82%87%E3%81%86",
+                            "content": [
+                                {
+                                    "tag": "ruby",
+                                    "content": [
+                                        "\uff2e",
+                                        {
+                                            "tag": "rt",
+                                            "content": "\u30a8\u30cc"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "tag": "ruby",
+                                    "content": [
+                                        "\u97ff",
+                                        {
+                                            "tag": "rt",
+                                            "content": "\u304d\u3087\u3046"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            [
+                "\uff2e\u97ff",
+                [
+                    "redirected from \uff2e\u97ff"
+                ]
+            ]
+        ],
+        "expect": {
+            "headwords": [
+                "\uff2e\u97ff"
+            ],
+            "readings": [
+                "\u30a8\u30cc\u304d\u3087\u3046"
+            ],
+            "min_sense_groups": 1,
+            "forbid_text": [
+                "redirected from"
+            ]
+        }
+    }
+}

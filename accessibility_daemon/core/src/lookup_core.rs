@@ -15,6 +15,7 @@ use crate::models::{
 };
 use crate::util::deinflector::{DeinflectionResult, Deinflector};
 use crate::util::{japanese, pitch};
+use crate::yomitan_parse;
 
 /// Owned result of a dictionary lookup.
 #[derive(Debug)]
@@ -270,7 +271,10 @@ pub fn process_results(
                     term_entries
                         .iter()
                         .filter(|entry| {
-                            let entry_tags: Vec<&str> = entry.rules.split_whitespace().collect();
+                            // ASCII space only, for the same NBSP-in-a-tag-name
+                            // reason as the tag rendering above.
+                            let entry_tags: Vec<&str> =
+                                yomitan_parse::split_space_separated(&entry.rules).collect();
                             required_types.is_empty()
                                 || required_types.iter().any(|required| {
                                     entry_tags
@@ -475,7 +479,9 @@ pub fn format_dictionary_results(
                     for segment_index in [0usize, 2] {
                         if let Some(segment) = segments.get(segment_index) {
                             let mut current_sense = None;
-                            for tag in segment.split_whitespace() {
+                            // ASCII space only: a tag name may contain NBSP
+                            // internally (see `split_space_separated`).
+                            for tag in yomitan_parse::split_space_separated(segment) {
                                 if let Ok(number) = tag.parse::<usize>() {
                                     current_sense = Some(number);
                                 } else if !tag.starts_with("grade:") {
