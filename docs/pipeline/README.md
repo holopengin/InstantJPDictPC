@@ -20,7 +20,8 @@ Pages:
 - [blank-gaps.md](blank-gaps.md) — spacing-ratio gap detection (per-orientation
   thresholds, three geometry sources, timestep walk), vertical-only placeholder
   insertion, candidate pool, LM ranking, fallback order, list retention.
-- [glyph-sizing.md](glyph-sizing.md) — cross-axis sizing, `glyphSizePx`, ink
+- [glyph-sizing.md](glyph-sizing.md) — cross-axis sizing, `glyphSizePx`, the
+  ink-fills-the-box correction, the yellow-not-bold highlight departure, ink
   centring, halfwidth handling.
 - [kana-correction.md](kana-correction.md) — small/large window, encoder,
   epsilon policy.

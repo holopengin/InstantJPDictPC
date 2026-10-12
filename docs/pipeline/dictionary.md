@@ -23,6 +23,35 @@ Jitendex packs every sense into one row's glossary; the walker
 - Deinflected matches carry their chain into the chain row (see
   [deinflection](deinflection.md)); plain terms render exactly as before.
 
+## Panel face: name the bundled family, never a generic one
+
+Every panel widget renders in the **bundled** face, and must ask iced for it
+*by family name*. `init_panel_font` captures the resolved face's family at
+startup (`loaded_face.family_name()` — the same face the overlay glyph cache
+rasterizes and the same bytes registered with iced); `bold_font` (the
+term-display weight, used by `headword_block`, `tag_chip`, `ruby_view`,
+`full_ruby_view`) is that family at `Weight::Bold`.
+
+Why the family name matters, because iced gives no way to forbid the system
+database: `FontSystem::new_with_fonts` calls `load_system_fonts()`, so every
+font installed on the machine is in the DB. A generic
+`Family::SansSerif` request then resolves to the family cosmic-text
+configured ("Open Sans"), and the kanji come from cosmic-text's per-glyph
+fallback list — `han_unification(locale)`, which is `Noto Sans CJK SC`
+unless the process locale is exactly `ja`. That is the "headwords render in
+Chinese/ancient forms while the rest of the UI is modern Japanese" symptom.
+With only the bundled Regular registered, a `Weight::Bold` request *within*
+the bundled family lands on that Regular — the weight is aspirational (see
+the ticket-06 note), but the glyph forms are always the bundled Japanese
+ones.
+
+Residual, accepted: (a) cosmic-text's per-glyph fallback still applies to
+codepoints the bundled face lacks (e.g. the settings window's `✕`), and
+(b) a *system* font installed under the literal family name `Noto Sans JP` /
+`Noto Serif JP` could tie-break ahead of the bundled face, since system faces
+are loaded first and `fontdb::find_best_match` breaks ties by first-seen.
+Most distributions expose CJK as `Noto Sans CJK JP`, so this rarely bites.
+
 ## Ticket-06 departure: body ruby is white regular (DELIBERATE)
 
 Body (mini) ruby is **white regular**, term ruby stays **bold cyan**
@@ -47,6 +76,9 @@ reason.
 - Dropping unknown tags/nodes instead of rendering their content (blanks a
   whole sense on dictionary updates).
 - Painting body ruby from the term display style (the ticket-06 symptom).
+- Requesting a generic family (or `IcedFont::default()`, which is
+  `Family::SansSerif`) for panel text: it silently renders in system fonts,
+  and CJK in Chinese forms. Name the bundled family (see above).
 - **Splitting a tag field with `str::split_whitespace`.** The field is ASCII
   space-joined, but an individual tag *name* carries NBSP internally —
   `old kanji form` is one tag, per Jitendex's `tag_bank_1.json`, where 7 of
@@ -77,7 +109,8 @@ reason.
   (`body_ruby_uses_body_typeface_not_term_display` `:4359`,
   `term_ruby_keeps_full_size_term_display` `:4371`,
   `pitch_line_renders_only_when_the_switch_is_on`,
-  `pitch_line_ships_off`).
+  `pitch_line_ships_off`); panel face (`src/viewer.rs`
+  `panel_fonts_never_request_a_generic_family`).
 - Conformance: `dictionary-01-jitendex`, `dictionary-02-tag-names-with-nbsp`,
   `dictionary-03-redirect-deinflection-pair` via `dictionary_cases`
   (`core/src/conformance.rs:887`); `ruby-style-01-modes` via `ruby_style_cases`

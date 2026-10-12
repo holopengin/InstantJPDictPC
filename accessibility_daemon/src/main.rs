@@ -1156,8 +1156,10 @@ fn run_ocr_viewer(
         .and_then(|path| std::fs::read(path).ok())
         .unwrap_or_default();
     // The dictionary panel's flow layout packs lines against the real face;
-    // give it the same bytes iced renders with.
+    // give it the same bytes iced renders with, and the same face by NAME so
+    // no widget can ask for a generic family and land on a system font.
     crate::viewer::init_panel_metrics(&font_bytes);
+    crate::viewer::init_panel_font(loaded_face.family_name());
 
     let app = iced::application(boot, update, OcrViewer::view)
         // One selected face for the overlay glyph cache AND the iced text
@@ -1168,8 +1170,9 @@ fn run_ocr_viewer(
         // desktop counterpart: PC has no guaranteed system JP face to
         // return to (the bundled files *are* the fallback chain), and the
         // panel layout here was tuned against the same face as the overlay.
-        // So the Sans/Serif setting applies to both; only the highlight
-        // weight may differ (serif ships no bold, so it fake-bolds).
+        // So the Sans/Serif setting applies to both, and neither the panel
+        // nor the overlay has a second weight face: the overlay marks a
+        // selected word by tint (yellow), not by bolding it.
         .font(font_bytes)
         .default_font(iced::Font::with_name(loaded_face.family_name()))
         .window(iced::window::Settings {

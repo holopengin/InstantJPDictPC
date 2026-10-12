@@ -86,6 +86,40 @@ pub fn init_panel_metrics(bytes: &[u8]) {
     }
 }
 
+/// The face every panel widget asks iced for, captured at startup by
+/// [`init_panel_font`].
+///
+/// iced's font database contains **every font installed on the machine**
+/// (cosmic-text's `FontSystem::new_with_fonts` calls `load_system_fonts`),
+/// so a request for a *generic* family does not mean "the app's font": iced
+/// maps `Family::SansSerif` to the system family cosmic-text configured
+/// ("Open Sans"), and cosmic-text then fills the kanji cosmic-text's own
+/// per-glyph fallback list — which for `Script::Han` is
+/// `Noto Sans CJK SC` unless the process locale is exactly `ja`. That is
+/// how the headword/term widgets ended up in Chinese/ancient glyph forms
+/// while every other widget showed the bundled Japanese ones.
+///
+/// So every request names the bundled face by family, and the weight only
+/// picks within it (no bundled bold face, so a bold request lands on the
+/// bundled Regular — the same glyph forms as the rest of the UI).
+static PANEL_FONT: std::sync::OnceLock<IcedFont> = std::sync::OnceLock::new();
+
+/// Hand the panel its font family. Call once at startup with the family
+/// name of the face actually resolved — the same one the overlay glyph
+/// cache rasterizes and the same bytes registered with iced.
+pub fn init_panel_font(family: &'static str) {
+    let _ = PANEL_FONT.set(IcedFont::with_name(family));
+}
+
+/// The panel face, or the default bundled family when nothing was
+/// registered (unit tests, which never rasterize).
+fn panel_font() -> IcedFont {
+    PANEL_FONT
+        .get()
+        .copied()
+        .unwrap_or_else(|| IcedFont::with_name(FontFace::Sans.family_name()))
+}
+
 /// Real advance of `text` at `size` in the panel face, kerning included.
 fn measured_advance(font: &fontdue::Font, text: &str, size: f32) -> f32 {
     let mut width = 0.0;
@@ -184,9 +218,10 @@ fn inline_cell_width(cell: &InlineCell) -> f32 {
     }
 }
 
-/// Mobile `LineOverlayView.textSize = fixedSize * 0.90f`: the one glyph size
-/// per line, taken from the line's own box (never a measured pitch).
-const TEXT_SIZE_RATIO: f32 = 0.9;
+/// Fraction of the char box the glyph ink fills along the cross axis, once
+/// the em is corrected for the face's ink ratio (see [`line_text_px`]).
+/// Slightly under 1.0 so ascenders/descenders do not touch the box edge.
+const GLYPH_FILL_RATIO: f32 = 0.98;
 /// Mobile LineOverlayView `ASCII_GLYPH_SCALE` (#49): the shared line-height
 /// text size renders halfwidth glyphs ~10% oversized next to CJK.
 const ASCII_GLYPH_SCALE: f32 = 0.9;
@@ -229,37 +264,50 @@ const OVERLAY_FG: (u8, u8, u8) = (255, 119, 119);
 /// Yellow for highlighted/matched characters.
 const OVERLAY_HL: (u8, u8, u8) = (255, 255, 0);
 
-/// Which face/variant a cached raster belongs to.
+/// Which tint a cached raster carries. Both variants rasterize the *same*
+/// regular face: a selected word is the same glyph in yellow, not a bold
+/// one. Mobile fake-bolded its highlights (and the PC port once bundled a
+/// sans bold companion for them); that weight is gone — see
+/// `docs/pipeline/glyph-sizing.md`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum GlyphKind {
     /// Regular face, pink.
     Pink,
-    /// Bold companion face, highlight yellow.
-    Bold,
-    /// Synthetic bold derived from the regular face (no bold companion).
-    Synthetic,
+    /// Regular face, yellow (the matched word).
+    Yellow,
 }
+
+/// Raster size the reference glyph is probed at to measure the face's ink
+/// ratio. Any size works (the ratio is size-independent); a mid-range one
+/// keeps the integer rounding error negligible.
+const INK_PROBE_PX: u32 = 64;
 
 /// Lazily rasterizes characters at requested pixel sizes, caching RGBA
 /// image handles. Thread‑safe via RefCell for interior mutability.
 pub struct GlyphCache {
     font: Font,
-    /// Real bold companion for highlighted glyphs; `None` falls back to
-    /// synthetic emboldening (mobile ships Regular only).
-    bold_font: Option<Font>,
     /// Rasterized glyphs keyed by `(kind, glyph id, px)`: the id may be a
     /// GSUB substitution (vertical forms), not just the cmap glyph.
     cache: HashMap<(GlyphKind, u16, u32), RasterGlyph>,
     /// GSUB `vert`/`vrt2` resolution results (source glyph -> vertical glyph).
     vert_cache: HashMap<u16, u16>,
-    /// Same for the bold companion face.
-    bold_vert_cache: HashMap<u16, u16>,
     /// Font-parser view of the regular bytes, for cmap and GSUB `vert`/`vrt2`
     /// resolution (fontdue exposes neither).
     vface: Option<ttf_parser::Face<'static>>,
-    /// Same for the bold companion.
-    bold_vface: Option<ttf_parser::Face<'static>>,
+    /// Fraction of the em that the reference glyph `あ` inks vertically
+    /// (0.86 for the bundled sans, 0.84 for the bundled serif). Multiplying
+    /// the em by a fixed ratio sizes the *em square*, not the ink, and leaves
+    /// every line floating inside its box; dividing the box by this puts the
+    /// ink edge to the box edge instead. Measured once at load, from the face
+    /// actually resolved. Falls back to [`DEFAULT_INK_RATIO`] if the probe
+    /// has no ink.
+    ink_height_ratio: f32,
 }
+
+/// Ink ratio used when the reference glyph cannot be measured (a face with
+/// no usable `あ`): between the 0.86 sans and 0.84 serif the bundled faces
+/// report.
+const DEFAULT_INK_RATIO: f32 = 0.85;
 
 /// Resolve the Japanese UI font file used by BOTH the OCR overlay glyph
 /// cache and the iced dictionary panel (they must render identically).
@@ -270,35 +318,18 @@ pub struct GlyphCache {
 /// [`GlyphCache::new_for`] resolves the face actually painted.
 
 impl GlyphCache {
-    /// Cache for the selected face, with the bold companion that matches the
-    /// file actually resolved: a serif selection that falls back to the sans
-    /// file (its own missing) pairs with the sans bold, never a mismatched
-    /// one. `None` means the overlay draws boxes without glyphs — mobile
-    /// degrades the same way (#84) rather than crashing.
+    /// Cache for the selected face. `None` means the overlay draws boxes
+    /// without glyphs — mobile degrades the same way (#84) rather than
+    /// crashing.
     pub fn new_for(face: FontFace) -> Option<Rc<RefCell<Self>>> {
-        let regular = jpdict_core::overlay_font::find_font_path(face);
-        let bold = regular
-            .as_deref()
-            .map(jpdict_core::overlay_font::face_of)
-            .and_then(jpdict_core::overlay_font::find_bold_font_path);
-        Self::from_paths(regular, bold)
+        Self::from_path(jpdict_core::overlay_font::find_font_path(face))
     }
 
-    /// Test/helper entry: regular face only (synthetic bold fallback).
-    #[cfg(test)]
+    /// Load the cache from a specific font file. A missing path or an
+    /// unreadable face yields `None` and the overlay draws boxes without
+    /// glyphs — mobile falls back to the platform face and never crashes the
+    /// overlay for a missing bundled font (OverlayFont #84).
     fn from_path(path: Option<std::path::PathBuf>) -> Option<Rc<RefCell<Self>>> {
-        Self::from_paths(path, None)
-    }
-
-    /// Load the cache from specific font files: the regular face and an
-    /// optional bold companion. A missing regular path or an unreadable face
-    /// yields `None` and the overlay draws boxes without glyphs — mobile
-    /// falls back to the platform face and never crashes the overlay for a
-    /// missing bundled font (OverlayFont #84).
-    fn from_paths(
-        path: Option<std::path::PathBuf>,
-        bold_path: Option<std::path::PathBuf>,
-    ) -> Option<Rc<RefCell<Self>>> {
         let Some(path) = path else {
             eprintln!("[GlyphCache] no CJK font found, overlay text will not render");
             return None;
@@ -315,48 +346,45 @@ impl GlyphCache {
             eprintln!("[GlyphCache] failed to parse font {}", path.display());
             return None;
         };
-        let (bold_font, bold_vface) = match bold_path {
-            Some(bp) => match std::fs::read(&bp) {
-                Ok(bdata) => {
-                    let bface_data: &'static [u8] =
-                        Box::leak(bdata.clone().into_boxed_slice());
-                    let bface = ttf_parser::Face::parse(bface_data, 0).ok();
-                    match Font::from_bytes(bdata, fontdue::FontSettings::default()) {
-                        Ok(bf) => {
-                            println!("[GlyphCache] bold face: {}", bp.display());
-                            (Some(bf), bface)
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "[GlyphCache] failed to parse bold font {}; highlights use synthetic bold",
-                                bp.display()
-                            );
-                            (None, None)
-                        }
-                    }
-                }
-                Err(_) => (None, None),
-            },
-            None => {
-                eprintln!("[GlyphCache] no bold face found; highlights use synthetic bold");
-                (None, None)
-            }
-        };
+        let ink_height_ratio = Self::measure_ink_height_ratio(&font);
         Some(Rc::new(RefCell::new(GlyphCache {
             font,
-            bold_font,
             cache: HashMap::new(),
             vert_cache: HashMap::new(),
-            bold_vert_cache: HashMap::new(),
             vface,
-            bold_vface,
+            ink_height_ratio,
         })))
     }
 
-    /// Look up or rasterize `ch` and return its drawable variant. Highlighted
-    /// glyphs come from the bundled bold companion face when one is present;
-    /// otherwise they fall back to synthetic emboldening (mobile's
-    /// `paint.isFakeBoldText`, which grows the stroke without clipping it).
+    /// How much of the em the reference glyph `あ` inks vertically. The em
+    /// size that fills a box of height `h` is therefore `h / ratio`: sizing
+    /// by the em (mobile's `fixedSize * 0.90`) instead draws the glyph that
+    /// much smaller than the box, which is the padding the overlay used to
+    /// show above and below every line.
+    fn measure_ink_height_ratio(font: &Font) -> f32 {
+        let gid = font.lookup_glyph_index('あ');
+        let (metrics, _) = Self::rasterize(font, gid, INK_PROBE_PX);
+        if metrics.height == 0 {
+            return DEFAULT_INK_RATIO;
+        }
+        let ratio = metrics.height as f32 / INK_PROBE_PX as f32;
+        if ratio > 0.0 && ratio.is_finite() {
+            ratio
+        } else {
+            DEFAULT_INK_RATIO
+        }
+    }
+
+    /// The face's measured ink ratio — the divisor that turns a box height
+    /// into an em size (see [`Self::measure_ink_height_ratio`]).
+    fn ink_height_ratio(&self) -> f32 {
+        self.ink_height_ratio
+    }
+
+    /// Look up or rasterize `ch` and return its drawable variant. A
+    /// highlighted glyph is the *same* regular-face glyph in yellow: the
+    /// weight no longer changes with the selection, so the two variants
+    /// differ only in tint.
     fn glyph_for(
         &mut self,
         ch: char,
@@ -364,17 +392,9 @@ impl GlyphCache {
         px: u32,
         highlighted: bool,
     ) -> Option<RasterGlyph> {
-        if highlighted {
-            if self.bold_font.is_some() {
-                if let Some(gid) = self.bold_glyph_id(ch, vertical) {
-                    return Some(self.variant(GlyphKind::Bold, gid, px));
-                }
-            }
-            let gid = self.glyph_id(ch, vertical)?;
-            return Some(self.variant(GlyphKind::Synthetic, gid, px));
-        }
+        let kind = if highlighted { GlyphKind::Yellow } else { GlyphKind::Pink };
         let gid = self.glyph_id(ch, vertical)?;
-        Some(self.variant(GlyphKind::Pink, gid, px))
+        Some(self.variant(kind, gid, px))
     }
 
     /// Rasterize (or fetch) one glyph variant. `gid` must belong to the face
@@ -383,45 +403,18 @@ impl GlyphCache {
         if let Some(entry) = self.cache.get(&(kind, gid, px)) {
             return entry.clone();
         }
-        let raster = match kind {
-            GlyphKind::Synthetic => {
-                let (m, coverage) = Self::rasterize(&self.font, gid, px);
-                let (w, h) = (m.width as u32, m.height as u32);
-                let radius = fake_bold_radius(px);
-                let (bold, bw, bh) = synthetic_bold(&coverage, w, h, radius);
-                RasterGlyph {
-                    handle: Self::make_handle(bw, bh, &bold, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2),
-                    w: bw,
-                    h: bh,
-                    xmin: m.xmin - radius,
-                    ymin: m.ymin - radius,
-                }
-            }
-            GlyphKind::Bold => {
-                let Some(face) = self.bold_font.as_ref() else {
-                    return self.variant(GlyphKind::Synthetic, gid, px);
-                };
-                let (m, coverage) = Self::rasterize(face, gid, px);
-                let (w, h) = (m.width as u32, m.height as u32);
-                RasterGlyph {
-                    handle: Self::make_handle(w, h, &coverage, OVERLAY_HL.0, OVERLAY_HL.1, OVERLAY_HL.2),
-                    w,
-                    h,
-                    xmin: m.xmin,
-                    ymin: m.ymin,
-                }
-            }
-            GlyphKind::Pink => {
-                let (m, coverage) = Self::rasterize(&self.font, gid, px);
-                let (w, h) = (m.width as u32, m.height as u32);
-                RasterGlyph {
-                    handle: Self::make_handle(w, h, &coverage, OVERLAY_FG.0, OVERLAY_FG.1, OVERLAY_FG.2),
-                    w,
-                    h,
-                    xmin: m.xmin,
-                    ymin: m.ymin,
-                }
-            }
+        let (m, coverage) = Self::rasterize(&self.font, gid, px);
+        let (w, h) = (m.width as u32, m.height as u32);
+        let (r, g, b) = match kind {
+            GlyphKind::Pink => OVERLAY_FG,
+            GlyphKind::Yellow => OVERLAY_HL,
+        };
+        let raster = RasterGlyph {
+            handle: Self::make_handle(w, h, &coverage, r, g, b),
+            w,
+            h,
+            xmin: m.xmin,
+            ymin: m.ymin,
         };
         self.cache.insert((kind, gid, px), raster.clone());
         raster
@@ -499,43 +492,6 @@ impl GlyphCache {
         Some(vert)
     }
 
-    /// Same resolution as [`Self::glyph_id`], on the bold companion face.
-    /// `None` when no bold face is loaded or it has no glyph for `ch`.
-    fn bold_glyph_id(&mut self, ch: char, vertical: bool) -> Option<u16> {
-        if self.bold_font.is_none() {
-            return None;
-        }
-        let gid = match self.bold_vface.as_ref() {
-            Some(face) => match face.glyph_index(ch) {
-                Some(g) => g.0,
-                None => self.bold_font.as_ref()?.lookup_glyph_index(ch),
-            },
-            None => self.bold_font.as_ref()?.lookup_glyph_index(ch),
-        };
-        if !vertical {
-            return Some(gid);
-        }
-        if let Some(v) = self.bold_vert_cache.get(&gid) {
-            return Some(*v);
-        }
-        let fallback = self.bold_vface.as_ref().and_then(|face| {
-            let vch = jpdict_core::util::japanese::to_vertical_glyph(ch);
-            if vch != ch {
-                face.glyph_index(vch).map(|g| g.0)
-            } else {
-                None
-            }
-        });
-        let vert = self
-            .bold_vface
-            .as_ref()
-            .and_then(|face| gsub_vert_glyph(face, gid))
-            .or(fallback)
-            .unwrap_or(gid);
-        self.bold_vert_cache.insert(gid, vert);
-        Some(vert)
-    }
-
 }
 
 /// GSUB `vert`/`vrt2` single substitution for a glyph, if the font has one.
@@ -581,60 +537,6 @@ fn gsub_vert_glyph(face: &ttf_parser::Face, gid: u16) -> Option<u16> {
         }
     }
     None
-}
-
-/// Skia's fake-bold stroke is ~1/24 of the text size end to end, so the
-/// coverage grows by about 1/48 of the size per side.
-fn fake_bold_radius(px: u32) -> i32 {
-    ((px as f32 / 48.0).round() as i32).max(1)
-}
-
-/// Grow a glyph's coverage by `radius` pixels in every direction — the
-/// bitmap equivalent of `paint.isFakeBoldText`, used for highlighted glyphs
-/// when no bold companion face is bundled.
-fn embolden(coverage: &[u8], w: u32, h: u32, radius: i32) -> Vec<u8> {
-    let (w, h) = (w as i32, h as i32);
-    if w <= 0 || h <= 0 || radius <= 0 {
-        return coverage.to_vec();
-    }
-    let src = |x: i32, y: i32| -> u8 {
-        if x < 0 || y < 0 || x >= w || y >= h {
-            0
-        } else {
-            coverage[(y * w + x) as usize]
-        }
-    };
-    let mut out = vec![0u8; coverage.len()];
-    for y in 0..h {
-        for x in 0..w {
-            let mut best = 0u8;
-            for dy in -radius..=radius {
-                for dx in -radius..=radius {
-                    best = best.max(src(x + dx, y + dy));
-                }
-            }
-            out[(y * w + x) as usize] = best;
-        }
-    }
-    out
-}
-
-/// Grow a glyph's coverage without clipping it: pad the ink box by `radius`
-/// first so the dilation has room, then dilate into the padding. The caller
-/// must offset the placement by `-radius` to keep the ink aligned.
-fn synthetic_bold(coverage: &[u8], w: u32, h: u32, radius: i32) -> (Vec<u8>, u32, u32) {
-    let r = radius.max(0) as u32;
-    if w == 0 || h == 0 || r == 0 {
-        return (coverage.to_vec(), w, h);
-    }
-    let (bw, bh) = (w + 2 * r, h + 2 * r);
-    let mut padded = vec![0u8; (bw * bh) as usize];
-    for y in 0..h {
-        for x in 0..w {
-            padded[((y + r) * bw + (x + r)) as usize] = coverage[(y * w + x) as usize];
-        }
-    }
-    (embolden(&padded, bw, bh, radius), bw, bh)
 }
 
 /// A rasterized glyph ready to draw: the ink bitmap plus the font metrics
@@ -724,7 +626,7 @@ fn line_glyph_px(line: &LineResult, quad: Option<&RotatedBox>) -> f32 {
 /// Content scale for sizing overlay work: `None` until the image size is
 /// known (`img_w`/`img_h` start at 1). A scale computed from the default 1
 /// is `min(window_w, window_h)` — ~960 instead of ~1 — which sized pre-warm
-/// glyphs at thousands of px and made `embolden` take seconds per line.
+/// glyphs at thousands of px and stalled the update handler.
 fn content_scale(window_w: f32, window_h: f32, img_w: u32, img_h: u32, zoom: f32) -> Option<f32> {
     if img_w <= 1 || img_h <= 1 {
         return None;
@@ -732,11 +634,32 @@ fn content_scale(window_w: f32, window_h: f32, img_w: u32, img_h: u32, zoom: f32
     Some(f32::min(window_w / img_w as f32, window_h / img_h as f32) * zoom)
 }
 
-/// The font pixel size a line's glyphs are rasterized at: mobile's
-/// `fixedSize * 0.90`, in source pixels, scaled to screen pixels by the
-/// content transform. Zero (no measurable box) means the line draws nothing.
-fn line_text_px(line: &LineResult, quad: Option<&RotatedBox>, total_scale: f32) -> f32 {
-    line_glyph_px(line, quad) * TEXT_SIZE_RATIO * total_scale
+/// The font pixel size a line's glyphs are rasterized at, in source pixels,
+/// scaled to screen pixels by the content transform.
+///
+/// The detector's char boxes are a tight fit around the real ink, so the em
+/// is sized so the reference glyph's ink *fills* the box:
+/// `box / ink_height_ratio`. Sizing the em square itself instead (mobile's
+/// `fixedSize * 0.90`) drew every line ~15% too small, leaving the padding
+/// above and below the text the user saw. `GLYPH_FILL_RATIO` keeps a hair of
+/// slack so hairline-touching ink does not abut the box edge.
+///
+/// Zero (no measurable box) means the line draws nothing. A degenerate ratio
+/// falls back to [`DEFAULT_INK_RATIO`] rather than dividing by zero — the
+/// draw path clamps the result to a sane raster size either way, but a NaN
+/// would poison every later comparison.
+fn line_text_px(
+    line: &LineResult,
+    quad: Option<&RotatedBox>,
+    total_scale: f32,
+    ink_height_ratio: f32,
+) -> f32 {
+    let ratio = if ink_height_ratio > 0.0 && ink_height_ratio.is_finite() {
+        ink_height_ratio
+    } else {
+        DEFAULT_INK_RATIO
+    };
+    line_glyph_px(line, quad) * total_scale * GLYPH_FILL_RATIO / ratio
 }
 
 /// Fillet radius for one polygon corner: the requested radius, clamped so
@@ -1380,14 +1303,20 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                     let Some(cache) = self.glyph_cache.as_ref() else {
                         continue;
                     };
-                    // Mobile `LineOverlayView`: one text size per line, the
-                    // line's own box height ×0.90 (the upright frame's cross
-                    // axis for rotated lines) — never a measured pitch, and
-                    // never a line-wide cross-axis cap. Horizontal glyphs use
-                    // `あ` as the ink reference; vertical ones centre their own
-                    // ink (see below). A line with no measurable box draws no
-                    // glyphs, exactly as mobile returns early on `fixedSize == 0`.
-                    let text_px = line_text_px(line, annotation.quad.as_ref(), total_scale);
+                    // One text size per line, from the line's own box (the
+                    // upright frame's cross axis for rotated lines) — never a
+                    // measured pitch, and never a line-wide cross-axis cap.
+                    // The em is corrected by the face's ink ratio so the ink
+                    // fills the box instead of floating inside it. Horizontal
+                    // glyphs use `あ` as the ink reference; vertical ones
+                    // centre their own ink (see below). A line with no
+                    // measurable box draws no glyphs.
+                    let text_px = line_text_px(
+                        line,
+                        annotation.quad.as_ref(),
+                        total_scale,
+                        cache.borrow().ink_height_ratio(),
+                    );
                     if text_px <= 0.0 || line.text.is_empty() || line.char_boxes.is_empty() {
                         continue;
                     }
@@ -1418,8 +1347,10 @@ impl canvas::Program<Message, Theme, Renderer> for OverlayProgram {
                         }
 
                         let Some(ch) = line.text.chars().nth(i) else { continue };
-                        // Mobile highlights the matched word only; the cursor
-                        // is drawn as chrome and keeps the glyph pink.
+                        // Only the matched word turns yellow; the cursor is
+                        // drawn as chrome and keeps the glyph pink. The tint
+                        // is the only difference — the weight no longer
+                        // changes with selection.
                         let highlighted = self.highlighted_coords.contains(&(line_idx, i));
                         // GSUB `vert`/`vrt2` picks the vertical presentation
                         // glyph for vertical lines (Unicode form fallback for
@@ -2160,8 +2091,8 @@ impl OcrViewer {
     fn prewarm_line_glyphs(&self, line: &LineResult, quad: Option<&RotatedBox>) {
         let Some(gc) = self.glyph_cache.as_ref() else { return };
         // The scale needs the real image size: before ImageReady arrives the
-        // content scale is unknown, and pre-warming against a bogus one costs
-        // seconds per line in `embolden`.
+        // content scale is unknown, and pre-warming against a bogus one
+        // rasterizes every glyph at thousands of px.
         let Some(total_scale) = content_scale(
             self.window_width,
             self.window_height,
@@ -2172,7 +2103,7 @@ impl OcrViewer {
             return;
         };
         // Exactly the draw pass's per-line text size.
-        let px = line_text_px(line, quad, total_scale)
+        let px = line_text_px(line, quad, total_scale, gc.borrow().ink_height_ratio())
             .round()
             .clamp(1.0, 1024.0) as u32;
         let mut cache = gc.borrow_mut();
@@ -2601,10 +2532,13 @@ impl OcrViewer {
         })
     }
 
+    /// Term-display weight: the bundled family (never a generic one — see
+    /// [`panel_font`]) at bold, which with only the bundled Regular
+    /// registered resolves to that same face rather than to a system font.
     fn bold_font() -> IcedFont {
         IcedFont {
             weight: iced::font::Weight::Bold,
-            ..IcedFont::default()
+            ..panel_font()
         }
     }
 
@@ -3632,6 +3566,7 @@ impl<'a, Message: Clone + 'static> From<TapOrDrag<'a, Message>> for Element<'a, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::font::Family;
     use jpdict_core::blank_gaps::blank_gap_positions;
 
     /// If the glyph is its own reference, both axes land exactly on the box
@@ -3733,10 +3668,17 @@ mod tests {
         }
         let g = draw_glyph(&cache, 'あ', true, 54, false).expect("serif kana");
         assert!(g.w > 0 && g.h > 0, "serif kana has ink: {}x{}", g.w, g.h);
-        // Serif ships Regular only, so highlights fake-bold through the same
-        // face (the cache loaded no bold companion).
+        // The highlight is the same glyph in yellow — the weight no longer
+        // changes, on either face (no bold companion, no fake bold).
         let hl = draw_glyph(&cache, 'あ', true, 54, true).expect("serif highlight");
-        assert!(hl.w >= g.w && hl.h >= g.h, "synthetic bold grows the ink box");
+        assert_eq!((hl.w, hl.h), (g.w, g.h), "highlight must not change weight");
+        // Each face measures its own ink ratio, so the serif switch also
+        // re-fits the glyphs rather than reusing the sans ratio.
+        let sans = GlyphCache::new_for(FontFace::Sans).expect("bundled sans face");
+        assert!(
+            (sans.borrow().ink_height_ratio() - cache.borrow().ink_height_ratio()).abs() > 0.0,
+            "the two faces ink `あ` differently, so their ratios differ"
+        );
     }
 
     /// Mobile skips glyphs whose measured ink is degenerate (`glyphW <= 0 ||
@@ -3795,58 +3737,44 @@ mod tests {
         assert_eq!(sz, Size::new(38.0, 48.0));
     }
 
-    /// Fake bold: a single lit pixel grows into a (2r+1)² block, and the
-    /// radius tracks the raster size (~1/24 em stroke).
+    /// A highlighted glyph is the SAME regular-face glyph in yellow — the
+    /// weight must not change with the selection (it used to fake-bold, and
+    /// the sans face used to swap in a real bold companion). Pin the ink
+    /// geometry: identical `w`/`h`/`xmin`/`ymin`, so only the tint differs.
     #[test]
-    fn embolden_grows_coverage_symmetrically() {
-        let mut cov = vec![0u8; 25];
-        cov[12] = 255; // centre of 5×5
-        let bold = embolden(&cov, 5, 5, 1);
-        for y in 1..=3 {
-            for x in 1..=3 {
-                assert_eq!(bold[y * 5 + x], 255, "({x},{y}) should be bold");
+    fn highlight_only_changes_the_tint_not_the_weight() {
+        for face in [FontFace::Sans, FontFace::Serif] {
+            let cache = GlyphCache::new_for(face).expect("bundled face");
+            for (ch, vertical) in [('語', false), ('あ', true), ('漢', false)] {
+                let pink = draw_glyph(&cache, ch, vertical, 54, false).expect("pink glyph");
+                let yellow = draw_glyph(&cache, ch, vertical, 54, true).expect("yellow glyph");
+                assert_eq!(
+                    (yellow.w, yellow.h, yellow.xmin, yellow.ymin),
+                    (pink.w, pink.h, pink.xmin, pink.ymin),
+                    "{ch:?} (vertical={vertical}) must keep its weight when highlighted"
+                );
+                assert!(pink.w > 0 && pink.h > 0, "glyph has ink");
             }
         }
-        assert_eq!(bold[0], 0, "corner stays clear");
-        // A zero radius returns the glyph untouched.
-        assert_eq!(embolden(&cov, 5, 5, 0), cov);
-        assert_eq!(fake_bold_radius(54), 1);
-        assert_eq!(fake_bold_radius(200), 4);
     }
 
-    /// Synthetic bold must grow the ink box instead of clipping the stroke:
-    /// a fully inked 1×1 glyph becomes a fully inked 3×3 at radius 1.
+    /// The face's ink ratio is what makes the ink fill its box: `あ` inks
+    /// well under a full em, so dividing the box by this ratio is what
+    /// removes the padding above and below each line. A ratio near 1.0 would
+    /// mean the probe measured the em box rather than the ink.
     #[test]
-    fn synthetic_bold_does_not_clip_grown_ink() {
-        let (bold, w, h) = synthetic_bold(&[255u8], 1, 1, 1);
-        assert_eq!((w, h), (3, 3));
-        assert!(bold.iter().all(|&a| a == 255), "grown ink was clipped: {bold:?}");
-    }
-
-    /// The bundled bold companion face loads and resolves glyphs, including
-    /// the GSUB vertical forms, so highlights rasterize from it rather than
-    /// the synthetic fallback.
-    #[test]
-    fn bundled_bold_face_loads_and_resolves() {
-        let dir = format!("{}/fonts", env!("CARGO_MANIFEST_DIR"));
-        let cache = GlyphCache::from_paths(
-            Some(std::path::PathBuf::from(format!("{dir}/NotoSansJP-Regular.ttf"))),
-            Some(std::path::PathBuf::from(format!("{dir}/NotoSansJP-Bold.ttf"))),
-        )
-        .expect("glyph cache with bundled faces");
-        let mut c = cache.borrow_mut();
-        let gid = c.bold_glyph_id('一', false).expect("bold glyph for 一");
-        assert_ne!(gid, 0, "bold cmap must resolve 一");
-        // Vertical forms resolve on the bold face too (GSUB vert).
-        let stop = c.bold_glyph_id('。', true).expect("bold vertical 。");
-        assert_ne!(stop, 0);
-        // No bold face is loaded when the bold path is absent.
-        let no_bold = GlyphCache::from_paths(
-            Some(std::path::PathBuf::from(format!("{dir}/NotoSansJP-Regular.ttf"))),
-            None,
-        )
-        .expect("regular-only cache");
-        assert!(no_bold.borrow_mut().bold_glyph_id('一', false).is_none());
+    fn ink_ratio_is_measured_from_the_reference_glyph() {
+        let cache = GlyphCache::new_for(FontFace::Sans).expect("bundled JP font");
+        let ratio = cache.borrow().ink_height_ratio();
+        assert!(
+            (0.7..0.95).contains(&ratio),
+            "あ ink ratio {ratio} should be CJK-ish, not an em box"
+        );
+        // Rasterizing `あ` at box / ratio puts the ink height back on the box
+        // height — that identity is the whole point of the correction.
+        let probe = draw_glyph(&cache, 'あ', false, 64, false).expect("あ");
+        let measured = probe.h as f32 / 64.0;
+        assert!((measured - ratio).abs() < 0.02, "probe {measured} vs ratio {ratio}");
     }
 
     #[test]
@@ -3872,10 +3800,18 @@ mod tests {
         }
     }
 
-    /// Mobile `LineResult.glyphSizePx()`: the tallest char box (the detector
-    /// box height, unclip padding included), drawn at ×0.90.
+    /// `LineResult.glyphSizePx()`: the tallest char box (the detector box
+    /// height, unclip padding included) is the basis, and the em is sized so
+    /// the reference glyph's ink FILLS it (`box / ink_ratio`), not so the em
+    /// square does.
+    ///
+    /// The ink ratio is passed in (the real one is measured from the face at
+    /// load); `0.9` here is just a stand-in — mobile's old ×0.90 — so the
+    /// arithmetic below reads as `box × 0.9 / ratio`.
     #[test]
-    fn line_text_size_uses_box_height_like_mobile() {
+    fn line_text_size_fills_the_box_with_the_glyph_ink() {
+        const RATIO: f32 = 0.9;
+        let px = |h: f32, scale: f32| h * scale * GLYPH_FILL_RATIO / RATIO;
         // Horizontal: 60px-tall boxes, however the centres are spaced.
         let line = line_with_boxes(
             "日本語",
@@ -3887,17 +3823,17 @@ mod tests {
             false,
         );
         assert!((line_glyph_px(&line, None) - 60.0).abs() < 1e-3);
-        assert!((line_text_px(&line, None, 1.0) - 54.0).abs() < 1e-3);
+        assert!((line_text_px(&line, None, 1.0, RATIO) - px(60.0, 1.0)).abs() < 1e-3);
         // Single char: same box-height rule, no pitch fallback.
         let single = line_with_boxes("あ", vec![BoundingBox::new(0, 0, 40, 60, 1.0)], false);
-        assert!((line_text_px(&single, None, 1.0) - 54.0).abs() < 1e-3);
-        // Tracked ASCII: the box height still wins (49 × 0.9), not the pitch.
+        assert!((line_text_px(&single, None, 1.0, RATIO) - px(60.0, 1.0)).abs() < 1e-3);
+        // Tracked ASCII: the box height still wins, not the pitch.
         let tracked = line_with_boxes(
             "Memo1Memo",
             (0..9).map(|i| BoundingBox::new(i * 35, 0, 35, 49, 1.0)).collect(),
             false,
         );
-        assert!((line_text_px(&tracked, None, 1.0) - 44.1).abs() < 1e-3);
+        assert!((line_text_px(&tracked, None, 1.0, RATIO) - px(49.0, 1.0)).abs() < 1e-3);
         // Vertical: the cell length (height) is the basis.
         let vertical = line_with_boxes(
             "翻訳",
@@ -3907,7 +3843,7 @@ mod tests {
             ],
             true,
         );
-        assert!((line_text_px(&vertical, None, 1.0) - 72.0).abs() < 1e-3);
+        assert!((line_text_px(&vertical, None, 1.0, RATIO) - px(80.0, 1.0)).abs() < 1e-3);
         // Rotated line: the upright frame's cross axis (the fitted rect's
         // short side), not the AABB-inflated char box height. Horizontal
         // frames measure their local height…
@@ -3920,14 +3856,35 @@ mod tests {
         assert!((line_glyph_px(&vertical, Some(&column)) - 30.0).abs() < 1e-3);
         // No measurable box: mobile returns before drawing.
         let empty = line_with_boxes("あ", vec![], false);
-        assert_eq!(line_text_px(&empty, None, 1.0), 0.0);
+        assert_eq!(line_text_px(&empty, None, 1.0, RATIO), 0.0);
         // The zoom transform scales the source size.
-        assert!((line_text_px(&line, None, 2.0) - 108.0).abs() < 1e-3);
+        assert!((line_text_px(&line, None, 2.0, RATIO) - px(60.0, 2.0)).abs() < 1e-3);
+    }
+
+    /// The correction must move the glyph toward the box, never past it: an
+    /// em of `box / ratio` is larger than the box (that is the point), while
+    /// the old `box × 0.90` left ~10% plus the ink shortfall — ~25% of the
+    /// box — as padding above and below.
+    #[test]
+    fn ink_correction_grows_the_glyph_past_the_old_em_scaling() {
+        const RATIO: f32 = 0.84;
+        let line = line_with_boxes("あ", vec![BoundingBox::new(0, 0, 40, 60, 1.0)], false);
+        let corrected = line_text_px(&line, None, 1.0, RATIO);
+        let old = 60.0 * 0.90;
+        assert!(corrected > old, "corrected {corrected} must exceed old {old}");
+        // Ink height lands on the box height (within the fill-ratio slack).
+        assert!(
+            (corrected * RATIO - 60.0 * GLYPH_FILL_RATIO).abs() < 1e-3,
+            "ink {} should fill 60 × {GLYPH_FILL_RATIO}",
+            corrected * RATIO
+        );
+        // And a degenerate ratio cannot produce a zero/NaN size.
+        assert!(line_text_px(&line, None, 1.0, 0.0).is_finite());
     }
 
     /// The pre-warm freeze: before ImageReady, img_w/img_h are 1, so a scale
     /// computed then is min(window_w, window_h) (~960) instead of ~1. That
-    /// scaled glyphs to thousands of px and `embolden` took seconds per line.
+    /// scaled glyphs to thousands of px and stalled the update handler.
     #[test]
     fn content_scale_needs_a_real_image_size() {
         assert_eq!(content_scale(960.0, 1018.0, 1, 1, 1.0), None);
@@ -4184,6 +4141,36 @@ mod tests {
             })
             .collect();
         assert_eq!(second, "de", "the ASCII word moves down together");
+    }
+
+    /// iced's font DB holds every *system* font too, and a generic
+    /// `Family::SansSerif` request resolves through cosmic-text's fallback
+    /// chain (Open Sans → `Noto Sans CJK SC` for Han unless the locale is
+    /// exactly `ja`), which is how the headwords showed Chinese/ancient
+    /// forms while the rest of the panel showed modern Japanese. Every panel
+    /// request must therefore name the bundled family.
+    #[test]
+    fn panel_fonts_never_request_a_generic_family() {
+        // Even with nothing registered (unit tests), the fallback names a face.
+        assert!(matches!(panel_font().family, Family::Name(_)));
+        init_panel_font(FontFace::Serif.family_name());
+        let bold = OcrViewer::bold_font();
+        assert!(
+            matches!(bold.family, Family::Name(_)),
+            "bold_font must name the bundled family, got {:?}",
+            bold.family
+        );
+        assert_eq!(bold.family, panel_font().family, "the weight must not escape the face");
+        assert_eq!(bold.weight, iced::font::Weight::Bold);
+        // Whichever of the two bundled faces won the set-once race, it is one
+        // of them — never the generic "sans-serif" that reaches the system DB.
+        assert!(
+            [FontFace::Sans.family_name(), FontFace::Serif.family_name()]
+                .iter()
+                .any(|f| matches!(panel_font().family, Family::Name(n) if n == *f)),
+            "registered panel family {:?} is not a bundled face",
+            panel_font().family
+        );
     }
 
     /// With real font metrics the flow measures true advances (CJK ≈ 1 em,

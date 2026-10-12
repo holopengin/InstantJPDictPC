@@ -105,10 +105,9 @@ fn main() {
     // ------------------------------------------------------------------
     // Fonts -> target/{profile}/fonts (next to the executable)
     // ------------------------------------------------------------------
-    // overlay_font::find_font_path()/find_bold_font_path() check exe_dir/fonts
-    // first, so copying here keeps every bundled face (sans + serif, plus the
-    // sans bold companion) discoverable regardless of the working directory
-    // (dev builds, systemd app launches, AppImage).
+    // overlay_font::find_font_path() checks exe_dir/fonts first, so copying
+    // here keeps every bundled face (sans + serif) discoverable regardless of
+    // the working directory (dev builds, systemd app launches, AppImage).
     let fonts_src = manifest_dir.join("../fonts");
     let fonts_dest = target_dir.join(&profile).join("fonts");
     if fonts_src.exists() {

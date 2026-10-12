@@ -7,17 +7,16 @@
 //! always had. A serif selection whose bundled file is missing warns and
 //! resolves the sans face instead: the overlay degrades, it never panics
 //! (mobile falls back to the platform sans face for the same case).
+//!
+//! One face per style, deliberately: the overlay paints its highlighted
+//! (selected) glyphs in yellow on the *same* regular face rather than
+//! bolding them, so no bold companion is bundled or resolved.
 
 use std::path::{Path, PathBuf};
 
 /// Bundled face files, matching the names mobile ships under `assets/fonts/`.
 pub const SANS_ASSET: &str = "NotoSansJP-Regular.ttf";
 pub const SERIF_ASSET: &str = "NotoSerifJP-Regular.ttf";
-/// Bundled bold companions. Only sans ships one today (the real-bold face for
-/// highlights); serif highlights fake-bold like mobile, which bundles Regular
-/// instances only.
-pub const SANS_BOLD_ASSET: &str = "NotoSansJP-Bold.ttf";
-pub const SERIF_BOLD_ASSET: &str = "NotoSerifJP-Bold.ttf";
 
 /// Faces the overlay can paint in. Stored as `"sans"` / `"serif"` — the exact
 /// strings mobile's `OverlayFont` reads and writes.
@@ -59,16 +58,6 @@ impl FontFace {
         match self {
             Self::Sans => SANS_ASSET,
             Self::Serif => SERIF_ASSET,
-        }
-    }
-
-    /// The bold companion this face would use if bundled. `find_bold_font_path`
-    /// returns `None` when the file is absent, and highlights fall back to
-    /// synthetic emboldening — no face ever mixes another face's bold.
-    pub fn bold_asset_name(self) -> &'static str {
-        match self {
-            Self::Sans => SANS_BOLD_ASSET,
-            Self::Serif => SERIF_BOLD_ASSET,
         }
     }
 
@@ -137,16 +126,8 @@ pub fn find_font_path(face: FontFace) -> Option<PathBuf> {
     resolve_font_path(face, &|path| path.exists())
 }
 
-/// Resolve the bold companion for `face`, if it ships next to the regular
-/// face. No system candidates: fontdue cannot read the system `.ttc`
-/// collections, so a missing bundled bold simply means synthetic bold.
-pub fn find_bold_font_path(face: FontFace) -> Option<PathBuf> {
-    bundled_candidate(face.bold_asset_name(), &|path| path.exists())
-}
-
 /// Which face a resolved path actually carries — `Serif` only for a bundled
-/// Noto Serif file. A serif request that fell back to the sans file therefore
-/// pairs with the sans bold, never a mismatched one.
+/// Noto Serif file.
 pub fn face_of(path: &Path) -> FontFace {
     match path.file_name().and_then(|name| name.to_str()) {
         Some(name) if name.starts_with("NotoSerifJP") => FontFace::Serif,
