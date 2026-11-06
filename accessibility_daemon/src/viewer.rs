@@ -1591,7 +1591,7 @@ fn entry_view(entry: &FormattedEntry, show_pitch: bool) -> El {
 }
 
 fn deinflection_row(chain: &DeinflectionChain, term: &str) -> El {
-    let mut r = row().gap(4.0).center_y().child(
+    let mut r = row().w_full().gap(4.0).center_y().flex_wrap().child(
         text(format!("{} → {}", chain.surface, term))
             .font(font(12.0))
             .color(LT_GRAY),
@@ -1603,7 +1603,7 @@ fn deinflection_row(chain: &DeinflectionChain, term: &str) -> El {
 }
 
 fn headword_block(entry: &FormattedEntry, show_pitch: bool) -> El {
-    let mut content = col().gap(2.0);
+    let mut content = col().w_full().gap(2.0);
 
     let kanji_groups: Vec<&FormattedReadingGroup> = entry
         .reading_groups
@@ -1645,7 +1645,7 @@ fn headword_block(entry: &FormattedEntry, show_pitch: bool) -> El {
             })
             .collect();
         let reserve_ruby = pairs.iter().any(|(kanji, reading)| kanji != reading);
-        let mut r = row().gap(2.0).items_end();
+        let mut r = row().w_full().gap(2.0).items_end().flex_wrap();
         for (i, (kanji, reading)) in pairs.iter().enumerate() {
             r = r.child(ruby_view(kanji, reading, false, reserve_ruby));
             if i + 1 < pairs.len() {
@@ -1696,7 +1696,7 @@ fn pitch_line(items: &[(String, Vec<i32>)]) -> El {
         b: 0.406448,
         a: 1.0,
     };
-    let mut r = row().gap(1.0).items_start();
+    let mut r = row().w_full().gap(1.0).items_start().flex_wrap();
     for (i, (reading, positions)) in items.iter().enumerate() {
         let morae = japanese::morae_of(reading);
         if morae.is_empty() {
@@ -1831,7 +1831,7 @@ fn sense_group(sg: &FormattedSenseGroup) -> El {
     let mut content = col().gap(3.0).w_full();
 
     if !sg.tags.is_empty() {
-        let mut tag_row = row().gap(3.0).center_y().pt(4.0);
+        let mut tag_row = row().w_full().gap(3.0).center_y().pt(4.0).flex_wrap();
         for tag in &sg.tags {
             tag_row = tag_row.child(tag_chip(tag));
         }
