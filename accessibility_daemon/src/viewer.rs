@@ -756,8 +756,28 @@ impl OcrViewer {
         self.window_width > self.window_height
     }
 
+    /// The iced build made the logical viewport 1280 pt wide and scaled the
+    /// whole UI by `image_width / 1280`. Keep that convention: at 1280 the
+    /// panel is 300 pt, at 1920 it is 450 pt, so it keeps the same share of
+    /// the screen instead of shrinking on larger displays.
+    fn ui_scale(&self) -> f32 {
+        (self.window_width / 1280.0).clamp(0.5, 4.0)
+    }
+
+    fn logical_width(&self) -> f32 {
+        self.window_width / self.ui_scale()
+    }
+
+    fn logical_height(&self) -> f32 {
+        self.window_height / self.ui_scale()
+    }
+
+    fn panel_logical_width(&self) -> f32 {
+        DICT_WIDTH + NEIGHBOR_WIDTH + 6.0
+    }
+
     fn panel_width(&self) -> f32 {
-        DICT_WIDTH + NEIGHBOR_WIDTH * 2.0 + 2.0 + 4.0
+        (DICT_WIDTH + NEIGHBOR_WIDTH * 2.0 + 6.0) * self.ui_scale()
     }
 
     pub fn apply_ocr_batch(&mut self, annotations: Vec<DetectedAnnotation>) {
@@ -866,15 +886,16 @@ impl OcrViewer {
         }
 
         if self.det_hud_visible {
+            let k = self.ui_scale();
             root = root.child(
                 el().key("det_hud")
-                    .absolute(8.0, 8.0)
-                    .padding(6.0)
-                    .radius(4.0)
+                    .absolute(8.0 * k, 8.0 * k)
+                    .padding(6.0 * k)
+                    .radius(4.0 * k)
                     .fill(rgba(0.0, 0.0, 0.0, 0.65))
                     .child(
                         text(self.det_hud_text())
-                            .font(font(13.0))
+                            .font(font(13.0 * k))
                             .color(rgba(0.95, 0.95, 0.95, 1.0)),
                     ),
             );
@@ -1369,44 +1390,98 @@ pub fn run(
 // ---------------------------------------------------------------------------
 
 impl OcrViewer {
-    fn panel(&self, s: &ViewerApp) -> El {
+    /// The dictionary/neighbour columns in logical points, before UI scaling.
+    fn panel_content(&self, s: &ViewerApp) -> El {
         let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
         let dict = self.dictionary_panel(s);
         let neigh = self.neighbor_panel(s);
 
-        let mut content = row().padding(2.0).gap(2.0).h_full().min_h(0.0);
+        let mut content = row()
+            .padding(2.0)
+            .gap(2.0)
+            .w(self.panel_logical_width())
+            .h_full()
+            .min_h(0.0);
         if panel_on_right {
             content = content.child(neigh).child(dict);
         } else {
             content = content.child(dict).child(neigh);
         }
-
-        let pin_left = if panel_on_right { None } else { Some(0.0) };
-        let pin_right = if panel_on_right { Some(0.0) } else { None };
         content
             .key("panel")
-            .pin(pin_left, Some(0.0), pin_right, Some(0.0))
-            .transition(Transition::opacity())
             .background_panel()
+    }
+
+    /// The panel drawn at `ui_scale`. A wrapper owns the on-screen box; the
+    /// logical panel is scaled about the screen edge so text stays crisp and
+    /// every metric (type, padding, radii) follows the 1280-pt logical grid.
+    fn panel(&self, s: &ViewerApp) -> El {
+        let scale = self.ui_scale();
+        let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
+        let logical_w = self.panel_logical_width();
+        let logical_h = self.logical_height();
+        let on_screen_w = logical_w * scale;
+        let x = if panel_on_right {
+            (self.window_width - on_screen_w).max(0.0)
+        } else {
+            0.0
+        };
+        let mut inner = self
+            .panel_content(s)
+            .w(logical_w)
+            .h(logical_h)
+            .motion(Spring::NONE);
+        inner = if panel_on_right {
+            inner.pin(None, Some(0.0), Some(0.0), None)
+        } else {
+            inner.pin(Some(0.0), Some(0.0), None, None)
+        };
+        el().key("panel_slot")
+            .absolute(x, 0.0)
+            .w(on_screen_w)
+            .h(self.window_height)
+            .transition(Transition::opacity())
+            .child(
+                inner
+                    .scale(scale)
+                    .origin(if panel_on_right { 1.0 } else { 0.0 }, 0.0),
+            )
     }
 
     /// The alternatives strip, laid out beside the panel but *before* it in
     /// paint order (see `view`). It fades in place instead of sliding.
     fn alternatives_overlay(&self, s: &ViewerApp) -> El {
+        let scale = self.ui_scale();
         let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
-        let panel_base = DICT_WIDTH + NEIGHBOR_WIDTH + 6.0;
+        let panel_w = self.panel_logical_width() * scale;
+        let strip_w = NEIGHBOR_WIDTH * scale;
+        let logical_h = self.logical_height();
         let x = if panel_on_right {
-            (self.window_width - panel_base - NEIGHBOR_WIDTH).max(0.0)
+            (self.window_width - panel_w - strip_w).max(0.0)
         } else {
-            panel_base
+            panel_w
+        };
+        let mut inner = self
+            .alternatives_panel(s)
+            .w(NEIGHBOR_WIDTH)
+            .h(logical_h)
+            .motion(Spring::NONE);
+        inner = if panel_on_right {
+            inner.pin(None, Some(0.0), Some(0.0), None)
+        } else {
+            inner.pin(Some(0.0), Some(0.0), None, None)
         };
         el().key("alt_overlay")
             .absolute(x, 0.0)
-            .w(NEIGHBOR_WIDTH)
+            .w(strip_w)
             .h(self.window_height)
             .motion(Spring::NONE)
             .transition(Transition::opacity())
-            .child(self.alternatives_panel(s).w_full().h_full())
+            .child(
+                inner
+                    .scale(scale)
+                    .origin(if panel_on_right { 1.0 } else { 0.0 }, 0.0),
+            )
     }
 
     fn dictionary_panel(&self, s: &ViewerApp) -> El {
@@ -1452,7 +1527,7 @@ impl OcrViewer {
 
     fn neighbor_panel(&self, _s: &ViewerApp) -> El {
         let state = self.state.get_neighbor_ui_state();
-        let item_size = self.window_width / 11.0;
+        let item_size = self.logical_width() / 11.0;
         let box_size = item_size.clamp(24.0, 40.0);
         let mut content = col().padding(2.0).gap(2.0).motion(Spring::NONE);
         for line in state {
@@ -1502,7 +1577,7 @@ impl OcrViewer {
     }
 
     fn alternatives_panel(&self, s: &ViewerApp) -> El {
-        let item_size = self.window_width / 11.0;
+        let item_size = self.logical_width() / 11.0;
         let box_size = item_size.clamp(24.0, 40.0);
         let mut content = col().padding(2.0).gap(2.0).motion(Spring::NONE);
         let selection = self
@@ -2164,6 +2239,24 @@ fn definition_table(rows: &[Vec<Vec<DefinitionNode>>], width: f32) -> El {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_metrics_follow_the_1280_logical_grid() {
+        let mut viewer = OcrViewer::new_empty(1280.0, 720.0, FontFace::Sans);
+        assert!((viewer.ui_scale() - 1.0).abs() < 1e-6);
+        assert!((viewer.panel_logical_width() - 348.0).abs() < 1e-6);
+        assert!((viewer.panel_width() - 390.0).abs() < 1e-6);
+
+        viewer.window_width = 1920.0;
+        viewer.window_height = 1080.0;
+        assert!((viewer.ui_scale() - 1.5).abs() < 1e-6);
+        assert!((viewer.panel_logical_width() - 348.0).abs() < 1e-6);
+        assert!((viewer.panel_width() - 585.0).abs() < 1e-6);
+
+        viewer.window_width = 2560.0;
+        assert!((viewer.ui_scale() - 2.0).abs() < 1e-6);
+        assert!((viewer.panel_width() - 780.0).abs() < 1e-6);
+    }
 
     #[test]
     fn blank_gap_placeholder_is_the_reversible_one() {
