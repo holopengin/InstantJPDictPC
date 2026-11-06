@@ -1848,8 +1848,13 @@ fn sense_group(sg: &FormattedSenseGroup) -> El {
         }
     } else {
         for sense in &sg.senses {
+            // The body must take the space left after the number, not the
+            // whole row: `w_full` on a flex item after the number would
+            // overflow the panel and clip example-box borders.
+            let body = render_definition(&sense.nodes, DICT_TEXT_WIDTH - 20.0);
             content = content.child(
                 row()
+                    .w_full()
                     .gap(3.0)
                     .items_start()
                     .child(
@@ -1857,7 +1862,7 @@ fn sense_group(sg: &FormattedSenseGroup) -> El {
                             .font(font(15.0))
                             .color(WHITE),
                     )
-                    .child(render_definition(&sense.nodes, DICT_TEXT_WIDTH - 20.0)),
+                    .child(el().grow(1.0).min_w(0.0).child(body)),
             );
         }
     }
