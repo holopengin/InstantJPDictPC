@@ -17,7 +17,7 @@ use anyhow::anyhow;
 use rune::tok::TextStyle;
 use rune::{
     col, el, row, text, AppSpec, Color, Cx, Drag, El, Key, KeyEvent, Phase, Pixels, ScrollSpec,
-    Spring, Tx, WheelEvent,
+    Spring, Transition, Tx, WheelEvent,
 };
 
 use jpdict_core::data::db::DictionaryDatabase;
@@ -113,15 +113,6 @@ const DEF_RUBY_SIZE: f32 = 9.0;
 const DICT_WIDTH: f32 = 300.0;
 const NEIGHBOR_WIDTH: f32 = 42.0;
 
-/// Mobile `OverlayBackdrop.SCREENSHOT_ALPHA` (#64): the screenshot is shown
-/// dimmed behind the overlay.
-const SCREENSHOT_ALPHA: f32 = 0.7;
-/// Mobile `OverlayBackdrop.SCRIM_COLOR = 0x8C000000`, alpha channel only.
-const SCRIM_ALPHA: f32 = 140.0 / 255.0;
-/// The mobile backdrop folds a dimmed screenshot and a flat scrim into one
-/// opaque layer; Rune paints the same folded value as a translucent scrim
-/// over the image so the result matches the native overlay.
-const BACKDROP_SCRIM: f32 = 1.0 - SCREENSHOT_ALPHA * (1.0 - SCRIM_ALPHA);
 /// Mobile line-box / quad-border fill: `Color.argb(100, 0, 0, 0)`.
 const BOX_FILL_ALPHA: f32 = 100.0 / 255.0;
 /// Mobile corner radius on the box fill (raw source px).
@@ -864,6 +855,13 @@ impl OcrViewer {
         root = root.child(self.world(s));
 
         if has_panel {
+            // The alternatives strip is a sibling *before* the panel, so its
+            // exit fade draws under the neighbour/dictionary columns instead
+            // of over them. Keeping it out of the panel row also means the
+            // columns do not shift when it opens or closes.
+            if self.alternatives_visible {
+                root = root.child(self.alternatives_overlay(s));
+            }
             root = root.child(self.panel(s));
         }
 
@@ -907,14 +905,6 @@ impl OcrViewer {
         if let Some(p) = self.image_pixels.as_ref() {
             world = world.pixels(p);
         }
-
-        // Folded mobile backdrop: dim screenshot + flat scrim.
-        world = world.child(
-            el().key("scrim")
-                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                .fill(rgba(0.0, 0.0, 0.0, BACKDROP_SCRIM))
-                .inert(),
-        );
 
         let mut glyphs = Vec::new();
         for (line_idx, annotation) in self.annotations.iter().enumerate() {
@@ -1005,7 +995,7 @@ impl OcrViewer {
         for g in glyphs {
             world = world.child(g);
         }
-        world.on_drag(pan_drag).on_wheel(zoom_wheel)
+        world.on_drag(pan_drag)
     }
 }
 
@@ -1109,6 +1099,26 @@ impl ViewerApp {
         self.repeat_count = 0;
     }
 
+    /// A navigation key came back up: stop hold-to-repeat. Before this, the
+    /// timer kept repeating after a single tap.
+    fn key_released(&mut self, e: &KeyEvent) -> bool {
+        let nav = match &e.key {
+            Key::Up | Key::Down | Key::Left | Key::Right => true,
+            Key::Text(t) => matches!(
+                t.chars().next(),
+                Some('w' | 'a' | 's' | 'd' | 'h' | 'j' | 'k' | 'l' | 'u' | 'e' | 'f' | 'm' | 'c')
+            ),
+            _ => false,
+        };
+        if nav {
+            self.held = None;
+            self.repeat_count = 0;
+            true
+        } else {
+            false
+        }
+    }
+
     fn scroll_dict(&mut self, tx: &mut Tx, delta: f32) {
         let at = self.dict_scroll.get();
         tx.scroll_to_y("dict_scroll", (at[1] + delta).max(0.0));
@@ -1119,9 +1129,16 @@ impl ViewerApp {
         let old = self.viewer.state.current_scale;
         let new = (old * factor).clamp(0.5, 5.0);
         let actual = if old > 0.0 { new / old } else { 1.0 };
+        // The world scales about its centre, so the cursor has to be
+        // expressed relative to that centre. Using window coordinates
+        // directly made every wheel zoom pull toward the middle.
+        let cx = self.viewer.window_width * 0.5;
+        let cy = self.viewer.window_height * 0.5;
+        let dx = x - cx;
+        let dy = y - cy;
         self.viewer.state.current_scale = new;
-        self.viewer.state.current_trans_x = x - (x - self.viewer.state.current_trans_x) * actual;
-        self.viewer.state.current_trans_y = y - (y - self.viewer.state.current_trans_y) * actual;
+        self.viewer.state.current_trans_x = dx - (dx - self.viewer.state.current_trans_x) * actual;
+        self.viewer.state.current_trans_y = dy - (dy - self.viewer.state.current_trans_y) * actual;
         self.viewer.is_zooming = true;
         self.viewer.zoom_idle_frames = 0;
     }
@@ -1177,6 +1194,11 @@ impl ViewerApp {
                             'j' | 's' => GamepadAction::NavigateDown,
                             _ => GamepadAction::NavigateUp,
                         };
+                        // The OS sends its own key repeats. Once one press armed
+                        // our timer, ignore those so the two don't double-step.
+                        if matches!(self.held, Some((held, _)) if held == action) {
+                            return true;
+                        }
                         self.navigate(action);
                         return true;
                     }
@@ -1280,6 +1302,7 @@ fn app_view(s: &ViewerApp, _cx: &mut Cx<ViewerApp>) -> El {
             s.zoom_at(e.delta, e.x, e.y);
             true
         })
+        .on_key_up(|s: &mut ViewerApp, e, _tx| s.key_released(e))
 }
 
 fn app_poll(s: &mut ViewerApp, _t: f64, tx: &mut Tx) -> bool {
@@ -1348,27 +1371,14 @@ pub fn run(
 impl OcrViewer {
     fn panel(&self, s: &ViewerApp) -> El {
         let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
-        let alt = self.alternatives_visible;
-
         let dict = self.dictionary_panel(s);
         let neigh = self.neighbor_panel(s);
-        let alt_panel = if alt {
-            Some(self.alternatives_panel(s))
-        } else {
-            None
-        };
 
         let mut content = row().padding(2.0).gap(2.0).h_full().min_h(0.0);
         if panel_on_right {
-            if let Some(a) = alt_panel {
-                content = content.child(a);
-            }
             content = content.child(neigh).child(dict);
         } else {
             content = content.child(dict).child(neigh);
-            if let Some(a) = alt_panel {
-                content = content.child(a);
-            }
         }
 
         let pin_left = if panel_on_right { None } else { Some(0.0) };
@@ -1376,7 +1386,27 @@ impl OcrViewer {
         content
             .key("panel")
             .pin(pin_left, Some(0.0), pin_right, Some(0.0))
+            .transition(Transition::opacity())
             .background_panel()
+    }
+
+    /// The alternatives strip, laid out beside the panel but *before* it in
+    /// paint order (see `view`). It fades in place instead of sliding.
+    fn alternatives_overlay(&self, s: &ViewerApp) -> El {
+        let panel_on_right = self.state.last_landscape_gravity == Gravity::End;
+        let panel_base = DICT_WIDTH + NEIGHBOR_WIDTH + 6.0;
+        let x = if panel_on_right {
+            (self.window_width - panel_base - NEIGHBOR_WIDTH).max(0.0)
+        } else {
+            panel_base
+        };
+        el().key("alt_overlay")
+            .absolute(x, 0.0)
+            .w(NEIGHBOR_WIDTH)
+            .h(self.window_height)
+            .motion(Spring::NONE)
+            .transition(Transition::opacity())
+            .child(self.alternatives_panel(s).w_full().h_full())
     }
 
     fn dictionary_panel(&self, s: &ViewerApp) -> El {
@@ -1386,7 +1416,7 @@ impl OcrViewer {
             Rc::new(Vec::new())
         };
 
-        let mut content = col().padding(4.0).gap(4.0).w_full();
+        let mut content = col().padding(4.0).gap(4.0).w_full().motion(Spring::NONE);
         if entries.is_empty() {
             content = content.child(
                 text("No dictionary entries found.")
@@ -1394,8 +1424,17 @@ impl OcrViewer {
                     .color(WHITE),
             );
         }
-        for entry in entries.iter() {
-            content = content.child(entry_view(entry, self.show_pitch));
+        for (i, entry) in entries.iter().enumerate() {
+            let key = format!(
+                "entry:{i}:{}:{}",
+                entry.term,
+                entry.dictionary_name.as_deref().unwrap_or("")
+            );
+            content = content.child(
+                entry_view(entry, self.show_pitch)
+                    .key(key)
+                    .transition(Transition::opacity()),
+            );
         }
 
         let scroll = s.dict_scroll.clone();
@@ -1415,7 +1454,7 @@ impl OcrViewer {
         let state = self.state.get_neighbor_ui_state();
         let item_size = self.window_width / 11.0;
         let box_size = item_size.clamp(24.0, 40.0);
-        let mut content = col().padding(2.0).gap(2.0);
+        let mut content = col().padding(2.0).gap(2.0).motion(Spring::NONE);
         for line in state {
             for cs in line.chars {
                 let key = format!("nb:{}:{}", line.line_idx, cs.char_idx);
@@ -1430,6 +1469,7 @@ impl OcrViewer {
                     .radius(0.0)
                     .fill(if is_selected { YELLOW } else { CHIP_BG })
                     .center()
+                    .transition(Transition::opacity())
                     .on_press_tx(move |s: &mut ViewerApp, tx: &mut Tx| {
                         s.viewer.select_neighbor(li, ci);
                         tx.scroll_to_instant("dict_scroll", 0.0, 0.0);
@@ -1464,7 +1504,12 @@ impl OcrViewer {
     fn alternatives_panel(&self, s: &ViewerApp) -> El {
         let item_size = self.window_width / 11.0;
         let box_size = item_size.clamp(24.0, 40.0);
-        let mut content = col().padding(2.0).gap(2.0);
+        let mut content = col().padding(2.0).gap(2.0).motion(Spring::NONE);
+        let selection = self
+            .selected_word
+            .as_ref()
+            .map(|sw| (sw.line_idx, sw.char_idx))
+            .unwrap_or((usize::MAX, usize::MAX));
 
         // Character preview image at the top, sized to match the chips.
         let preview = self.selected_word.as_ref().and_then(|sw| {
@@ -1479,11 +1524,16 @@ impl OcrViewer {
             Some(px)
         });
         if let Some(px) = preview {
-            content = content.child(el().key("alt_preview").size(box_size, box_size).pixels(&px));
+            content = content.child(
+                el().key(format!("alt_preview:{}:{}", selection.0, selection.1))
+                    .size(box_size, box_size)
+                    .transition(Transition::opacity())
+                    .pixels(&px),
+            );
         }
 
         if let Some(alt_state) = self.state.get_alternatives_ui_state() {
-            for c in alt_state.candidates {
+            for (index, c) in alt_state.candidates.into_iter().enumerate() {
                 let ch = c.char;
                 let is_selected = c.is_selected;
                 let tint = match c.source {
@@ -1495,12 +1545,20 @@ impl OcrViewer {
                     jpdict_core::util::oov_suggestions::Source::Lm => rgba(0.55, 0.85, 1.0, 1.0),
                 };
                 let vertical_ch = chip_text(&ch.to_string(), self.is_landscape());
-                let key = format!("alt:{}", c.char as u32);
+                // Include the slot and the selected character: when a neighbour
+                // changes, a shared candidate may move slots. A key that follows
+                // the char would animate it across the list; keying the slot
+                // makes the old one fade out and the new one fade in.
+                let key = format!(
+                    "alt:{}:{}:{index}:{}",
+                    selection.0, selection.1, c.char as u32
+                );
                 content = content.child(
                     el().key(key)
                         .size(box_size, box_size)
                         .fill(if is_selected { YELLOW } else { CHIP_BG })
                         .center()
+                        .transition(Transition::opacity())
                         .on_press_tx(move |s: &mut ViewerApp, _tx: &mut Tx| {
                             s.viewer.select_alternative(ch);
                         })
@@ -2112,11 +2170,6 @@ mod tests {
         // The detector itself lives in core; this guards that the viewer's
         // edits and the core's gap materialiser use the same placeholder.
         assert_eq!(GAP_CHAR, '\u{25CC}');
-    }
-
-    #[test]
-    fn backdrop_scrim_matches_native_overlay() {
-        assert!((BACKDROP_SCRIM - 0.68431).abs() < 1e-4, "{BACKDROP_SCRIM}");
     }
 
     struct PanelState;

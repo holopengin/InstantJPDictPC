@@ -759,10 +759,14 @@ fn action_button<S: SettingsHost>(label: &'static str, enabled: bool, on_press: 
 fn catalog_row<S: SettingsHost>(entry: &CatalogEntry, installed: bool, disabled: bool) -> El {
     let info = col()
         .gap(2.0)
+        .grow(1.0)
+        .min_w(0.0)
         .child(
             text(entry.name.clone())
                 .font(TextStyle::new(15.0, 500.0))
-                .color(TEXT),
+                .color(TEXT)
+                .wrap()
+                .w_full(),
         )
         .child(
             text(format!(
@@ -772,7 +776,9 @@ fn catalog_row<S: SettingsHost>(entry: &CatalogEntry, installed: bool, disabled:
                 entry.license
             ))
             .font(TextStyle::new(12.0, 400.0))
-            .color(MUTED),
+            .color(MUTED)
+            .wrap()
+            .w_full(),
         );
 
     let action = if installed {
@@ -814,7 +820,6 @@ fn catalog_row<S: SettingsHost>(entry: &CatalogEntry, installed: bool, disabled:
                 .gap(10.0)
                 .center_y()
                 .child(info)
-                .child(el().grow(1.0))
                 .child(action),
         )
 }
@@ -874,14 +879,19 @@ fn dict_row<S: SettingsHost>(dict: &DictionaryMeta, disabled: bool) -> El {
                 .gap(10.0)
                 .center_y()
                 .child(enable_box)
-                .child(text(name_text).font(TextStyle::new(15.0, 400.0)).color(
-                    if dict.enabled || dict.built_in {
-                        TEXT
-                    } else {
-                        MUTED
-                    },
-                ))
-                .child(el().grow(1.0))
+                .child(
+                    el().grow(1.0).min_w(0.0).child(
+                        text(name_text)
+                            .font(TextStyle::new(15.0, 400.0))
+                            .color(if dict.enabled || dict.built_in {
+                                TEXT
+                            } else {
+                                MUTED
+                            })
+                            .wrap()
+                            .w_full(),
+                    ),
+                )
                 .child(controls),
         )
 }
