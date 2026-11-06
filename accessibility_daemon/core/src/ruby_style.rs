@@ -3,8 +3,8 @@
 //! Port of the ticket-06 rule: body (mini) ruby renders in the surrounding
 //! body typeface — white regular base at body size with a gray ruby row —
 //! while the term display keeps full-size bold cyan. The values are pinned by
-//! the `ruby_style` conformance cases; the iced binary converts [`RubyStyle`]
-//! to `iced::Color` at the paint site, so this module is the single
+//! the `ruby_style` conformance cases; the Rune binary converts [`RubyStyle`]
+//! to a Rune colour at the paint site, so this module is the single
 //! implementation both the UI and the tests read.
 
 /// Resolved ruby treatment for one renderer input, as plain data.

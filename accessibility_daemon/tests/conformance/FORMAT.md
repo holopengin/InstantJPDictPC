@@ -339,7 +339,7 @@ flows use. `base` is a color label (`white` = `Color::WHITE` /
 the values attached; anything unmapped fails the runner loudly instead of
 drifting. `bold` pins the weight decision.
 
-Deliberately NOT pinned here: rendered pixels (painting an iced `Text` or
+Deliberately NOT pinned here: rendered pixels (painting a Rune text element or
 a `TextView` needs the UI framework — Robolectric is not an Android test
 dependency), the point sizes, and the gray ruby row. Those stay pinned in
 per-side unit tests (PC `viewer.rs`: `body_ruby_uses_body_typeface_not_term_display`,

@@ -20,7 +20,7 @@ pub const SETTINGS_FILE: &str = "settings.json";
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
-    /// Face the OCR overlay paints in — and, on desktop, the iced dictionary
+    /// Face the OCR overlay paints in — and, on desktop, the Rune dictionary
     /// panel too (see `run_ocr_viewer` for why the mobile overlay/panel split
     /// has no desktop counterpart).
     pub overlay_font: FontFace,

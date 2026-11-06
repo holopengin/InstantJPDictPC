@@ -3,9 +3,9 @@
 //! This crate owns the behaviour the PC port reverse-engineered out of the
 //! Android app: detection post-processing, rotated geometry, reading order,
 //! recognition decode, kana correction, ruby rules, blank handling, and
-//! dictionary import/lookup/formatting. The desktop UI (iced), capture
+//! dictionary import/lookup/formatting. The desktop UI (Rune), capture
 //! (KWin/zbus), and binary glue stay in the `accessibility_daemon` binary,
-//! which consumes this crate. No module here may depend on iced, winit,
+//! which consumes this crate. No module here may depend on Rune, winit,
 //! KWin/zbus, or rfd.
 //!
 //! # Data in / data out
@@ -20,7 +20,7 @@
 //!   (`data::importer::ImportProgress`, `db` feature).
 //! * No UI types cross the boundary: colours are `[f32; 3]` RGB
 //!   ([`ruby_style::RubyStyle`]), sizes are `f32` display points, geometry is
-//!   plain pixel structs. The binary converts these to iced types.
+//!   plain pixel structs. The binary converts these to Rune types.
 //!
 //! # Thread-safety and ownership
 //!

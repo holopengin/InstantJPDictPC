@@ -954,7 +954,7 @@ fn deinflection_cases() {
 
 /// Ticket 06: body ruby vs term-display ruby, pinned at the unit-testable
 /// style-resolution seam (`ruby_style(is_mini)`), not rendered
-/// pixels — painting an iced `Text` needs the UI framework, and sizes plus
+/// pixels — painting a Rune text element needs the UI framework, and sizes plus
 /// the gray ruby row stay pinned in the binary's `viewer.rs` unit tests.
 /// `mode` selects the renderer input: `body` is `is_mini = true` (everything
 /// `inline_line` builds), `term` is `is_mini = false` (headword/term rows).

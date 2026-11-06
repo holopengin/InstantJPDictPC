@@ -1,5 +1,9 @@
 # Android Port Assessment — InstantJPDictPC
 
+> **Historical note.** This assessment was written when the desktop UI was
+> iced 0.14. The `experiment/rune-ui` branch replaces iced with Rune; the
+> iced-specific sections below are background only once that branch lands.
+
 ## Summary
 
 Porting to Android is feasible. None of the core dependencies are Android-incompatible by nature, but several need feature-flag or configuration changes, and the GUI shell needs a different entry point than the current desktop-native main(). Below is a component-by-component analysis.

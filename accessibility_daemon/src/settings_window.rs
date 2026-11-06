@@ -1,33 +1,69 @@
-//! Settings/management window for dictionary import and configuration.
+//! Settings/management window for dictionary import and configuration,
+//! rendered with Rune.
 
-use iced::{
-    alignment::{Horizontal, Vertical},
-    widget::{
-        button, checkbox, column, container, row, scrollable, text, Button, Column,
-        Container, Space, Text,
-    },
-    Element, Length, Pixels, Task,
-};
 use std::sync::{Arc, Mutex};
+
+use rune::tok::TextStyle;
+use rune::{col, el, row, text, Color, El, ScrollSpec};
 
 use jpdict_core::app_settings::AppSettings;
 use jpdict_core::data::catalog::{self, CatalogEntry};
 use jpdict_core::data::db::DictionaryDatabase;
-use jpdict_core::data::models::DictionaryMeta;
 use jpdict_core::data::importer::{DictionaryImporter, ImportOptions, ImportProgress};
+use jpdict_core::data::models::DictionaryMeta;
 use jpdict_core::overlay_font::FontFace;
-use futures_timer::Delay;
-use std::time::Duration;
+
+// Rune's colours are linear-light; these are the sRGB design values decoded.
+const BG: Color = Color {
+    r: 0.009715,
+    g: 0.009715,
+    b: 0.009715,
+    a: 1.0,
+};
+const CARD: Color = Color {
+    r: 0.018478,
+    g: 0.018478,
+    b: 0.018478,
+    a: 1.0,
+};
+const CARD_BORDER: Color = Color {
+    r: 0.046964,
+    g: 0.046964,
+    b: 0.046964,
+    a: 1.0,
+};
+const TEXT: Color = Color {
+    r: 0.868899,
+    g: 0.868899,
+    b: 0.868899,
+    a: 1.0,
+};
+const MUTED: Color = Color {
+    r: 0.342392,
+    g: 0.342392,
+    b: 0.342392,
+    a: 1.0,
+};
+const ACCENT: Color = Color {
+    r: 0.046964,
+    g: 0.223414,
+    b: 0.748414,
+    a: 1.0,
+};
+const DANGER: Color = Color {
+    r: 0.342392,
+    g: 0.039682,
+    b: 0.039682,
+    a: 1.0,
+};
 
 /// Message type for the settings window.
 #[derive(Debug, Clone)]
 pub enum SettingsMessage {
     ImportDictionary,
-    ImportProgress,
     ImportDone(Result<usize, String>),
     /// #71: one-click install of a catalog entry (download, verify, import).
     InstallCatalog(String),
-    InstallProgress,
     InstallDone(Result<usize, String>),
     RefreshStatus,
     DeleteDictionary(i64),
@@ -43,7 +79,6 @@ pub enum SettingsMessage {
     /// Font face switch, rendered here so all behaviour lives in one place.
     /// Like the furigana switch, the frontend owns the file and saves.
     SetFontFace(FontFace),
-    CloseWindow,
 }
 
 /// Progress of a catalog install: the download phase, then the import phase
@@ -61,13 +96,20 @@ fn all_dictionaries(db: &DictionaryDatabase) -> Vec<DictionaryMeta> {
     db.get_all_dictionaries().unwrap_or_default()
 }
 
+/// A view can be hosted by the frontend app or by a standalone settings
+/// window, so its handlers ask the host for the window they edit.
+pub trait SettingsHost: 'static {
+    fn settings_window(&self) -> &SettingsWindow;
+    fn settings_window_mut(&mut self) -> &mut SettingsWindow;
+}
+
 pub struct SettingsWindow {
     db: Arc<DictionaryDatabase>,
     /// Snapshot of the persisted app settings (rendered by the Behaviour
     /// section). The frontend owns the file and saves changes; this copy is
     /// refreshed by [`SettingsMessage::SetFuriganaFilter`],
     /// [`SettingsMessage::SetPitchAccent`] and [`SettingsMessage::SetFontFace`].
-    app_settings: AppSettings,
+    pub app_settings: AppSettings,
     entry_count: usize,
     dictionaries: Vec<DictionaryMeta>,
     status_text: String,
@@ -112,319 +154,56 @@ impl SettingsWindow {
         window
     }
 
+    pub fn app_settings(&self) -> &AppSettings {
+        &self.app_settings
+    }
+
     fn refresh(&mut self) {
         self.entry_count = self.db.get_entry_count().unwrap_or(0) as usize;
         self.dictionaries = all_dictionaries(&self.db);
     }
 
-    pub fn update(&mut self, message: SettingsMessage) -> Task<SettingsMessage> {
-        match message {
-            SettingsMessage::ImportDictionary => {
-                if self.busy {
-                    return Task::none();
-                }
-                self.status_text = "Selecting file...".to_string();
-                self.import_progress = None;
-                *self.import_shared.lock().unwrap() = None;
-
-                // Spawn the file picker and import on a dedicated thread.
-                let db = Arc::clone(&self.db);
-                let shared = Arc::clone(&self.import_shared);
-
-                let join_handle = std::thread::spawn(move || -> Result<usize, String> {
-                    let path = rfd::FileDialog::new()
-                        .add_filter("ZIP files", &["zip"])
-                        .pick_file();
-
-                    let path = match path {
-                        Some(p) => p,
-                        None => return Err("No file selected".to_string()),
-                    };
-
-                    let importer = DictionaryImporter::new(&db);
-                    let shared_for_cb = Arc::clone(&shared);
-                    let cb = Box::new(move |p: ImportProgress| {
-                        *shared_for_cb.lock().unwrap() = Some(p);
-                    });
-
-                    let result = importer.import_zip(path, Some(cb)).map_err(|e| e.to_string());
-
-                    // Write final sentinel to shared state.
-                    let final_progress = match &result {
-                        Ok(count) => ImportProgress {
-                            entries_imported: *count,
-                            banks_done: 0,
-                            banks_total: 0,
-                            current_file: format!("DONE:{count}"),
-                        },
-                        Err(e) => ImportProgress {
-                            entries_imported: 0,
-                            banks_done: 0,
-                            banks_total: 0,
-                            current_file: format!("ERROR:{e}"),
-                        },
-                    };
-                    *shared.lock().unwrap() = Some(final_progress);
-
-                    result
-                });
-
-                self.import_running = true;
-                self.busy = true;
-                self.import_join_handle = Some(join_handle);
-
-                // Return a task that polls the shared state once.
-                Task::perform(async {}, |_| SettingsMessage::ImportProgress)
-            }
-
-            SettingsMessage::ImportProgress => {
-                // Read the latest progress from shared state.
-                let progress = self
-                    .import_shared
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or(ImportProgress {
-                        entries_imported: 0,
-                        banks_done: 0,
-                        banks_total: 0,
-                        current_file: String::new(),
-                    });
-
-                let done = progress.current_file.starts_with("DONE:")
-                    || progress.current_file.starts_with("ERROR:");
-
+    /// Called once per frame by the host. Polls the worker threads and
+    /// returns true when something on screen changed.
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        if self.import_running {
+            let progress = self.import_shared.lock().unwrap().clone();
+            if let Some(p) = progress {
+                let done =
+                    p.current_file.starts_with("DONE:") || p.current_file.starts_with("ERROR:");
                 if done {
-                    // Import finished.
                     self.import_running = false;
                     self.busy = false;
                     self.import_progress = None;
                     *self.import_shared.lock().unwrap() = None;
                     self.import_join_handle = None;
-
-                    let result = if progress.current_file.starts_with("DONE:") {
-                        let count_str = progress
-                            .current_file
-                            .strip_prefix("DONE:")
-                            .unwrap_or("");
-                        let count: usize = count_str.parse().unwrap_or(0);
-                        Ok(count)
+                    let result = if let Some(count) = p.current_file.strip_prefix("DONE:") {
+                        Ok(count.parse().unwrap_or(0))
                     } else {
-                        let err = progress
+                        Err(p
                             .current_file
                             .strip_prefix("ERROR:")
-                            .unwrap_or("Unknown error");
-                        Err(err.to_string())
+                            .unwrap_or("Unknown error")
+                            .to_string())
                     };
-
-                    return Task::perform(
-                    async move { result },
-                    SettingsMessage::ImportDone,
-                );
+                    self.handle(SettingsMessage::ImportDone(result));
                 } else {
-                    // Still running — update progress and keep polling.
-                    self.import_progress = Some(progress);
-                    let shared = Arc::clone(&self.import_shared);
-                    Task::perform(
-                        async move {
-                            Delay::new(Duration::from_millis(80)).await;
-                            shared.lock().unwrap().clone().unwrap_or(ImportProgress {
-                                entries_imported: 0,
-                                banks_done: 0,
-                                banks_total: 0,
-                                current_file: String::new(),
-                            })
-                        },
-                        |_| SettingsMessage::ImportProgress,
-                    )
+                    self.import_progress = Some(p);
                 }
+                changed = true;
             }
-
-            SettingsMessage::ImportDone(result) => {
-                match result {
-                    Ok(count) => {
-                        self.status_text = format!("Imported {count} entries");
-                        self.refresh();
-                    }
-                    Err(e) => {
-                        if e != "No file selected" {
-                            self.status_text = format!("Error: {e}");
-                        } else {
-                            self.status_text = "Import cancelled".to_string();
-                        }
-                    }
-                }
-                Task::none()
-            }
-
-            SettingsMessage::RefreshStatus => {
-                self.refresh();
-                self.status_text = "Refreshed".to_string();
-                Task::none()
-            }
-
-            SettingsMessage::DeleteDictionary(id) => {
-                if self.busy {
-                    return Task::none();
-                }
-                // The bundled pitch dictionary is app state: never deletable,
-                // even if a stale button ever reaches this handler.
-                if self.dictionaries.iter().any(|d| d.id == id && d.built_in) {
-                    self.status_text = "Bundled dictionaries cannot be deleted".to_string();
-                    return Task::none();
-                }
-                if let Err(e) = self.db.delete_dictionary(id) {
-                    self.status_text = format!("Delete failed: {}", e);
-                } else {
-                    self.status_text = "Dictionary deleted".to_string();
-                    self.refresh();
-                }
-                Task::none()
-            }
-
-            SettingsMessage::ToggleEnabled(id, enabled) => {
-                if self.busy {
-                    return Task::none();
-                }
-                if let Err(e) = self.db.set_dictionary_enabled(id, enabled) {
-                    eprintln!("Error toggling dictionary {}: {}", id, e);
-                    self.status_text = format!("Error: {}", e);
-                }
-                self.refresh();
-                Task::none()
-            }
-
-            SettingsMessage::MoveUp(id) => {
-                if self.busy {
-                    return Task::none();
-                }
-                self.swap_priority(id, true);
-                self.refresh();
-                Task::none()
-            }
-
-            SettingsMessage::MoveDown(id) => {
-                if self.busy {
-                    return Task::none();
-                }
-                self.swap_priority(id, false);
-                self.refresh();
-                Task::none()
-            }
-
-            SettingsMessage::SetFuriganaFilter(enabled) => {
-                // The frontend owns settings.json and saves the change; keep
-                // this window's rendered copy in step.
-                self.app_settings.furigana_filter = enabled;
-                Task::none()
-            }
-
-            SettingsMessage::SetPitchAccent(enabled) => {
-                // Same ownership as the furigana switch: the frontend saves.
-                self.app_settings.pitch_accent = enabled;
-                Task::none()
-            }
-
-            SettingsMessage::SetFontFace(face) => {
-                // Same ownership as the furigana switch: the frontend saves.
-                self.app_settings.overlay_font = face;
-                Task::none()
-            }
-
-            SettingsMessage::InstallCatalog(id) => {
-                if self.busy {
-                    return Task::none();
-                }
-                let Some(entry) = self.catalog.iter().find(|e| e.id == id).cloned() else {
-                    return Task::none();
-                };
-                self.status_text = format!("Downloading {}...", entry.name);
-                self.install_progress = None;
-                *self.install_shared.lock().unwrap() = None;
-                println!(
-                    "[Catalog] Installing '{}' from {} ({})",
-                    entry.name, entry.source, entry.license
-                );
-
-                let db = Arc::clone(&self.db);
-                let shared = Arc::clone(&self.install_shared);
-                let name = entry.name.clone();
-
-                let join_handle = std::thread::spawn(move || -> Result<usize, String> {
-                    let dest = std::env::temp_dir().join(format!("ijd-catalog-{}.zip", entry.id));
-                    let result = (|| -> Result<usize, String> {
-                        // Download and verify first: nothing reaches the
-                        // database until the pinned size and SHA-256 match.
-                        {
-                            let shared = Arc::clone(&shared);
-                            let mut on_progress = move |written: u64, total: u64| {
-                                *shared.lock().unwrap() =
-                                    Some(InstallProgress::Download { written, total });
-                            };
-                            jpdict_core::data::download::download_verified(
-                                &entry,
-                                &dest,
-                                &mut on_progress,
-                            )
-                            .map_err(|e| format!("{e:#}"))?;
-                        }
-
-                        let importer = DictionaryImporter::new(&db);
-                        let shared_for_cb = Arc::clone(&shared);
-                        let cb = Box::new(move |p: ImportProgress| {
-                            *shared_for_cb.lock().unwrap() = Some(InstallProgress::Import(p));
-                        });
-                        importer
-                            .import_zip_with(
-                                &dest,
-                                Some(cb),
-                                ImportOptions {
-                                    built_in: false,
-                                    catalog_id: Some(entry.id.clone()),
-                                },
-                            )
-                            .map_err(|e| e.to_string())
-                    })();
-                    let _ = std::fs::remove_file(&dest);
-
-                    // Write the completion sentinel the poll loop watches for,
-                    // on success or failure alike: a failed download must not
-                    // leave the window polling forever.
-                    let final_progress = match &result {
-                        Ok(count) => ImportProgress {
-                            entries_imported: *count,
-                            banks_done: 0,
-                            banks_total: 0,
-                            current_file: format!("DONE:{count}"),
-                        },
-                        Err(e) => ImportProgress {
-                            entries_imported: 0,
-                            banks_done: 0,
-                            banks_total: 0,
-                            current_file: format!("ERROR:{e}"),
-                        },
-                    };
-                    *shared.lock().unwrap() = Some(InstallProgress::Import(final_progress));
-                    result
-                });
-
-                self.install_running = true;
-                self.busy = true;
-                self.install_entry = Some(name);
-                self.install_join_handle = Some(join_handle);
-
-                Task::perform(async {}, |_| SettingsMessage::InstallProgress)
-            }
-
-            SettingsMessage::InstallProgress => {
-                let progress = self.install_shared.lock().unwrap().clone();
-                let done = match &progress {
-                    Some(InstallProgress::Import(p)) => {
-                        p.current_file.starts_with("DONE:") || p.current_file.starts_with("ERROR:")
+        }
+        if self.install_running {
+            let progress = self.install_shared.lock().unwrap().clone();
+            if let Some(p) = progress {
+                let done = match &p {
+                    InstallProgress::Import(ip) => {
+                        ip.current_file.starts_with("DONE:")
+                            || ip.current_file.starts_with("ERROR:")
                     }
                     _ => false,
                 };
-
                 if done {
                     self.install_running = false;
                     self.busy = false;
@@ -432,13 +211,12 @@ impl SettingsWindow {
                     self.install_join_handle = None;
                     self.install_progress = None;
                     *self.install_shared.lock().unwrap() = None;
-
-                    let result = match progress {
-                        Some(InstallProgress::Import(p)) => {
-                            if let Some(count) = p.current_file.strip_prefix("DONE:") {
+                    let result = match p {
+                        InstallProgress::Import(ip) => {
+                            if let Some(count) = ip.current_file.strip_prefix("DONE:") {
                                 Ok(count.parse().unwrap_or(0))
                             } else {
-                                Err(p
+                                Err(ip
                                     .current_file
                                     .strip_prefix("ERROR:")
                                     .unwrap_or("Unknown error")
@@ -447,33 +225,230 @@ impl SettingsWindow {
                         }
                         _ => Err("Install finished without a result".to_string()),
                     };
-                    Task::perform(async move { result }, SettingsMessage::InstallDone)
+                    self.handle(SettingsMessage::InstallDone(result));
                 } else {
-                    self.install_progress = progress;
-                    Task::perform(
-                        async {
-                            Delay::new(Duration::from_millis(80)).await;
-                        },
-                        |_| SettingsMessage::InstallProgress,
-                    )
+                    self.install_progress = Some(p);
                 }
-            }
-
-            SettingsMessage::InstallDone(result) => {
-                match result {
-                    Ok(count) => {
-                        self.status_text = format!("Installed {count} entries");
-                        self.refresh();
-                    }
-                    Err(e) => self.status_text = format!("Install failed: {e}"),
-                }
-                Task::none()
-            }
-
-            SettingsMessage::CloseWindow => {
-                std::process::exit(0);
+                changed = true;
             }
         }
+        changed
+    }
+
+    pub fn handle(&mut self, message: SettingsMessage) {
+        match message {
+            SettingsMessage::ImportDone(result) => match result {
+                Ok(count) => {
+                    self.status_text = format!("Imported {count} entries");
+                    self.refresh();
+                }
+                Err(e) => {
+                    self.status_text = if e == "No file selected" {
+                        "Import cancelled".to_string()
+                    } else {
+                        format!("Error: {e}")
+                    };
+                }
+            },
+            SettingsMessage::InstallDone(result) => match result {
+                Ok(count) => {
+                    self.status_text = format!("Installed {count} entries");
+                    self.refresh();
+                }
+                Err(e) => self.status_text = format!("Install failed: {e}"),
+            },
+            SettingsMessage::RefreshStatus => {
+                self.refresh();
+                self.status_text = "Refreshed".to_string();
+            }
+            SettingsMessage::DeleteDictionary(id) => {
+                if self.busy {
+                    return;
+                }
+                // The bundled pitch dictionary is app state: never deletable,
+                // even if a stale button ever reaches this handler.
+                if self.dictionaries.iter().any(|d| d.id == id && d.built_in) {
+                    self.status_text = "Bundled dictionaries cannot be deleted".to_string();
+                    return;
+                }
+                if let Err(e) = self.db.delete_dictionary(id) {
+                    self.status_text = format!("Delete failed: {e}");
+                } else {
+                    self.status_text = "Dictionary deleted".to_string();
+                    self.refresh();
+                }
+            }
+            SettingsMessage::ToggleEnabled(id, enabled) => {
+                if self.busy {
+                    return;
+                }
+                if let Err(e) = self.db.set_dictionary_enabled(id, enabled) {
+                    eprintln!("Error toggling dictionary {id}: {e}");
+                    self.status_text = format!("Error: {e}");
+                }
+                self.refresh();
+            }
+            SettingsMessage::MoveUp(id) => {
+                if !self.busy {
+                    self.swap_priority(id, true);
+                    self.refresh();
+                }
+            }
+            SettingsMessage::MoveDown(id) => {
+                if !self.busy {
+                    self.swap_priority(id, false);
+                    self.refresh();
+                }
+            }
+            SettingsMessage::SetFuriganaFilter(enabled) => {
+                // The frontend owns settings.json and saves the change; keep
+                // this window's rendered copy in step.
+                self.app_settings.furigana_filter = enabled;
+            }
+            SettingsMessage::SetPitchAccent(enabled) => {
+                self.app_settings.pitch_accent = enabled;
+            }
+            SettingsMessage::SetFontFace(face) => {
+                self.app_settings.overlay_font = face;
+            }
+            SettingsMessage::ImportDictionary => self.start_import(),
+            SettingsMessage::InstallCatalog(id) => self.start_install(id),
+        }
+    }
+
+    fn start_import(&mut self) {
+        if self.busy {
+            return;
+        }
+        self.status_text = "Selecting file...".to_string();
+        self.import_progress = None;
+        *self.import_shared.lock().unwrap() = None;
+
+        // Spawn the file picker and import on a dedicated thread.
+        let db = Arc::clone(&self.db);
+        let shared = Arc::clone(&self.import_shared);
+
+        let join_handle = std::thread::spawn(move || -> Result<usize, String> {
+            let path = rfd::FileDialog::new()
+                .add_filter("ZIP files", &["zip"])
+                .pick_file();
+
+            let path = match path {
+                Some(p) => p,
+                None => return Err("No file selected".to_string()),
+            };
+
+            let importer = DictionaryImporter::new(&db);
+            let shared_for_cb = Arc::clone(&shared);
+            let cb = Box::new(move |p: ImportProgress| {
+                *shared_for_cb.lock().unwrap() = Some(p);
+            });
+
+            let result = importer
+                .import_zip(path, Some(cb))
+                .map_err(|e| e.to_string());
+
+            // Write final sentinel to shared state.
+            let final_progress = match &result {
+                Ok(count) => ImportProgress {
+                    entries_imported: *count,
+                    banks_done: 0,
+                    banks_total: 0,
+                    current_file: format!("DONE:{count}"),
+                },
+                Err(e) => ImportProgress {
+                    entries_imported: 0,
+                    banks_done: 0,
+                    banks_total: 0,
+                    current_file: format!("ERROR:{e}"),
+                },
+            };
+            *shared.lock().unwrap() = Some(final_progress);
+            result
+        });
+
+        self.import_running = true;
+        self.busy = true;
+        self.import_join_handle = Some(join_handle);
+    }
+
+    fn start_install(&mut self, id: String) {
+        if self.busy {
+            return;
+        }
+        let Some(entry) = self.catalog.iter().find(|e| e.id == id).cloned() else {
+            return;
+        };
+        self.status_text = format!("Downloading {}...", entry.name);
+        self.install_progress = None;
+        *self.install_shared.lock().unwrap() = None;
+        println!(
+            "[Catalog] Installing '{}' from {} ({})",
+            entry.name, entry.source, entry.license
+        );
+
+        let db = Arc::clone(&self.db);
+        let shared = Arc::clone(&self.install_shared);
+        let name = entry.name.clone();
+
+        let join_handle = std::thread::spawn(move || -> Result<usize, String> {
+            let dest = std::env::temp_dir().join(format!("ijd-catalog-{}.zip", entry.id));
+            let result = (|| -> Result<usize, String> {
+                // Download and verify first: nothing reaches the database
+                // until the pinned size and SHA-256 match.
+                {
+                    let shared = Arc::clone(&shared);
+                    let mut on_progress = move |written: u64, total: u64| {
+                        *shared.lock().unwrap() =
+                            Some(InstallProgress::Download { written, total });
+                    };
+                    jpdict_core::data::download::download_verified(&entry, &dest, &mut on_progress)
+                        .map_err(|e| format!("{e:#}"))?;
+                }
+
+                let importer = DictionaryImporter::new(&db);
+                let shared_for_cb = Arc::clone(&shared);
+                let cb = Box::new(move |p: ImportProgress| {
+                    *shared_for_cb.lock().unwrap() = Some(InstallProgress::Import(p));
+                });
+                importer
+                    .import_zip_with(
+                        &dest,
+                        Some(cb),
+                        ImportOptions {
+                            built_in: false,
+                            catalog_id: Some(entry.id.clone()),
+                        },
+                    )
+                    .map_err(|e| e.to_string())
+            })();
+            let _ = std::fs::remove_file(&dest);
+
+            // Write the completion sentinel the poll loop watches for, on
+            // success or failure alike: a failed download must not leave the
+            // window polling forever.
+            let final_progress = match &result {
+                Ok(count) => ImportProgress {
+                    entries_imported: *count,
+                    banks_done: 0,
+                    banks_total: 0,
+                    current_file: format!("DONE:{count}"),
+                },
+                Err(e) => ImportProgress {
+                    entries_imported: 0,
+                    banks_done: 0,
+                    banks_total: 0,
+                    current_file: format!("ERROR:{e}"),
+                },
+            };
+            *shared.lock().unwrap() = Some(InstallProgress::Import(final_progress));
+            result
+        });
+
+        self.install_running = true;
+        self.busy = true;
+        self.install_entry = Some(name);
+        self.install_join_handle = Some(join_handle);
     }
 
     fn swap_priority(&self, id: i64, up: bool) {
@@ -501,47 +476,60 @@ impl SettingsWindow {
             .update_dictionary_priority(dicts[neighbor_idx].id, my_priority);
     }
 
-    pub fn view(&self) -> Element<'_, SettingsMessage> {
-        let title = Text::new("Instant JP Dict")
-            .size(28)
-            .style(text::primary);
+    /// The settings screen. `S` is the host app, so the same screen works in
+    /// the frontend's morphed state and in a standalone settings window.
+    pub fn view<S: SettingsHost>(&self) -> El {
+        let title = text("Instant JP Dict")
+            .font(TextStyle::new(28.0, 700.0))
+            .color(TEXT);
 
-        let status = Text::new(format!(
+        let status = text(format!(
             "DB contains {} entries in {} dictionaries",
             self.entry_count,
             self.dictionaries.len()
         ))
-        .size(14);
+        .font(TextStyle::new(14.0, 400.0))
+        .color(MUTED);
 
-        // --- Close button at top-right ---
-        let close_btn = Button::new(
-            Text::new("✕")
-                .size(18)
-                .align_x(Horizontal::Center),
-        )
-        .width(Pixels(40.0))
-        .height(Pixels(40.0))
-        .style(button::danger)
-        .on_press(SettingsMessage::CloseWindow);
+        let close_btn = el()
+            .key("close")
+            .role("button")
+            .label("Close")
+            .size(40.0, 40.0)
+            .radius(8.0)
+            .fill(DANGER)
+            .hover(lighten(DANGER, 0.1))
+            .cursor(rune::Cursor::Pointer)
+            .center()
+            .on_press_tx(|_: &mut S, tx| tx.quit())
+            .child(
+                text("×")
+                    .font(TextStyle::new(22.0, 500.0))
+                    .color(TEXT)
+                    .a11y_hidden(),
+            );
 
-        let header = row![
-            title,
-            Space::new().width(Length::Fill),
-            close_btn,
-        ]
-        .spacing(10)
-        .align_y(Vertical::Center);
+        let header = row()
+            .w_full()
+            .center_y()
+            .gap(10.0)
+            .child(title)
+            .child(el().grow(1.0))
+            .child(close_btn);
 
-        let mut content = column![header, status,]
-            .spacing(8)
-            .padding(24)
-            .width(Length::Fill);
+        let mut content = col()
+            .w_full()
+            .padding(24.0)
+            .gap(8.0)
+            .fill(BG)
+            .child(header)
+            .child(status);
 
         if !self.status_text.is_empty() {
-            content = content.push(
-                Text::new(&self.status_text)
-                    .size(13)
-                    .style(text::secondary),
+            content = content.child(
+                text(self.status_text.clone())
+                    .font(TextStyle::new(13.0, 400.0))
+                    .color(MUTED),
             );
         }
 
@@ -550,285 +538,406 @@ impl SettingsWindow {
             if let Some(ref progress) = self.import_progress {
                 content = import_progress_lines(progress, content);
             }
-            content = content.push(Space::new().height(Pixels(4.0)));
         }
         if self.install_running {
             if let Some(InstallProgress::Download { written, total }) = &self.install_progress {
                 let mb = |b: u64| b as f64 / 1_048_576.0;
-                content = content.push(
-                    Text::new(format!(
+                content = content.child(
+                    text(format!(
                         "Downloading {}: {:.1} / {:.1} MB",
                         self.install_entry.as_deref().unwrap_or("dictionary"),
                         mb(*written),
                         mb(*total),
                     ))
-                    .size(13)
-                    .style(text::secondary),
+                    .font(TextStyle::new(13.0, 400.0))
+                    .color(MUTED),
                 );
             }
             if let Some(InstallProgress::Import(progress)) = &self.install_progress {
                 content = import_progress_lines(progress, content);
             }
-            content = content.push(Space::new().height(Pixels(4.0)));
         }
 
-        content = content.push(Space::new().height(Pixels(8.0)));
+        content = content.child(el().h(8.0));
 
         // --- Behaviour: toggles that apply to the next capture / launch. ---
-
-        content = content.push(Text::new("Behaviour").size(18).style(text::primary));
-        content = content.push(Space::new().height(Pixels(4.0)));
-
-        // #100: the furigana (ruby) rule, off by default — it is flaky on
-        // camera photos and a wrong drop costs a whole line. Off keeps the
-        // small ruby contours as their own lines.
-        let furigana_check = checkbox(self.app_settings.furigana_filter)
-            .on_toggle(SettingsMessage::SetFuriganaFilter);
-        content = content.push(
-            row![
-                furigana_check,
-                Text::new("Filter furigana (ruby)").size(14),
-            ]
-            .spacing(6)
-            .align_y(Vertical::Center),
-        );
-        content = content.push(
-            Text::new(
-                "Drops small ruby text beside kanji so it does not become its own \
-                 result. Applies to the next capture.",
-            )
-            .size(12)
-            .style(text::secondary),
+        content = content.child(
+            text("Behaviour")
+                .font(TextStyle::new(18.0, 600.0))
+                .color(TEXT),
         );
 
-        // #43/#86: the pitch-accent line, off by default like mobile's
-        // home-screen toggle. Applies to the next launch (the viewer reads the
-        // setting once at startup).
-        let pitch_check = checkbox(self.app_settings.pitch_accent)
-            .on_toggle(SettingsMessage::SetPitchAccent);
-        content = content.push(
-            row![
-                pitch_check,
-                Text::new("Show pitch accent").size(14),
-            ]
-            .spacing(6)
-            .align_y(Vertical::Center),
-        );
-        content = content.push(
-            Text::new("Draws the pitch-accent line under each entry's headwords. \
-                        Takes effect next launch.")
-                .size(12)
-                .style(text::secondary),
-        );
+        content = content.child(checkbox_row::<S>(
+            "furigana",
+            "Filter furigana (ruby)",
+            self.app_settings.furigana_filter,
+            |s| {
+                let on = !s.settings_window().app_settings.furigana_filter;
+                s.settings_window_mut()
+                    .handle(SettingsMessage::SetFuriganaFilter(on));
+            },
+        ));
+        content = content.child(hint(
+            "Drops small ruby text beside kanji so it does not become its own \
+             result. Applies to the next capture.",
+        ));
 
-        // Font face, moved here from the frontend menu so all behaviour lives
-        // in one place. Applies to the overlay and the dictionary panel alike
-        // (both register the same face at viewer startup).
-        let serif_check = checkbox(self.app_settings.overlay_font == FontFace::Serif)
-            .on_toggle(|serif| {
-                SettingsMessage::SetFontFace(if serif {
-                    FontFace::Serif
-                } else {
-                    FontFace::Sans
-                })
-            });
-        content = content.push(
-            row![
-                serif_check,
-                Text::new("Serif font (Noto Serif JP)").size(14),
-            ]
-            .spacing(6)
-            .align_y(Vertical::Center),
-        );
-        content = content.push(
-            Text::new("Overlay & dictionary panel — takes effect next launch.")
-                .size(12)
-                .style(text::secondary),
-        );
+        content = content.child(checkbox_row::<S>(
+            "pitch",
+            "Show pitch accent",
+            self.app_settings.pitch_accent,
+            |s| {
+                let on = !s.settings_window().app_settings.pitch_accent;
+                s.settings_window_mut()
+                    .handle(SettingsMessage::SetPitchAccent(on));
+            },
+        ));
+        content = content.child(hint(
+            "Draws the pitch-accent line under each entry's headwords. \
+             Takes effect next launch.",
+        ));
 
-        content = content.push(Space::new().height(Pixels(16.0)));
+        content = content.child(checkbox_row::<S>(
+            "serif",
+            "Serif font (Noto Serif JP)",
+            self.app_settings.overlay_font == FontFace::Serif,
+            |s| {
+                let on = s.settings_window().app_settings.overlay_font == FontFace::Serif;
+                s.settings_window_mut()
+                    .handle(SettingsMessage::SetFontFace(if on {
+                        FontFace::Sans
+                    } else {
+                        FontFace::Serif
+                    }));
+            },
+        ));
+        content = content.child(hint(
+            "Overlay & dictionary panel — takes effect next launch.",
+        ));
+
+        content = content.child(el().h(16.0));
 
         // --- Action buttons (disabled while busy) ---
-
         let disabled = self.busy;
-        content = content.push(action_button(
+        content = content.child(action_button::<S>(
             "Import Yomitan Dictionary (.zip)",
-            SettingsMessage::ImportDictionary,
-            disabled,
+            !disabled,
+            |s| {
+                s.settings_window_mut()
+                    .handle(SettingsMessage::ImportDictionary)
+            },
         ));
-        content = content.push(action_button(
-            "Refresh Status",
-            SettingsMessage::RefreshStatus,
-            disabled,
-        ));
+        content = content.child(action_button::<S>("Refresh Status", !disabled, |s| {
+            s.settings_window_mut()
+                .handle(SettingsMessage::RefreshStatus)
+        }));
 
-        content = content.push(Space::new().height(Pixels(16.0)));
-        content = content.push(Text::new("Dictionary Catalog").size(18).style(text::primary));
-        content = content.push(Space::new().height(Pixels(4.0)));
+        content = content.child(el().h(16.0));
+        content = content.child(
+            text("Dictionary Catalog")
+                .font(TextStyle::new(18.0, 600.0))
+                .color(TEXT),
+        );
 
         // --- One-click installs (#71): the dictionaries that used to be
-        // bundled. An installed entry keeps its row and shows "Installed"
-        // (mobile's chip); the dictionary is also in the list below, where it
-        // can be reordered. ---
+        // bundled. An installed entry keeps its row and shows "Installed". ---
         for entry in self.catalog {
             let installed = catalog::is_installed(&self.dictionaries, entry);
-            content = content.push(self.catalog_row(entry, installed, disabled));
+            content = content.child(catalog_row::<S>(entry, installed, disabled));
         }
 
-        content = content.push(Space::new().height(Pixels(16.0)));
-        content = content.push(Text::new("Dictionary Manager").size(18).style(text::primary));
-        content = content.push(Space::new().height(Pixels(4.0)));
+        content = content.child(el().h(16.0));
+        content = content.child(
+            text("Dictionary Manager")
+                .font(TextStyle::new(18.0, 600.0))
+                .color(TEXT),
+        );
 
         // --- Installed dictionaries (disabled while busy) ---
-
         if self.dictionaries.is_empty() {
-            content = content.push(
-                Text::new("No dictionaries imported yet.")
-                    .size(13)
-                    .style(text::secondary),
+            content = content.child(
+                text("No dictionaries imported yet.")
+                    .font(TextStyle::new(13.0, 400.0))
+                    .color(MUTED),
             );
         } else {
             for dict in &self.dictionaries {
-                content = content.push(self.dict_row(dict, disabled));
+                content = content.child(dict_row::<S>(dict, disabled));
             }
         }
 
-        container(scrollable(content))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        content
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .w_full()
+            .h_full()
+            .min_h(0.0)
     }
+}
 
-    /// One catalog row: name, description + size + licence, and either an
-    /// Install button or the "Installed" marker (mobile's chip).
-    fn catalog_row<'a>(
-        &'a self,
-        entry: &'a CatalogEntry,
-        installed: bool,
-        disabled: bool,
-    ) -> Container<'a, SettingsMessage> {
-        let info = column![
-            Text::new(&entry.name).size(15),
-            Text::new(format!(
+/// Wire a [`SettingsMessage`] to the host's window.
+fn send<S: SettingsHost>(msg: SettingsMessage) -> impl Fn(&mut S) + 'static {
+    move |s: &mut S| s.settings_window_mut().handle(msg.clone())
+}
+
+fn checkbox_row<S: SettingsHost>(
+    key: &'static str,
+    label: &'static str,
+    on: bool,
+    flip: fn(&mut S),
+) -> El {
+    let box_el = el()
+        .key(key)
+        .role("checkbox")
+        .label(label)
+        .checked(on)
+        .focusable(true)
+        .size(18.0, 18.0)
+        .radius(4.0)
+        .border(1.0, if on { ACCENT } else { CARD_BORDER })
+        .fill(if on { ACCENT } else { Color::TRANSPARENT })
+        .center()
+        .cursor(rune::Cursor::Pointer)
+        .on_press(flip)
+        .child(
+            text(if on { "✓" } else { "" })
+                .font(TextStyle::new(12.0, 700.0))
+                .color(Color::WHITE)
+                .a11y_hidden(),
+        );
+
+    row()
+        .key(format!("{key}_row"))
+        .w_full()
+        .gap(6.0)
+        .center_y()
+        .child(box_el)
+        .child(
+            text(label)
+                .font(TextStyle::new(14.0, 400.0))
+                .color(TEXT)
+                .a11y_hidden(),
+        )
+}
+
+fn hint(body: &str) -> El {
+    text(body.to_string())
+        .font(TextStyle::new(12.0, 400.0))
+        .color(MUTED)
+        .wrap()
+        .w_full()
+}
+
+fn action_button<S: SettingsHost>(label: &'static str, enabled: bool, on_press: fn(&mut S)) -> El {
+    let mut b = el()
+        .key(label)
+        .role("button")
+        .label(label)
+        .w_full()
+        .padding(10.0)
+        .radius(8.0)
+        .fill(if enabled { ACCENT } else { CARD })
+        .center();
+    if enabled {
+        b = b
+            .hover(lighten(ACCENT, 0.08))
+            .press(lighten(ACCENT, 0.16))
+            .cursor(rune::Cursor::Pointer)
+            .on_press(on_press);
+    }
+    b.child(
+        text(label)
+            .font(TextStyle::new(15.0, 500.0))
+            .color(if enabled { Color::WHITE } else { MUTED })
+            .a11y_hidden(),
+    )
+}
+
+/// One catalog row: name, description + size + licence, and either an
+/// Install button or the "Installed" marker (mobile's chip).
+fn catalog_row<S: SettingsHost>(entry: &CatalogEntry, installed: bool, disabled: bool) -> El {
+    let info = col()
+        .gap(2.0)
+        .child(
+            text(entry.name.clone())
+                .font(TextStyle::new(15.0, 500.0))
+                .color(TEXT),
+        )
+        .child(
+            text(format!(
                 "{} · {:.1} MB · {}",
                 entry.description,
                 entry.bytes as f64 / 1_048_576.0,
                 entry.license
             ))
-            .size(12)
-            .style(text::secondary),
-        ]
-        .spacing(2);
+            .font(TextStyle::new(12.0, 400.0))
+            .color(MUTED),
+        );
 
-        let action: Element<'a, SettingsMessage> = if installed {
-            Text::new("Installed").size(13).style(text::secondary).into()
-        } else if disabled {
-            Button::new(Text::new("Install").size(13)).into()
-        } else {
-            Button::new(Text::new("Install").size(13))
-                .on_press(SettingsMessage::InstallCatalog(entry.id.clone()))
-                .into()
-        };
-
-        let row_content = row![
-            info,
-            Space::new().width(Length::Fill),
-            action
-        ]
-        .spacing(10)
-        .align_y(Vertical::Center)
-        .width(Length::Fill);
-
-        container(row_content).padding(8).style(container::rounded_box)
-    }
-
-    fn dict_row<'a>(
-        &'a self,
-        dict: &'a DictionaryMeta,
-        disabled: bool,
-    ) -> Container<'a, SettingsMessage> {
-        let name_text = if dict.built_in {
-            Text::new(format!("{} (bundled)", dict.name)).size(15)
-        } else if dict.enabled {
-            Text::new(&dict.name).size(15)
-        } else {
-            Text::new(format!("{} (disabled)", dict.name))
-                .size(15)
-                .style(text::secondary)
-        };
-
-        let enabled_checkbox = checkbox(dict.enabled)
-            .on_toggle(move |checked| SettingsMessage::ToggleEnabled(dict.id, checked));
-
-        let up_btn = Button::new(Text::new("▲").size(14))
-            .on_press(SettingsMessage::MoveUp(dict.id))
-            .style(button::secondary);
-
-        let down_btn = Button::new(Text::new("▼").size(14))
-            .on_press(SettingsMessage::MoveDown(dict.id))
-            .style(button::secondary);
-
-        // The bundled dictionary has no Delete: it is app state, not a
-        // user import (mobile hides built-ins from the manager entirely).
-        let delete_btn = if dict.built_in {
-            None
-        } else if disabled {
-            Some(Button::new(Text::new("Delete").size(13)).style(button::danger))
-        } else {
-            Some(
-                Button::new(Text::new("Delete").size(13))
-                    .on_press(SettingsMessage::DeleteDictionary(dict.id))
-                    .style(button::danger),
-            )
-        };
-
-        let mut controls = row![up_btn, down_btn].spacing(6).align_y(Vertical::Center);
-        if let Some(btn) = delete_btn {
-            controls = controls.push(btn);
+    let action = if installed {
+        el().child(
+            text("Installed")
+                .font(TextStyle::new(13.0, 400.0))
+                .color(MUTED),
+        )
+    } else {
+        let id = entry.id.clone();
+        let mut b = el()
+            .role("button")
+            .label("Install")
+            .px(12.0)
+            .py(6.0)
+            .radius(6.0)
+            .fill(if disabled { CARD } else { ACCENT });
+        if !disabled {
+            b = b
+                .hover(lighten(ACCENT, 0.08))
+                .cursor(rune::Cursor::Pointer)
+                .on_press(send::<S>(SettingsMessage::InstallCatalog(id)));
         }
+        b.child(
+            text("Install")
+                .font(TextStyle::new(13.0, 500.0))
+                .color(if disabled { MUTED } else { Color::WHITE }),
+        )
+    };
 
-        let row_content = row![
-            enabled_checkbox,
-            name_text,
-            Space::new().width(Length::Fill),
-            controls
-        ]
-        .spacing(10)
-        .align_y(Vertical::Center)
-        .width(Length::Fill);
-
-        container(row_content).padding(8).style(container::rounded_box)
-    }
+    el().w_full()
+        .padding(8.0)
+        .radius(8.0)
+        .fill(CARD)
+        .border(1.0, CARD_BORDER)
+        .child(
+            row()
+                .w_full()
+                .gap(10.0)
+                .center_y()
+                .child(info)
+                .child(el().grow(1.0))
+                .child(action),
+        )
 }
 
-/// Helper to create a full-width action button.
-fn action_button<'a>(
-    label: &'static str,
-    msg: SettingsMessage,
-    disabled: bool,
-) -> Button<'a, SettingsMessage> {
-    let btn = Button::new(
-        Text::new(label)
-            .size(15)
-            .align_x(Horizontal::Center),
-    )
-    .width(Length::Fill)
-    .padding(10);
-
-    if disabled {
-        btn
+fn dict_row<S: SettingsHost>(dict: &DictionaryMeta, disabled: bool) -> El {
+    let name_text = if dict.built_in {
+        format!("{} (bundled)", dict.name)
+    } else if dict.enabled {
+        dict.name.clone()
     } else {
-        btn.on_press(msg)
+        format!("{} (disabled)", dict.name)
+    };
+
+    let id = dict.id;
+    let enabled = dict.enabled;
+    let enable_box = el()
+        .role("checkbox")
+        .label(name_text.clone())
+        .checked(enabled)
+        .focusable(true)
+        .size(18.0, 18.0)
+        .radius(4.0)
+        .border(1.0, if enabled { ACCENT } else { CARD_BORDER })
+        .fill(if enabled { ACCENT } else { Color::TRANSPARENT })
+        .center()
+        .cursor(rune::Cursor::Pointer)
+        .on_press(send::<S>(SettingsMessage::ToggleEnabled(id, !enabled)))
+        .child(
+            text(if enabled { "✓" } else { "" })
+                .font(TextStyle::new(12.0, 700.0))
+                .color(Color::WHITE),
+        );
+
+    let up_btn = small_button("▲", !disabled, send::<S>(SettingsMessage::MoveUp(id)));
+    let down_btn = small_button("▼", !disabled, send::<S>(SettingsMessage::MoveDown(id)));
+
+    // The bundled dictionary has no Delete: it is app state, not a user
+    // import (mobile hides built-ins from the manager entirely).
+    let mut controls = row().gap(6.0).center_y().child(up_btn).child(down_btn);
+    if !dict.built_in {
+        controls = controls.child(text_button(
+            "Delete",
+            !disabled,
+            DANGER,
+            send::<S>(SettingsMessage::DeleteDictionary(id)),
+        ));
     }
+
+    el().w_full()
+        .padding(8.0)
+        .radius(8.0)
+        .fill(CARD)
+        .border(1.0, CARD_BORDER)
+        .child(
+            row()
+                .w_full()
+                .gap(10.0)
+                .center_y()
+                .child(enable_box)
+                .child(text(name_text).font(TextStyle::new(15.0, 400.0)).color(
+                    if dict.enabled || dict.built_in {
+                        TEXT
+                    } else {
+                        MUTED
+                    },
+                ))
+                .child(el().grow(1.0))
+                .child(controls),
+        )
+}
+
+fn small_button<S: SettingsHost>(
+    label: &'static str,
+    enabled: bool,
+    on_press: impl Fn(&mut S) + 'static,
+) -> El {
+    let mut b = el()
+        .role("button")
+        .label(label)
+        .size(30.0, 26.0)
+        .radius(6.0)
+        .fill(CARD)
+        .border(1.0, CARD_BORDER)
+        .center();
+    if enabled {
+        b = b
+            .hover(lighten(CARD, 0.08))
+            .cursor(rune::Cursor::Pointer)
+            .on_press(on_press);
+    }
+    b.child(text(label).font(TextStyle::new(14.0, 500.0)).color(TEXT))
+}
+
+fn text_button<S: SettingsHost>(
+    label: &'static str,
+    enabled: bool,
+    fill: Color,
+    on_press: impl Fn(&mut S) + 'static,
+) -> El {
+    let mut b = el()
+        .role("button")
+        .label(label)
+        .px(10.0)
+        .py(5.0)
+        .radius(6.0)
+        .fill(if enabled { fill } else { CARD });
+    if enabled {
+        b = b
+            .hover(lighten(fill, 0.08))
+            .cursor(rune::Cursor::Pointer)
+            .on_press(on_press);
+    }
+    b.child(
+        text(label)
+            .font(TextStyle::new(13.0, 500.0))
+            .color(if enabled { TEXT } else { MUTED }),
+    )
 }
 
 /// The progress lines both import phases share: entry/bank counts and the
 /// current file (never the `DONE:`/`ERROR:` sentinel, which the poll loop
 /// consumes instead of rendering).
-fn import_progress_lines<'a>(
-    progress: &ImportProgress,
-    mut content: Column<'a, SettingsMessage>,
-) -> Column<'a, SettingsMessage> {
+fn import_progress_lines(progress: &ImportProgress, mut content: El) -> El {
     let percentage = if progress.banks_total > 0 {
         (progress.banks_done as f32 / progress.banks_total as f32) * 100.0
     } else {
@@ -842,22 +951,35 @@ fn import_progress_lines<'a>(
     } else {
         format!("Importing: {} entries...", progress.entries_imported)
     };
-    content = content.push(Text::new(progress_text).size(13).style(text::secondary));
+    content = content.child(
+        text(progress_text)
+            .font(TextStyle::new(13.0, 400.0))
+            .color(MUTED),
+    );
 
-    let sentinel = progress.current_file.starts_with("DONE:")
-        || progress.current_file.starts_with("ERROR:");
+    let sentinel =
+        progress.current_file.starts_with("DONE:") || progress.current_file.starts_with("ERROR:");
     if !progress.current_file.is_empty() && !sentinel {
         let file_name = std::path::Path::new(&progress.current_file)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(&progress.current_file);
-        content = content.push(
-            Text::new(format!("  → {file_name}"))
-                .size(11)
-                .style(text::secondary),
+        content = content.child(
+            text(format!("  → {file_name}"))
+                .font(TextStyle::new(11.0, 400.0))
+                .color(MUTED),
         );
     }
     content
+}
+
+fn lighten(c: Color, amount: f32) -> Color {
+    Color {
+        r: (c.r + amount).min(1.0),
+        g: (c.g + amount).min(1.0),
+        b: (c.b + amount).min(1.0),
+        a: c.a,
+    }
 }
 
 #[cfg(test)]
@@ -876,9 +998,9 @@ mod tests {
     fn pitch_message_updates_snapshot_copy() {
         let mut window = SettingsWindow::new(empty_db(), AppSettings::default());
         assert!(!window.app_settings.pitch_accent);
-        let _ = window.update(SettingsMessage::SetPitchAccent(true));
+        window.handle(SettingsMessage::SetPitchAccent(true));
         assert!(window.app_settings.pitch_accent);
-        let _ = window.update(SettingsMessage::SetPitchAccent(false));
+        window.handle(SettingsMessage::SetPitchAccent(false));
         assert!(!window.app_settings.pitch_accent);
     }
 }

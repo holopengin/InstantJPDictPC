@@ -62,7 +62,7 @@ impl FontFace {
     }
 
     /// Family name the font database sees after the file is registered (the
-    /// `name` table's family record). Used as the iced application default
+    /// `name` table's family record). Used as the Rune application's default
     /// font so the dictionary panel renders in the selected face.
     pub fn family_name(self) -> &'static str {
         match self {

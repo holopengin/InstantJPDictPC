@@ -23,34 +23,18 @@ Jitendex packs every sense into one row's glossary; the walker
 - Deinflected matches carry their chain into the chain row (see
   [deinflection](deinflection.md)); plain terms render exactly as before.
 
-## Panel face: name the bundled family, never a generic one
+## Panel face: one bundled family
 
-Every panel widget renders in the **bundled** face, and must ask iced for it
-*by family name*. `init_panel_font` captures the resolved face's family at
-startup (`loaded_face.family_name()` — the same face the overlay glyph cache
-rasterizes and the same bytes registered with iced); `bold_font` (the
-term-display weight, used by `headword_block`, `tag_chip`, `ruby_view`,
-`full_ruby_view`) is that family at `Weight::Bold`.
+Every panel widget renders in the **bundled** face. `run_ocr_viewer` resolves
+the persisted Sans/Serif choice at startup (`loaded_face`), registers both
+bundled files through Rune's `AppSpec::fonts`, and passes the selected family
+as the app's sans family (`AppSpec::families`). Panel text therefore uses
+`Family::Sans`, which is that face rather than a system fallback.
 
-Why the family name matters, because iced gives no way to forbid the system
-database: `FontSystem::new_with_fonts` calls `load_system_fonts()`, so every
-font installed on the machine is in the DB. A generic
-`Family::SansSerif` request then resolves to the family cosmic-text
-configured ("Open Sans"), and the kanji come from cosmic-text's per-glyph
-fallback list — `han_unification(locale)`, which is `Noto Sans CJK SC`
-unless the process locale is exactly `ja`. That is the "headwords render in
-Chinese/ancient forms while the rest of the UI is modern Japanese" symptom.
-With only the bundled Regular registered, a `Weight::Bold` request *within*
-the bundled family lands on that Regular — the weight is aspirational (see
-the ticket-06 note), but the glyph forms are always the bundled Japanese
-ones.
-
-Residual, accepted: (a) cosmic-text's per-glyph fallback still applies to
-codepoints the bundled face lacks (e.g. the settings window's `✕`), and
-(b) a *system* font installed under the literal family name `Noto Sans JP` /
-`Noto Serif JP` could tie-break ahead of the bundled face, since system faces
-are loaded first and `fontdb::find_best_match` breaks ties by first-seen.
-Most distributions expose CJK as `Noto Sans CJK JP`, so this rarely bites.
+Bold requests stay inside the bundled family, which has a Regular face only,
+so the weight is aspirational: the glyph forms are always the bundled
+Japanese ones. This is the same choice the iced build made for the same
+reason (see the ticket-06 note).
 
 ## Ticket-06 departure: body ruby is white regular (DELIBERATE)
 

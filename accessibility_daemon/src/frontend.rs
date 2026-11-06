@@ -1,4 +1,4 @@
-//! Frontend launcher window.
+//! Frontend launcher window, rendered with Rune.
 //!
 //! Shown when the app is launched with no arguments. Two options:
 //!   - "Launch Settings Window" — the frontend morphs into the settings UI
@@ -6,40 +6,78 @@
 //!     as a detached process and closes this window. If a watcher is already
 //!     running, the button becomes "Stop File Watcher" instead.
 
-use iced::{
-    alignment::Horizontal,
-    widget::{button, column, text, Button, Space, Text},
-    Element, Length, Pixels, Subscription, Task,
-};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::anyhow;
+use rune::tok::type_;
+use rune::{col, el, row, text, AppSpec, Color, Cx, El};
+
+use crate::settings_window::{SettingsHost, SettingsWindow};
+use crate::watcher;
 use jpdict_core::app_settings::AppSettings;
 use jpdict_core::data::db::DictionaryDatabase;
-use crate::settings_window::{SettingsMessage, SettingsWindow};
-use crate::watcher;
 
-/// Messages for the frontend window.
-#[derive(Debug, Clone)]
-pub enum FrontMsg {
-    OpenSettings,
-    BackToMenu,
-    StartWatcher,
-    StopWatcher,
-    WatcherTick,
-    Settings(SettingsMessage),
+/// Bundled Japanese face: the frontend also lists dictionary names, so the
+/// UI font must cover Japanese. Rune embeds the face in the binary.
+pub const SANS_FONT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fonts/NotoSansJP-Regular.ttf"
+));
+pub const SERIF_FONT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fonts/NotoSerifJP-Regular.ttf"
+));
+
+// Rune's colours are linear-light; these are the sRGB design values decoded.
+const BG: Color = Color {
+    r: 0.009715,
+    g: 0.009715,
+    b: 0.009715,
+    a: 1.0,
+};
+const CARD: Color = Color {
+    r: 0.018478,
+    g: 0.018478,
+    b: 0.018478,
+    a: 1.0,
+};
+const TEXT: Color = Color {
+    r: 0.868899,
+    g: 0.868899,
+    b: 0.868899,
+    a: 1.0,
+};
+const MUTED: Color = Color {
+    r: 0.342392,
+    g: 0.342392,
+    b: 0.342392,
+    a: 1.0,
+};
+const ACCENT: Color = Color {
+    r: 0.046964,
+    g: 0.223414,
+    b: 0.748414,
+    a: 1.0,
+};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Menu,
+    Settings,
 }
 
-pub struct FrontendWindow {
+pub struct FrontendApp {
     db: Arc<DictionaryDatabase>,
     data_dir: PathBuf,
     app_settings: AppSettings,
+    screen: Screen,
     settings: Option<SettingsWindow>,
     watcher_running: bool,
 }
 
-impl FrontendWindow {
+impl FrontendApp {
     pub fn new(db: Arc<DictionaryDatabase>, data_dir: PathBuf) -> Self {
         let watcher_running = watcher::is_running(&data_dir);
         let app_settings = AppSettings::load(&data_dir);
@@ -47,98 +85,24 @@ impl FrontendWindow {
             db,
             data_dir,
             app_settings,
+            screen: Screen::Menu,
             settings: None,
             watcher_running,
         }
     }
 
-    /// Poll the watcher's liveness once per second so the button label
-    /// stays in sync (e.g. if the watcher dies on its own).
-    pub fn subscription(&self) -> Subscription<FrontMsg> {
-        iced::time::every(Duration::from_secs(1)).map(|_| FrontMsg::WatcherTick)
-    }
-
-    pub fn update(&mut self, msg: FrontMsg) -> Task<FrontMsg> {
-        match msg {
-            FrontMsg::OpenSettings => {
-                if self.settings.is_none() {
-                    self.settings = Some(SettingsWindow::new(
-                        Arc::clone(&self.db),
-                        self.app_settings.clone(),
-                    ));
-                }
-                Task::none()
-            }
-            FrontMsg::BackToMenu => {
-                self.settings = None;
-                self.refresh_watcher();
-                Task::none()
-            }
-            FrontMsg::StartWatcher => {
-                self.launch_watcher();
-                // Give the watcher a moment to write its pid file: if we
-                // exit before that, a quick relaunch sees "not running"
-                // and starts a second watcher, orphaning this one.
-                for _ in 0..25 {
-                    if watcher::is_running(&self.data_dir) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                // Close the frontend window; the watcher keeps running detached.
-                std::process::exit(0);
-            }
-            FrontMsg::StopWatcher => {
-                watcher::request_stop(&self.data_dir);
-                self.watcher_running = false;
-                Task::none()
-            }
-            FrontMsg::WatcherTick => {
-                self.refresh_watcher();
-                Task::none()
-            }
-            FrontMsg::Settings(m) => {
-                // The Behaviour switches are app state, not dictionary state:
-                // the settings window only renders them, the frontend owns the
-                // file. Keep our copy in step so a later save cannot write a
-                // stale value back.
-                match &m {
-                    SettingsMessage::SetFuriganaFilter(enabled) => {
-                        if self.app_settings.furigana_filter != *enabled {
-                            self.app_settings.furigana_filter = *enabled;
-                            if let Err(e) = self.app_settings.save(&self.data_dir) {
-                                eprintln!("[Frontend] Failed to save settings: {e}");
-                            }
-                        }
-                    }
-                    SettingsMessage::SetPitchAccent(enabled) => {
-                        if self.app_settings.pitch_accent != *enabled {
-                            self.app_settings.pitch_accent = *enabled;
-                            if let Err(e) = self.app_settings.save(&self.data_dir) {
-                                eprintln!("[Frontend] Failed to save settings: {e}");
-                            }
-                        }
-                    }
-                    SettingsMessage::SetFontFace(face) => {
-                        if self.app_settings.overlay_font != *face {
-                            self.app_settings.overlay_font = *face;
-                            if let Err(e) = self.app_settings.save(&self.data_dir) {
-                                eprintln!("[Frontend] Failed to save settings: {e}");
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                if let Some(sw) = self.settings.as_mut() {
-                    sw.update(m).map(FrontMsg::Settings)
-                } else {
-                    Task::none()
-                }
-            }
+    fn open_settings(&mut self) {
+        if self.settings.is_none() {
+            self.settings = Some(SettingsWindow::new(
+                Arc::clone(&self.db),
+                self.app_settings.clone(),
+            ));
         }
+        self.screen = Screen::Settings;
     }
 
-    fn refresh_watcher(&mut self) {
+    fn back_to_menu(&mut self) {
+        self.screen = Screen::Menu;
         self.watcher_running = watcher::is_running(&self.data_dir);
     }
 
@@ -161,67 +125,214 @@ impl FrontendWindow {
             Ok(_) => println!("[Frontend] File watcher started (detached)."),
             Err(e) => eprintln!("[Frontend] Failed to start watcher: {e}"),
         }
-    }
-
-    pub fn view(&self) -> Element<'_, FrontMsg> {
-        if let Some(sw) = &self.settings {
-            let back = Button::new(Text::new("← Back to Menu").size(15))
-                .on_press(FrontMsg::BackToMenu)
-                .style(button::secondary);
-            return column![back, sw.view().map(FrontMsg::Settings)]
-                .spacing(6)
-                .padding(8)
-                .into();
+        // Give the watcher a moment to write its pid file: if we exit before
+        // that, a quick relaunch sees "not running" and starts a second
+        // watcher, orphaning this one.
+        for _ in 0..25 {
+            if watcher::is_running(&self.data_dir) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        self.menu_view()
+        std::process::exit(0);
     }
 
-    fn menu_view(&self) -> Element<'_, FrontMsg> {
-        let title = Text::new("Instant JP Dict").size(30).style(text::primary);
-        let subtitle = Text::new("OCR overlay & dictionary daemon")
-            .size(14)
-            .style(text::secondary);
+    fn poll(&mut self) -> bool {
+        let mut changed = false;
+        let running = watcher::is_running(&self.data_dir);
+        if running != self.watcher_running {
+            self.watcher_running = running;
+            changed = true;
+        }
+        if let Some(sw) = self.settings.as_mut() {
+            changed |= sw.poll();
+            // Settings own the behaviour switches; keep the frontend's copy
+            // in step so a later save cannot write a stale value back.
+            if sw.app_settings() != &self.app_settings {
+                self.app_settings = sw.app_settings().clone();
+                if let Err(e) = self.app_settings.save(&self.data_dir) {
+                    eprintln!("[Frontend] Failed to save settings: {e}");
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+}
 
-        let settings_btn = Button::new(
-            Text::new("Launch Settings Window")
-                .size(16)
-                .align_x(Horizontal::Center),
+impl SettingsHost for FrontendApp {
+    fn settings_window(&self) -> &SettingsWindow {
+        self.settings
+            .as_ref()
+            .expect("settings screen is only shown with a settings window")
+    }
+    fn settings_window_mut(&mut self) -> &mut SettingsWindow {
+        self.settings
+            .as_mut()
+            .expect("settings screen is only shown with a settings window")
+    }
+}
+
+fn app_view(s: &FrontendApp, cx: &mut Cx<FrontendApp>) -> El {
+    let _ = cx;
+    match s.screen {
+        Screen::Menu => menu_view(s),
+        Screen::Settings => {
+            let body = s
+                .settings
+                .as_ref()
+                .map(|w| w.view::<FrontendApp>())
+                .unwrap_or_else(|| text("Settings unavailable").color(MUTED));
+            col()
+                .w_full()
+                .h_full()
+                .fill(BG)
+                .child(
+                    row()
+                        .w_full()
+                        .px(16.0)
+                        .py(10.0)
+                        .center_y()
+                        .child(back_button("← Back to Menu", |s: &mut FrontendApp| {
+                            s.back_to_menu()
+                        })),
+                )
+                .child(el().w_full().grow(1.0).min_h(0.0).child(body))
+        }
+    }
+}
+
+fn menu_view(s: &FrontendApp) -> El {
+    let title = text("Instant JP Dict")
+        .font(rune::tok::TextStyle::new(30.0, 700.0))
+        .color(TEXT);
+    let subtitle = text("OCR overlay & dictionary daemon")
+        .font(type_::BODY)
+        .color(MUTED);
+
+    let settings_btn = button("Launch Settings Window", ACCENT, |s: &mut FrontendApp| {
+        s.open_settings()
+    });
+
+    let (label, msg): (&str, fn(&mut FrontendApp)) = if s.watcher_running {
+        (
+            "Stop File Watcher",
+            (|s: &mut FrontendApp| {
+                watcher::request_stop(&s.data_dir);
+                s.watcher_running = false;
+            }) as fn(&mut FrontendApp),
         )
-        .width(Length::Fill)
-        .padding(12)
-        .on_press(FrontMsg::OpenSettings);
+    } else {
+        (
+            "Launch File Watcher",
+            (|s: &mut FrontendApp| s.launch_watcher()) as fn(&mut FrontendApp),
+        )
+    };
+    let watcher_btn = button(label, CARD, msg);
 
-        let (label, msg) = if self.watcher_running {
-            ("Stop File Watcher", FrontMsg::StopWatcher)
-        } else {
-            ("Launch File Watcher", FrontMsg::StartWatcher)
-        };
-        let watcher_btn = Button::new(Text::new(label).size(16).align_x(Horizontal::Center))
-            .width(Length::Fill)
-            .padding(12)
-            .on_press(msg);
+    let status = text(if s.watcher_running {
+        "File watcher: running"
+    } else {
+        "File watcher: stopped"
+    })
+    .font(type_::LABEL)
+    .color(MUTED);
 
-        let status = Text::new(if self.watcher_running {
-            "File watcher: running"
-        } else {
-            "File watcher: stopped"
-        })
-        .size(13)
-        .style(text::secondary);
+    col()
+        .w_full()
+        .h_full()
+        .padding(24.0)
+        .gap(8.0)
+        .fill(BG)
+        .child(title)
+        .child(subtitle)
+        .child(el().h(16.0))
+        .child(settings_btn)
+        .child(el().h(4.0))
+        .child(watcher_btn)
+        .child(el().h(8.0))
+        .child(status)
+}
 
-        column![
-            title,
-            subtitle,
-            Space::new().height(Pixels(24.0)),
-            settings_btn,
-            Space::new().height(Pixels(8.0)),
-            watcher_btn,
-            Space::new().height(Pixels(16.0)),
-            status,
-        ]
-        .spacing(8)
-        .padding(24)
-        .width(Length::Fill)
-        .into()
+fn button(label: &str, fill: Color, on_press: fn(&mut FrontendApp)) -> El {
+    el().key(label.to_string())
+        .role("button")
+        .label(label)
+        .w_full()
+        .padding(12.0)
+        .radius(8.0)
+        .fill(fill)
+        .hover(lighten(fill, 0.08))
+        .press(lighten(fill, 0.16))
+        .cursor(rune::Cursor::Pointer)
+        .center()
+        .on_press(on_press)
+        .child(
+            text(label.to_string())
+                .font(rune::tok::TextStyle::new(16.0, 500.0))
+                .color(Color::WHITE)
+                .a11y_hidden(),
+        )
+}
+
+fn back_button(label: &str, on_press: fn(&mut FrontendApp)) -> El {
+    el().role("button")
+        .label(label)
+        .px(12.0)
+        .py(6.0)
+        .radius(6.0)
+        .hover(CARD)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(on_press)
+        .child(
+            text(label.to_string())
+                .font(type_::BODY)
+                .color(TEXT)
+                .a11y_hidden(),
+        )
+}
+
+fn lighten(c: Color, amount: f32) -> Color {
+    Color {
+        r: (c.r + amount).min(1.0),
+        g: (c.g + amount).min(1.0),
+        b: (c.b + amount).min(1.0),
+        a: c.a,
     }
+}
+
+fn app_poll(s: &mut FrontendApp, _t: f64, tx: &mut rune::Tx) -> bool {
+    // Keep the watcher status live even while the window sits idle.
+    tx.wake_after(Duration::from_millis(500));
+    s.poll()
+}
+
+fn app_key(s: &mut FrontendApp, e: &rune::KeyEvent, _tx: &mut rune::Tx) -> bool {
+    if s.screen == Screen::Settings && matches!(e.key, rune::Key::Escape) {
+        s.back_to_menu();
+        return true;
+    }
+    false
+}
+
+pub fn run(db: Arc<DictionaryDatabase>, data_dir: PathBuf) -> anyhow::Result<()> {
+    static FONTS: &[&[u8]] = &[SANS_FONT, SERIF_FONT];
+    let spec = AppSpec::<FrontendApp> {
+        title: "Instant JP Dict",
+        size: (560.0, 420.0),
+        fonts: FONTS,
+        families: ("Noto Sans JP", "Noto Sans JP"),
+        poll: Some(app_poll),
+        on_key: Some(app_key),
+        ..AppSpec::new(
+            "Instant JP Dict",
+            (560.0, 420.0),
+            || unreachable!("FrontendApp is built by App::init"),
+            app_view,
+        )
+    };
+    rune::App::new(spec)
+        .init(move || FrontendApp::new(db, data_dir))
+        .try_run()
+        .map_err(|e| anyhow!(e))
 }
