@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+# Block commits that would leave the shared OCR backend out of sync.
+# Run once per clone: git config core.hooksPath .githooks
+set -eu
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+MOBILE=${INSTANTJPDICT_MOBILE:-"$ROOT/../InstantJPDict"}
+[ -d "$MOBILE" ] || exit 0
+exec "$ROOT/tools/sync_ppocr_core.sh" --check "$MOBILE"

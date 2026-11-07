@@ -4,8 +4,8 @@
 // is compiled by BOTH apps:
 //   - Android (InstantJPDict): app/src/main/cpp/ncnn_jni.cpp is a thin JNI
 //     wrapper over this core.
-//   - PC (InstantJPDictDecky): native/ppocr_ncnn/ppocr_ncnn_core.* is a copy
-//     of this file; ppocr_ncnn_capi.cpp exposes it to Rust.
+//   - PC (InstantJPDictPC): native/ppocr_ncnn/ppocr_ncnn_core.* is a copy of
+//     this file; ppocr_ncnn_capi.cpp exposes it to Rust.
 //
 // Keep this file and ppocr_ncnn_core.cpp byte-identical between the two
 // repositories (PC: tools/sync_ppocr_core.sh can check/update the copy).

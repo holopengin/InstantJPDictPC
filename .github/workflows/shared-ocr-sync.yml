@@ -1,0 +1,28 @@
+name: Shared OCR backend sync
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the PC repo
+        uses: actions/checkout@v4
+
+      - name: Check out the Android repo
+        uses: actions/checkout@v4
+        with:
+          repository: holopengin/InstantJPDict
+          path: InstantJPDict
+
+      - name: Verify shared cores, models and data
+        run: tools/sync_ppocr_core.sh --check "$GITHUB_WORKSPACE/InstantJPDict"
+
+      - name: Verify the conformance corpus copy
+        run: |
+          diff -rq tests/conformance/cases \
+            InstantJPDict/app/src/test/resources/conformance/cases
+          cmp tests/data/jitendex/entries.json \
+            InstantJPDict/app/src/test/resources/jitendex/entries.json

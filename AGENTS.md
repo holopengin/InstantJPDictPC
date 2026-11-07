@@ -12,6 +12,15 @@ Five canonical triage roles, using the default label strings. See `docs/agents/t
 
 Single-context: one root `CONTEXT.md` plus `docs/adr/`. See `docs/agents/domain.md`.
 
+### Shared OCR backend sync
+
+`native/ppocr_ncnn/ppocr_ncnn_core.{h,cpp}`, `native/kana_size/kana_size_core.{h,cpp}`,
+the model assets, and the shared pipeline data are mirrored from the Android
+repo. Verify with `tools/sync_ppocr_core.sh --check /path/to/InstantJPDict`;
+the `.githooks/pre-commit` hook and the `shared-ocr-sync` workflow run the same
+check. The Android repo is the source of truth for those files; this repo is
+the source of truth for `jpdict-core`.
+
 ### Pipeline parity (pipeline-sharing/01 + 02)
 
 Pipeline invariant specs live under `docs/pipeline/` (index: `docs/pipeline/README.md`);
