@@ -111,6 +111,8 @@ fn all_dictionaries(db: &DictionaryDatabase) -> Vec<DictionaryMeta> {
 pub trait SettingsHost: 'static {
     fn settings_window(&self) -> &SettingsWindow;
     fn settings_window_mut(&mut self) -> &mut SettingsWindow;
+    /// Leave the first-run wizard (or open the main menu after it).
+    fn finish_wizard(&mut self);
 }
 
 pub struct SettingsWindow {
@@ -174,6 +176,12 @@ impl SettingsWindow {
     fn refresh(&mut self) {
         self.entry_count = self.db.get_entry_count().unwrap_or(0) as usize;
         self.dictionaries = all_dictionaries(&self.db);
+    }
+
+    /// Re-query the database before the host leaves a screen that was showing
+    /// this window, so a background bundled install is reflected next time.
+    pub fn refresh_now(&mut self) {
+        self.refresh();
     }
 
     /// Called once per frame by the host. Polls the worker threads and
@@ -526,6 +534,125 @@ impl SettingsWindow {
         let _ = self
             .db
             .update_dictionary_priority(dicts[neighbor_idx].id, my_priority);
+    }
+
+    /// The first-run wizard: install a dictionary and optionally register the
+    /// capture shortcut before entering the main menu.
+    pub fn wizard_view<S: SettingsHost>(&self) -> El {
+        let title = text("Welcome to InstantJPDict")
+            .font(TextStyle::new(26.0, 700.0))
+            .color(TEXT);
+        let subtitle = text(
+            "Install a dictionary to start looking up Japanese text. \
+             You can change all of this later in Settings.",
+        )
+        .font(TextStyle::new(14.0, 400.0))
+        .color(MUTED)
+        .wrap()
+        .w_full();
+
+        let mut content = col()
+            .w_full()
+            .padding(24.0)
+            .gap(8.0)
+            .fill(BG)
+            .child(title)
+            .child(subtitle)
+            .child(el().h(8.0));
+
+        if !self.status_text.is_empty() {
+            content = content.child(
+                text(self.status_text.clone())
+                    .font(TextStyle::new(13.0, 400.0))
+                    .color(MUTED)
+                    .wrap()
+                    .w_full(),
+            );
+        }
+        if self.import_running {
+            if let Some(ref progress) = self.import_progress {
+                content = import_progress_lines(progress, content);
+            }
+        }
+        if self.install_running {
+            if let Some(InstallProgress::Download { written, total }) = &self.install_progress {
+                let mb = |b: u64| b as f64 / 1_048_576.0;
+                content = content.child(
+                    text(format!(
+                        "Downloading {}: {:.1} / {:.1} MB",
+                        self.install_entry.as_deref().unwrap_or("dictionary"),
+                        mb(*written),
+                        mb(*total),
+                    ))
+                    .font(TextStyle::new(13.0, 400.0))
+                    .color(MUTED),
+                );
+            }
+            if let Some(InstallProgress::Import(progress)) = &self.install_progress {
+                content = import_progress_lines(progress, content);
+            }
+        }
+
+        content = content.child(
+            text("Dictionaries")
+                .font(TextStyle::new(18.0, 600.0))
+                .color(TEXT),
+        );
+        for entry in self.catalog {
+            let installed = catalog::is_installed(&self.dictionaries, entry);
+            content = content.child(catalog_row::<S>(entry, installed, self.busy));
+        }
+        content = content.child(action_button::<S>(
+            "Import Yomitan Dictionary (.zip)",
+            !self.busy,
+            |s| {
+                s.settings_window_mut()
+                    .handle(SettingsMessage::ImportDictionary)
+            },
+        ));
+
+        content = content.child(el().h(16.0));
+        content = content.child(
+            text("Window Capture")
+                .font(TextStyle::new(18.0, 600.0))
+                .color(TEXT),
+        );
+        content = content.child(hint(&format!(
+            "Command: {}",
+            capture::capture_command()
+        )));
+        content = content.child(hint(&match &self.capture_shortcut {
+            Some(combo) => format!("Current shortcut: {combo}"),
+            None => "Current shortcut: not registered yet".to_string(),
+        }));
+        content = content.child(action_button::<S>(
+            "Set Up Capture Shortcut",
+            !self.busy,
+            |s| {
+                s.settings_window_mut()
+                    .handle(SettingsMessage::SetupCaptureShortcut)
+            },
+        ));
+        content = content.child(hint(&format!(
+            "Registers {} (or Ctrl+Alt+S if taken). Optional — you can do this later.",
+            capture::DEFAULT_CAPTURE_SHORTCUT
+        )));
+
+        content = content.child(el().h(16.0));
+        content = content.child(action_button::<S>("Continue", true, |s| {
+            s.finish_wizard()
+        }));
+        content = content.child(hint(
+            "You can install, remove or reorder dictionaries later in Settings.",
+        ));
+
+        content
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .w_full()
+            .h_full()
+            .min_h(0.0)
     }
 
     /// The settings screen. `S` is the host app, so the same screen works in

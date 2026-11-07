@@ -1423,9 +1423,12 @@ fn zoom_wheel(s: &mut ViewerApp, e: WheelEvent, tx: &mut Tx) -> bool {
     if (dict_left..=dict_right).contains(&e.x)
         && (0.0..=s.viewer.window_height).contains(&e.y)
     {
+        // WheelEvent::dy is the direction the content should move (positive
+        // down), while scroll_dict takes a scroll-offset delta (positive
+        // moves further down the list).
         let delta = if e.precise { e.dy } else { e.dy * 120.0 };
         if delta != 0.0 {
-            s.scroll_dict(tx, delta);
+            s.scroll_dict(tx, -delta);
         }
         return true;
     }

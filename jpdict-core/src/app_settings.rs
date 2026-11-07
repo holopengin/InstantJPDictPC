@@ -34,6 +34,10 @@ pub struct AppSettings {
     /// by default. Gates the pitch-accent line under each dictionary entry's
     /// headwords; the Kanjium data still installs and loads either way.
     pub pitch_accent: bool,
+    /// Whether the first-run wizard has been shown and dismissed. A fresh
+    /// install (with only the bundled pitch dictionary) sees the wizard once;
+    /// deleting every dictionary later does not bring it back.
+    pub first_run_complete: bool,
 }
 
 impl AppSettings {
@@ -102,6 +106,7 @@ mod tests {
         assert_eq!(settings.overlay_font, FontFace::Sans);
         assert!(!settings.furigana_filter, "the furigana rule ships off");
         assert!(!settings.pitch_accent, "the pitch line ships off");
+        assert!(!settings.first_run_complete, "a fresh install sees the wizard");
     }
 
     /// #100: the furigana switch round-trips through the store.
@@ -142,6 +147,27 @@ mod tests {
         };
         off.save(&dir).expect("save off");
         assert!(!AppSettings::load(&dir).pitch_accent);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first-run flag round-trips and defaults to false.
+    #[test]
+    fn first_run_flag_round_trips() {
+        let dir = sandbox("first_run");
+        let done = AppSettings {
+            first_run_complete: true,
+            ..AppSettings::default()
+        };
+        done.save(&dir).expect("save done");
+        assert!(AppSettings::load(&dir).first_run_complete);
+
+        let fresh = AppSettings {
+            first_run_complete: false,
+            ..AppSettings::default()
+        };
+        fresh.save(&dir).expect("save fresh");
+        assert!(!AppSettings::load(&dir).first_run_complete);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -189,6 +215,7 @@ mod tests {
         let loaded = AppSettings::load(&dir);
         assert!(loaded.furigana_filter);
         assert!(!loaded.pitch_accent, "missing pitch key reads as off");
+        assert!(!loaded.first_run_complete, "missing wizard key reads as not complete");
 
         std::fs::write(
             dir.join(SETTINGS_FILE),

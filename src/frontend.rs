@@ -69,6 +69,7 @@ const DANGER: Color = Color {
 enum Screen {
     Menu,
     Settings,
+    Wizard,
 }
 
 pub struct FrontendApp {
@@ -82,15 +83,41 @@ pub struct FrontendApp {
 
 impl FrontendApp {
     pub fn new(db: Arc<DictionaryDatabase>, data_dir: PathBuf) -> Self {
-        let app_settings = AppSettings::load(&data_dir);
-        Self {
+        let mut app_settings = AppSettings::load(&data_dir);
+        let has_dictionary = db
+            .get_all_dictionaries()
+            .map(|dicts| dicts.iter().any(|dict| !dict.built_in))
+            .unwrap_or(false);
+
+        // Returning users (or an install that completed before the wizard was
+        // dismissed) skip the wizard permanently.
+        if !app_settings.first_run_complete && has_dictionary {
+            app_settings.first_run_complete = true;
+            if let Err(e) = app_settings.save(&data_dir) {
+                eprintln!("[Frontend] Failed to save first-run state: {e}");
+            }
+        }
+        let show_wizard = !app_settings.first_run_complete && !has_dictionary;
+
+        let mut app = Self {
             db,
             data_dir,
             app_settings,
-            screen: Screen::Menu,
+            screen: if show_wizard {
+                Screen::Wizard
+            } else {
+                Screen::Menu
+            },
             settings: None,
             drop_error: None,
+        };
+        if show_wizard {
+            app.settings = Some(SettingsWindow::new(
+                Arc::clone(&app.db),
+                app.app_settings.clone(),
+            ));
         }
+        app
     }
 
     /// Open one OCR window per dropped image. Each window is a separate
@@ -150,6 +177,17 @@ impl FrontendApp {
         self.screen = Screen::Menu;
     }
 
+    fn complete_first_run(&mut self) {
+        self.app_settings.first_run_complete = true;
+        if let Err(e) = self.app_settings.save(&self.data_dir) {
+            eprintln!("[Frontend] Failed to save first-run state: {e}");
+        }
+        if let Some(settings) = self.settings.as_mut() {
+            settings.refresh_now();
+        }
+        self.screen = Screen::Menu;
+    }
+
     fn poll(&mut self) -> bool {
         let mut changed = false;
         if let Some(sw) = self.settings.as_mut() {
@@ -179,12 +217,23 @@ impl SettingsHost for FrontendApp {
             .as_mut()
             .expect("settings screen is only shown with a settings window")
     }
+    fn finish_wizard(&mut self) {
+        self.complete_first_run();
+    }
 }
 
 fn app_view(s: &FrontendApp, cx: &mut Cx<FrontendApp>) -> El {
     let _ = cx;
     let root = match s.screen {
         Screen::Menu => menu_view(s),
+        Screen::Wizard => {
+            let body = s
+                .settings
+                .as_ref()
+                .map(|w| w.wizard_view::<FrontendApp>())
+                .unwrap_or_else(|| text("Setup unavailable").color(MUTED));
+            col().w_full().h_full().fill(BG).child(body)
+        }
         Screen::Settings => {
             let body = s
                 .settings
@@ -340,8 +389,14 @@ fn app_poll(s: &mut FrontendApp, _t: f64, tx: &mut rune::Tx) -> bool {
 }
 
 fn app_key(s: &mut FrontendApp, e: &rune::KeyEvent, _tx: &mut rune::Tx) -> bool {
-    if s.screen == Screen::Settings && matches!(e.key, rune::Key::Escape) {
-        s.back_to_menu();
+    if matches!(s.screen, Screen::Settings | Screen::Wizard)
+        && matches!(e.key, rune::Key::Escape)
+    {
+        if s.screen == Screen::Wizard {
+            s.complete_first_run();
+        } else {
+            s.back_to_menu();
+        }
         return true;
     }
     false
