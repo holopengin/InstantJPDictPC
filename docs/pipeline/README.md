@@ -8,9 +8,9 @@ that pin it.
 
 Android paths are relative to
 `app/src/main/java/com/holopengin/instantjpdict/` in the mobile repo;
-PC paths are relative to `accessibility_daemon/` — pipeline modules live
-under `core/src/` (the UI-free `jpdict_core` crate, ticket 03), the desktop
-UI under `src/`.
+PC paths are relative to the repository root — pipeline modules live
+under `jpdict-jpdict-core/src/` (the UI-free `jpdict-core` crate, ticket 03), the
+desktop UI under `src/`.
 
 Pages:
 
@@ -39,7 +39,7 @@ Pages:
 
 Authority and tolerances: numeric tolerances and the accepted platform
 substitutions (Skia-vs-fontdue metrics, JNI-vs-Rust ncnn low bits, converged
-detection defaults) live in `accessibility_daemon/tests/conformance/` —
+detection defaults) live in `tests/conformance/` —
 `TOLERANCES.md` is the authority and these pages link it rather than
 duplicating it. Case format: `FORMAT.md` in the same directory.
 

@@ -13,7 +13,7 @@ Chain plumbing and labels, graduated to the corpus by `c7dc78b`:
   reasons; derivations dedupe by term, first wins (`deinflect`, `:75`;
   mobile `deinflect`, `util/Deinflector.kt:55`).
 - The derivation guard is a **character** count: a term shorter than two
-  characters is never deinflected (`deinflect`, `core/src/util/deinflector.rs`;
+  characters is never deinflected (`deinflect`, `jpdict-core/src/util/deinflector.rs`;
   mobile `term.length < 2`, `util/Deinflector.kt:62`). A byte count lets every
   single non-ASCII character through — 「た」 would derive 「る」, and lookups
   deinflect prefixes down to one character, so the spurious candidate would
@@ -54,7 +54,7 @@ Chain plumbing and labels, graduated to the corpus by `c7dc78b`:
   `deinflection-03-adjective-past`, `deinflection-04-dictionary-form-noop`
   (identity carries no reasons), `deinflection-05-single-char-noop`
   (`expect_absent` pins the one-character guard), via `deinflection_cases`
-  (`core/src/conformance.rs:767`) against the shipped `assets/deinflect.json`
+  (`jpdict-core/src/conformance.rs:767`) against the shipped `assets/deinflect.json`
   (byte-identical to the Android asset copy at graduation).
 - Mobile: `DeinflectionChainTest` (`reasons_carryRuleNames`,
   `reasons_accumulateOutermostFirst_multiStep`, `identityResult_hasNoReasons`,

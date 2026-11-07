@@ -1,14 +1,16 @@
 [package]
-name = "accessibility_daemon"
+name = "instantjpdict"
 version = "0.1.0"
 edition = "2021"
+description = "Japanese OCR overlay and dictionary lookup for KDE Plasma"
+license = "AGPL-3.0-or-later"
 
 [workspace]
-members = ["core"]
+members = ["jpdict-core"]
 
 [dependencies]
-# UI-free OCR + dictionary pipeline (see core/src/lib.rs for the boundary).
-jpdict_core = { path = "core" }
+# UI-free OCR + dictionary pipeline (see jpdict-core/src/lib.rs for the boundary).
+jpdict-core = { path = "jpdict-core" }
 
 # Image loading for captures and viewer display
 image = "0.25"

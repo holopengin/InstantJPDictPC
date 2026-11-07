@@ -3,7 +3,7 @@
 //! These run here (not in the core crate) on purpose: dev-tree resolution
 //! ends in the working-directory fallback (`fonts/` next to the crate
 //! root), which holds when cargo runs this package's tests — the core
-//! crate's own working directory is `core/`, where it does not. The
+//! crate's own working directory is `jpdict-core/`, where it does not. The
 //! fallback-chain logic itself is pinned by predicate-based unit tests in
 //! the core crate; this pins that the dev tree actually ships the files
 //! the chain expects.

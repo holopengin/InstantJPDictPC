@@ -162,7 +162,7 @@ fn menu_view(_s: &FrontendApp) -> El {
     let title = text("Instant JP Dict")
         .font(rune::tok::TextStyle::new(30.0, 700.0))
         .color(TEXT);
-    let subtitle = text("OCR overlay & dictionary daemon")
+    let subtitle = text("Japanese OCR overlay & dictionary lookup")
         .font(type_::BODY)
         .color(MUTED);
 

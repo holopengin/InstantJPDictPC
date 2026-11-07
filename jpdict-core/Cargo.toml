@@ -1,7 +1,9 @@
 [package]
-name = "jpdict_core"
+name = "jpdict-core"
 version = "0.1.0"
 edition = "2021"
+description = "UI-free Japanese OCR and dictionary pipeline"
+license = "AGPL-3.0-or-later"
 
 [build-dependencies]
 # Compiles the shared PP-OCRv6 ncnn core + C ABI (native/ppocr_ncnn).

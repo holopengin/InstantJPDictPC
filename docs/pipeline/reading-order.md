@@ -2,7 +2,7 @@
 
 ## Rule
 
-Sort (`sort_detected_boxes`, `core/src/ocr_engine.rs:1545`):
+Sort (`sort_detected_boxes`, `jpdict-core/src/ocr_engine.rs:1545`):
 
 - Split by the frame's own sizes (mobile `isVerticalLineBox`;
   near-square counts as horizontal), then horizontals first, verticals after.
@@ -10,7 +10,7 @@ Sort (`sort_detected_boxes`, `core/src/ocr_engine.rs:1545`):
 - Verticals: right-edge-to-left (AABB **right** edge, not left),
   then top-to-bottom.
 
-Nav graph (`core/src/nav_graph.rs`): per global char index, `[north, south,
+Nav graph (`jpdict-core/src/nav_graph.rs`): per global char index, `[north, south,
 east, west]` targets from char-box centres normalised by the page extents
 (`NavGraph::build`, `:24`):
 
@@ -28,7 +28,7 @@ east, west]` targets from char-box centres normalised by the page extents
 - Fewer than 5 nodes take the `fallback` (`:262`); `navigate(idx, dir)`
   (`:255`) resolves the four directions. The viewer leaves the graph dirty
   after a batch and rebuilds on demand (`build_nav_graph`,
-  `core/src/overlay_state.rs:263`; `apply_ocr_batch` seeds the cursor on the
+  `jpdict-core/src/overlay_state.rs:263`; `apply_ocr_batch` seeds the cursor on the
   first non-empty line, never on a placeholder).
 
 ## Mirrored Android source
@@ -54,11 +54,11 @@ east, west]` targets from char-box centres normalised by the page extents
 
 - Conformance: `reading-order-01-mixed`, `detection-01/02/03` (expectations
   in reading order), via `reading_order_cases` / `detection_cases`
-  (`core/src/conformance.rs:327` / `:237`).
+  (`jpdict-core/src/conformance.rs:327` / `:237`).
 - PC viewer: `apply_ocr_batch_fills_all_slots_in_one_pass`
   (`src/viewer.rs:4195`), `apply_ocr_batch_without_text_leaves_cursor_unset`
   (`:4258`); main: `detection_annotations_keep_indices_and_quads`.
-- PC core: `nav_graph_01..08` (`core/src/nav_graph.rs`) pin the exact
+- PC core: `nav_graph_01..08` (`jpdict-core/src/nav_graph.rs`) pin the exact
   neighbour tables / `initial_edges`; `nav_graph_09/10` are differential
   oracle tests for the #107 top-k enumerators; `nav_graph_11` asserts strong
   connectivity after build on every layout; `nav_graph_12` proves the #107
@@ -73,4 +73,4 @@ east, west]` targets from char-box centres normalised by the page extents
   mirrors are `sortDetectedBoxes` itself and the branch runner.
 - Gap: the nav graph has no conformance-corpus case (the corpus has no
   nav-graph kind); the Rust unit tests above are the pin, mirrored on the
-  Android side by `nav_graph_core/src/lib.rs` and `NavGraphCoreTest.kt`.
+  Android side by `nav_graph_jpdict-core/src/lib.rs` and `NavGraphCoreTest.kt`.

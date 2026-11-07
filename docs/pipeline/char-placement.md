@@ -3,7 +3,7 @@
 ## Rule
 
 - Per-character boxes come from **CAP**, the CTC-anchored placement
-  (`char_placement::place`, `core/src/char_placement.rs`; mobile
+  (`char_placement::place`, `jpdict-core/src/char_placement.rs`; mobile
   `CharPlacement.place`, adopted behind `PREF_BOX_PLACEMENT_CAP`): CTC run
   centres anchor each glyph, a robust template fit (em / X0 / letter-spacing,
   Huber-reweighted, ridge on `ls`) seeds the line, an ink-profile pass refines
@@ -18,7 +18,7 @@
   fallback, never throws; profile walks clamp at the profile length
   (spec §1.3.1's blank-lines rule).
 - The integer rounding to `BoundingBox` happens once, in
-  `compute_char_boxes_line` (`core/src/ocr_engine.rs`), with the shipped
+  `compute_char_boxes_line` (`jpdict-core/src/ocr_engine.rs`), with the shipped
   chain's conventions: horizontal `(crop + edge).round()` with the line bbox's
   full cross span, vertical likewise on x.
 - **Kill switch**: `BOX_PLACEMENT_CAP=0` restores the shipped
@@ -61,11 +61,11 @@
   (`boxesContainTheirCharactersInkCentre`, ±0.5 px) and reports Tier-2-style
   metrics per case under `CONFORMANCE_DUMP=1`. Format: `FORMAT.md`
   (`char_placement` section), tolerance authority `TOLERANCES.md`.
-- **Unit** (`core/src/char_placement.rs`): the edge-window regression
+- **Unit** (`jpdict-core/src/char_placement.rs`): the edge-window regression
   (`last_glyph_window_reaching_the_line_end_does_not_walk_past_the_profile`),
   the guard-rail set, full-cross-axis spans in both orientations.
 - **Pipeline**: `synth_char_boxes_cap_span_and_position`
-  (`core/src/ocr_engine.rs`) — one box per character, cross span, frame
+  (`jpdict-core/src/ocr_engine.rs`) — one box per character, cross span, frame
   containment, and synth truth-centre positions end-to-end; the `recognition`
   kind's machine-generated `char_boxes` pins (regenerate wholesale with
   `CONFORMANCE_DUMP=1` after an intentional algorithm change, spot-check the

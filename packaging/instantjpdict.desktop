@@ -2,7 +2,7 @@
 Type=Application
 Name=InstantJPDict
 Comment=Japanese OCR overlay with dictionary lookup
-Exec=accessibility_daemon
-Icon=myapp
+Exec=instantjpdict
+Icon=instantjpdict
 Terminal=false
 Categories=Utility;Accessibility;

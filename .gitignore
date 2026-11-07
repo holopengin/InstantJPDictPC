@@ -1,9 +1,18 @@
-docs.rs/
+# Rust build output
+target/
+dist/
+AppDir/
+
+# Vendored ncnn build (produced by tools/build_ncnn_pc.sh)
+third_party/
+
 # Local markdown issue tracker: per-feature specs and tickets, working state.
 .scratch/
+
+# Profiling artifacts
 perf.data
 perf.data.old
+*.perf
 flamegraph.svg
 flamegraph.html
 collapsed_perf.txt
-*.perf

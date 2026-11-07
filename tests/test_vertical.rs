@@ -1,6 +1,8 @@
 fn main() {
     // Quick test: NotoSansJP vertical form glyphs
-    let font_data = std::fs::read("/var/home/holopengin/repos/InstantJPDictDecky/accessibility_daemon/fonts/NotoSansJP-Regular.ttf").unwrap();
+    let font_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fonts/NotoSansJP-Regular.ttf");
+    let font_data = std::fs::read(font_path).unwrap();
     let font = fontdue::Font::from_bytes(font_data, fontdue::FontSettings::default()).unwrap();
 
     let pairs = [

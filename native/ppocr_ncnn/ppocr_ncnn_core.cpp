@@ -1,6 +1,6 @@
 // Platform-independent PP-OCRv6 ncnn inference core.
 // See ppocr_ncnn_core.h — keep this file byte-identical with the PC copy in
-// InstantJPDictDecky/accessibility_daemon/native/ppocr_ncnn/.
+// InstantJPDictPC/native/ppocr_ncnn/.
 #include "ppocr_ncnn_core.h"
 
 #include <atomic>

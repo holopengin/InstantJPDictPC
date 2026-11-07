@@ -24,10 +24,11 @@
 set -eu
 
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-cd "$HERE"
+ROOT="$(CDPATH= cd -- "$HERE/.." && pwd)"
+cd "$ROOT"
 
 ARCH="$(uname -m)"
-OUTPATH="${OUTPATH:-$HERE/dist}"
+OUTPATH="${OUTPATH:-$ROOT/dist}"
 OUTNAME="${OUTNAME:-InstantJPDict-$ARCH.AppImage}"
 
 # Pinned packaging tool: version AND checksum, so an upstream change cannot
@@ -35,7 +36,7 @@ OUTNAME="${OUTNAME:-InstantJPDict-$ARCH.AppImage}"
 AT_VERSION=0.5.1
 AT_URL="https://github.com/pkgforge-dev/appimagetool/releases/download/$AT_VERSION/appimagetool-full-x86_64-linux"
 AT_SHA256=6025afd9d452360ffe84e5cc4e4e7d029a2d500b893f058de1ff396aacee1d79
-AT_BIN="${APPIMAGETOOL:-$HERE/target/appimagetool-$AT_VERSION}"
+AT_BIN="${APPIMAGETOOL:-$ROOT/target/appimagetool-$AT_VERSION}"
 
 # Shared PP-OCRv6 backend: build the pinned ncnn fork first (static libncnn.a).
 if [ ! -f third_party/ncnn-pc/install/lib/libncnn.a ]; then
@@ -58,28 +59,45 @@ echo "$AT_SHA256  $AT_BIN" | sha256sum -c - >/dev/null
 
 # Assemble the AppDir. `assets/` and `fonts/` must sit next to the binary —
 # it resolves both relative to its own location, which is the same layout
-# core/build.rs stages under target/{profile}/.
-APPDIR="$HERE/target/AppDir"
+# jpdict-core/build.rs stages under target/{profile}/.
+APPDIR="$ROOT/target/AppDir"
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR"
-cp target/release/accessibility_daemon "$APPDIR/"
+cp target/release/instantjpdict "$APPDIR/"
 cp -r target/release/assets "$APPDIR/"
 cp -r target/release/fonts "$APPDIR/"
 
 # Plain launcher: no sharun, no bundled loader, no cross-libc re-exec.
+#
+# Run the binary through a stable copy under ~/.local/share/instantjpdict/bin.
+# KWin authorizes screenshots by the caller's executable path, and the AppImage
+# mount path (/tmp/.mount_*) changes every run. A stable path also lets the
+# registered command shortcut survive an AppImage restart. The copy is skipped
+# when the bundled binary is not newer than it.
 cat >"$APPDIR/AppRun" <<'APPRUN'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
 export APPDIR="$HERE"
-exec "$HERE/accessibility_daemon" "$@"
+BIN_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/instantjpdict/bin"
+BIN="$BIN_DIR/instantjpdict"
+mkdir -p "$BIN_DIR"
+if [ ! -x "$BIN" ] || [ "$HERE/instantjpdict" -nt "$BIN" ]; then
+	# Replace atomically: a running copy may still be the previous binary,
+	# and writing over a busy executable fails with ETXTBSY.
+	NEW="$BIN.new.$$"
+	cp "$HERE/instantjpdict" "$NEW"
+	chmod +x "$NEW"
+	mv -f "$NEW" "$BIN"
+fi
+exec "$BIN" "$@"
 APPRUN
 chmod +x "$APPDIR/AppRun"
 
 ICON="${ICON:-$HERE/icon.png}"
-DESKTOP="${DESKTOP:-$HERE/myapp.desktop}"
-cp "$ICON" "$APPDIR/myapp.png"
+DESKTOP="${DESKTOP:-$HERE/instantjpdict.desktop}"
+cp "$ICON" "$APPDIR/instantjpdict.png"
 cp "$ICON" "$APPDIR/.DirIcon"
-cp "$DESKTOP" "$APPDIR/myapp.desktop"
+cp "$DESKTOP" "$APPDIR/instantjpdict.desktop"
 
 mkdir -p "$OUTPATH"
 ARCH="$ARCH" "$AT_BIN" "$APPDIR" -o "$OUTPATH" -n "$OUTNAME"

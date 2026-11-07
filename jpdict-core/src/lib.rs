@@ -4,7 +4,7 @@
 //! Android app: detection post-processing, rotated geometry, reading order,
 //! recognition decode, kana correction, ruby rules, blank handling, and
 //! dictionary import/lookup/formatting. The desktop UI (Rune), capture
-//! (KWin/zbus), and binary glue stay in the `accessibility_daemon` binary,
+//! (KWin/zbus), and binary glue stay in the `instantjpdict` binary,
 //! which consumes this crate. No module here may depend on Rune, winit,
 //! KWin/zbus, or rfd.
 //!
@@ -37,18 +37,17 @@
 //!   the UI thread. The pure lookup/format pipeline lives in [`lookup`]
 //!   (`db` feature) as free functions over plain data (no `Rc`, no `Cell`),
 //!   so it is `Send` and is the surface a binding exposes; the desktop state
-//!   delegates to it. See `core/UNIFFI_READINESS.md`.
+//!   delegates to it. See `jpdict-core/UNIFFI_READINESS.md`.
 //! * Callbacks are ownership-free: `recognize_boxes_collect` returns owned
 //!   `Vec`s; the streaming variant drives a caller-provided `Fn` emitter and
 //!   blocks until drained. Import progress is a pull/poll callback
 //!   (`Option<impl Fn(ImportProgress)>`), never a stored handle.
 //!
-//! Test-only: the shared conformance corpus lives at
-//! `accessibility_daemon/tests/conformance/` (kept there so the documented
-//! location in `tests/conformance/FORMAT.md` and the Android re-sync
-//! procedure keep working); this crate's harness (`conformance`, `#[cfg(test)]`)
-//! reaches it via `../tests`, as do the `assets/`, `fonts/`, and
-//! `test_images/` fixtures.
+//! Test-only: the shared conformance corpus lives at `tests/conformance/`
+//! (kept there so the documented location in `tests/conformance/FORMAT.md`
+//! and the Android re-sync procedure keep working); this crate's harness
+//! (`conformance`, `#[cfg(test)]`) reaches it via `../tests`, as do the
+//! `assets/`, `fonts/`, and `test_images/` fixtures.
 //!
 //! # Features
 //!

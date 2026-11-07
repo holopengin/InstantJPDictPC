@@ -1,6 +1,6 @@
 # UniFFI-readiness note (ticket pipeline-sharing/03, doc only — no binding implemented)
 
-The `jpdict_core` crate (`accessibility_daemon/core/`) is the unit a
+The `jpdict-core` crate (`jpdict-core/`) is the unit a
 Kotlin/Android host would consume through generated bindings (UniFFI or a
 thin JNI shim). Boundary vocabulary follows what crosses the JNI line in
 the Android app today (`OcrEngine.kt` + `DetNcnn`/`RecNcnn`/`KanaSizeNcnn`

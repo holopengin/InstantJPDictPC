@@ -38,6 +38,38 @@ fn resolve_asset_path(filename: &str) -> String {
     format!("{}/{}", dir, filename)
 }
 
+/// Resolve the application's data directory.
+///
+/// The directory is keyed by the application name (`instantjpdict`). A data
+/// directory from the pre-rename `accessibility_daemon` build is moved across
+/// once, so an installed dictionary and the saved settings survive the rename.
+fn resolve_data_dir() -> std::path::PathBuf {
+    let new_dir = directories::ProjectDirs::from("com", "holopengin", "instantjpdict")
+        .map(|dirs| dirs.data_dir().to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    if new_dir.exists() {
+        return new_dir;
+    }
+
+    let legacy = ["com", "org", "net"].iter().find_map(|qualifier| {
+        directories::ProjectDirs::from(qualifier, "Example", "accessibility_daemon")
+            .map(|dirs| dirs.data_dir().to_path_buf())
+            .filter(|path| path.exists())
+    });
+
+    if let Some(old_dir) = legacy {
+        // Best effort: if the move fails (e.g. a different filesystem), keep
+        // using the old directory rather than appearing to lose the data.
+        if std::fs::rename(&old_dir, &new_dir).is_ok() {
+            return new_dir;
+        }
+        return old_dir;
+    }
+
+    new_dir
+}
+
 /// Resolve the assets directory, checking binary-relative and AppImage paths.
 fn resolve_asset_dir() -> String {
     // Binary-relative: next to the executable
@@ -49,14 +81,14 @@ fn resolve_asset_dir() -> String {
             }
         }
     }
-    // AppImage mount: $APPDIR/usr/bin/assets/
+    // AppImage mount: assets at the AppDir root (this packaging layout) or
+    // under usr/bin (the conventional AppImage layout).
     if let Ok(appdir) = std::env::var("APPDIR") {
-        let p = std::path::Path::new(&appdir)
-            .join("usr")
-            .join("bin")
-            .join("assets");
-        if p.exists() {
-            return p.to_string_lossy().to_string();
+        let appdir = std::path::Path::new(&appdir);
+        for p in [appdir.join("assets"), appdir.join("usr/bin/assets")] {
+            if p.exists() {
+                return p.to_string_lossy().to_string();
+            }
         }
     }
     // Fallback: relative to CWD
@@ -65,21 +97,9 @@ fn resolve_asset_dir() -> String {
 
 fn main() -> Result<()> {
     env_logger::init();
-    println!("Accessibility Daemon Starting...");
+    println!("InstantJPDict starting...");
 
-    let data_dir = directories::ProjectDirs::from("com", "Example", "accessibility_daemon")
-        .or(directories::ProjectDirs::from(
-            "org",
-            "Example",
-            "accessibility_daemon",
-        ))
-        .or(directories::ProjectDirs::from(
-            "net",
-            "Example",
-            "accessibility_daemon",
-        ))
-        .map(|dirs| dirs.data_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let data_dir = resolve_data_dir();
     std::fs::create_dir_all(&data_dir)?;
     let _ = data_dir; // data directory created, but dict loaded lazily in bootstrap thread
 
@@ -90,13 +110,35 @@ fn main() -> Result<()> {
         return Ok(());
     }
     // One-time (idempotent) setup for capture mode: install the desktop file
-    // KWin requires before it will hand screenshots to this binary.
+    // KWin requires before it will hand screenshots to this binary, and
+    // register the global shortcut that launches it.
     if args.len() >= 2 && args[1] == "--setup-capture" {
-        let desktop = capture::setup_capture_authorization()?;
+        let setup = capture::setup_capture_shortcut()?;
         println!(
             "[Capture] Registered {} as an authorized screenshot client.",
-            desktop.display()
+            setup.desktop_file.display()
         );
+        match (&setup.shortcut, setup.live) {
+            (Some(combo), true) => println!(
+                "[Capture] Registered the window-capture shortcut: {combo} (active now)."
+            ),
+            (Some(combo), false) => println!(
+                "[Capture] Saved the window-capture shortcut: {combo} \
+                 (takes effect after logging out and back in)."
+            ),
+            (None, _) => println!("[Capture] No window-capture shortcut was registered."),
+        }
+        if let Some(note) = &setup.note {
+            println!("[Capture] {note}");
+        }
+        println!(
+            "[Capture] KWin scans its screenshot allow-list at startup. A fresh \
+             install may need one logout/login; upgrades are already covered by \
+             the compatibility entry."
+        );
+        println!();
+        println!("Capture command:");
+        println!("  {}", capture::capture_command());
         println!();
         println!("{}", capture::shortcut_instructions());
         return Ok(());
@@ -162,7 +204,7 @@ fn run_capture(extra_args: &[String], data_dir: &std::path::Path) -> Result<()> 
     );
     // Hand the capture to the normal OCR viewer. Appending the path last is
     // safe: the viewer's option parser accepts positionals anywhere.
-    let mut args: Vec<String> = vec!["accessibility_daemon".to_string()];
+    let mut args: Vec<String> = vec!["instantjpdict".to_string()];
     args.extend(extra_args.iter().cloned());
     args.push(path.to_string_lossy().into_owned());
     run_ocr_viewer(args, data_dir)
@@ -171,15 +213,15 @@ fn run_capture(extra_args: &[String], data_dir: &std::path::Path) -> Result<()> 
 fn print_usage() {
     let name = std::env::args()
         .next()
-        .unwrap_or_else(|| "accessibility_daemon".into());
-    println!("InstantJPDict accessibility overlay — OCR and dictionary daemon");
+        .unwrap_or_else(|| "instantjpdict".into());
+    println!("InstantJPDict — Japanese OCR overlay and dictionary lookup");
     println!();
     println!("USAGE:");
     println!("  {name} [OPTIONS] <IMAGE_PATH>");
     println!("  {name} [OPTIONS] --headless <IMAGE_PATH|DIRECTORY> [MORE_IMAGES...]");
     println!("  {name}                     Opens the frontend window (no arguments)");
     println!("  {name} --capture [OPTIONS] Screenshot the focused window and OCR it");
-    println!("  {name} --setup-capture     Authorize KWin screenshots for this binary");
+    println!("  {name} --setup-capture     Authorize KWin and register the capture shortcut");
     println!("  {name} --help              Show this help message");
     println!();
     println!("OPTIONS:");
@@ -200,10 +242,13 @@ fn print_usage() {
     println!("  picker and no file in ~/Pictures/Screenshots — then opens the OCR");
     println!("  viewer on it.");
     println!();
-    println!("  Run --setup-capture once first: KWin only hands screenshots to");
-    println!("  binaries whose .desktop file declares");
-    println!("  X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2");
-    println!("  (the same mechanism Spectacle uses).");
+    println!("  Run `{name} --setup-capture` once first. It authorizes KWin to hand");
+    println!("  screenshots to this binary and registers a global shortcut");
+    println!("  ({}) that runs:", capture::DEFAULT_CAPTURE_SHORTCUT);
+    println!("      {}", capture::capture_command());
+    println!("  The same setup button lives in the Settings window. To choose a");
+    println!("  different key, add this command under");
+    println!("  System Settings → Keyboard → Shortcuts → Add → Command or Script.");
     println!();
     println!("FRONTEND WINDOW:");
     println!("  Launching with no arguments opens the settings window:");
@@ -224,7 +269,7 @@ fn print_usage() {
     println!("  {name} --headless --font=~/myfont.ttf image.png");
     println!("  {name} --headless screenshots_dir/");
     println!("  {name} --headless shot1.png shot2.png shot3.png");
-    println!("  {name} --setup-capture       (once; then bind a shortcut to --capture)");
+    println!("  {name} --setup-capture       (authorize KWin + register the shortcut)");
     println!("  {name} --capture --vert");
     println!("  {name}                     (opens the frontend window)");
     println!();
@@ -457,6 +502,7 @@ fn run_ocr_viewer(args: Vec<String>, data_dir: &std::path::Path) -> Result<()> {
     let (tune_tx, tune_rx) = std::sync::mpsc::channel::<TuneCmd>();
 
     let image_path2 = image_path.clone();
+    let bootstrap_data_dir = data_dir.to_path_buf();
     let furigana_filter = app_settings.furigana_filter;
     std::thread::Builder::new()
         .name("bootstrap".into())
@@ -488,20 +534,7 @@ fn run_ocr_viewer(args: Vec<String>, data_dir: &std::path::Path) -> Result<()> {
             }
 
             // Phase 2: load dictionary
-            let db_path = directories::ProjectDirs::from("com", "Example", "accessibility_daemon")
-                .or(directories::ProjectDirs::from(
-                    "org",
-                    "Example",
-                    "accessibility_daemon",
-                ))
-                .or(directories::ProjectDirs::from(
-                    "net",
-                    "Example",
-                    "accessibility_daemon",
-                ))
-                .map(|dirs| dirs.data_dir().to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("dictionary.sqlite");
+            let db_path = bootstrap_data_dir.join("dictionary.sqlite");
             let db = match DictionaryDatabase::open(&db_path) {
                 Ok(d) => {
                     println!(
@@ -944,7 +977,7 @@ mod tests {
     use super::*;
 
     fn args(v: &[&str]) -> Vec<String> {
-        std::iter::once("accessibility_daemon".to_string())
+        std::iter::once("instantjpdict".to_string())
             .chain(v.iter().map(|s| s.to_string()))
             .collect()
     }

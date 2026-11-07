@@ -3,17 +3,18 @@
 One corpus of pipeline cases that both codebases run from their own test
 suites (ticket `pipeline-sharing/01`). Each case is a single JSON file in
 `cases/` plus, for image-level cases, a synthetic input PNG in `images/`.
-The PC harness is `core/src/conformance.rs` (runs under `cargo test`); the
-Android runner is a follow-up (see the ticket comments).
+The PC harness is `jpdict-core/src/conformance.rs` (runs under `cargo test`);
+the Android runner is a follow-up (see the ticket comments).
 
 ## Why this directory
 
-`accessibility_daemon/tests/conformance/` (not top-level): the cases belong
-to the PC crate's test suite, cargo resolves `tests/` helpers and data by
-convention, and `CARGO_MANIFEST_DIR` gives the harness a stable path to the
-files at test time. The Android side reads the same files from its own
-checkout; the format uses only plain data (ints, floats, strings, string
-lists) so a Kotlin `kotlinx.serialization` mirror needs no Rust types.
+`tests/conformance/` is the repository's integration-test directory, so cargo
+resolves `tests/` helpers and data by convention, and `CARGO_MANIFEST_DIR`
+gives the harness a stable path to the files at test time. The harness walks
+up one level from the `jpdict-core` crate to reach it. The Android side reads
+the same files from its own checkout; the format uses only plain data (ints,
+floats, strings, string lists) so a Kotlin `kotlinx.serialization` mirror
+needs no Rust types.
 
 ## Envelope (every case)
 

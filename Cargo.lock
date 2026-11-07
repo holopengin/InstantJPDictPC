@@ -19,24 +19,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
-name = "accessibility_daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "directories",
- "env_logger",
- "fontdue",
- "image",
- "jpdict_core",
- "jxl-oxide",
- "log",
- "rfd",
- "rune",
- "ttf-parser 0.21.1",
- "zbus 5.19.0",
-]
-
-[[package]]
 name = "accesskit"
 version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1894,6 +1876,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "instantjpdict"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "env_logger",
+ "fontdue",
+ "image",
+ "jpdict-core",
+ "jxl-oxide",
+ "log",
+ "rfd",
+ "rune",
+ "ttf-parser 0.21.1",
+ "zbus 5.19.0",
+]
+
+[[package]]
 name = "interpolate_name"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2027,7 +2027,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jpdict_core"
+name = "jpdict-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",

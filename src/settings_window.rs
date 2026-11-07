@@ -1,6 +1,8 @@
 //! Settings/management window for dictionary import and configuration,
 //! rendered with Rune.
 
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use rune::tok::TextStyle;
@@ -12,6 +14,8 @@ use jpdict_core::data::db::DictionaryDatabase;
 use jpdict_core::data::importer::{DictionaryImporter, ImportOptions, ImportProgress};
 use jpdict_core::data::models::DictionaryMeta;
 use jpdict_core::overlay_font::FontFace;
+
+use crate::capture;
 
 // Rune's colours are linear-light; these are the sRGB design values decoded.
 const BG: Color = Color {
@@ -79,6 +83,12 @@ pub enum SettingsMessage {
     /// Font face switch, rendered here so all behaviour lives in one place.
     /// Like the furigana switch, the frontend owns the file and saves.
     SetFontFace(FontFace),
+    /// Authorize KWin and register the window-capture shortcut.
+    SetupCaptureShortcut,
+    /// Put `instantjpdict --capture` on the clipboard.
+    CopyCaptureCommand,
+    /// Open System Settings on the keyboard-shortcuts page.
+    OpenCaptureShortcutSettings,
 }
 
 /// Progress of a catalog install: the download phase, then the import phase
@@ -113,6 +123,8 @@ pub struct SettingsWindow {
     entry_count: usize,
     dictionaries: Vec<DictionaryMeta>,
     status_text: String,
+    /// The shortcut currently stored in `kglobalshortcutsrc`, if any.
+    capture_shortcut: Option<String>,
     busy: bool,
 
     // Import progress
@@ -138,6 +150,7 @@ impl SettingsWindow {
             entry_count: 0,
             dictionaries: Vec::new(),
             status_text: String::new(),
+            capture_shortcut: capture::capture_shortcut_status(),
             busy: false,
             import_running: false,
             import_progress: None,
@@ -310,6 +323,45 @@ impl SettingsWindow {
             }
             SettingsMessage::SetFontFace(face) => {
                 self.app_settings.overlay_font = face;
+            }
+            SettingsMessage::SetupCaptureShortcut => {
+                match capture::setup_capture_shortcut() {
+                    Ok(setup) => {
+                        self.capture_shortcut = setup.shortcut.clone();
+                        self.status_text = match (&setup.shortcut, setup.live) {
+                            (Some(combo), true) => {
+                                format!("Window capture ready on {combo}")
+                            }
+                            (Some(combo), false) => format!(
+                                "Saved {combo}; log out and back in to activate it"
+                            ),
+                            (None, _) => setup
+                                .note
+                                .clone()
+                                .unwrap_or_else(|| "No shortcut registered".to_string()),
+                        };
+                        if let (Some(note), true) = (setup.note, setup.live) {
+                            self.status_text.push_str(&format!(" — {note}"));
+                        }
+                    }
+                    Err(e) => self.status_text = format!("Capture setup failed: {e}"),
+                }
+            }
+            SettingsMessage::CopyCaptureCommand => {
+                let command = capture::capture_command();
+                self.status_text = match copy_to_clipboard(&command) {
+                    Ok(()) => format!("Copied: {command}"),
+                    Err(e) => format!("Could not copy ({e}). Command: {command}"),
+                };
+            }
+            SettingsMessage::OpenCaptureShortcutSettings => {
+                // Copy first so the paste step is a single click in Settings.
+                let _ = copy_to_clipboard(&capture::capture_command());
+                self.status_text = match open_capture_shortcut_settings() {
+                    Ok(()) => "Opened Keyboard Shortcuts — paste the command and choose a key"
+                        .to_string(),
+                    Err(e) => format!("Could not open System Settings: {e}"),
+                };
             }
             SettingsMessage::ImportDictionary => self.start_import(),
             SettingsMessage::InstallCatalog(id) => self.start_install(id),
@@ -617,8 +669,66 @@ impl SettingsWindow {
 
         content = content.child(el().h(16.0));
 
-        // --- Action buttons (disabled while busy) ---
+        // --- Window capture: authorize KWin + register the global shortcut. ---
+        content = content.child(
+            text("Window Capture")
+                .font(TextStyle::new(18.0, 600.0))
+                .color(TEXT),
+        );
+        content = content.child(hint(
+            "Capture the focused window and look up its Japanese text without \
+             leaving the keyboard. This also authorizes KWin to hand \
+             screenshots directly to InstantJPDict.",
+        ));
+        content = content.child(hint(&format!(
+            "Command: {}",
+            capture::capture_command()
+        )));
+        content = content.child(hint(&match &self.capture_shortcut {
+            Some(combo) => format!("Current shortcut: {combo}"),
+            None => "Current shortcut: not registered yet".to_string(),
+        }));
+
         let disabled = self.busy;
+        content = content.child(action_button::<S>(
+            "Set Up Capture Shortcut",
+            !disabled,
+            |s| {
+                s.settings_window_mut()
+                    .handle(SettingsMessage::SetupCaptureShortcut)
+            },
+        ));
+        content = content.child(action_button::<S>(
+            "Copy Capture Command",
+            !disabled,
+            |s| {
+                s.settings_window_mut()
+                    .handle(SettingsMessage::CopyCaptureCommand)
+            },
+        ));
+        content = content.child(action_button::<S>(
+            "Open Keyboard Shortcuts",
+            !disabled,
+            |s| {
+                s.settings_window_mut()
+                    .handle(SettingsMessage::OpenCaptureShortcutSettings)
+            },
+        ));
+        content = content.child(hint(&format!(
+            "One click registers {}. If that key is taken, the fallback is \
+             Ctrl+Alt+S. To use another key: Add → Command or Script in \
+             System Settings and paste the command above.",
+            capture::DEFAULT_CAPTURE_SHORTCUT
+        )));
+        content = content.child(hint(
+            "KWin scans its screenshot allow-list at startup. A fresh install \
+             may need one logout/login; upgrades are already covered by the \
+             compatibility entry.",
+        ));
+
+        content = content.child(el().h(16.0));
+
+        // --- Action buttons (disabled while busy) ---
         content = content.child(action_button::<S>(
             "Import Yomitan Dictionary (.zip)",
             !disabled,
@@ -727,6 +837,58 @@ fn hint(body: &str) -> El {
         .color(MUTED)
         .wrap()
         .w_full()
+}
+
+/// Put text on the Wayland/X11 clipboard. Returns an error string when none of
+/// the usual tools is available, so the caller can show the command instead.
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let tools: [(&str, &[&str]); 3] = [
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for (tool, args) in tools {
+        let child = Command::new(tool)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        match child.wait() {
+            Ok(status) if status.success() => return Ok(()),
+            _ => continue,
+        }
+    }
+    Err("no clipboard tool (wl-copy, xclip, or xsel) found".to_string())
+}
+
+/// Open the Plasma keyboard-shortcuts KCM. The command was copied to the
+/// clipboard just before this, so the user only has to add a command entry and
+/// paste.
+fn open_capture_shortcut_settings() -> Result<(), String> {
+    let openers: [(&str, &[&str]); 3] = [
+        ("kcmshell6", &["kcm_keys"]),
+        ("systemsettings", &["kcm_keys"]),
+        ("systemsettings5", &["kcm_keys"]),
+    ];
+    for (program, args) in openers {
+        match Command::new(program)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(_) => return Ok(()),
+            Err(_) => continue,
+        }
+    }
+    Err("neither kcmshell6 nor systemsettings is available".to_string())
 }
 
 fn action_button<S: SettingsHost>(label: &'static str, enabled: bool, on_press: fn(&mut S)) -> El {

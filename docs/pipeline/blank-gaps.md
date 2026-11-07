@@ -6,9 +6,9 @@ Detection (the detector reports both orientations; the materialisation
 *policy* below is vertical-only):
 
 - A gap is a char spacing ≥ the line's **orientation threshold** × the line's
-  own median spacing (`GapDetector::detect`, `core/src/blank_gaps.rs:111`;
+  own median spacing (`GapDetector::detect`, `jpdict-core/src/blank_gaps.rs:111`;
   mobile `GapDetector.detect`, `util/GapDetector.kt:80`). Vertical fires at
-  1.6 (`DEFAULT_VERTICAL_RATIO`, `core/src/blank_gaps.rs:27`) — measured
+  1.6 (`DEFAULT_VERTICAL_RATIO`, `jpdict-core/src/blank_gaps.rs:27`) — measured
   recall 1.00, no false positives — and horizontal at 1.8
   (`DEFAULT_HORIZONTAL_RATIO`, `:33`), which is still weak on its own (a
   quarter of horizontal deletions leave no wider gap at all, so the
@@ -19,7 +19,7 @@ Detection (the detector reports both orientations; the materialisation
   `threshold_for`; `detect_with` for sweeping the curve without rebuilding,
   `:119`). Median averages the two middles for even counts (`median_of`,
   `:250`; mobile `medianOf`, `util/GapDetector.kt:224`).
-- Geometry comes from, in order (`geometry_of`, `core/src/blank_gaps.rs:150`):
+- Geometry comes from, in order (`geometry_of`, `jpdict-core/src/blank_gaps.rs:150`):
   1. `char_boxes` centres — `center_y` for vertical, `center_x` for
      horizontal, integer maths matching mobile `JpDictRect`; spacings are
      already pixels.
@@ -48,15 +48,15 @@ Detection (the detector reports both orientations; the materialisation
   threshold.
 - **The materialisation policy is vertical-only** — `BlankGaps.apply` returns
   early on horizontal lines (mobile `util/BlankGaps.kt:56`; PC
-  `apply_blank_gaps`, `core/src/blank_gaps.rs:413`), because 13% of ordinary
+  `apply_blank_gaps`, `jpdict-core/src/blank_gaps.rs:413`), because 13% of ordinary
   horizontal intervals look like gaps. A horizontal line is therefore never
   given a placeholder even though the detector can report a gap on it.
-- Each gap materialises as a `◌` (`GAP_CHAR`, U+25CC, `core/src/models.rs:385`;
+- Each gap materialises as a `◌` (`GAP_CHAR`, U+25CC, `jpdict-core/src/models.rs:385`;
   mobile `OcrEngine.GAP_CHAR`) placeholder inserted right-to-left so detector
   indices stay valid, growing **every** parallel per-character list together —
   text, char boxes, alternatives, `char_cols` — and shifting `overrides` keys
   `>= index` by +1 so a filled blank or an applied correction keeps pointing
-  at its own character (`with_gap_char_at`, `core/src/blank_gaps.rs:337`;
+  at its own character (`with_gap_char_at`, `jpdict-core/src/blank_gaps.rs:337`;
   mobile `LineResult.withGapCharAt`, `util/LineResultGap.kt:48`). Lists that
   carry no data stay empty ("empty" means "unknown"); the placeholder itself
   is not inserted as an override. Idempotent: a line already containing the
@@ -69,16 +69,16 @@ Detection (the detector reports both orientations; the materialisation
 Candidates for a blank:
 
 - The pool comes from **every** per-timestep top-K list in discovery order,
-  deduped, capped at 15 (`MAX`, `core/src/util/gap_candidates.rs:16`;
+  deduped, capped at 15 (`MAX`, `jpdict-core/src/util/gap_candidates.rs:16`;
   `generate` `:30`; mobile `GapCandidates.MAX` / `generate`,
   `util/GapCandidates.kt:19` / `:44`).
 - The CharLM reorders the pool by line context (`CharLm::rank`,
-  `core/src/util/char_lm.rs:149`; mobile `CharLm.rank`, `util/CharLm.kt:81`).
+  `jpdict-core/src/util/char_lm.rs:149`; mobile `CharLm.rank`, `util/CharLm.kt:81`).
   The LM itself: packed table, orders 1–4 (`MAX_ORDER`, `:25`), binary
   search (`count` `:80`), longest-context back-off (`log_prob` `:124`).
 - Empty pool falls back to **punctuation then kana**
   (`PUNCT_DEFAULTS` `、。「」…ー`, `KANA_DEFAULTS` `はのをに と`,
-  `fallback` `core/src/util/gap_candidates.rs:62`; mobile
+  `fallback` `jpdict-core/src/util/gap_candidates.rs:62`; mobile
   `util/GapCandidates.kt:63-81`, LM-ranked per class when a model is loaded).
 - Context stops at the placeholder and is clipped to `MAX_ORDER - 1` chars
   (`context_before` `:77`; mobile `contextBefore`,
@@ -159,7 +159,7 @@ Candidates for a blank:
   schema in `tests/conformance/FORMAT.md`); `gap-01-discovery-order`,
   `gap-02-lm-reorder`, `gap-03-fallback-order`, `gap-04-context-clip`,
   `charlm-01-counts-and-rank`, via `gap_detection_cases` / `gap_cases` /
-  `char_lm_cases` (`core/src/conformance.rs`).
+  `char_lm_cases` (`jpdict-core/src/conformance.rs`).
 - Mobile: `GapDetectorTest` (thresholds, geometry fallbacks, the timestep
   walk, the median), `BlankGapsTest` (placeholder geometry, idempotence,
   fill retention), `LineResultGapTest` (parallel-list growth, override

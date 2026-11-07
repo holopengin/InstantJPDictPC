@@ -7,7 +7,7 @@ override) into the form dictionary lookup keys on. Three stages run in a fixed
 order, and the order is part of the contract:
 
 1. **Width conversion** — `convert_width`
-   (`core/src/util/japanese.rs`); mobile `JapaneseUtil.convertWidth`
+   (`jpdict-core/src/util/japanese.rs`); mobile `JapaneseUtil.convertWidth`
    (`util/JapaneseUtil.kt`). Halfwidth katakana widen to fullwidth, including
    the voiced (`ｶﾞ` → `ガ`) and semi-voiced (`ﾊﾟ` → `パ`) digraphs; fullwidth
    ASCII (`FF01`–`FF5E`) folds to ASCII; the ideographic space folds to a
@@ -101,7 +101,7 @@ be a fold key; both sides pin this in their own unit test.
 
 ## Pinning tests
 
-- PC unit (`core/src/util/japanese.rs`): `fold_expands_voiced_iteration_mark`,
+- PC unit (`jpdict-core/src/util/japanese.rs`): `fold_expands_voiced_iteration_mark`,
   `fold_leaves_mark_that_cannot_be_repeated`,
   `fold_folds_compatibility_and_chinese_only_forms`,
   `fold_folds_measured_unihan_variants`,
@@ -112,6 +112,6 @@ be a fold key; both sides pin this in their own unit test.
   `normalize_stages_run_in_pipeline_order`,
   `normalize_existing_behaviour_is_unchanged`.
 - Conformance: `normalize-01-variant-fold` via `normalize_cases`
-  (`core/src/conformance.rs`); schema in
-  `accessibility_daemon/tests/conformance/FORMAT.md`.
+  (`jpdict-jpdict-core/src/conformance.rs`); schema in
+  `tests/conformance/FORMAT.md`.
 - Mobile: `JapaneseUtilVariantFoldTest` (20 tests).

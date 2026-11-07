@@ -3,7 +3,7 @@
     "rust-analyzer": {
       "initialization_options": {
         "linkedProjects": [
-          "accessibility_daemon/Cargo.toml"
+          "Cargo.toml"
         ],
         "checkOnSave": true,
         "check": {
@@ -13,7 +13,7 @@
             "cargo",
             "check",
             "--manifest-path",
-            "accessibility_daemon/Cargo.toml",
+            "Cargo.toml",
             "--message-format=json"
           ]
         }

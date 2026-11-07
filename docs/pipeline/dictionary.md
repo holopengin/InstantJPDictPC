@@ -3,7 +3,7 @@
 ## Rule (the #88 rendering model)
 
 Jitendex packs every sense into one row's glossary; the walker
-(`format_dictionary_results`, `core/src/overlay_state.rs:893`) renders:
+(`format_dictionary_results`, `jpdict-core/src/overlay_state.rs:893`) renders:
 
 - One glossary per repeated headword form — a repeated reading glossary is
   not rendered twice; identical headword rows render senses once.
@@ -39,7 +39,7 @@ reason (see the ticket-06 note).
 ## Ticket-06 departure: body ruby is white regular (DELIBERATE)
 
 Body (mini) ruby is **white regular**, term ruby stays **bold cyan**
-(`jpdict_core::ruby_style::ruby_style`, `core/src/ruby_style.rs`; one shared palette between
+(`jpdict_core::ruby_style::ruby_style`, `jpdict-core/src/ruby_style.rs`; one shared palette between
 aligned `ruby_view` `:2958` and fallback `full_ruby_view` `:3010` paths).
 Mobile changed together: `RubyBaseStyle.forMini`
 (`RubyBaseStyle.kt:36`), shipped as Android commit `1719405`; the PC side as
@@ -78,7 +78,7 @@ reason.
 
 ## Pinning tests
 
-- PC unit (`core/src/overlay_state.rs` tests):
+- PC unit (`jpdict-core/src/overlay_state.rs` tests):
   `a_repeated_reading_glossary_is_not_rendered_twice`,
   `identical_headword_rows_render_senses_once`,
   `a_lone_sense_is_not_echoed_into_the_header`,
@@ -97,7 +97,7 @@ reason.
   `panel_fonts_never_request_a_generic_family`).
 - Conformance: `dictionary-01-jitendex`, `dictionary-02-tag-names-with-nbsp`,
   `dictionary-03-redirect-deinflection-pair` via `dictionary_cases`
-  (`core/src/conformance.rs:887`); `ruby-style-01-modes` via `ruby_style_cases`
+  (`jpdict-core/src/conformance.rs:887`); `ruby-style-01-modes` via `ruby_style_cases`
   (`:822`).
 - Mobile: `JitendexStructuredContentTest`, `FormatPerDictTest`,
   `DictionaryRedirectsTest`, `RubyBaseStyleTest` (`bodyRuby_isWhiteRegular`,

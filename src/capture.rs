@@ -13,8 +13,16 @@
 //! desktop file for the running binary; [`capture_active_window`] calls it
 //! automatically the first time KWin refuses.
 //!
-//! Captures are written under `$XDG_RUNTIME_DIR/accessibility_daemon/captures`
-//! (a tmpfs), or the daemon's data dir as a fallback.
+//! The canonical desktop file is also a KDE command shortcut
+//! (`X-KDE-GlobalAccel-CommandShortcut`), so [`setup_capture_shortcut`] can
+//! launch the app and bind the key in one step. Inside an AppImage, KWin must
+//! see the runtime's real executable path, so a hidden compatibility alias
+//! carries that path while the visible shortcut keeps the stable `.AppImage`
+//! path. KWin reads its allow-list at startup, so a freshly written file may
+//! need one logout/login before the compositor accepts captures.
+//!
+//! Captures are written under `$XDG_RUNTIME_DIR/instantjpdict/captures`
+//! (a tmpfs), or the app's data dir as a fallback.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -27,6 +35,21 @@ use anyhow::{Context, Result};
 use zbus::zvariant::{Fd, Value};
 
 use image::RgbaImage;
+
+/// Desktop-file id for the KWin authorization / command-shortcut entry.
+pub const CAPTURE_DESKTOP_ID: &str = "net.local.instantjpdict.desktop";
+/// Shortcut registered by `--setup-capture` when no shortcut exists yet.
+pub const DEFAULT_CAPTURE_SHORTCUT: &str = "Meta+Print";
+/// Fallback if the default is already taken.
+const FALLBACK_CAPTURE_SHORTCUT: &str = "Ctrl+Alt+S";
+const CAPTURE_DESKTOP_NAME: &str = "InstantJPDict: Capture Window";
+const LEGACY_DESKTOP_ID: &str = "accessibility_daemon.desktop";
+
+const KGLOBALACCEL_BUS_NAME: &str = "org.kde.kglobalaccel";
+const KGLOBALACCEL_OBJECT_PATH: &str = "/kglobalaccel";
+const KGLOBALACCEL_INTERFACE: &str = "org.kde.KGlobalAccel";
+/// `KGlobalAccel::SetPresent`: register the key and persist it.
+const KGLOBALACCEL_SET_PRESENT: u32 = 4;
 
 const KWIN_BUS_NAME: &str = "org.kde.KWin";
 const KWIN_OBJECT_PATH: &str = "/org/kde/KWin/ScreenShot2";
@@ -270,7 +293,7 @@ pub fn save_capture(image: &RgbaImage, data_dir: &Path) -> Result<PathBuf> {
 fn capture_dir(data_dir: &Path) -> PathBuf {
     match std::env::var("XDG_RUNTIME_DIR") {
         Ok(runtime) if !runtime.is_empty() => PathBuf::from(runtime)
-            .join("accessibility_daemon")
+            .join("instantjpdict")
             .join("captures"),
         _ => data_dir.join("captures"),
     }
@@ -297,27 +320,38 @@ fn prune_old_captures(dir: &Path) {
 }
 
 /// Install (or refresh) the desktop file that lets KWin authorize this binary
-/// for `org.kde.KWin.ScreenShot2`. Returns the desktop file path.
+/// for `org.kde.KWin.ScreenShot2` **and** makes it available to KDE's
+/// command-shortcut registry. Returns the desktop file path.
+///
+/// The canonical file is the command shortcut: its `Exec` is the launcher the
+/// user runs (the AppImage path when packaged). KWin authorizes by the
+/// caller's real executable path, which inside an AppImage is the transient
+/// mount path, so the hidden compatibility alias carries the current runtime
+/// path instead. Splitting the two keeps the shortcut stable while KWin still
+/// accepts the capture.
 pub fn setup_capture_authorization() -> Result<PathBuf> {
-    let exe = std::env::current_exe().context("cannot resolve the running executable")?;
-    let exe = exe.canonicalize().unwrap_or(exe);
+    let launch_exe = launch_path();
+    let launch_exe = launch_exe.canonicalize().unwrap_or(launch_exe);
+    let runtime_exe = runtime_path();
+    let runtime_exe = runtime_exe.canonicalize().unwrap_or(runtime_exe);
 
     let app_dir = applications_dir()?;
     std::fs::create_dir_all(&app_dir)
         .with_context(|| format!("failed to create {}", app_dir.display()))?;
 
-    let desktop_path = app_dir.join("accessibility_daemon.desktop");
+    let desktop_path = app_dir.join(CAPTURE_DESKTOP_ID);
     let contents = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=InstantJPDict Capture\n\
-         Comment=Authorizes the InstantJPDict daemon to take screenshots with KWin\n\
+         Name={CAPTURE_DESKTOP_NAME}\n\
+         Comment=Capture the focused window and look up Japanese text with InstantJPDict\n\
          Exec={} --capture\n\
          Terminal=false\n\
          StartupNotify=false\n\
          NoDisplay=true\n\
+         X-KDE-GlobalAccel-CommandShortcut=true\n\
          {RESTRICTED_INTERFACES_KEY}={KWIN_INTERFACE}\n",
-        exe.display(),
+        launch_exe.display(),
     );
 
     // A cookie-cutter rewrite would be harmless, but skipping identical
@@ -328,12 +362,21 @@ pub fn setup_capture_authorization() -> Result<PathBuf> {
             .with_context(|| format!("failed to write {}", desktop_path.display()))?;
     }
 
+    // Older builds wrote an authorization-only file under the old name. KWin
+    // read that file when the session started and re-reads its contents on a
+    // request, so keeping a current alias under the old name makes a running
+    // session accept the new binary without a logout. The alias deliberately
+    // omits the command-shortcut flag, so it cannot appear twice in System
+    // Settings.
+    sync_legacy_authorization_alias(&app_dir, &runtime_exe)?;
+
     // Always refresh KService's cache, even when the content was already
     // correct. Rewriting a file in place leaves its *directory* mtime
     // untouched, and KService's staleness check is directory-based, so a
     // cache built before the first registration survives both re-runs of
     // `--setup-capture` and a logout. That left KWin refusing screenshots of
-    // a binary whose desktop file was perfectly in order.
+    // a binary whose desktop file was perfectly in order. The same cache is
+    // what makes the command shortcut visible to kglobalaccel.
     if !refresh_service_cache() {
         eprintln!(
             "[capture] warning: could not refresh the KDE service cache \
@@ -342,6 +385,274 @@ pub fn setup_capture_authorization() -> Result<PathBuf> {
         );
     }
     Ok(desktop_path)
+}
+
+/// Result of [`setup_capture_shortcut`].
+#[derive(Debug, Clone)]
+pub struct CaptureSetup {
+    pub desktop_file: PathBuf,
+    /// The active key combination, when one is registered.
+    pub shortcut: Option<String>,
+    /// Whether the shortcut was installed into the running kglobalaccel.
+    pub live: bool,
+    /// Extra guidance when automatic registration was not possible.
+    pub note: Option<String>,
+}
+
+/// Install the KWin authorization and register the capture shortcut in one
+/// step. An existing shortcut is preserved; otherwise the default is used (or
+/// a fallback when the default is already taken).
+pub fn setup_capture_shortcut() -> Result<CaptureSetup> {
+    let desktop_file = setup_capture_authorization()?;
+
+    if let Some(existing) = capture_shortcut_status() {
+        return match register_live_shortcut(&existing) {
+            Ok(true) => Ok(CaptureSetup {
+                desktop_file,
+                shortcut: Some(existing),
+                live: true,
+                note: None,
+            }),
+            Ok(false) => Ok(CaptureSetup {
+                desktop_file,
+                shortcut: Some(existing),
+                live: false,
+                note: Some(
+                    "The shortcut is saved but could not be applied to the running \
+                     session; log out and back in once."
+                        .to_string(),
+                ),
+            }),
+            Err(e) => Ok(CaptureSetup {
+                desktop_file,
+                shortcut: Some(existing),
+                live: false,
+                note: Some(format!(
+                    "The shortcut is saved but could not be applied to the running \
+                     session ({e}); log out and back in once."
+                )),
+            }),
+        };
+    }
+
+    for combo in [DEFAULT_CAPTURE_SHORTCUT, FALLBACK_CAPTURE_SHORTCUT] {
+        match register_live_shortcut(combo) {
+            Ok(true) => {
+                return Ok(CaptureSetup {
+                    desktop_file,
+                    shortcut: Some(combo.to_string()),
+                    live: true,
+                    note: None,
+                })
+            }
+            Ok(false) => continue,
+            Err(e) => {
+                return Ok(CaptureSetup {
+                    desktop_file,
+                    shortcut: None,
+                    live: false,
+                    note: Some(format!(
+                        "Could not reach KDE's global-shortcut service ({e}). \
+                         Add the shortcut manually in System Settings."
+                    )),
+                })
+            }
+        }
+    }
+
+    Ok(CaptureSetup {
+        desktop_file,
+        shortcut: None,
+        live: false,
+        note: Some(format!(
+            "{DEFAULT_CAPTURE_SHORTCUT} and {FALLBACK_CAPTURE_SHORTCUT} are both \
+             already taken. Add another key in System Settings."
+        )),
+    })
+}
+
+/// The registered capture shortcut, read from `kglobalshortcutsrc`.
+pub fn capture_shortcut_status() -> Option<String> {
+    let config = config_dir()?.join("kglobalshortcutsrc");
+    let text = std::fs::read_to_string(config).ok()?;
+    let mut section = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line.trim_matches(&['[', ']'][..]).to_string();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "_launch" {
+            continue;
+        }
+        if section == format!("services][{CAPTURE_DESKTOP_ID}")
+            || section == CAPTURE_DESKTOP_ID
+        {
+            let combo = value.split(',').next().unwrap_or("").trim();
+            if !combo.is_empty() && combo != "none" {
+                return Some(combo.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The exact command a user pastes into System Settings → Shortcuts.
+pub fn capture_command() -> String {
+    format!("{} --capture", executable_name())
+}
+
+/// Ask kglobalaccel to create the command-shortcut component from the freshly
+/// installed desktop file, then bind the key. This is the same handshake the
+/// Plasma shortcut KCM performs, so the shortcut starts working immediately
+/// instead of waiting for the next login.
+fn register_live_shortcut(combo: &str) -> Result<bool> {
+    let key = key_sequence(combo)
+        .with_context(|| format!("unsupported capture shortcut `{combo}`"))?;
+
+    let conn = zbus::blocking::Connection::session()
+        .context("no session D-Bus (is this a KDE Plasma session?)")?;
+
+    // A dummy action makes kglobalaccel parse the desktop file and create its
+    // KServiceActionComponent. The empty action is then discarded.
+    let action_id = vec![
+        CAPTURE_DESKTOP_ID.to_string(),
+        CAPTURE_DESKTOP_NAME.to_string(),
+        String::new(),
+        String::new(),
+    ];
+    conn.call_method(
+        Some(KGLOBALACCEL_BUS_NAME),
+        KGLOBALACCEL_OBJECT_PATH,
+        Some(KGLOBALACCEL_INTERFACE),
+        "doRegister",
+        &action_id,
+    )
+    .context("kglobalaccel did not accept the capture command")?;
+    let _ = conn.call_method(
+        Some(KGLOBALACCEL_BUS_NAME),
+        KGLOBALACCEL_OBJECT_PATH,
+        Some(KGLOBALACCEL_INTERFACE),
+        "unregister",
+        &(CAPTURE_DESKTOP_ID, ""),
+    );
+
+    let action = vec![
+        CAPTURE_DESKTOP_ID.to_string(),
+        "_launch".to_string(),
+        CAPTURE_DESKTOP_NAME.to_string(),
+        CAPTURE_DESKTOP_NAME.to_string(),
+    ];
+    let reply = conn
+        .call_method(
+            Some(KGLOBALACCEL_BUS_NAME),
+            KGLOBALACCEL_OBJECT_PATH,
+            Some(KGLOBALACCEL_INTERFACE),
+            "setShortcut",
+            &(action, vec![key], KGLOBALACCEL_SET_PRESENT),
+        )
+        .context("kglobalaccel rejected the shortcut")?;
+    let accepted: Vec<i32> = reply.body().deserialize().unwrap_or_default();
+    Ok(accepted.first().copied() == Some(key))
+}
+
+/// Convert `Meta+Print` / `Ctrl+Alt+S` into Qt's combined key code, which is
+/// what kglobalaccel's D-Bus API expects.
+fn key_sequence(combo: &str) -> Option<i32> {
+    const SHIFT: i32 = 0x0200_0000;
+    const CTRL: i32 = 0x0400_0000;
+    const ALT: i32 = 0x0800_0000;
+    const META: i32 = 0x1000_0000;
+    const KEY_PRINT: i32 = 0x0100_0009;
+
+    let mut modifiers = 0;
+    let mut key = None;
+    for part in combo.split('+') {
+        let part = part.trim().to_ascii_lowercase();
+        match part.as_str() {
+            "shift" => modifiers |= SHIFT,
+            "ctrl" | "control" => modifiers |= CTRL,
+            "alt" => modifiers |= ALT,
+            "meta" | "super" | "win" => modifiers |= META,
+            "print" | "printscreen" => key = Some(KEY_PRINT),
+            other if other.chars().count() == 1 => {
+                key = Some(other.chars().next()?.to_ascii_uppercase() as i32);
+            }
+            _ => return None,
+        }
+    }
+    key.map(|key| modifiers | key)
+}
+
+fn config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg));
+        }
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+}
+
+/// Keep the pre-rename authorization file in step with the new one.
+///
+/// A running KWin has already scanned the desktop files that existed when it
+/// started; it re-reads those files for each capture request. Updating the
+/// legacy filename therefore authorizes a running session immediately, while
+/// a fresh install still needs one logout/login before KWin scans the new
+/// canonical file. Only files that identify themselves as InstantJPDict's are
+/// rewritten.
+fn sync_legacy_authorization_alias(app_dir: &Path, exe: &Path) -> Result<()> {
+    let path = app_dir.join(LEGACY_DESKTOP_ID);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let ours = existing.contains(RESTRICTED_INTERFACES_KEY)
+            || existing.contains("Name=InstantJPDict");
+        if !ours {
+            return Ok(());
+        }
+    }
+
+    let contents = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=InstantJPDict Capture (compatibility)\n\
+         Comment=Compatibility alias that authorizes KWin screenshots for InstantJPDict\n\
+         Exec={} --capture\n\
+         Terminal=false\n\
+         StartupNotify=false\n\
+         NoDisplay=true\n\
+         {RESTRICTED_INTERFACES_KEY}={KWIN_INTERFACE}\n",
+        exe.display(),
+    );
+    let changed = std::fs::read_to_string(&path).ok().as_deref() != Some(contents.as_str());
+    if changed {
+        std::fs::write(&path, contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_sequence;
+
+    #[test]
+    fn default_shortcut_maps_to_the_qt_meta_print_code() {
+        assert_eq!(key_sequence("Meta+Print"), Some(0x1100_0009));
+    }
+
+    #[test]
+    fn fallback_shortcut_maps_to_ctrl_alt_s() {
+        assert_eq!(key_sequence("Ctrl+Alt+S"), Some(0x0C00_0053));
+    }
+
+    #[test]
+    fn unknown_shortcuts_are_rejected() {
+        assert_eq!(key_sequence("Hyper+F13"), None);
+        assert_eq!(key_sequence("Meta"), None);
+    }
 }
 
 /// Where user-level .desktop files live (`$XDG_DATA_HOME/applications`, or the
@@ -373,8 +684,15 @@ fn refresh_service_cache() -> bool {
         "kbuildsycoca5",
         "/usr/bin/kbuildsycoca5",
     ] {
+        // AppImage sets LD_LIBRARY_PATH/APPDIR/APPIMAGE for the packaged
+        // process; the host's kbuildsycoca must not inherit those or it fails
+        // to load the host Qt libraries.
         let spawned = std::process::Command::new(tool)
             .arg("--noincremental")
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("APPDIR")
+            .env_remove("APPIMAGE")
+            .env_remove("ARGV0")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -386,22 +704,43 @@ fn refresh_service_cache() -> bool {
     false
 }
 
+/// The path the user's shortcut should launch.
+///
+/// Inside an AppImage this is the original `.AppImage` path (the runtime
+/// exposes it as `$APPIMAGE`), not the transient mount path.
+fn launch_path() -> PathBuf {
+    if let Some(appimage) = std::env::var_os("APPIMAGE") {
+        if !appimage.is_empty() {
+            return PathBuf::from(appimage);
+        }
+    }
+    runtime_path()
+}
+
+/// The executable that is actually running: the AppImage runtime uses this
+/// for KWin's authorization check, and the packaged AppRun keeps it stable at
+/// `~/.local/share/instantjpdict/bin`.
+fn runtime_path() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("instantjpdict"))
+}
+
 fn executable_name() -> String {
-    std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "accessibility_daemon".to_string())
+    launch_path().display().to_string()
 }
 
 /// Human-readable instructions for wiring up the global shortcut.
 pub fn shortcut_instructions() -> String {
-    let exe = executable_name();
+    let command = capture_command();
     format!(
-        "Bind a global shortcut (KDE Plasma):\n\
+        "To use a different key (KDE Plasma):\n\
          \x20 System Settings → Keyboard → Shortcuts → Add → Command or Script\n\
-         \x20 Command: {exe} --capture\n\
+         \x20 Command: {command}\n\
          \x20 (older Plasma: Custom Shortcuts → Edit → New Global Shortcut → Command/URL)\n\
          \n\
-         Suggested keys: Meta+Print, or Ctrl+Alt+S.\n\
+         Suggested keys: {DEFAULT_CAPTURE_SHORTCUT}, or {FALLBACK_CAPTURE_SHORTCUT}.\n\
+         The Settings window has a one-click setup button and a “copy command”\n\
+         button for this same step.\n\
+         \n\
          Pressing the shortcut captures the focused window and opens the OCR\n\
          overlay on it directly — nothing is written to the screenshot folder,\n\
          so no second viewer opens for the same image."
