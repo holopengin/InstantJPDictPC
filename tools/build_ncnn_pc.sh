@@ -86,6 +86,7 @@ if [ -f "$BUILD/CMakeCache.txt" ] && \
   rm -rf "$BUILD"
 fi
 cmake -S "$SRC" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_LIBDIR=lib \
   -DNCNN_VULKAN=OFF -DNCNN_BUILD_TOOLS=OFF \
   -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_TESTS=OFF -DNCNN_BUILD_BENCHMARK=OFF
 cmake --build "$BUILD" -j"$JOBS" --target ncnn
@@ -103,6 +104,9 @@ else
   exit 1
 fi
 
+# Replace, don't merge: a previous run on a distro whose GNUInstallDirs picks
+# lib64 leaves a stale install/lib64 that build.rs would never read anyway.
+rm -rf "$OUT/install"
 cmake --install "$BUILD" --prefix "$OUT/install"
 echo "ncnn -> $OUT/install"
 echo OK
