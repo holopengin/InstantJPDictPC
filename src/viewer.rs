@@ -942,6 +942,11 @@ impl OcrViewer {
     /// glyphs laid out at the current zoom. Scaling is applied to the layout
     /// metrics rather than to the whole subtree, so text is rasterized at its
     /// final size instead of being stretched from a cached layer mid-zoom.
+    ///
+    /// The pan offset lives on an inner, unclipped `camera` node: Rune's clip
+    /// is the node's drawn rect, so offsetting the clipped node itself moved
+    /// the scissor with the content, and zooming in left the right and bottom
+    /// of the window unpainted (the image looked cut off mid-pan).
     fn world(&self, _s: &ViewerApp) -> El {
         let (iw, ih) = (self.img_w.max(1) as f32, self.img_h.max(1) as f32);
         let base_scale = content_scale(
@@ -956,16 +961,16 @@ impl OcrViewer {
         let origin_x = (self.window_width - iw * base_scale) / 2.0;
         let origin_y = (self.window_height - ih * base_scale) / 2.0;
 
-        let mut world = el()
-            .key("world")
+        let mut cam = el()
+            .key("camera")
+            .absolute(0.0, 0.0)
             .size(self.window_width, self.window_height)
             .offset(self.state.current_trans_x, self.state.current_trans_y)
             .motion(Spring::NONE)
-            .clip_rounded(0.0)
             .transition(Transition::none());
 
         if let Some(p) = self.image_pixels.as_ref() {
-            world = world.child(
+            cam = cam.child(
                 el().key("image")
                     .absolute(origin_x, origin_y)
                     .size(iw * total_scale, ih * total_scale)
@@ -982,7 +987,7 @@ impl OcrViewer {
 
             if let Some(q) = annotation.quad {
                 // Angled line: draw the rotated quad instead of its AABB.
-                world = world.child(
+                cam = cam.child(
                     el().key(format!("qb{line_idx}"))
                         .absolute(
                             origin_x + (q.cx - q.w / 2.0) * total_scale,
@@ -995,7 +1000,7 @@ impl OcrViewer {
                         .inert(),
                 );
             } else {
-                world = world.child(
+                cam = cam.child(
                     el().key(format!("bx{line_idx}"))
                         .absolute(bx1, by1)
                         .size(
@@ -1083,12 +1088,17 @@ impl OcrViewer {
             }
         }
         for g in glyphs {
-            world = world.child(g);
+            cam = cam.child(g);
         }
         if let Some(g) = cursor_glyph {
-            world = world.child(g);
+            cam = cam.child(g);
         }
-        world.on_drag(pan_drag)
+        el().key("world")
+            .size(self.window_width, self.window_height)
+            .clip_rounded(0.0)
+            .transition(Transition::none())
+            .on_drag(pan_drag)
+            .child(cam)
     }
 }
 
