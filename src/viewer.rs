@@ -1379,6 +1379,12 @@ impl ViewerApp {
     }
 }
 
+/// A drag over the OCR panel belongs to the panel (scrolling the dictionary,
+/// pressing a row), never to the image underneath: the viewer's root pans the
+/// image on drag, and the panel sits above it in paint order but has no drag
+/// handler of its own, so the root was winning and moving the overlay.
+fn panel_drag(_s: &mut ViewerApp, _d: &mut Drag, _tx: &mut Tx) {}
+
 fn pan_drag(s: &mut ViewerApp, d: &mut Drag, _tx: &mut Tx) {
     match d.phase {
         Phase::Down => {
@@ -1588,6 +1594,7 @@ impl OcrViewer {
             .w(on_screen_w)
             .h(self.window_height)
             .transition(Transition::none())
+            .on_drag(panel_drag)
             .child(
                 inner
                     .scale(scale)
@@ -1624,6 +1631,7 @@ impl OcrViewer {
             .h(self.window_height)
             .motion(Spring::NONE)
             .transition(Transition::none())
+            .on_drag(panel_drag)
             .child(
                 inner
                     .scale(scale)
