@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the vgf89/ncnn fork for the PC (Linux) app.
+# Build the holopengin/ncnn fork for the PC (Linux) app.
 #
 # This is the desktop sibling of the mobile app's tools/build_ncnn.sh: it
 # pins the SAME fork commit the Android build ships (FORK_PIN below must be
@@ -21,8 +21,8 @@
 #   way. Without --src the tree at <out>/src is reset to FORK_PIN.
 set -euo pipefail
 
-FORK=https://github.com/vgf89/ncnn.git
-FORK_PIN=a2b8507f6a3449e80f1c2585a127e3c08e3a9f3f # keep equal to InstantJPDict tools/build_ncnn.sh FORK_PIN
+FORK=https://github.com/holopengin/ncnn.git
+FORK_PIN=b498fc0786102a68af498ecf36c05b0b3b1fc074 # keep equal to InstantJPDict tools/build_ncnn.sh FORK_PIN
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 
 OUT="$HERE/third_party/ncnn-pc"
