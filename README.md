@@ -28,6 +28,10 @@ cargo run -- screenshot.png    # OCR an image and open the viewer
 cargo test --workspace
 ```
 
+You can also drag a JPEG, PNG, JPEG XL, or WebP file onto either the launcher
+window or an open OCR window. Dropping on the launcher opens a new OCR window;
+dropping on an existing viewer reloads that window with the new image.
+
 ## Set up window capture
 
 Window capture uses KWin's `ScreenShot2` D-Bus API, so it needs two things:

@@ -1,13 +1,15 @@
 //! OCR viewer, rendered with Rune.
 //!
-//! The screenshot is an `El::pixels` quad inside a camera (a world element
-//! sized in image pixels, scaled to fit the window and panned by `.offset`).
-//! Every OCR box and glyph is a normal element in that world, so hit testing,
-//! hover and accessibility come from Rune's layout instead of a hand-written
-//! canvas program.
+//! The screenshot is an `El::pixels` image inside a camera (a world element
+//! sized to the window and panned by `.offset`). Zoom is applied to layout
+//! metrics, not through `El::scale`, so glyphs rasterize at their final size
+//! instead of being stretched from an offscreen layer. Every OCR box and glyph
+//! is a normal element in that world, so hit testing, hover and accessibility
+//! come from Rune's layout instead of a hand-written canvas program.
 
 use std::cell::{Cell as StdCell, RefCell};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -97,6 +99,13 @@ pub enum BootstrapMsg {
 pub struct TuneCmd {
     pub thresh: f32,
     pub unclip: f32,
+}
+
+/// Commands sent from the viewer to the worker that owns the OCR engine and
+/// the current image.
+pub enum WorkerCmd {
+    Tune(TuneCmd),
+    Reload(PathBuf),
 }
 
 /// Text width available inside the fixed 300px dictionary column: panel and
@@ -419,6 +428,31 @@ impl OcrViewer {
         self.state.img_h = h;
         *self.decoded_image.borrow_mut() =
             image::RgbaImage::from_raw(w, h, rgba_pixels).map(image::DynamicImage::ImageRgba8);
+    }
+
+    /// Clear the current image state before a dropped image is processed.
+    /// The window keeps its size; the new image is fitted into it.
+    pub fn prepare_for_reload(&mut self) {
+        self.image_pixels = None;
+        *self.decoded_image.borrow_mut() = None;
+        self.cached_preview.borrow_mut().take();
+        self.annotations = Rc::new(Vec::new());
+        self.annotations_sync_dirty.set(true);
+        self.edited_lines.clear();
+        self.selected_word = None;
+        self.alternatives_visible = false;
+        self.state.active_line_results.clear();
+        self.state.cached_entries = Rc::new(Vec::new());
+        self.state.cached_lookup_term.clear();
+        self.state.current_word_length = 0;
+        self.state.is_dictionary_visible = false;
+        self.state.current_tapped_idx = -1;
+        self.state.current_tapped_line_idx = -1;
+        self.state.current_tapped_char_idx_in_line = -1;
+        self.state.last_highlighted_coords.clear();
+        self.state.current_scale = 1.0;
+        self.state.current_trans_x = 0.0;
+        self.state.current_trans_y = 0.0;
     }
 
     /// Crop the screenshot to show the given character with padding.
@@ -904,47 +938,58 @@ impl OcrViewer {
         root
     }
 
-    /// The camera: a world sized in image pixels, scaled to fit and panned.
+    /// The camera: a world sized to the window, with the image, boxes and
+    /// glyphs laid out at the current zoom. Scaling is applied to the layout
+    /// metrics rather than to the whole subtree, so text is rasterized at its
+    /// final size instead of being stretched from a cached layer mid-zoom.
     fn world(&self, _s: &ViewerApp) -> El {
         let (iw, ih) = (self.img_w.max(1) as f32, self.img_h.max(1) as f32);
-        let total_scale = content_scale(
+        let base_scale = content_scale(
             self.window_width,
             self.window_height,
             self.img_w,
             self.img_h,
-            self.state.current_scale,
+            1.0,
         )
         .unwrap_or(1.0);
+        let total_scale = base_scale * self.state.current_scale;
+        let origin_x = (self.window_width - iw * base_scale) / 2.0;
+        let origin_y = (self.window_height - ih * base_scale) / 2.0;
 
         let mut world = el()
             .key("world")
-            .size(iw, ih)
-            .scale(total_scale)
+            .size(self.window_width, self.window_height)
             .offset(self.state.current_trans_x, self.state.current_trans_y)
             .motion(Spring::NONE)
-            .scale_motion(Spring::NONE)
             .clip_rounded(0.0)
             .transition(Transition::none());
 
         if let Some(p) = self.image_pixels.as_ref() {
-            world = world.pixels(p);
+            world = world.child(
+                el().key("image")
+                    .absolute(origin_x, origin_y)
+                    .size(iw * total_scale, ih * total_scale)
+                    .pixels(p),
+            );
         }
 
         let mut glyphs = Vec::new();
         let mut cursor_glyph = None;
         for (line_idx, annotation) in self.annotations.iter().enumerate() {
             let bbox = &annotation.bbox;
-            let bx1 = bbox.x as f32;
-            let by1 = bbox.y as f32;
-            let _ = total_scale;
+            let bx1 = origin_x + bbox.x as f32 * total_scale;
+            let by1 = origin_y + bbox.y as f32 * total_scale;
 
             if let Some(q) = annotation.quad {
                 // Angled line: draw the rotated quad instead of its AABB.
                 world = world.child(
                     el().key(format!("qb{line_idx}"))
-                        .absolute(q.cx - q.w / 2.0, q.cy - q.h / 2.0)
-                        .size(q.w, q.h)
-                        .radius(BOX_CORNER_RADIUS)
+                        .absolute(
+                            origin_x + (q.cx - q.w / 2.0) * total_scale,
+                            origin_y + (q.cy - q.h / 2.0) * total_scale,
+                        )
+                        .size(q.w * total_scale, q.h * total_scale)
+                        .radius(BOX_CORNER_RADIUS * total_scale)
                         .rotate(q.angle)
                         .fill(rgba(0.0, 0.0, 0.0, BOX_FILL_ALPHA))
                         .inert(),
@@ -953,8 +998,11 @@ impl OcrViewer {
                 world = world.child(
                     el().key(format!("bx{line_idx}"))
                         .absolute(bx1, by1)
-                        .size(bbox.w.max(1) as f32, bbox.h.max(1) as f32)
-                        .radius(BOX_CORNER_RADIUS)
+                        .size(
+                            bbox.w.max(1) as f32 * total_scale,
+                            bbox.h.max(1) as f32 * total_scale,
+                        )
+                        .radius(BOX_CORNER_RADIUS * total_scale)
                         .fill(rgba(0.0, 0.0, 0.0, BOX_FILL_ALPHA))
                         .inert(),
                 );
@@ -984,8 +1032,13 @@ impl OcrViewer {
                     (char_box.w.max(1) as f32, char_box.h.max(1) as f32),
                     (char_box.w as f32, char_box.h as f32),
                 );
-                let em =
-                    (px * fit * if is_half { ASCII_GLYPH_SCALE } else { 1.0 }).clamp(1.0, 1024.0);
+                let em = (px
+                    * fit
+                    * if is_half { ASCII_GLYPH_SCALE } else { 1.0 }
+                    * total_scale)
+                    .clamp(1.0, 4096.0);
+                let box_w = char_box.w.max(1) as f32 * total_scale;
+                let box_h = char_box.h.max(1) as f32 * total_scale;
                 let highlighted = self.state.last_highlighted_coords.contains(&(line_idx, i));
                 let color = if highlighted { YELLOW } else { PINK };
                 let is_cursor = cursor == Some((line_idx, i));
@@ -994,8 +1047,11 @@ impl OcrViewer {
                 let ci = i;
                 let mut g = el()
                     .key(key)
-                    .absolute(char_box.x as f32, char_box.y as f32)
-                    .size(char_box.w.max(1) as f32, char_box.h.max(1) as f32)
+                    .absolute(
+                        origin_x + char_box.x as f32 * total_scale,
+                        origin_y + char_box.y as f32 * total_scale,
+                    )
+                    .size(box_w, box_h)
                     .center()
                     .rotate(tilt)
                     .on_drag(pan_drag)
@@ -1006,11 +1062,13 @@ impl OcrViewer {
                         tx.scroll_into_view(format!("nb:{li}:{ci}"));
                     });
                 if is_cursor {
-                    g = g.border(CURSOR_STROKE, WHITE).radius(CURSOR_RADIUS);
+                    g = g
+                        .border(CURSOR_STROKE * total_scale, WHITE)
+                        .radius(CURSOR_RADIUS * total_scale);
                 }
                 g = g.child(
                     text(ch.to_string())
-                        .font(TextStyle::new(em, 400.0).lh(char_box.h.max(1) as f32))
+                        .font(TextStyle::new(em, 400.0).lh(box_h))
                         .color(color)
                         .align(rune::Align::Center)
                         .a11y_hidden(),
@@ -1041,7 +1099,7 @@ impl OcrViewer {
 pub struct ViewerApp {
     pub viewer: OcrViewer,
     rx: Receiver<BootstrapMsg>,
-    tune_tx: Mutex<Sender<TuneCmd>>,
+    worker_tx: Mutex<Sender<WorkerCmd>>,
     pan_origin: [f32; 2],
     dict_scroll: Rc<StdCell<[f32; 2]>>,
     held: Option<(GamepadAction, Instant)>,
@@ -1049,15 +1107,24 @@ pub struct ViewerApp {
 }
 
 impl ViewerApp {
-    pub fn new(viewer: OcrViewer, rx: Receiver<BootstrapMsg>, tune_tx: Sender<TuneCmd>) -> Self {
+    pub fn new(viewer: OcrViewer, rx: Receiver<BootstrapMsg>, worker_tx: Sender<WorkerCmd>) -> Self {
         Self {
             viewer,
             rx,
-            tune_tx: Mutex::new(tune_tx),
+            worker_tx: Mutex::new(worker_tx),
             pan_origin: [0.0, 0.0],
             dict_scroll: Rc::new(StdCell::new([0.0, 0.0])),
             held: None,
             repeat_count: 0,
+        }
+    }
+
+    /// Drop a new image into this window: clear the current result and ask
+    /// the OCR worker to process the image at the existing window size.
+    pub fn reload_image(&mut self, path: PathBuf) {
+        self.viewer.prepare_for_reload();
+        if let Ok(tx) = self.worker_tx.lock() {
+            let _ = tx.send(WorkerCmd::Reload(path));
         }
     }
 
@@ -1170,13 +1237,22 @@ impl ViewerApp {
         let old = self.viewer.state.current_scale;
         let new = (old * factor).clamp(0.5, 5.0);
         let actual = if old > 0.0 { new / old } else { 1.0 };
-        // The world scales about its centre, so the cursor has to be
-        // expressed relative to that centre. Using window coordinates
-        // directly made every wheel zoom pull toward the middle.
-        let cx = self.viewer.window_width * 0.5;
-        let cy = self.viewer.window_height * 0.5;
-        let dx = x - cx;
-        let dy = y - cy;
+        // The image is laid out from its fit-to-window origin and then scaled,
+        // so express the cursor relative to that origin, not the window centre.
+        let base_scale = content_scale(
+            self.viewer.window_width,
+            self.viewer.window_height,
+            self.viewer.img_w,
+            self.viewer.img_h,
+            1.0,
+        )
+        .unwrap_or(1.0);
+        let origin_x =
+            (self.viewer.window_width - self.viewer.img_w.max(1) as f32 * base_scale) / 2.0;
+        let origin_y =
+            (self.viewer.window_height - self.viewer.img_h.max(1) as f32 * base_scale) / 2.0;
+        let dx = x - origin_x;
+        let dy = y - origin_y;
         self.viewer.state.current_scale = new;
         self.viewer.state.current_trans_x = dx - (dx - self.viewer.state.current_trans_x) * actual;
         self.viewer.state.current_trans_y = dy - (dy - self.viewer.state.current_trans_y) * actual;
@@ -1187,22 +1263,22 @@ impl ViewerApp {
     fn tune(&mut self, param: DetParam, delta: f32) {
         self.viewer.adjust_det_tuning(param, delta);
         self.viewer.det_busy = true;
-        if let Ok(tx) = self.tune_tx.lock() {
-            let _ = tx.send(TuneCmd {
+        if let Ok(tx) = self.worker_tx.lock() {
+            let _ = tx.send(WorkerCmd::Tune(TuneCmd {
                 thresh: self.viewer.det_thresh,
                 unclip: self.viewer.det_unclip,
-            });
+            }));
         }
     }
 
     fn tune_reset(&mut self) {
         self.viewer.reset_det_tuning();
         self.viewer.det_busy = true;
-        if let Ok(tx) = self.tune_tx.lock() {
-            let _ = tx.send(TuneCmd {
+        if let Ok(tx) = self.worker_tx.lock() {
+            let _ = tx.send(WorkerCmd::Tune(TuneCmd {
                 thresh: self.viewer.det_thresh,
                 unclip: self.viewer.det_unclip,
-            });
+            }));
         }
     }
 
@@ -1328,6 +1404,32 @@ fn zoom_wheel(s: &mut ViewerApp, e: WheelEvent, tx: &mut Tx) -> bool {
     if dy == 0.0 {
         return false;
     }
+
+    // The dictionary column is a scroll view, but the root wheel handler was
+    // winning over it. Route wheel input over that column to the dictionary
+    // instead of the camera.
+    let scale = s.viewer.ui_scale();
+    let panel_left = if s.viewer.state.last_landscape_gravity == Gravity::End {
+        s.viewer.window_width - s.viewer.panel_logical_width() * scale
+    } else {
+        0.0
+    };
+    let dict_left = if s.viewer.state.last_landscape_gravity == Gravity::End {
+        panel_left + NEIGHBOR_WIDTH * scale
+    } else {
+        panel_left
+    };
+    let dict_right = dict_left + DICT_WIDTH * scale;
+    if (dict_left..=dict_right).contains(&e.x)
+        && (0.0..=s.viewer.window_height).contains(&e.y)
+    {
+        let delta = if e.precise { e.dy } else { e.dy * 120.0 };
+        if delta != 0.0 {
+            s.scroll_dict(tx, delta);
+        }
+        return true;
+    }
+
     // An instant commit makes Rune rasterize the glyphs at the new scale in
     // this frame instead of stretching the previous texture while it settles.
     tx.instant();
@@ -1342,7 +1444,13 @@ fn app_view(s: &ViewerApp, _cx: &mut Cx<ViewerApp>) -> El {
         .on_layout(|s: &mut ViewerApp, [_, _, w, h]| {
             s.resize(w, h);
         });
-    root.on_secondary_press(|s: &mut ViewerApp, _p, tx| s.back(tx))
+    root.accepts_extensions(&["jpg", "jpeg", "png", "jxl", "webp"])
+        .on_drop_files(|s: &mut ViewerApp, files, _tx| {
+            if let Some(path) = files.first() {
+                s.reload_image(path.clone());
+            }
+        })
+        .on_secondary_press(|s: &mut ViewerApp, _p, tx| s.back(tx))
         .on_drag(pan_drag)
         .on_wheel(zoom_wheel)
         .on_magnify(|s: &mut ViewerApp, e, tx| {

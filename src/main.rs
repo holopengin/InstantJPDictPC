@@ -27,7 +27,7 @@ fn open_image(path: impl AsRef<std::path::Path>) -> Result<image::DynamicImage> 
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
-use crate::viewer::{BootstrapMsg, OcrViewer, TuneCmd};
+use crate::viewer::{BootstrapMsg, OcrViewer, WorkerCmd};
 use jpdict_core::data::db::DictionaryDatabase;
 use jpdict_core::models::*;
 use jpdict_core::util::deinflector::Deinflector;
@@ -348,6 +348,57 @@ fn detection_annotations(boxes: &[BoundingBox], rotated: &[RotatedBox]) -> Vec<D
         .collect()
 }
 
+/// Run detection + recognition with the worker's engine, returning one
+/// annotation per detected box (detection-only entries where recognition
+/// produced no text).
+fn recognize_image(
+    engine: &mut jpdict_core::ocr_engine::OcrEngine,
+    image: &image::DynamicImage,
+) -> Result<Vec<DetectedAnnotation>> {
+    let t_detect = std::time::Instant::now();
+    let det = engine.detect_lines(image).context("line detection failed")?;
+    let boxes = det.boxes;
+    let rotated = det.rotated;
+    println!(
+        "[OCR timing] Line detection:       {:>8.2} ms ({} boxes)",
+        t_detect.elapsed().as_secs_f64() * 1000.0,
+        boxes.len()
+    );
+
+    let mut results = detection_annotations(&boxes, &rotated);
+    let ppocr_vocab = engine.ppocr_vocab.clone();
+    let rec_remap = engine.rec_remap.clone();
+    let batch_sz = engine.batch_size;
+    let rec_mode = engine.recognition_mode;
+    let t_recognize = std::time::Instant::now();
+    match jpdict_core::ocr_engine::recognize_boxes_collect(
+        image,
+        &boxes,
+        &rotated,
+        engine.ppocr_rec.clone(),
+        engine.kana_size.clone(),
+        &ppocr_vocab,
+        &rec_remap,
+        batch_sz,
+        rec_mode,
+        std::path::Path::new("/tmp"),
+    ) {
+        Ok(recognized) => {
+            for (idx, ann) in recognized {
+                if let Some(slot) = results.get_mut(idx) {
+                    *slot = ann;
+                }
+            }
+        }
+        Err(e) => eprintln!("[OCR] Recognition error: {e}"),
+    }
+    println!(
+        "[OCR timing] Character recognition: {:>8.2} ms",
+        t_recognize.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(results)
+}
+
 fn run_ocr_viewer(args: Vec<String>, data_dir: &std::path::Path) -> Result<()> {
     let t_start = std::time::Instant::now();
     let mut image_paths: Vec<String> = Vec::new();
@@ -499,7 +550,7 @@ fn run_ocr_viewer(args: Vec<String>, data_dir: &std::path::Path) -> Result<()> {
     let (bootstrap_tx, bootstrap_rx) = std::sync::mpsc::channel::<BootstrapMsg>();
     // Live tuning channel — the viewer's tune keys send the latest
     // DET_THRESH / DET_UNCLIP values to the OCR worker.
-    let (tune_tx, tune_rx) = std::sync::mpsc::channel::<TuneCmd>();
+    let (worker_tx, worker_rx) = std::sync::mpsc::channel::<WorkerCmd>();
 
     let image_path2 = image_path.clone();
     let bootstrap_data_dir = data_dir.to_path_buf();
@@ -509,7 +560,7 @@ fn run_ocr_viewer(args: Vec<String>, data_dir: &std::path::Path) -> Result<()> {
         .spawn(move || {
             // Phase 1: load the screenshot image and send it to the viewer
             let t_load = std::time::Instant::now();
-            let image = match open_image(&image_path2) {
+            let mut image = match open_image(&image_path2) {
                 Ok(img) => img,
                 Err(e) => {
                     eprintln!("[Bootstrap] Failed to open image: {e}");
@@ -605,117 +656,94 @@ fn run_ocr_viewer(args: Vec<String>, data_dir: &std::path::Path) -> Result<()> {
 
                 // Warm up PP-OCR sessions
 
-                // Detection
-                let t_detect = std::time::Instant::now();
-                let det = match engine.detect_lines(&image) {
-                    Ok(d) => d,
+                let results = match recognize_image(&mut engine, &image) {
+                    Ok(results) => results,
                     Err(e) => {
-                        eprintln!("[OCR] Detection error: {e}");
+                        eprintln!("[OCR] {e:#}");
                         return;
                     }
                 };
-                let boxes = det.boxes;
-                let rotated = det.rotated;
-                let detect_ms = t_detect.elapsed().as_secs_f64() * 1000.0;
-                println!(
-                    "[OCR timing] Line detection:       {:>8.2} ms ({} boxes)",
-                    detect_ms,
-                    boxes.len()
-                );
-
-                // Detection-only annotations for every box, indexed by the
-                // box's original index. Recognition below replaces the
-                // entries that produced text; the rest stay as placeholders.
-                let mut results = detection_annotations(&boxes, &rotated);
-
-                // Recognition
-                let ppocr_vocab = engine.ppocr_vocab.clone();
-                let rec_remap = engine.rec_remap.clone();
-                let batch_sz = engine.batch_size;
-                let rec_mode = engine.recognition_mode;
-                let t_recognize = std::time::Instant::now();
-                match jpdict_core::ocr_engine::recognize_boxes_collect(
-                    &image,
-                    &boxes,
-                    &rotated,
-                    engine.ppocr_rec.clone(),
-                    engine.kana_size.clone(),
-                    &ppocr_vocab,
-                    &rec_remap,
-                    batch_sz,
-                    rec_mode,
-                    std::path::Path::new("/tmp"),
-                ) {
-                    Ok(recognized) => {
-                        for (idx, ann) in recognized {
-                            if let Some(slot) = results.get_mut(idx) {
-                                *slot = ann;
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!("[OCR] Recognition error: {e}"),
-                }
-                let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;
-                println!(
-                    "[OCR timing] Character recognition: {:>8.2} ms",
-                    recognize_ms
-                );
                 if bootstrap_tx.send(BootstrapMsg::Results(results)).is_err() {
                     return;
                 }
 
-                // ── Live detection tuning ────────────────────────────────
-                // Keep the engine + image alive so the viewer can sweep
-                // DET_THRESH / DET_UNCLIP without restarting. Commands that
-                // pile up while a sweep is running are coalesced to the latest.
-                while let Ok(first) = tune_rx.recv() {
-                    let mut cmd = first;
-                    while let Ok(next) = tune_rx.try_recv() {
-                        cmd = next;
-                    }
-                    engine.det_thresh_override = Some(cmd.thresh);
-                    engine.det_unclip_override = Some(cmd.unclip);
-                    let t_tune = std::time::Instant::now();
-                    let det = match engine.detect_lines(&image) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            eprintln!("[Tune] detection error: {e}");
-                            continue;
-                        }
+                // Keep the engine + current image alive for live tuning and
+                // for images dropped into the viewer. Reloads replace the
+                // image; tunes rerun the same one with new detection params.
+                let mut pending: Option<WorkerCmd> = None;
+                loop {
+                    let cmd = match pending.take() {
+                        Some(cmd) => cmd,
+                        None => match worker_rx.recv() {
+                            Ok(cmd) => cmd,
+                            Err(_) => break,
+                        },
                     };
-                    let boxes = det.boxes;
-                    let rotated = det.rotated;
-                    let mut anns = detection_annotations(&boxes, &rotated);
-                    match jpdict_core::ocr_engine::recognize_boxes_collect(
-                        &image,
-                        &boxes,
-                        &rotated,
-                        engine.ppocr_rec.clone(),
-                        engine.kana_size.clone(),
-                        &ppocr_vocab,
-                        &rec_remap,
-                        batch_sz,
-                        rec_mode,
-                        std::path::Path::new("/tmp"),
-                    ) {
-                        Ok(recognized) => {
-                            for (idx, ann) in recognized {
-                                if idx < anns.len() {
-                                    anns[idx] = ann;
+                    match cmd {
+                        WorkerCmd::Reload(path) => {
+                            let new_image = match open_image(&path) {
+                                Ok(image) => image,
+                                Err(e) => {
+                                    eprintln!("[Reload] failed to open {}: {e}", path.display());
+                                    continue;
                                 }
+                            };
+                            let (w, h) = (new_image.width(), new_image.height());
+                            println!("[Reload] {} ({}x{})", path.display(), w, h);
+                            let rgba = new_image.to_rgba8().into_raw();
+                            if bootstrap_tx
+                                .send(BootstrapMsg::ImageReady(rgba, w, h))
+                                .is_err()
+                            {
+                                break;
+                            }
+                            image = new_image;
+                            match recognize_image(&mut engine, &image) {
+                                Ok(results) => {
+                                    if bootstrap_tx
+                                        .send(BootstrapMsg::Results(results))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(e) => eprintln!("[Reload] OCR error: {e:#}"),
                             }
                         }
-                        Err(e) => eprintln!("[Tune] recognition error: {e}"),
-                    }
-                    println!(
-                        "[Tune] DET_THRESH={:.2} DET_UNCLIP={:.2} → {} boxes in {:.0} ms",
-                        cmd.thresh,
-                        cmd.unclip,
-                        anns.len(),
-                        t_tune.elapsed().as_secs_f64() * 1000.0
-                    );
-                    if bootstrap_tx.send(BootstrapMsg::Retuned(anns)).is_err() {
-                        break;
+                        WorkerCmd::Tune(mut cmd) => {
+                            // Coalesce sweeping tune keys, but don't swallow a
+                            // reload that arrived behind them.
+                            while let Ok(next) = worker_rx.try_recv() {
+                                match next {
+                                    WorkerCmd::Tune(next) => cmd = next,
+                                    other => {
+                                        pending = Some(other);
+                                        break;
+                                    }
+                                }
+                            }
+                            engine.det_thresh_override = Some(cmd.thresh);
+                            engine.det_unclip_override = Some(cmd.unclip);
+                            let t_tune = std::time::Instant::now();
+                            match recognize_image(&mut engine, &image) {
+                                Ok(anns) => {
+                                    println!(
+                                        "[Tune] DET_THRESH={:.2} DET_UNCLIP={:.2} → {} boxes in {:.0} ms",
+                                        cmd.thresh,
+                                        cmd.unclip,
+                                        anns.len(),
+                                        t_tune.elapsed().as_secs_f64() * 1000.0
+                                    );
+                                    if bootstrap_tx
+                                        .send(BootstrapMsg::Retuned(anns))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(e) => eprintln!("[Tune] OCR error: {e:#}"),
+                            }
+                        }
                     }
                 }
             }
@@ -792,7 +820,7 @@ fn run_ocr_viewer(args: Vec<String>, data_dir: &std::path::Path) -> Result<()> {
             viewer.det_unclip = u;
             viewer.det_unclip_default = u;
         }
-        crate::viewer::ViewerApp::new(viewer, bootstrap_rx, tune_tx)
+        crate::viewer::ViewerApp::new(viewer, bootstrap_rx, worker_tx)
     };
 
     let to_spawn_ms = t_start.elapsed().as_secs_f64() * 1000.0;

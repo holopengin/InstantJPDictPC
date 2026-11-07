@@ -4,12 +4,13 @@
 //! settings/dictionary-management UI.
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
 use rune::tok::type_;
-use rune::{col, el, row, text, AppSpec, Color, Cx, El};
+use rune::{canvas, col, el, row, text, AppSpec, Color, Cx, El, LineCap, Shape};
 
 use crate::settings_window::{SettingsHost, SettingsWindow};
 use jpdict_core::app_settings::AppSettings;
@@ -57,6 +58,12 @@ const ACCENT: Color = Color {
     b: 0.748414,
     a: 1.0,
 };
+const DANGER: Color = Color {
+    r: 0.65,
+    g: 0.12,
+    b: 0.12,
+    a: 1.0,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -70,6 +77,7 @@ pub struct FrontendApp {
     app_settings: AppSettings,
     screen: Screen,
     settings: Option<SettingsWindow>,
+    drop_error: Option<String>,
 }
 
 impl FrontendApp {
@@ -81,6 +89,40 @@ impl FrontendApp {
             app_settings,
             screen: Screen::Menu,
             settings: None,
+            drop_error: None,
+        }
+    }
+
+    /// Open one OCR window per dropped image. Each window is a separate
+    /// process so the launcher stays usable and the new viewer keeps its own
+    /// image-sized window.
+    fn open_dropped_images(&mut self, files: &[PathBuf]) {
+        self.drop_error = None;
+        // Spawn the stable AppImage path when packaged; the cache binary it
+        // runs from lives inside the parent's transient mount.
+        let exe = std::env::var_os("APPIMAGE")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_exe().ok())
+            .unwrap_or_else(|| PathBuf::from("instantjpdict"));
+        for path in files {
+            println!("[Drop] opening OCR window for {}", path.display());
+            match Command::new(&exe).arg(path).spawn() {
+                Ok(mut child) => {
+                    // Reap the child without holding up the launcher.
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                }
+                Err(e) => {
+                    self.drop_error = Some(format!(
+                        "Could not open {}: {e}",
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string())
+                    ));
+                }
+            }
         }
     }
 
@@ -131,7 +173,7 @@ impl SettingsHost for FrontendApp {
 
 fn app_view(s: &FrontendApp, cx: &mut Cx<FrontendApp>) -> El {
     let _ = cx;
-    match s.screen {
+    let root = match s.screen {
         Screen::Menu => menu_view(s),
         Screen::Settings => {
             let body = s
@@ -155,10 +197,13 @@ fn app_view(s: &FrontendApp, cx: &mut Cx<FrontendApp>) -> El {
                 )
                 .child(el().w_full().grow(1.0).min_h(0.0).child(body))
         }
-    }
+    };
+
+    root.accepts_extensions(&["jpg", "jpeg", "png", "jxl", "webp"])
+        .on_drop_files(|s: &mut FrontendApp, files, _tx| s.open_dropped_images(files))
 }
 
-fn menu_view(_s: &FrontendApp) -> El {
+fn menu_view(s: &FrontendApp) -> El {
     let title = text("Instant JP Dict")
         .font(rune::tok::TextStyle::new(30.0, 700.0))
         .color(TEXT);
@@ -170,7 +215,7 @@ fn menu_view(_s: &FrontendApp) -> El {
         s.open_settings()
     });
 
-    col()
+    let mut menu = col()
         .w_full()
         .h_full()
         .padding(24.0)
@@ -180,6 +225,43 @@ fn menu_view(_s: &FrontendApp) -> El {
         .child(subtitle)
         .child(el().h(16.0))
         .child(settings_btn)
+        .child(drop_hint());
+
+    if let Some(error) = &s.drop_error {
+        menu = menu.child(
+            text(error.clone())
+                .font(type_::BODY)
+                .color(DANGER)
+                .wrap()
+                .w_full(),
+        );
+    }
+    menu
+}
+
+/// A small drag-and-drop affordance under the Settings button.
+fn drop_hint() -> El {
+    let icon = canvas(
+        Shape::new()
+            .line([12.0, 4.0], [12.0, 15.0], 2.0, LineCap::Round, MUTED)
+            .line([8.0, 11.0], [12.0, 15.0], 2.0, LineCap::Round, MUTED)
+            .line([16.0, 11.0], [12.0, 15.0], 2.0, LineCap::Round, MUTED)
+            .line([5.0, 19.0], [19.0, 19.0], 2.0, LineCap::Round, MUTED)
+            .view_box(24.0, 24.0),
+    )
+    .size(28.0, 28.0);
+
+    col()
+        .w_full()
+        .items_center()
+        .gap(6.0)
+        .py(14.0)
+        .child(icon)
+        .child(
+            text("Drop an image here to OCR it")
+                .font(type_::BODY)
+                .color(MUTED),
+        )
 }
 
 fn button(label: &str, fill: Color, on_press: fn(&mut FrontendApp)) -> El {
