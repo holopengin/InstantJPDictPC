@@ -22,7 +22,7 @@
 set -euo pipefail
 
 FORK=https://github.com/holopengin/ncnn.git
-FORK_PIN=b498fc0786102a68af498ecf36c05b0b3b1fc074 # keep equal to InstantJPDict tools/build_ncnn.sh FORK_PIN
+FORK_PIN=44d6b00574df0112f66df7569a7620b437a25f71 # keep equal to InstantJPDict tools/build_ncnn.sh FORK_PIN
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 
 OUT="$HERE/third_party/ncnn-pc"
