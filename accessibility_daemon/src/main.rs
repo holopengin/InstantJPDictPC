@@ -207,7 +207,7 @@ fn print_usage() {
     println!();
     println!("FRONTEND WINDOW:");
     println!("  Launching with no arguments opens the settings window:");
-    println!("    - Launch Settings Window  (dictionary import & configuration)");
+    println!("    - Settings  (dictionary import & configuration)");
     println!("  It also carries the overlay font choice: a \"Serif font\" checkbox");
     println!("  (sans is the default) persisted to settings.json next to");
     println!("  dictionary.sqlite, applied to the overlay and dictionary panel on");

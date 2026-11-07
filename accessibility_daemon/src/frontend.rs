@@ -166,7 +166,7 @@ fn menu_view(_s: &FrontendApp) -> El {
         .font(type_::BODY)
         .color(MUTED);
 
-    let settings_btn = button("Launch Settings Window", ACCENT, |s: &mut FrontendApp| {
+    let settings_btn = button("Settings", ACCENT, |s: &mut FrontendApp| {
         s.open_settings()
     });
 
