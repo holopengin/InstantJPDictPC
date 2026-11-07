@@ -1423,12 +1423,14 @@ fn zoom_wheel(s: &mut ViewerApp, e: WheelEvent, tx: &mut Tx) -> bool {
     if (dict_left..=dict_right).contains(&e.x)
         && (0.0..=s.viewer.window_height).contains(&e.y)
     {
-        // WheelEvent::dy is the direction the content should move (positive
-        // down), while scroll_dict takes a scroll-offset delta (positive
-        // moves further down the list).
-        let delta = if e.precise { e.dy } else { e.dy * 120.0 };
-        if delta != 0.0 {
-            s.scroll_dict(tx, -delta);
+        // WheelEvent::dy is already in layout points (Rune turned a notched
+        // wheel's line steps into 40 points each), which is exactly the unit
+        // scroll_dict's offset uses — the same 1:1 delta Rune's own scroll
+        // views get. Scaling it again made one notch fly past a whole page.
+        // The sign is inverted because Rune's wheel moves the content by
+        // `offset - dy`, while scroll_dict adds to the offset.
+        if e.dy != 0.0 {
+            s.scroll_dict(tx, -e.dy);
         }
         return true;
     }
