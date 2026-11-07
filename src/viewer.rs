@@ -870,7 +870,8 @@ impl OcrViewer {
             .w_full()
             .h_full()
             .fill(BLACK)
-            .clip_rounded(0.0);
+            .clip_rounded(0.0)
+            .transition(Transition::none());
 
         root = root.child(self.world(s));
 
@@ -921,7 +922,9 @@ impl OcrViewer {
             .scale(total_scale)
             .offset(self.state.current_trans_x, self.state.current_trans_y)
             .motion(Spring::NONE)
-            .clip_rounded(0.0);
+            .scale_motion(Spring::NONE)
+            .clip_rounded(0.0)
+            .transition(Transition::none());
 
         if let Some(p) = self.image_pixels.as_ref() {
             world = world.pixels(p);
@@ -997,6 +1000,7 @@ impl OcrViewer {
                     .rotate(tilt)
                     .on_drag(pan_drag)
                     .on_press_tx(move |s: &mut ViewerApp, tx: &mut Tx| {
+                        tx.instant();
                         s.viewer.select_character(li, ci);
                         tx.scroll_to_instant("dict_scroll", 0.0, 0.0);
                         tx.scroll_into_view(format!("nb:{li}:{ci}"));
@@ -1086,6 +1090,7 @@ impl ViewerApp {
     }
 
     fn back(&mut self, tx: &mut Tx) {
+        tx.instant();
         if self.viewer.alternatives_visible {
             self.viewer.alternatives_visible = false;
         } else if self.viewer.selected_word.is_some() {
@@ -1202,6 +1207,9 @@ impl ViewerApp {
     }
 
     fn key(&mut self, e: &KeyEvent, tx: &mut Tx) -> bool {
+        // Fades are disabled throughout the viewer; land every key-driven
+        // change (panel open/close, lookup rows, HUD) in the same frame.
+        tx.instant();
         let key = &e.key;
         match key {
             Key::Escape | Key::Backspace => {
@@ -1315,11 +1323,14 @@ fn pan_drag(s: &mut ViewerApp, d: &mut Drag, _tx: &mut Tx) {
     }
 }
 
-fn zoom_wheel(s: &mut ViewerApp, e: WheelEvent, _tx: &mut Tx) -> bool {
+fn zoom_wheel(s: &mut ViewerApp, e: WheelEvent, tx: &mut Tx) -> bool {
     let dy = if e.precise { e.dy / 40.0 } else { e.dy };
     if dy == 0.0 {
         return false;
     }
+    // An instant commit makes Rune rasterize the glyphs at the new scale in
+    // this frame instead of stretching the previous texture while it settles.
+    tx.instant();
     s.zoom_at(dy, e.x, e.y);
     true
 }
@@ -1334,7 +1345,8 @@ fn app_view(s: &ViewerApp, _cx: &mut Cx<ViewerApp>) -> El {
     root.on_secondary_press(|s: &mut ViewerApp, _p, tx| s.back(tx))
         .on_drag(pan_drag)
         .on_wheel(zoom_wheel)
-        .on_magnify(|s: &mut ViewerApp, e, _tx| {
+        .on_magnify(|s: &mut ViewerApp, e, tx| {
+            tx.instant();
             s.zoom_at(e.delta, e.x, e.y);
             true
         })
@@ -1364,6 +1376,13 @@ fn app_poll(s: &mut ViewerApp, _t: f64, tx: &mut Tx) -> bool {
         } else {
             s.repeat_count = 0;
         }
+    }
+
+    // A late image/result commit mounts the whole OCR overlay after the
+    // window's first frame. Its default fade is the blurry load-in; land
+    // bootstrap changes in the same frame instead.
+    if changed {
+        tx.instant();
     }
 
     // Keep polling bootstrap channels and the repeat clock. The previous
