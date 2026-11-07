@@ -1,10 +1,7 @@
 //! Frontend launcher window, rendered with Rune.
 //!
-//! Shown when the app is launched with no arguments. Two options:
-//!   - "Launch Settings Window" — the frontend morphs into the settings UI
-//!   - "Launch File Watcher"    — spawns `accessibility_daemon --watcher`
-//!     as a detached process and closes this window. If a watcher is already
-//!     running, the button becomes "Stop File Watcher" instead.
+//! Shown when the app is launched with no arguments: one entry point into the
+//! settings/dictionary-management UI.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +12,6 @@ use rune::tok::type_;
 use rune::{col, el, row, text, AppSpec, Color, Cx, El};
 
 use crate::settings_window::{SettingsHost, SettingsWindow};
-use crate::watcher;
 use jpdict_core::app_settings::AppSettings;
 use jpdict_core::data::db::DictionaryDatabase;
 
@@ -74,12 +70,10 @@ pub struct FrontendApp {
     app_settings: AppSettings,
     screen: Screen,
     settings: Option<SettingsWindow>,
-    watcher_running: bool,
 }
 
 impl FrontendApp {
     pub fn new(db: Arc<DictionaryDatabase>, data_dir: PathBuf) -> Self {
-        let watcher_running = watcher::is_running(&data_dir);
         let app_settings = AppSettings::load(&data_dir);
         Self {
             db,
@@ -87,7 +81,6 @@ impl FrontendApp {
             app_settings,
             screen: Screen::Menu,
             settings: None,
-            watcher_running,
         }
     }
 
@@ -103,47 +96,10 @@ impl FrontendApp {
 
     fn back_to_menu(&mut self) {
         self.screen = Screen::Menu;
-        self.watcher_running = watcher::is_running(&self.data_dir);
-    }
-
-    fn launch_watcher(&mut self) {
-        let exe = match std::env::current_exe() {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("[Frontend] Cannot resolve current exe: {e}");
-                return;
-            }
-        };
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("--watcher")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // Detach from our process group so closing the terminal doesn't kill it.
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-        match cmd.spawn() {
-            Ok(_) => println!("[Frontend] File watcher started (detached)."),
-            Err(e) => eprintln!("[Frontend] Failed to start watcher: {e}"),
-        }
-        // Give the watcher a moment to write its pid file: if we exit before
-        // that, a quick relaunch sees "not running" and starts a second
-        // watcher, orphaning this one.
-        for _ in 0..25 {
-            if watcher::is_running(&self.data_dir) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        std::process::exit(0);
     }
 
     fn poll(&mut self) -> bool {
         let mut changed = false;
-        let running = watcher::is_running(&self.data_dir);
-        if running != self.watcher_running {
-            self.watcher_running = running;
-            changed = true;
-        }
         if let Some(sw) = self.settings.as_mut() {
             changed |= sw.poll();
             // Settings own the behaviour switches; keep the frontend's copy
@@ -202,7 +158,7 @@ fn app_view(s: &FrontendApp, cx: &mut Cx<FrontendApp>) -> El {
     }
 }
 
-fn menu_view(s: &FrontendApp) -> El {
+fn menu_view(_s: &FrontendApp) -> El {
     let title = text("Instant JP Dict")
         .font(rune::tok::TextStyle::new(30.0, 700.0))
         .color(TEXT);
@@ -214,30 +170,6 @@ fn menu_view(s: &FrontendApp) -> El {
         s.open_settings()
     });
 
-    let (label, msg): (&str, fn(&mut FrontendApp)) = if s.watcher_running {
-        (
-            "Stop File Watcher",
-            (|s: &mut FrontendApp| {
-                watcher::request_stop(&s.data_dir);
-                s.watcher_running = false;
-            }) as fn(&mut FrontendApp),
-        )
-    } else {
-        (
-            "Launch File Watcher",
-            (|s: &mut FrontendApp| s.launch_watcher()) as fn(&mut FrontendApp),
-        )
-    };
-    let watcher_btn = button(label, CARD, msg);
-
-    let status = text(if s.watcher_running {
-        "File watcher: running"
-    } else {
-        "File watcher: stopped"
-    })
-    .font(type_::LABEL)
-    .color(MUTED);
-
     col()
         .w_full()
         .h_full()
@@ -248,10 +180,6 @@ fn menu_view(s: &FrontendApp) -> El {
         .child(subtitle)
         .child(el().h(16.0))
         .child(settings_btn)
-        .child(el().h(4.0))
-        .child(watcher_btn)
-        .child(el().h(8.0))
-        .child(status)
 }
 
 fn button(label: &str, fill: Color, on_press: fn(&mut FrontendApp)) -> El {
@@ -302,7 +230,7 @@ fn lighten(c: Color, amount: f32) -> Color {
 }
 
 fn app_poll(s: &mut FrontendApp, _t: f64, tx: &mut rune::Tx) -> bool {
-    // Keep the watcher status live even while the window sits idle.
+    // Keep polling settings import/install progress while the window sits idle.
     tx.wake_after(Duration::from_millis(500));
     s.poll()
 }
@@ -319,14 +247,14 @@ pub fn run(db: Arc<DictionaryDatabase>, data_dir: PathBuf) -> anyhow::Result<()>
     static FONTS: &[&[u8]] = &[SANS_FONT, SERIF_FONT];
     let spec = AppSpec::<FrontendApp> {
         title: "Instant JP Dict",
-        size: (560.0, 420.0),
+        size: (560.0, 300.0),
         fonts: FONTS,
         families: ("Noto Sans JP", "Noto Sans JP"),
         poll: Some(app_poll),
         on_key: Some(app_key),
         ..AppSpec::new(
             "Instant JP Dict",
-            (560.0, 420.0),
+            (560.0, 300.0),
             || unreachable!("FrontendApp is built by App::init"),
             app_view,
         )

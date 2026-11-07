@@ -62,8 +62,8 @@ pub struct OcrEngine {
     /// #100: mobile's "Filter furigana in screenshots" switch, **off** by
     /// default — the rule is flaky on camera photos and a wrong drop costs a
     /// whole line. Off keeps every small contour, so ruby survives as its own
-    /// line. Read once per run from `settings.json` (each capture/watcher
-    /// child is a fresh process, matching mobile's per-run preference read).
+    /// line. Read once per run from `settings.json` (each capture run
+    /// is a fresh process, matching mobile's per-run preference read).
     pub det_furigana: bool,
 }
 
@@ -943,8 +943,8 @@ fn save_line_sample(crop: &image::DynamicImage, text: &str) -> Option<std::path:
         .map(|d| d.as_millis())
         .unwrap_or(0);
     // Always write to the system temp dir. The caller may pass the source
-    // image's directory (batch mode), which would clutter it and re-trigger
-    // the file watcher; /tmp gets cleared on reboot.
+    // image's directory (batch mode), which would clutter it; /tmp gets
+    // cleared on reboot.
     let stem = std::env::temp_dir().join(format!("ocr_line_{ts}_{id}"));
     if let Err(e) = crop.save(stem.with_extension("png")) {
         eprintln!("[dataset] failed to save line crop: {e}");

@@ -23,7 +23,6 @@ fn open_image(path: impl AsRef<std::path::Path>) -> Result<image::DynamicImage> 
         Ok(image::open(path)?)
     }
 }
-mod watcher;
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -88,11 +87,6 @@ fn main() -> Result<()> {
     // Check for help before any parsing
     if args.len() >= 2 && (args[1] == "--help" || args[1] == "-help" || args[1] == "/?") {
         print_usage();
-        return Ok(());
-    }
-    // File watcher mode: `--watcher [daemon args...]` — blocks until stopped.
-    if args.len() >= 2 && args[1] == "--watcher" {
-        watcher::run(&data_dir, &args[2..]);
         return Ok(());
     }
     // One-time (idempotent) setup for capture mode: install the desktop file
@@ -184,7 +178,6 @@ fn print_usage() {
     println!("  {name} [OPTIONS] <IMAGE_PATH>");
     println!("  {name} [OPTIONS] --headless <IMAGE_PATH|DIRECTORY> [MORE_IMAGES...]");
     println!("  {name}                     Opens the frontend window (no arguments)");
-    println!("  {name} --watcher [ARGS]    Run the file watcher (blocks until stopped)");
     println!("  {name} --capture [OPTIONS] Screenshot the focused window and OCR it");
     println!("  {name} --setup-capture     Authorize KWin screenshots for this binary");
     println!("  {name} --help              Show this help message");
@@ -205,8 +198,7 @@ fn print_usage() {
     println!("CAPTURE MODE (for a global shortcut):");
     println!("  --capture takes the screenshot itself — the focused window, no");
     println!("  picker and no file in ~/Pictures/Screenshots — then opens the OCR");
-    println!("  viewer on it. Because nothing lands in a watched folder, the file");
-    println!("  watcher cannot open a second viewer for the same image.");
+    println!("  viewer on it.");
     println!();
     println!("  Run --setup-capture once first: KWin only hands screenshots to");
     println!("  binaries whose .desktop file declares");
@@ -214,11 +206,8 @@ fn print_usage() {
     println!("  (the same mechanism Spectacle uses).");
     println!();
     println!("FRONTEND WINDOW:");
-    println!("  Launching with no arguments opens a window with two options:");
+    println!("  Launching with no arguments opens the settings window:");
     println!("    - Launch Settings Window  (dictionary import & configuration)");
-    println!("    - Launch File Watcher     (monitors ~/Pictures/Screenshots and new");
-    println!("                              images in /tmp; replaced with");
-    println!("                              \"Stop File Watcher\" while it is running)");
     println!("  It also carries the overlay font choice: a \"Serif font\" checkbox");
     println!("  (sans is the default) persisted to settings.json next to");
     println!("  dictionary.sqlite, applied to the overlay and dictionary panel on");
@@ -235,7 +224,6 @@ fn print_usage() {
     println!("  {name} --headless --font=~/myfont.ttf image.png");
     println!("  {name} --headless screenshots_dir/");
     println!("  {name} --headless shot1.png shot2.png shot3.png");
-    println!("  {name} --watcher --vert");
     println!("  {name} --setup-capture       (once; then bind a shortcut to --capture)");
     println!("  {name} --capture --vert");
     println!("  {name}                     (opens the frontend window)");
@@ -366,7 +354,7 @@ fn run_ocr_viewer(args: Vec<String>, data_dir: &std::path::Path) -> Result<()> {
     let _ = font_path;
     let tuning = parse_det_tuning(&args);
 
-    // Persisted app settings, read once per run: every capture/watcher child
+    // Persisted app settings, read once per run: every capture run
     // is a fresh process, so a change applies to the next run (mobile reads
     // its preferences per detection run).
     let app_settings = jpdict_core::app_settings::AppSettings::load(data_dir);

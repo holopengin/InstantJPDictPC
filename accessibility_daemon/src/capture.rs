@@ -1,10 +1,10 @@
-//! Active-window capture — take the screenshot ourselves instead of watching
-//! a folder for one (the `screenshot/watch_and_ocr.sh` / `watcher.rs` path).
+//! Active-window capture — take the screenshot ourselves instead of waiting
+//! for one to appear in a folder.
 //!
 //! On KDE Wayland, KWin exposes `org.kde.KWin.ScreenShot2` on the session bus.
 //! The compositor hands the raw pixels back over a pipe we create, so no
-//! screenshot ever hits `~/Pictures/Screenshots` and the file watcher can
-//! never fire a second OCR window for the same capture.
+//! screenshot ever hits `~/Pictures/Screenshots` and no second viewer can open
+//! for the same capture.
 //!
 //! KWin restricts this interface to processes whose executable is named in an
 //! installed `.desktop` file carrying
@@ -14,7 +14,7 @@
 //! automatically the first time KWin refuses.
 //!
 //! Captures are written under `$XDG_RUNTIME_DIR/accessibility_daemon/captures`
-//! (a tmpfs the watcher never scans), or the daemon's data dir as a fallback.
+//! (a tmpfs), or the daemon's data dir as a fallback.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -35,8 +35,8 @@ const KWIN_INTERFACE: &str = "org.kde.KWin.ScreenShot2";
 const ERROR_NOT_AUTHORIZED: &str = "org.kde.KWin.ScreenShot2.Error.NoAuthorized";
 /// Desktop-file key KWin reads to decide who may use ScreenShot2.
 const RESTRICTED_INTERFACES_KEY: &str = "X-KDE-DBUS-Restricted-Interfaces";
-/// Prefix for files this module writes; the watcher ignores it defensively in
-/// case `XDG_RUNTIME_DIR` ever points somewhere that gets scanned.
+/// Prefix for files this module writes, so cleanup only removes our own
+/// captures.
 pub const CAPTURE_PREFIX: &str = "instantjp_capture-";
 
 /// Capture the currently focused window as an RGBA image.
@@ -93,7 +93,7 @@ fn classify_capture_error(err: &zbus::Error) -> Option<anyhow::Error> {
         "org.freedesktop.DBus.Error.ServiceUnknown" => Some(anyhow::anyhow!(
             "KWin's ScreenShot2 D-Bus service is not available.\n\
              --capture currently needs a KDE Plasma session; on Steam Deck game\n\
-             mode (gamescope) the file-watcher path still applies."
+             mode (gamescope), open the screenshot directly."
         )),
         "org.kde.KWin.ScreenShot2.Error.NoActiveWindow" => {
             Some(anyhow::anyhow!("no window is focused, so there is nothing to capture"))
@@ -404,6 +404,6 @@ pub fn shortcut_instructions() -> String {
          Suggested keys: Meta+Print, or Ctrl+Alt+S.\n\
          Pressing the shortcut captures the focused window and opens the OCR\n\
          overlay on it directly — nothing is written to the screenshot folder,\n\
-         so the folder watcher never fires a second viewer for the same image."
+         so no second viewer opens for the same image."
     )
 }
