@@ -126,6 +126,16 @@ impl FrontendApp {
         }
     }
 
+    /// Fallback for sessions whose window system does not deliver file drags.
+    fn pick_images(&mut self) {
+        if let Some(files) = rfd::FileDialog::new()
+            .add_filter("Images", &["png", "jpg", "jpeg", "jxl", "webp"])
+            .pick_files()
+        {
+            self.open_dropped_images(&files);
+        }
+    }
+
     fn open_settings(&mut self) {
         if self.settings.is_none() {
             self.settings = Some(SettingsWindow::new(
@@ -225,7 +235,7 @@ fn menu_view(s: &FrontendApp) -> El {
         .child(subtitle)
         .child(el().h(16.0))
         .child(settings_btn)
-        .child(drop_hint());
+        .child(drop_hint(|s: &mut FrontendApp| s.pick_images()));
 
     if let Some(error) = &s.drop_error {
         menu = menu.child(
@@ -239,8 +249,10 @@ fn menu_view(s: &FrontendApp) -> El {
     menu
 }
 
-/// A small drag-and-drop affordance under the Settings button.
-fn drop_hint() -> El {
+/// A small drag-and-drop affordance under the Settings button. Clicking it
+/// opens a file picker, which also works on Wayland (winit does not deliver
+/// file drags there).
+fn drop_hint(on_press: fn(&mut FrontendApp)) -> El {
     let icon = canvas(
         Shape::new()
             .line([12.0, 4.0], [12.0, 15.0], 2.0, LineCap::Round, MUTED)
@@ -251,16 +263,26 @@ fn drop_hint() -> El {
     )
     .size(28.0, 28.0);
 
-    col()
+    el().key("drop_hint")
+        .role("button")
+        .label("Drop or choose an image to OCR")
         .w_full()
-        .items_center()
-        .gap(6.0)
         .py(14.0)
-        .child(icon)
+        .radius(8.0)
+        .hover(CARD)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(on_press)
         .child(
-            text("Drop an image here to OCR it")
-                .font(type_::BODY)
-                .color(MUTED),
+            col()
+                .w_full()
+                .items_center()
+                .gap(6.0)
+                .child(icon)
+                .child(
+                    text("Drop an image here, or click to choose one")
+                        .font(type_::BODY)
+                        .color(MUTED),
+                ),
         )
 }
 

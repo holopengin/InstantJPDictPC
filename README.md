@@ -30,7 +30,9 @@ cargo test --workspace
 
 You can also drag a JPEG, PNG, JPEG XL, or WebP file onto either the launcher
 window or an open OCR window. Dropping on the launcher opens a new OCR window;
-dropping on an existing viewer reloads that window with the new image.
+dropping on an existing viewer reloads that window with the new image. On
+Wayland the window toolkit does not deliver file drags yet, so the launcher's
+drop hint also opens a file picker when clicked.
 
 ## Set up window capture
 
