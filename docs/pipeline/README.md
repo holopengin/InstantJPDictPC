@@ -9,7 +9,7 @@ that pin it.
 Android paths are relative to
 `app/src/main/java/com/holopengin/instantjpdict/` in the mobile repo;
 PC paths are relative to the repository root — pipeline modules live
-under `jpdict-jpdict-core/src/` (the UI-free `jpdict-core` crate, ticket 03), the
+under `jpdict-core/src/` (the UI-free `jpdict-core` crate, ticket 03), the
 desktop UI under `src/`.
 
 Pages:

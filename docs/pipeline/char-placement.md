@@ -72,7 +72,7 @@
   texts first).
 - **Tier-2 (quality, spec §4–5)**: dump a `synthesize.py` corpus
   (seed defaults to 7) with
-  `cargo run -p jpdict_core --example cap_dump -- <data_dir> <out.jsonl>`,
+  `cargo run -p jpdict-core --example cap_dump -- <data_dir> <out.jsonl>`,
   then score it in the mobile checkout with
   `eval.py --data <data_dir> --only clean --boxes-from <out.jsonl>`. Measured
   2026-09-23 (this environment): the `imported` row equals the reference

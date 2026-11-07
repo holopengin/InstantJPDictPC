@@ -59,7 +59,7 @@ Test-only `conformance` harness needs both features
 ## Mobile-swap notes (ticket pipeline-sharing/04)
 
 - An Android consumer that only needs the algorithm modules depends on
-  `jpdict_core` with `default-features = false` (optionally `features = ["db"]`
+  `jpdict-core` with `default-features = false` (optionally `features = ["db"]`
   if it also wants the dictionary stack without inference) and never pays for
   — or requires the toolchain for — the native inference stack.
 - `build.rs` returns immediately when `native` is off: no C++ compiler

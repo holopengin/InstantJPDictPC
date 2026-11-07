@@ -3,7 +3,7 @@
 //! `pc_boxes.jsonl` that `eval.py --boxes-from` scores as the `imported` row.
 //!
 //! ```text
-//! cargo run -p jpdict_core --example cap_dump -- <data_dir> <out.jsonl>
+//! cargo run -p jpdict-core --example cap_dump -- <data_dir> <out.jsonl>
 //! /tmp/opencode/cap-venv/bin/python eval.py --data <data_dir> --only clean \
 //!     --boxes-from <out.jsonl>
 //! ```

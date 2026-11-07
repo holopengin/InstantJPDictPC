@@ -112,6 +112,6 @@ be a fold key; both sides pin this in their own unit test.
   `normalize_stages_run_in_pipeline_order`,
   `normalize_existing_behaviour_is_unchanged`.
 - Conformance: `normalize-01-variant-fold` via `normalize_cases`
-  (`jpdict-jpdict-core/src/conformance.rs`); schema in
+  (`jpdict-core/src/conformance.rs`); schema in
   `tests/conformance/FORMAT.md`.
 - Mobile: `JapaneseUtilVariantFoldTest` (20 tests).
