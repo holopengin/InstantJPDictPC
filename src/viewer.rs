@@ -928,6 +928,7 @@ impl OcrViewer {
         }
 
         let mut glyphs = Vec::new();
+        let mut cursor_glyph = None;
         for (line_idx, annotation) in self.annotations.iter().enumerate() {
             let bbox = &annotation.bbox;
             let bx1 = bbox.x as f32;
@@ -1001,7 +1002,7 @@ impl OcrViewer {
                         tx.scroll_into_view(format!("nb:{li}:{ci}"));
                     });
                 if is_cursor {
-                    g = g.border(CURSOR_STROKE, WHITE).radius(CURSOR_RADIUS).raise();
+                    g = g.border(CURSOR_STROKE, WHITE).radius(CURSOR_RADIUS);
                 }
                 g = g.child(
                     text(ch.to_string())
@@ -1010,10 +1011,19 @@ impl OcrViewer {
                         .align(rune::Align::Center)
                         .a11y_hidden(),
                 );
-                glyphs.push(g);
+                if is_cursor {
+                    // Draw the cursor above the other glyphs, but stay inside the
+                    // world layer so the dictionary panel still paints on top.
+                    cursor_glyph = Some(g);
+                } else {
+                    glyphs.push(g);
+                }
             }
         }
         for g in glyphs {
+            world = world.child(g);
+        }
+        if let Some(g) = cursor_glyph {
             world = world.child(g);
         }
         world.on_drag(pan_drag)
@@ -1103,9 +1113,12 @@ impl ViewerApp {
         }
     }
 
-    fn navigate(&mut self, action: GamepadAction) {
+    fn navigate(&mut self, action: GamepadAction, tx: &mut Tx) {
         if self.viewer.alternatives_visible {
             self.viewer.navigate_alternatives(action);
+            if let Some((li, ci)) = self.viewer.state.current_cursor() {
+                tx.scroll_into_view(format!("alt:{li}:{ci}"));
+            }
             return;
         }
         self.viewer.defer_lookup = false;
@@ -1114,7 +1127,9 @@ impl ViewerApp {
             self.viewer.move_cursor_to(li, ci);
             if self.viewer.state.is_dictionary_visible {
                 self.viewer.do_lookup(li, ci);
+                tx.scroll_to_instant("dict_scroll", 0.0, 0.0);
             }
+            tx.scroll_into_view(format!("nb:{li}:{ci}"));
         }
         self.held = Some((action, Instant::now()));
         self.repeat_count = 0;
@@ -1220,7 +1235,7 @@ impl ViewerApp {
                         if matches!(self.held, Some((held, _)) if held == action) {
                             return true;
                         }
-                        self.navigate(action);
+                        self.navigate(action, tx);
                         return true;
                     }
                     'u' | 'e' | 'f' => {
@@ -1259,19 +1274,19 @@ impl ViewerApp {
                 return true;
             }
             Key::Up => {
-                self.navigate(GamepadAction::NavigateUp);
+                self.navigate(GamepadAction::NavigateUp, tx);
                 return true;
             }
             Key::Down => {
-                self.navigate(GamepadAction::NavigateDown);
+                self.navigate(GamepadAction::NavigateDown, tx);
                 return true;
             }
             Key::Left => {
-                self.navigate(GamepadAction::NavigateLeft);
+                self.navigate(GamepadAction::NavigateLeft, tx);
                 return true;
             }
             Key::Right => {
-                self.navigate(GamepadAction::NavigateRight);
+                self.navigate(GamepadAction::NavigateRight, tx);
                 return true;
             }
             _ => {}
@@ -1341,7 +1356,7 @@ fn app_poll(s: &mut ViewerApp, _t: f64, tx: &mut Tx) -> bool {
             let due = ((elapsed.as_millis() - 250) / 40) as u64;
             if due > s.repeat_count {
                 s.repeat_count = due;
-                s.navigate(action);
+                s.navigate(action, tx);
                 // A repeat must not restart the hold timer.
                 s.held = Some((action, started));
                 changed = true;
@@ -1440,7 +1455,7 @@ impl OcrViewer {
             .absolute(x, 0.0)
             .w(on_screen_w)
             .h(self.window_height)
-            .transition(Transition::opacity())
+            .transition(Transition::none())
             .child(
                 inner
                     .scale(scale)
@@ -1476,7 +1491,7 @@ impl OcrViewer {
             .w(strip_w)
             .h(self.window_height)
             .motion(Spring::NONE)
-            .transition(Transition::opacity())
+            .transition(Transition::none())
             .child(
                 inner
                     .scale(scale)
@@ -1508,7 +1523,7 @@ impl OcrViewer {
             content = content.child(
                 entry_view(entry, self.show_pitch)
                     .key(key)
-                    .transition(Transition::opacity()),
+                    .transition(Transition::none()),
             );
         }
 
@@ -1544,8 +1559,11 @@ impl OcrViewer {
                     .radius(0.0)
                     .fill(if is_selected { YELLOW } else { CHIP_BG })
                     .center()
-                    .transition(Transition::opacity())
+                    .transition(Transition::none())
                     .on_press_tx(move |s: &mut ViewerApp, tx: &mut Tx| {
+                        // Fill and text colour must change together; without this the
+                        // text keeps Rune's short colour fade while the fill snaps.
+                        tx.instant();
                         s.viewer.select_neighbor(li, ci);
                         tx.scroll_to_instant("dict_scroll", 0.0, 0.0);
                     })
@@ -1602,7 +1620,7 @@ impl OcrViewer {
             content = content.child(
                 el().key(format!("alt_preview:{}:{}", selection.0, selection.1))
                     .size(box_size, box_size)
-                    .transition(Transition::opacity())
+                    .transition(Transition::none())
                     .pixels(&px),
             );
         }
@@ -1633,8 +1651,11 @@ impl OcrViewer {
                         .size(box_size, box_size)
                         .fill(if is_selected { YELLOW } else { CHIP_BG })
                         .center()
-                        .transition(Transition::opacity())
-                        .on_press_tx(move |s: &mut ViewerApp, _tx: &mut Tx| {
+                        .transition(Transition::none())
+                        .on_press_tx(move |s: &mut ViewerApp, tx: &mut Tx| {
+                            // Match the neighbour chips: selection colour and
+                            // background change in the same frame.
+                            tx.instant();
                             s.viewer.select_alternative(ch);
                         })
                         .child(
