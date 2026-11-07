@@ -1,12 +1,12 @@
-// C ABI over the kana small/large model (#44), for Rust.
+// C ABI over the shared kana small/large ncnn core, for Rust.
 //
 // The Android app runs the same graph through app/src/main/cpp/kana_size_ncnn.cpp
-// (JNI); this shell only owns the net handle and copies logits into a malloc'd
-// buffer, so no C++ type crosses the FFI boundary.
+// (JNI); both shells sit on kana_size_core.{h,cpp}, which is mirrored verbatim.
+// This layer only owns the handle and copies logits into a malloc'd buffer, so
+// no C++ type crosses the FFI boundary.
 //
-// The graph and the pinned net options are duplicated from the mobile wrapper
-// deliberately: the fp32 pin is load-bearing (fp16 costs ~1.5e-03 against the
-// fp32 reference on this model), and both apps must run identical numerics.
+// The fp32 pin is load-bearing (fp16 costs ~1.5e-03 against the fp32
+// reference on this model); both apps must run identical numerics.
 #pragma once
 
 #include <stddef.h>

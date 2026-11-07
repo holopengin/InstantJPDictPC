@@ -52,15 +52,15 @@ fn main() {
     // ------------------------------------------------------------------
     // Kana small/large model (#44) C ABI (native/kana_size)
     // ------------------------------------------------------------------
-    // Separate from the shared PP-OCR core on purpose: this model is not part
-    // of it (the mobile side has a JNI wrapper, not a core file), but it links
-    // the same pinned ncnn fork.
+    // Same split as the PP-OCR core: kana_size_core.{h,cpp} is mirrored from
+    // the Android app, while kana_size_capi.cpp is the PC-only C ABI shell.
     cc::Build::new()
         .cpp(true)
         .std("c++17")
         .warnings(false)
         .include(&ncnn_include_dir)
         .include(manifest_dir.join("../native/kana_size"))
+        .file(manifest_dir.join("../native/kana_size/kana_size_core.cpp"))
         .file(manifest_dir.join("../native/kana_size/kana_size_capi.cpp"))
         .compile("kana_size");
     println!("cargo:rerun-if-changed=../native/kana_size");
