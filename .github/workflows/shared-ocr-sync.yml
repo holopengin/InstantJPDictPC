@@ -17,6 +17,9 @@ jobs:
           repository: holopengin/InstantJPDict
           path: InstantJPDict
 
+      - name: Fetch the Android LFS model files
+        run: git -C InstantJPDict lfs pull --include="app/src/main/assets/PP-OCRv6_small_ncnn/*.bin"
+
       - name: Verify shared cores, models and data
         run: tools/sync_ppocr_core.sh --check "$GITHUB_WORKSPACE/InstantJPDict"
 
