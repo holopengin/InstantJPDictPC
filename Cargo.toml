@@ -31,7 +31,7 @@ zbus = { version = "5.19", features = ["blocking-api"] }
 
 # GUI: Rune for the frontend, settings and annotated-image viewer.
 # Pinned to a `dev` revision: Rune is pre-release and `dev` is never rewritten.
-rune = { git = "https://github.com/anomalyco/rune", rev = "f73f72cdc563534e4f7de9f5a79bed007ac42384" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "5d421fd908ba19b760b93a3dcf821e159ec1d4d7" }
 
 # File dialogs
 rfd = "0.14"
