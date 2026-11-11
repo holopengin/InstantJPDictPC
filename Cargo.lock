@@ -3928,7 +3928,7 @@ dependencies = [
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=5d421fd908ba19b760b93a3dcf821e159ec1d4d7#5d421fd908ba19b760b93a3dcf821e159ec1d4d7"
+source = "git+https://github.com/anomalyco/rune?rev=20f9057ddc53d08da1ddb9886d4d40591cabdc5f#20f9057ddc53d08da1ddb9886d4d40591cabdc5f"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -3943,6 +3943,8 @@ dependencies = [
  "fontique",
  "futures-util",
  "half",
+ "icu_properties",
+ "icu_segmenter",
  "image",
  "js-sys",
  "libc",
@@ -3976,6 +3978,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
+ "skrifa 0.44.0",
  "swash",
  "symphonia",
  "taffy",
@@ -4005,12 +4008,12 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/anomalyco/rune?rev=5d421fd908ba19b760b93a3dcf821e159ec1d4d7#5d421fd908ba19b760b93a3dcf821e159ec1d4d7"
+source = "git+https://github.com/anomalyco/rune?rev=20f9057ddc53d08da1ddb9886d4d40591cabdc5f#20f9057ddc53d08da1ddb9886d4d40591cabdc5f"
 
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=5d421fd908ba19b760b93a3dcf821e159ec1d4d7#5d421fd908ba19b760b93a3dcf821e159ec1d4d7"
+source = "git+https://github.com/anomalyco/rune?rev=20f9057ddc53d08da1ddb9886d4d40591cabdc5f#20f9057ddc53d08da1ddb9886d4d40591cabdc5f"
 dependencies = [
  "wgpu",
 ]
@@ -4018,7 +4021,7 @@ dependencies = [
 [[package]]
 name = "rune-taffy"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=5d421fd908ba19b760b93a3dcf821e159ec1d4d7#5d421fd908ba19b760b93a3dcf821e159ec1d4d7"
+source = "git+https://github.com/anomalyco/rune?rev=20f9057ddc53d08da1ddb9886d4d40591cabdc5f#20f9057ddc53d08da1ddb9886d4d40591cabdc5f"
 dependencies = [
  "taffy",
 ]
