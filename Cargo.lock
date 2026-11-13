@@ -3928,7 +3928,7 @@ dependencies = [
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=29f28a9aacef60141deeda9423116b36facf4bc0#29f28a9aacef60141deeda9423116b36facf4bc0"
+source = "git+https://github.com/anomalyco/rune?rev=c369cc0542ead1d62a665934dd2272b22eae870b#c369cc0542ead1d62a665934dd2272b22eae870b"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -3966,6 +3966,7 @@ dependencies = [
  "opuscule",
  "parking_lot",
  "parley",
+ "parley_engine",
  "png 0.18.1",
  "pollster 1.0.1",
  "portable-atomic",
@@ -3980,6 +3981,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skrifa 0.44.0",
+ "spellbook",
  "swash",
  "symphonia",
  "taffy",
@@ -4010,12 +4012,12 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/anomalyco/rune?rev=29f28a9aacef60141deeda9423116b36facf4bc0#29f28a9aacef60141deeda9423116b36facf4bc0"
+source = "git+https://github.com/anomalyco/rune?rev=c369cc0542ead1d62a665934dd2272b22eae870b#c369cc0542ead1d62a665934dd2272b22eae870b"
 
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=29f28a9aacef60141deeda9423116b36facf4bc0#29f28a9aacef60141deeda9423116b36facf4bc0"
+source = "git+https://github.com/anomalyco/rune?rev=c369cc0542ead1d62a665934dd2272b22eae870b#c369cc0542ead1d62a665934dd2272b22eae870b"
 dependencies = [
  "wgpu",
 ]
@@ -4023,7 +4025,7 @@ dependencies = [
 [[package]]
 name = "rune-taffy"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=29f28a9aacef60141deeda9423116b36facf4bc0#29f28a9aacef60141deeda9423116b36facf4bc0"
+source = "git+https://github.com/anomalyco/rune?rev=c369cc0542ead1d62a665934dd2272b22eae870b#c369cc0542ead1d62a665934dd2272b22eae870b"
 dependencies = [
  "taffy",
 ]
@@ -4418,6 +4420,16 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spellbook"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d204abcbdf8e88729306a8d0ca01a79d8a49969fe1f84696909d6dbc4321c1a"
+dependencies = [
+ "foldhash 0.1.5",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
