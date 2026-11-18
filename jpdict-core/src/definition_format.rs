@@ -636,10 +636,17 @@ pub(crate) struct ParsedSenseGroup {
 // Redirects (moved verbatim from `overlay_state.rs`)
 // ---------------------------------------------------------------------------
 
-/// #65: JMdict pointer entries (variant spellings) carry only `?query=`
-/// links; this returns those headwords so lookup can resolve them. Entries
-/// with any real definitional content yield nothing (their `see also` links
-/// are not redirects). Mirrors `DictionaryRedirects.extractTargets`.
+/// #65: pointer entries carry only `?query=` links; this returns those
+/// headwords so lookup can resolve them. Two shapes exist:
+///
+/// * JMdict's bare pointer node with no wrapper class;
+/// * Jitendex's old-kanji rows, which wrap the pointer in a `div` whose
+///   `data.content` is `redirect-glossary` (observed on 138,529 rows in the
+///   pinned 2026.08.11.0 archive). That marker is a redirect wrapper, not a
+///   definition, so it must not trip the definitional-content guard.
+///
+/// Entries with any real definitional content yield nothing (their `see also`
+/// links are not redirects). Mirrors `DictionaryRedirects.extractTargets`.
 pub fn extract_redirect_targets(definitions_json: &str, max_targets: usize) -> Vec<String> {
     let Ok(root) = serde_json::from_str::<serde_json::Value>(definitions_json) else {
         return Vec::new();
@@ -676,7 +683,7 @@ pub fn extract_redirect_targets(definitions_json: &str, max_targets: usize) -> V
                     .and_then(|d| d.get("content"))
                     .and_then(|v| v.as_str())
                 {
-                    if dc != "references" && dc != "refGlosses" {
+                    if dc != "references" && dc != "refGlosses" && dc != "redirect-glossary" {
                         *has_definitional = true;
                     }
                 }
@@ -1012,4 +1019,73 @@ pub fn parse_glossary_to_json(glossary_json: &str) -> String {
     serde_json::to_string(&out).unwrap_or_else(|_| {
         "{\"structured\":false,\"groups\":[],\"plain\":[],\"trailing\":[]}".to_string()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verbatim shape of the pinned Jitendex 2026.08.11.0 說教 row: the
+    /// pointer sits under a `redirect-glossary` wrapper and the definitions
+    /// array also carries the v3 deinflection pair.
+    #[test]
+    fn jitendex_redirect_glossary_is_a_pointer() {
+        let payload = serde_json::json!([
+            {
+                "type": "structured-content",
+                "content": {
+                    "tag": "div",
+                    "lang": "ja",
+                    "data": {"content": "redirect-glossary"},
+                    "content": [
+                        "⟶",
+                        {
+                            "tag": "a",
+                            "lang": "ja",
+                            "href": "?query=%E8%AA%AC%E6%95%99&wildcards=off&primary_reading=%E3%81%9B%E3%81%A3%E3%81%8D%E3%82%87%E3%81%86",
+                            "content": [
+                                {"tag": "ruby", "content": ["説", {"tag": "rt", "content": "せっ"}]},
+                                {"tag": "ruby", "content": ["教", {"tag": "rt", "content": "きょう"}]}
+                            ]
+                        }
+                    ]
+                }
+            },
+            ["説教", ["redirected from 說教"]]
+        ]);
+
+        assert_eq!(
+            extract_redirect_targets(&payload.to_string(), 3),
+            vec!["説教"]
+        );
+    }
+
+    /// A real Jitendex glossary that also contains a reference link is not a
+    /// redirect: the `glossary` / `sense` classes must keep the guard closed.
+    #[test]
+    fn jitendex_glossary_with_link_is_not_a_pointer() {
+        let payload = serde_json::json!([
+            {
+                "type": "structured-content",
+                "content": {
+                    "tag": "div",
+                    "data": {"content": "sense-group"},
+                    "content": [
+                        {
+                            "tag": "ul",
+                            "data": {"content": "glossary"},
+                            "content": [{"tag": "li", "content": "sermon"}]
+                        },
+                        {
+                            "tag": "a",
+                            "href": "?query=%E8%AA%AC%E6%95%99&wildcards=off",
+                            "content": "see"
+                        }
+                    ]
+                }
+            }
+        ]);
+
+        assert!(extract_redirect_targets(&payload.to_string(), 3).is_empty());
+    }
 }
