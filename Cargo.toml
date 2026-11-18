@@ -31,7 +31,7 @@ zbus = { version = "5.19", features = ["blocking-api"] }
 
 # GUI: Rune for the frontend, settings and annotated-image viewer.
 # Pinned to a `dev` revision: Rune is pre-release and `dev` is never rewritten.
-rune = { git = "https://github.com/anomalyco/rune", rev = "631e8a67cb3c40225efa3f6c4f57b80e7b18f190" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666" }
 
 # File dialogs
 rfd = "0.14"
@@ -42,10 +42,10 @@ directories = "6.0"
 # Rune ships patched forks in its workspace; Cargo does not inherit a
 # dependency's patches, so the app must patch them at the same revision.
 [patch.crates-io]
-winit = { git = "https://github.com/anomalyco/rune", rev = "631e8a67cb3c40225efa3f6c4f57b80e7b18f190" }
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "631e8a67cb3c40225efa3f6c4f57b80e7b18f190" }
-wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "631e8a67cb3c40225efa3f6c4f57b80e7b18f190" }
-accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "631e8a67cb3c40225efa3f6c4f57b80e7b18f190" }
-accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "631e8a67cb3c40225efa3f6c4f57b80e7b18f190" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "47eaa86eba751687597d0aaf6ee325baeecd4666" }
 
 [profile.release]
