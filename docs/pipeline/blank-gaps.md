@@ -32,8 +32,8 @@ Detection (the detector reports both orientations; the materialisation
      emitted character for a timestep is the list's **first** entry (the
      argmax); a blank timestep is stored as `'\u3000'` (`TIMESTEP_BLANK_CHAR`)
      and **resets** the previous character, so a repeat after a blank is
-     emitted; a space is always emitted and never collapses; any other
-     character collapses only against the immediately preceding emitted one.
+     emitted; every other class — **space included** — collapses against the
+     immediately preceding emitted one, so one run is one emission.
      A derived column count that disagrees with the text length is not
      geometry — a line that already carries a `◌` placeholder derives fewer
      columns than its text, which is the expected mismatch.

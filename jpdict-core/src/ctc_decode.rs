@@ -247,14 +247,10 @@ where
 
         if class_idx == BLANK_CLASS {
             prev_class = BLANK_CLASS;
-        } else if class_idx == SPACE_CLASS {
-            text.push(' ');
-            prev_class = SPACE_CLASS;
-            char_cols.push(t_frac);
-            alternatives.push(indexed);
-            alt_rows.push(t);
         } else if class_idx == prev_class {
-            // Collapse a repeated non-blank class.
+            // Collapse a repeated non-blank class. This is the CTC rule for
+            // every symbol, the space class included: only a blank ends a run,
+            // so `space space` is one space and `space blank space` is two.
         } else {
             let ch = decode_char(vocab, class_idx);
             if ch != '\u{FFFD}' {
@@ -550,12 +546,77 @@ mod tests {
         let v = vocab();
         let remap: Vec<i32> = (0..=TEST_VOCAB.len() as i32).collect();
         let res = ctc_decode_topk(&v, &remap, &packed_steps(steps, 3), steps.len(), 3);
-        assert_eq!(res.text, "ああ  い");
-        assert_eq!(res.char_cols, vec![0.0, 3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(res.alternatives.len(), 5);
+        assert_eq!(res.text, "ああ い");
+        assert_eq!(res.char_cols, vec![0.0, 3.0, 4.0, 6.0]);
+        assert_eq!(res.alternatives.len(), 4);
         assert_eq!(res.raw_alternatives.len(), steps.len());
         assert!(res.raw_alternatives.iter().all(|row| row.len() == 3));
         assert_eq!(res.raw_alternatives[2][0], ('\u{3000}', 0.95));
+    }
+
+    /// A run of one class is **one** emission, whichever class it is — the
+    /// space class included. Only a blank ends a run: two spaces separated by
+    /// a blank are two spaces. This is the CTC rule the reference decoders
+    /// implement (`collapse adjacent repeats, then drop blanks`), and the space
+    /// class is an ordinary symbol to the loss.
+    #[test]
+    fn a_space_run_is_one_emission_and_a_blank_splits_it() {
+        let v = vocab();
+        let remap: Vec<i32> = (0..=20_000).collect();
+        let decode = |classes: &[i32]| {
+            let steps: Vec<Vec<(i32, f32)>> =
+                classes.iter().map(|&c| vec![(c, 1.0), (0, 0.1)]).collect();
+            let refs: Vec<&[(i32, f32)]> = steps.iter().map(|s| s.as_slice()).collect();
+            ctc_decode_topk(&v, &remap, &packed_steps(&refs, 2), classes.len(), 2)
+        };
+
+        assert_eq!(decode(&[18_709, 18_709]).text, " ");
+        assert_eq!(decode(&[18_709, 18_709, 18_709]).text, " ");
+        assert_eq!(decode(&[18_709, 0, 18_709]).text, "  ");
+        assert_eq!(decode(&[18_709, 18_709, 0, 18_709]).text, "  ");
+        // The same rule for an ordinary character, for contrast.
+        assert_eq!(decode(&[1, 1]).text, "あ");
+        assert_eq!(decode(&[1, 0, 1]).text, "ああ");
+    }
+
+    /// Differential pin against the textbook form of the algorithm
+    /// (`collapse every adjacent repeat, then drop the blanks`) over every
+    /// sequence up to length 6 on an alphabet that can tell the two orders
+    /// apart — blank, two characters, and the space class. The single-pass
+    /// state machine must agree with it on all of them, which is what makes
+    /// the walk's blank-resets-the-run rule auditable rather than asserted.
+    #[test]
+    fn greedy_walk_matches_collapse_then_drop_blank() {
+        let v = vocab();
+        let remap: Vec<i32> = (0..=20_000).collect();
+        let alphabet = [0i32, 1, 2, 18_709];
+
+        let mut seq = Vec::new();
+        for len in 1..=6usize {
+            for n in 0..4usize.pow(len as u32) {
+                seq.clear();
+                seq.extend((0..len).map(|i| alphabet[(n / 4usize.pow(i as u32)) % alphabet.len()]));
+                let steps: Vec<Vec<(i32, f32)>> = seq
+                    .iter()
+                    .map(|&c| vec![(c, 1.0), (0, 0.1)])
+                    .collect();
+                let refs: Vec<&[(i32, f32)]> = steps.iter().map(|s| s.as_slice()).collect();
+                let res = ctc_decode_topk(&v, &remap, &packed_steps(&refs, 2), len, 2);
+
+                let mut expected = String::new();
+                let mut prev: Option<i32> = None;
+                for &c in &seq {
+                    if prev == Some(c) {
+                        continue;
+                    }
+                    prev = Some(c);
+                    if c != BLANK_CLASS {
+                        expected.push(decode_char(&v, c));
+                    }
+                }
+                assert_eq!(res.text, expected, "classes {seq:?}");
+            }
+        }
     }
 
     /// The recorded `alt_rows` is exactly the identity a boundary relies on:
@@ -571,13 +632,13 @@ mod tests {
             &[(0, 0.95), (1, 0.4), (2, 0.2)], // blank: no row recorded
             &[(1, 0.7), (3, 0.6), (0, 0.1)],
             &[(18709, 0.6), (1, 0.5), (0, 0.1)], // space: recorded
-            &[(18709, 0.5), (2, 0.4), (0, 0.1)], // space again: recorded
+            &[(18709, 0.5), (2, 0.4), (0, 0.1)], // same run: collapsed, no row
             &[(2, 0.9), (0, 0.3), (1, 0.1)],
         ];
         let v = vocab();
         let remap: Vec<i32> = (0..=TEST_VOCAB.len() as i32).collect();
         let res = ctc_decode_topk(&v, &remap, &packed_steps(steps, 3), steps.len(), 3);
-        assert_eq!(res.alt_rows, vec![0, 3, 4, 5, 6]);
+        assert_eq!(res.alt_rows, vec![0, 3, 4, 6]);
         assert_eq!(res.alt_rows.len(), res.alternatives.len());
         assert_eq!(res.alt_rows.len(), res.char_cols.len());
         for (j, &t) in res.alt_rows.iter().enumerate() {

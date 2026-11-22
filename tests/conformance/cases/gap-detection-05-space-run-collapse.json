@@ -1,0 +1,22 @@
+{
+  "id": "gap-detection-05-space-run-collapse",
+  "kind": "gap_detection",
+  "description": "The timestep walk is the same CTC state machine as the recognise step: a run of one class — the space class included — is ONE emission, and only a blank ends the run, so a space on each side of a blank stays two spaces. This probe is discriminating: the run of three space timesteps must collapse to one emitted column, giving text length == derived column count (4 == 4) and a readable gap after the space. With the old 'spaces never collapse' walk the run derived 6 columns for a 4-character text, the count mismatched, and no geometry was reported at all.",
+  "mobile_mirror": "GapDetectorTest.timestep_walk_matches_the_documented_assumptions",
+  "tolerances": { "gap_ratio": 0.0001, "gap_span_px": 0.0001 },
+  "case": {
+    "lines": [
+      {
+        "text": "あい う",
+        "is_vertical": false,
+        "raw_alternatives": [
+          [["あ", 1.0]], [["い", 1.0]], [["い", 0.9]],
+          [[" ", 0.8]], [[" ", 0.7]], [[" ", 0.6]],
+          [["\u3000", 0.99]], [["う", 1.0]], [["う", 0.9]]
+        ],
+        "seq_len_total": 9,
+        "expect": [{ "insert_at": 3, "ratio": 2.0, "span_px": 32 }]
+      }
+    ]
+  }
+}

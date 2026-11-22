@@ -1017,8 +1017,8 @@ pub struct ReDecodedLine {
 /// Mobile `OcrEngine.reDecodeLineResult`'s walk, without the `LineResult`
 /// plumbing: greedy CTC over the cached raw alternatives — entry 0 is the
 /// argmax, `'\u{3000}'` is the blank marker (so blank resets the collapse
-/// state), a space never collapses, any other character collapses only
-/// against the immediately preceding emitted character. Emits at most one
+/// state), a run of one character collapses to one emission (space included),
+/// and a repeat after a blank is emitted again. Emits at most one
 /// character per timestep; `alternatives` stays index-aligned with `text`.
 /// Columns carry the winner's own score at the neighbouring timesteps
 /// (matched by character, absent → integer column), like the live decode —
@@ -1066,13 +1066,9 @@ pub fn re_decode_raw_alternatives(
         if top_char == '\u{3000}' {
             // Blank: resets the repeat state but is never emitted.
             prev_char = None;
-        } else if top_char == ' ' {
-            text.push(' ');
-            prev_char = Some(' ');
-            char_cols.push(t as f32 + frac_for(t, ' ', top_score));
-            new_alts.push(alts.clone());
         } else if prev_char == Some(top_char) {
-            // collapse repeat
+            // Collapse the repeat. One rule for every class, space included:
+            // only the blank ends a run.
         } else {
             text.push(top_char);
             char_cols.push(t as f32 + frac_for(t, top_char, top_score));
@@ -1439,6 +1435,36 @@ mod tests {
     /// The env-reading entry points agree with the explicit variant at
     /// default knob settings (knobs default on; no font needed — an empty
     /// ink table is what a missing font measures).
+    /// The model-free re-decode must collapse a space run exactly like the live
+    /// decode: one emission per run, and a blank ends the run so a space on each
+    /// side of it stays two spaces. The cached rows only carry characters, so
+    /// blank is the `U+3000` marker here.
+    #[test]
+    fn re_decode_collapses_space_runs_like_the_live_decode() {
+        let raw = vec![
+            vec![(' ', 0.60)],        // t0 space
+            vec![(' ', 0.50)],        // t1 space: same run, collapsed
+            vec![('\u{3000}', 0.90)], // t2 blank: ends the run
+            vec![(' ', 0.70)],        // t3 space: a new run, emitted
+        ];
+        let re = re_decode_raw_alternatives(&raw, false).expect("walk decodes");
+        assert_eq!(re.text, "  ");
+        assert_eq!(re.char_cols, vec![0.0, 3.0]);
+        assert_eq!(re.alternatives.len(), 2);
+        // And an ordinary character keeps its own rule (repeat collapsed,
+        // blank splits), so the two rules stay one rule.
+        let raw = vec![
+            vec![('あ', 0.9)],
+            vec![('あ', 0.8)],
+            vec![('\u{3000}', 0.9)],
+            vec![('あ', 0.7)],
+        ];
+        assert_eq!(
+            re_decode_raw_alternatives(&raw, false).unwrap().text,
+            "ああ"
+        );
+    }
+
     #[test]
     fn compute_entry_points_match_the_explicit_variant_at_defaults() {
         let cols = [0.0f32, 1.0, 2.0, 3.0];

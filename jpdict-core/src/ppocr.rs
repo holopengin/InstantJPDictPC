@@ -1048,9 +1048,9 @@ mod tests {
             step(&[(2, 'い', 0.9), (0, '\u{3000}', 0.3), (1, 'あ', 0.1)]),
         ];
         let res = decode_topk(&steps);
-        assert_eq!(res.text, "ああ  い");
-        assert_eq!(res.char_cols, vec![0.0, 3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(res.alternatives.len(), 5);
+        assert_eq!(res.text, "ああ い");
+        assert_eq!(res.char_cols, vec![0.0, 3.0, 4.0, 6.0]);
+        assert_eq!(res.alternatives.len(), 4);
 
         assert_eq!(res.raw_alternatives.len(), steps.len());
         for (t, raw) in res.raw_alternatives.iter().enumerate() {
@@ -1131,8 +1131,9 @@ mod tests {
     }
 
     /// Mobile's documented walk (the Kotlin `timestepColumns` fixture): a
-    /// blank resets the repeat state, a space never collapses, and the
-    /// alternatives stay one entry per emitted character.
+    /// blank resets the repeat state, every class — space included — collapses
+    /// against the previous emitted one, and the alternatives stay one entry
+    /// per emitted character.
     #[test]
     fn re_decode_walk_matches_mobile() {
         let steps = [
@@ -1145,9 +1146,9 @@ mod tests {
             step(&[(2, 'い', 0.90), (0, '\u{3000}', 0.10)]),
         ];
         let re = re_decode(&steps, false);
-        assert_eq!(re.text, "ああ  い");
-        assert_eq!(re.char_cols, vec![0.0, 3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(re.alternatives.len(), 5);
+        assert_eq!(re.text, "ああ い");
+        assert_eq!(re.char_cols, vec![0.0, 3.0, 4.0, 6.0]);
+        assert_eq!(re.alternatives.len(), 4);
         assert_eq!(re.alternatives[1], steps[3].1, "repeat after a blank is emitted");
         assert!(re_decode_raw_alternatives(&[], false).is_none());
     }

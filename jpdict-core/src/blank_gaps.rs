@@ -240,9 +240,9 @@ fn pixel_per_timestep(line: &LineResult) -> f32 {
 ///   for that timestep is its **first** entry (the argmax).
 /// - Blank is stored as [`TIMESTEP_BLANK_CHAR`] and **resets** the previous
 ///   character, so a repeat after a blank is emitted.
-/// - A space is always emitted and never collapses.
-/// - Any other character collapses only against the immediately preceding
-///   emitted character.
+/// - Every other class — **space included** — collapses against the
+///   immediately preceding emitted character, so one run is one emission and
+///   only a blank can split two runs of the same character.
 ///
 /// Returns an empty list for input that derives nothing; the caller compares
 /// the length against the text length and gives up when they disagree.
@@ -256,11 +256,8 @@ pub fn timestep_columns(raw: &[Vec<(char, f32)>]) -> Vec<f32> {
         let ch = top.0;
         if ch == TIMESTEP_BLANK_CHAR {
             prev = None;
-        } else if ch == ' ' {
-            cols.push(t as f32);
-            prev = Some(' ');
         } else if Some(ch) == prev {
-            // CTC repeat collapse.
+            // CTC repeat collapse: one rule for every class, space included.
         } else {
             cols.push(t as f32);
             prev = Some(ch);
@@ -913,7 +910,8 @@ mod tests {
 
     /// Android `timestep_walk_matches_the_documented_assumptions`: entry 0 is
     /// the argmax, `'\u3000'` is the blank entry, blank resets the repeat
-    /// state, spaces never collapse.
+    /// state, and every class — the space class included — collapses against
+    /// the previous emitted character.
     #[test]
     fn timestep_walk_matches_the_documented_assumptions() {
         let raw = vec![
@@ -922,11 +920,45 @@ mod tests {
             blank_step(),     // t2 blank → resets the previous char
             step('あ', 0.70), // t3 emitted again after the blank
             step(' ', 0.60),  // t4 space
-            step(' ', 0.50),  // t5 space again — spaces never collapse
-            step('い', 0.90), // t6
+            step(' ', 0.50),  // t5 space again — same run, collapsed
+            blank_step(),     // t6 blank → ends the space run
+            step(' ', 0.40),  // t7 space — a new run, emitted
+            step('い', 0.90), // t8
         ];
 
-        assert_eq!(timestep_columns(&raw), vec![0.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(timestep_columns(&raw), vec![0.0, 3.0, 4.0, 7.0, 8.0]);
+    }
+
+    /// The discriminating space-run probe (`gap-detection-05` in the
+    /// conformance corpus): the run of three space timesteps is **one** emitted
+    /// column, so the derived column count equals the 4-character text and the
+    /// wide pair is readable geometry. With "spaces never collapse" the walk
+    /// derived 6 columns for 4 characters, `geometry_of` returned `None`, and
+    /// this line reported no gap at all.
+    #[test]
+    fn space_run_collapses_so_the_walk_derives_the_text_length() {
+        let line = LineResult {
+            text: "あい う".to_string(),
+            is_vertical: false,
+            seq_len_total: 9,
+            raw_alternatives: vec![
+                step('あ', 1.0),
+                step('い', 1.0),
+                step('い', 0.9),
+                step(' ', 0.8),
+                step(' ', 0.7),
+                step(' ', 0.6),
+                blank_step(),
+                step('う', 1.0),
+                step('う', 0.9),
+            ],
+            ..Default::default()
+        };
+        let gaps = GapDetector::default().detect(&line);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].insert_at, 3);
+        assert!((gaps[0].ratio - 2.0).abs() < 1e-4);
+        assert!((gaps[0].span_px - 32.0).abs() < 1e-4);
     }
 
     /// Android `blank_marker_and_placeholder_are_different_characters`.

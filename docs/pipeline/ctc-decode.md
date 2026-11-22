@@ -5,6 +5,14 @@
 - CTC blank (class 0) is stored as the **ideographic space U+3000** so the
   walk can tell blank from real space (`decode_char`, `jpdict-core/src/ppocr.rs:114`;
   mobile same convention into `ctcDecodeTopK`, `OcrEngine.kt:1907`).
+- Greedy collapse is **one rule for every class**: a run of the same class —
+  **space included** — is one emission, and only a blank ends a run, so
+  `space blank space` is two spaces. That is the textbook
+  "collapse adjacent repeats, then drop blanks" order evaluated in one pass
+  (`ctc_decode_candidates`, `ctc_decode.rs:209`; the same walk in
+  `re_decode_raw_alternatives` and `timestep_columns`). The space class is an
+  ordinary symbol to the CTC loss; treating it as exempt produced one space
+  per space-class timestep on every word gap.
 - Every timestep caches its full top-K list (`raw_alternatives`,
   `PpocrResult`, `jpdict-core/src/ppocr.rs:53`; built per timestep at `:320-380`;
   mobile passes the same lists to `ctcDecodeTopK`).
