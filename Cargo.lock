@@ -54,7 +54,7 @@ dependencies = [
 [[package]]
 name = "accesskit_macos"
 version = "0.27.2"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -85,7 +85,7 @@ dependencies = [
 [[package]]
 name = "accesskit_windows"
 version = "0.35.2"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -2453,17 +2453,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mio"
-version = "1.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
-dependencies = [
- "libc",
- "wasi",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2780,6 +2769,7 @@ checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags 2.13.2",
  "objc2 0.6.5",
+ "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
 ]
@@ -3262,7 +3252,7 @@ checksum = "9c4482d912d7671a7cd2089794f90ef3bb5f5f8c738230fb0fcd50fa020f0ed3"
 [[package]]
 name = "parley_engine"
 version = "0.12.0"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "fontique",
  "harfrust",
@@ -3947,31 +3937,31 @@ dependencies = [
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "accesskit",
  "accesskit_macos",
  "accesskit_unix",
  "accesskit_windows",
  "arboard",
+ "async-channel",
+ "async-executor",
+ "async-io",
  "blake3",
- "block2 0.5.1",
  "block2 0.6.2",
  "bytemuck",
  "console_error_panic_hook",
- "futures-util",
+ "futures-lite",
  "half",
  "image",
  "js-sys",
  "libc",
  "libloading",
- "objc2 0.5.2",
  "objc2 0.6.5",
- "objc2-app-kit 0.2.2",
+ "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-core-video",
- "objc2-foundation 0.2.2",
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
  "parley",
@@ -3993,7 +3983,6 @@ dependencies = [
  "serde",
  "serde_json",
  "taffy",
- "tokio",
  "unicode-segmentation",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -4009,14 +3998,14 @@ dependencies = [
  "winit",
  "x11rb",
  "xkbcommon",
- "zbus 6.2.1",
+ "zbus 5.19.0",
  "zeroize",
 ]
 
 [[package]]
 name = "rune-core"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "js-sys",
  "libc",
@@ -4035,7 +4024,7 @@ dependencies = [
 [[package]]
 name = "rune-edit"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "js-sys",
  "parley",
@@ -4049,7 +4038,7 @@ dependencies = [
 [[package]]
 name = "rune-gpu"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -4062,6 +4051,7 @@ dependencies = [
  "parking_lot",
  "pollster 1.0.1",
  "raw-window-metal",
+ "rune-core",
  "rune-motion",
  "rune-staging",
  "wayland-client",
@@ -4075,13 +4065,13 @@ dependencies = [
 [[package]]
 name = "rune-image"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "blake3",
  "image",
  "js-sys",
- "objc2 0.5.2",
- "objc2-foundation 0.2.2",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
  "resvg",
  "rune-core",
  "wasm-bindgen",
@@ -4092,9 +4082,10 @@ dependencies = [
 [[package]]
 name = "rune-media"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "ash",
+ "blake3",
  "block2 0.6.2",
  "bytemuck",
  "libc",
@@ -4108,6 +4099,7 @@ dependencies = [
  "objc2-io-surface",
  "objc2-metal 0.3.2",
  "opuscule",
+ "pollster 1.0.1",
  "rune-core",
  "rune-gpu",
  "rune-image",
@@ -4121,16 +4113,16 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 
 [[package]]
 name = "rune-spell"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "js-sys",
- "objc2-app-kit 0.2.2",
- "objc2-foundation 0.2.2",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "rune-core",
  "rustc-hash 2.1.2",
  "spellbook",
@@ -4145,15 +4137,16 @@ dependencies = [
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "wgpu",
+ "windows",
 ]
 
 [[package]]
 name = "rune-taffy"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "stacker",
  "taffy",
@@ -4162,7 +4155,7 @@ dependencies = [
 [[package]]
 name = "rune-text"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "bytemuck",
  "fontique",
@@ -4175,16 +4168,26 @@ dependencies = [
  "rune-core",
  "rune-image",
  "rune-motion",
+ "rune-tiny-skia-path",
  "rustc-hash 2.1.2",
  "skrifa 0.44.0",
  "swash",
- "tiny-skia-path 0.11.4 (git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d)",
  "unicode-segmentation",
  "wasm-bindgen",
  "windows",
  "windows-core",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "rune-tiny-skia-path"
+version = "0.11.4"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
+dependencies = [
+ "arrayref",
+ "bytemuck",
+ "strict-num",
 ]
 
 [[package]]
@@ -4328,7 +4331,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "sctk-adwaita"
 version = "0.10.1"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "log",
  "smithay-client-toolkit",
@@ -4566,16 +4569,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "socket2"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4886,7 +4879,7 @@ dependencies = [
  "cfg-if",
  "log",
  "png 0.17.16",
- "tiny-skia-path 0.11.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tiny-skia-path",
 ]
 
 [[package]]
@@ -4894,16 +4887,6 @@ name = "tiny-skia-path"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
-dependencies = [
- "arrayref",
- "bytemuck",
- "strict-num",
-]
-
-[[package]]
-name = "tiny-skia-path"
-version = "0.11.4"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
 dependencies = [
  "arrayref",
  "bytemuck",
@@ -4927,25 +4910,7 @@ version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
- "bytes",
- "libc",
- "mio",
  "pin-project-lite",
- "signal-hook-registry",
- "socket2",
- "tokio-macros",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "tokio-macros"
-version = "2.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.9",
 ]
 
 [[package]]
@@ -5131,7 +5096,7 @@ dependencies = [
  "siphasher",
  "strict-num",
  "svgtypes",
- "tiny-skia-path 0.11.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tiny-skia-path",
  "xmlwriter",
 ]
 
@@ -5541,7 +5506,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "30.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -5899,7 +5864,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "git+https://github.com/anomalyco/rune?rev=8fbc395190dbff430db9d9fc515bb6ac8cc7d13d#8fbc395190dbff430db9d9fc515bb6ac8cc7d13d"
+source = "git+https://github.com/anomalyco/rune?rev=2a59b0f95b82972478a497c42151dbcb3ca5c69f#2a59b0f95b82972478a497c42151dbcb3ca5c69f"
 dependencies = [
  "ahash",
  "android-activity",
@@ -6278,34 +6243,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zbus"
-version = "6.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ddb2961d9587ef9f24ad14cde1c3bc4c5edc9f1525932a8cffdd5bd98886eb9"
-dependencies = [
- "async-trait",
- "bitflags 2.13.2",
- "endi",
- "futures-core",
- "hex",
- "libc",
- "ordered-stream",
- "rustix 1.1.4",
- "serde",
- "serde_repr",
- "socket2",
- "tokio",
- "uds_windows",
- "uuid",
- "windows-sys 0.61.2",
- "winnow",
- "zbus_macros 6.2.1",
- "zbus_utils",
- "zcheapstr",
- "zruntime",
-]
-
-[[package]]
 name = "zbus-lockstep"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6358,18 +6295,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zbus_macros"
-version = "6.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "083b38add47c340fc12ec560124fb1d9c23acb584f7021099f85ec6587a03c54"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.9",
- "zbus_utils",
-]
-
-[[package]]
 name = "zbus_names"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6389,19 +6314,6 @@ dependencies = [
  "serde",
  "winnow",
  "zvariant 5.15.1",
-]
-
-[[package]]
-name = "zbus_utils"
-version = "6.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af55e52da295311b368c45bcae221f020e28e97a2420360170ce389218e76ec7"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde",
- "syn 3.0.9",
- "winnow",
 ]
 
 [[package]]
@@ -6530,16 +6442,6 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[package]]
-name = "zruntime"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23ef5ed7d628cdf0af82f93dfe03330a8e37383bf7422a1d3d6eb72326680be5"
-dependencies = [
- "futures-core",
- "futures-io",
-]
 
 [[package]]
 name = "zune-core"
