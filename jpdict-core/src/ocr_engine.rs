@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use image::{DynamicImage, Rgba, RgbaImage};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::models::*;
 use crate::ppocr_ncnn::{DetNet, RecNet};
 
-use crate::char_boxes::{box_layout_snap, box_placement_cap, compute_char_boxes_line};
 #[cfg(test)]
 use crate::char_boxes::{
     compute_char_boxes, is_vertical_closing_punct, is_vertical_opening_punct, legacy_cells,
@@ -34,11 +34,120 @@ const PPOCR_DET_THRESH: f32 = 0.25;
 const PPOCR_DET_BOX_THRESH: f32 = 0.8;
 const PPOCR_DET_UNCLIP_RATIO: f32 = 0.7;
 
-
-
 /// Rec workers sharing the one loaded ncnn net (mobile fans out to 4;
 /// `PPOCR_REC_WORKERS` overrides for tuning).
 const DEFAULT_REC_WORKERS: usize = 4;
+
+/// Detection knobs for one page run.
+///
+/// The desktop viewer still drives these from its live keys and the `DET_*`
+/// environment; the page pipeline passes them explicitly so a mobile page can
+/// carry its own preferences without touching process-global state.
+#[derive(Clone, Copy, Debug)]
+pub struct DetectOptions {
+    pub model_size: u32,
+    pub long_side: u32,
+    pub thresh: f32,
+    pub unclip: f32,
+    pub furigana: bool,
+    pub expand_cap: f32,
+    pub h_down: f32,
+    pub v_trim: f32,
+    pub ruby_trim_vertical: bool,
+    pub split_overlap: bool,
+}
+
+impl Default for DetectOptions {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl DetectOptions {
+    /// The desktop's environment-driven defaults, exactly as `detect()` read
+    /// them before this record existed.
+    pub fn from_env() -> Self {
+        let model_size = std::env::var("DET_MODEL_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(PPOCR_DET_MODEL_SIZE);
+        DetectOptions {
+            model_size,
+            long_side: PPOCR_DET_LONG_SIDE,
+            thresh: default_det_thresh(),
+            unclip: default_det_unclip(),
+            furigana: false,
+            expand_cap: std::env::var("DET_EXPAND_CAP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(f32::INFINITY),
+            h_down: std::env::var("DET_H_DOWN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0),
+            v_trim: std::env::var("DET_V_SHRINK")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0),
+            ruby_trim_vertical: std::env::var("RUBY_TRIM_VERTICAL")
+                .map(|v| v != "0")
+                .unwrap_or(false),
+            split_overlap: std::env::var("DET_SPLIT_OVERLAP").is_ok(),
+        }
+    }
+}
+
+/// Recognition / char-box knobs for one page run. `None` fields fall back to
+/// the environment, which keeps the desktop CLI unchanged.
+#[derive(Clone, Copy, Debug)]
+pub struct RecognizeOptions {
+    pub cap: bool,
+    pub snap: bool,
+    pub uniform: bool,
+    pub rec_squish: f32,
+    pub workers: usize,
+    pub kana_size_correction: bool,
+    pub save_samples: bool,
+}
+
+impl Default for RecognizeOptions {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl RecognizeOptions {
+    pub fn from_env() -> Self {
+        RecognizeOptions {
+            cap: std::env::var("BOX_PLACEMENT_CAP")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            snap: std::env::var("BOX_LAYOUT_MODE")
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(1)
+                == 1,
+            uniform: std::env::var("BOX_UNIFORM_SIZE")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            rec_squish: std::env::var("REC_SQUISH")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.5)
+                .clamp(0.2, 1.0),
+            workers: std::env::var("PPOCR_REC_WORKERS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_REC_WORKERS),
+            kana_size_correction: true,
+            save_samples: true,
+        }
+    }
+}
+
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+}
 
 pub struct OcrEngine {
     /// PP-OCRv6 detection (ncnn DB) — shared core with the Android app.
@@ -290,6 +399,7 @@ pub(crate) fn fit_components(
     img_top: f32,
     scale_w: f32,
     scale_h: f32,
+    cancel: Option<&AtomicBool>,
 ) -> (Vec<RotatedBox>, Vec<RotatedBox>) {
     let ow = out_w as usize;
     let oh = out_h as usize;
@@ -299,6 +409,9 @@ pub(crate) fn fit_components(
     let mut pre_quads: Vec<RotatedBox> = Vec::new();
     let mut quads: Vec<RotatedBox> = Vec::new();
     for y in 0..oh {
+        if y % 32 == 0 && cancelled(cancel) {
+            break;
+        }
         for x in 0..ow {
             let idx = y * ow + x;
             if visited[idx] != 0 || prob_map.get(idx).copied().unwrap_or(0.0) <= det_thresh {
@@ -496,12 +609,7 @@ fn trim_ruby_gutter_vertical(
     image: &DynamicImage,
 ) -> usize {
     let (luminance, width, height) = gutter_luminance(image);
-    crate::gutter_trim::trim_ruby_gutter_vertical(
-        pairs,
-        &luminance,
-        width,
-        height,
-    )
+    crate::gutter_trim::trim_ruby_gutter_vertical(pairs, &luminance, width, height)
 }
 
 // The pure char-box stages (legacy columns, ink snap, punctuation rules,
@@ -510,7 +618,11 @@ fn trim_ruby_gutter_vertical(
 // calls [`crate::char_boxes::compute_char_boxes_line`] here.
 
 impl OcrEngine {
-    pub fn new(model_dir: &str, recognition_mode: RecognitionMode, batch_size: usize) -> Result<Self> {
+    pub fn new(
+        model_dir: &str,
+        recognition_mode: RecognitionMode,
+        batch_size: usize,
+    ) -> Result<Self> {
         let model_path = Path::new(model_dir);
 
         // PP-OCRv6 ncnn detection (shared core with the mobile app).
@@ -526,7 +638,10 @@ impl OcrEngine {
         }
         let kana_size = load_kana_size(model_path);
 
-        println!("Recognition mode: {:?}, batch size: {}", recognition_mode, batch_size);
+        println!(
+            "Recognition mode: {:?}, batch size: {}",
+            recognition_mode, batch_size
+        );
 
         Ok(OcrEngine {
             det_net,
@@ -554,13 +669,31 @@ impl OcrEngine {
         self.det_unclip_override.unwrap_or_else(default_det_unclip)
     }
 
-
     /// Detects bounding boxes using PP-OCRv6 segmentation-based detection model.
     /// The model outputs a probability map [1,1,H,W]. Post-processing:
     /// threshold → connected components → min-area rotated rects (PP-OCR's
     /// minAreaRect) → sort. Returns axis-aligned boxes for display plus the
     /// rotated rects for crop un-rotation.
     pub fn detect(&mut self, image: &DynamicImage) -> Result<DetectionResult> {
+        let mut opts = DetectOptions::from_env();
+        opts.thresh = self.det_thresh();
+        opts.unclip = self.det_unclip();
+        opts.furigana = self.det_furigana;
+        self.detect_with(image, &opts, None)
+    }
+
+    /// [`detect`](Self::detect) with explicit knobs and an optional
+    /// cooperative-cancel flag. The page pipeline uses this so one page run
+    /// carries its own preferences instead of the process environment.
+    pub fn detect_with(
+        &mut self,
+        image: &DynamicImage,
+        opts: &DetectOptions,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<DetectionResult> {
+        if cancelled(cancel) {
+            anyhow::bail!("detection cancelled");
+        }
         let orig_w = image.width() as f32;
         let orig_h = image.height() as f32;
 
@@ -569,12 +702,8 @@ impl OcrEngine {
         // content in a square and fill the border with gray. This matches the
         // mobile detect() preprocessing (and therefore the model's training
         // geometry) instead of the old top-left 32-multiple padding.
-        let model_size = std::env::var("DET_MODEL_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(PPOCR_DET_MODEL_SIZE)
-            .clamp(320, 960);
-        let target_long = PPOCR_DET_LONG_SIDE.min(model_size);
+        let model_size = opts.model_size.clamp(320, 960);
+        let target_long = opts.long_side.min(model_size);
         let scale = target_long as f32 / orig_w.max(orig_h);
         let resize_w = ((orig_w * scale).round() as u32).max(32);
         let resize_h = ((orig_h * scale).round() as u32).max(32);
@@ -635,7 +764,9 @@ impl OcrEngine {
                         up[y * w + x] = raw_map[sy * dim as usize + sx];
                     }
                 }
-                eprintln!("[PP-OCR DET] upsampled det output {dim}x{dim} -> {model_size}x{model_size}");
+                eprintln!(
+                    "[PP-OCR DET] upsampled det output {dim}x{dim} -> {model_size}x{model_size}"
+                );
                 (up, model_size, model_size)
             } else {
                 let side = (raw_map.len() as f64).sqrt() as u32;
@@ -667,14 +798,8 @@ impl OcrEngine {
         // space, then RotatedGeometry.fitQuad. The viewer's tuning keys write
         // the overrides; DET_THRESH / DET_UNCLIP env vars still work when no
         // override is set.
-        let det_thresh = self.det_thresh();
-        let det_unclip = self.det_unclip();
-        // PC-only expansion cap in source pixels; the default is Android's
-        // uncapped DB unclip.
-        let expand_cap: f32 = std::env::var("DET_EXPAND_CAP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(f32::INFINITY);
+        let det_thresh = opts.thresh;
+        let det_unclip = opts.unclip;
 
         let (pre_quads, quads) = fit_components(
             &prob_map,
@@ -682,11 +807,12 @@ impl OcrEngine {
             out_h,
             det_thresh,
             det_unclip,
-            expand_cap,
+            opts.expand_cap,
             img_left,
             img_top,
             scale_w,
             scale_h,
+            cancel,
         );
 
         // 6-9. Mobile detectRotated's post-fit stages: furigana rejection on
@@ -697,27 +823,19 @@ impl OcrEngine {
             &quads,
             orig_w as i32,
             orig_h as i32,
-            self.det_furigana,
+            opts.furigana,
         );
 
         // The PC-only orientation knobs default to Android behaviour (off).
-        let h_down: f32 = std::env::var("DET_H_DOWN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
-        let v_trim: f32 = std::env::var("DET_V_SHRINK")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1.0);
         let mut pp_pairs: Vec<(BoundingBox, RotatedBox)> = Vec::with_capacity(kept.len());
         for quad_in in &kept {
             let mut quad = *quad_in;
-            if h_down != 0.0 && !quad.is_vertical() && quad.h >= 24.0 {
-                quad.h += h_down;
-                quad.cy += h_down / 2.0;
+            if opts.h_down != 0.0 && !quad.is_vertical() && quad.h >= 24.0 {
+                quad.h += opts.h_down;
+                quad.cy += opts.h_down / 2.0;
             }
-            if v_trim != 1.0 && quad.is_vertical() {
-                quad.h *= v_trim;
+            if opts.v_trim != 1.0 && quad.is_vertical() {
+                quad.h *= opts.v_trim;
             }
             let (bx, by, bw, bh) = quad.aabb();
             pp_pairs.push((
@@ -737,21 +855,26 @@ impl OcrEngine {
         for (i, (b, r)) in pp_pairs.iter().enumerate() {
             eprintln!(
                 "  [{i}] x={} y={} w={} h={} angle={:.1}° c={:.3}",
-                b.x, b.y, b.w, b.h, r.angle.to_degrees(), b.confidence
+                b.x,
+                b.y,
+                b.w,
+                b.h,
+                r.angle.to_degrees(),
+                b.confidence
             );
         }
 
-        // PC-only ruby-gutter trim (#48) behind RUBY_TRIM_VERTICAL: Android's
-        // default rotated path does not trim, so the default is off (D7.2).
-        if std::env::var("RUBY_TRIM_VERTICAL").map(|v| v != "0").unwrap_or(false) {
+        // Ruby-gutter trim (#48): Android's default rotated path does not
+        // trim, so the desktop and page defaults keep it off (D7.2).
+        if opts.ruby_trim_vertical {
             let trimmed = trim_ruby_gutter_vertical(&mut pp_pairs, image);
             if trimmed > 0 {
                 eprintln!("[PP-OCR DET] rubyTrim applied to {trimmed} box(es)");
             }
         }
-        // PC-only stacked-overlap split (DET_SPLIT_OVERLAP, off by default):
-        // Android's default rotated path does not split.
-        if std::env::var("DET_SPLIT_OVERLAP").is_ok() {
+        // Stacked-overlap split (DET_SPLIT_OVERLAP, off by default): Android's
+        // default rotated path does not split.
+        if opts.split_overlap {
             let h_indices: Vec<usize> = pp_pairs
                 .iter()
                 .enumerate()
@@ -778,7 +901,8 @@ impl OcrEngine {
                     let lower_bottom = pp_pairs[lower].0.y + pp_pairs[lower].0.h;
                     // Check vertical overlap: upper box bottom > lower box top
                     if upper_bottom > pp_pairs[lower].0.y {
-                        let overlap_mid = (pp_pairs[lower].0.y + upper_bottom.min(lower_bottom)) / 2;
+                        let overlap_mid =
+                            (pp_pairs[lower].0.y + upper_bottom.min(lower_bottom)) / 2;
                         pp_pairs[upper].0.h = (overlap_mid - pp_pairs[upper].0.y).max(1);
                         pp_pairs[lower].0.y = pp_pairs[upper].0.y + pp_pairs[upper].0.h;
                         pp_pairs[lower].0.h = (lower_bottom - pp_pairs[lower].0.y).max(1);
@@ -794,7 +918,12 @@ impl OcrEngine {
         for (i, (b, r)) in pp_pairs.iter().enumerate() {
             eprintln!(
                 "  [{i}] x={} y={} w={} h={} angle={:.1}° c={:.3}",
-                b.x, b.y, b.w, b.h, r.angle.to_degrees(), b.confidence
+                b.x,
+                b.y,
+                b.w,
+                b.h,
+                r.angle.to_degrees(),
+                b.confidence
             );
         }
 
@@ -830,9 +959,13 @@ impl OcrEngine {
             let mut rgba = image.to_rgba8();
             for (b, r) in boxes.iter().zip(rotated.iter()) {
                 // AABB in red
-                let rect = imageproc::rect::Rect::at(b.x, b.y).of_size(b.w.max(1) as u32, b.h.max(1) as u32);
+                let rect = imageproc::rect::Rect::at(b.x, b.y)
+                    .of_size(b.w.max(1) as u32, b.h.max(1) as u32);
                 imageproc::drawing::draw_hollow_rect_mut(
-                    &mut rgba, rect, Rgba([255u8, 60u8, 60u8, 255u8]));
+                    &mut rgba,
+                    rect,
+                    Rgba([255u8, 60u8, 60u8, 255u8]),
+                );
                 // Rotated quad in green
                 let (ux, uy) = (r.angle.cos(), r.angle.sin());
                 let (vx, vy) = (-uy, ux);
@@ -848,7 +981,11 @@ impl OcrEngine {
                     let (x0, y0) = pts[k];
                     let (x1, y1) = pts[(k + 1) % 4];
                     imageproc::drawing::draw_line_segment_mut(
-                        &mut rgba, (x0, y0), (x1, y1), Rgba([60u8, 255u8, 60u8, 255u8]));
+                        &mut rgba,
+                        (x0, y0),
+                        (x1, y1),
+                        Rgba([60u8, 255u8, 60u8, 255u8]),
+                    );
                 }
             }
             let ts = std::time::SystemTime::now()
@@ -866,9 +1003,10 @@ impl OcrEngine {
         Ok(DetectionResult { boxes, rotated })
     }
 
-
-
-    pub fn sort_detected_boxes(&self, mut boxes: Vec<(BoundingBox, RotatedBox)>) -> Vec<(BoundingBox, RotatedBox)> {
+    pub fn sort_detected_boxes(
+        &self,
+        mut boxes: Vec<(BoundingBox, RotatedBox)>,
+    ) -> Vec<(BoundingBox, RotatedBox)> {
         // Separate by orientation — the frame's own sizes decide, like mobile
         // isVerticalLineBox (near-square counts as horizontal).
         let mut horizontal: Vec<(BoundingBox, RotatedBox)> = Vec::new();
@@ -898,15 +1036,23 @@ impl OcrEngine {
         boxes
     }
 
-
-
-
     // Modified: return the annotated image in-memory when `render` is true
     /// Just line detection — returns raw bounding boxes (fast, no character recognition).
     /// Used by the streaming OCR pipeline to show the image immediately.
     pub fn detect_lines(&mut self, image: &DynamicImage) -> Result<DetectionResult> {
-        let det = self.detect(image)?;
-        let pairs: Vec<(BoundingBox, RotatedBox)> = det.boxes.into_iter().zip(det.rotated).collect();
+        self.detect_lines_with(image, &DetectOptions::from_env(), None)
+    }
+
+    /// [`detect_lines`](Self::detect_lines) with explicit knobs and cancel.
+    pub fn detect_lines_with(
+        &mut self,
+        image: &DynamicImage,
+        opts: &DetectOptions,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<DetectionResult> {
+        let det = self.detect_with(image, opts, cancel)?;
+        let pairs: Vec<(BoundingBox, RotatedBox)> =
+            det.boxes.into_iter().zip(det.rotated).collect();
         // Mobile's axis-aligned path merges overlapping boxes
         // (`mergeOverlappingBoxes`); the rotated path deliberately does not.
         // Apply the same rule to the straight boxes so a long line whose DB
@@ -923,7 +1069,6 @@ impl OcrEngine {
 /// here so `detect_lines`, the unit tests below and `crate::conformance` keep
 /// resolving it through this module.
 pub(crate) use crate::merge_boxes::merge_straight_boxes;
-
 
 // ---------------------------------------------------------------------------
 // Streaming recognition (standalone, Send-friendly)
@@ -981,7 +1126,15 @@ pub fn recognize_boxes_streaming(
     _out_dir: &std::path::Path,
 ) -> Result<()> {
     recognize_boxes_core(
-        image, sorted, rotated, rec, kana_size, ppocr_vocab, rec_remap,
+        image,
+        sorted,
+        rotated,
+        rec,
+        kana_size,
+        ppocr_vocab,
+        rec_remap,
+        &RecognizeOptions::from_env(),
+        None,
         std::sync::Arc::new(move |idx, ann| sender.send((idx, ann)).is_ok()),
     )
 }
@@ -1003,11 +1156,46 @@ pub fn recognize_boxes_collect(
     _recognition_mode: RecognitionMode,
     _out_dir: &std::path::Path,
 ) -> Result<Vec<(usize, DetectedAnnotation)>> {
+    recognize_boxes_collect_with(
+        image,
+        sorted,
+        rotated,
+        rec,
+        kana_size,
+        ppocr_vocab,
+        rec_remap,
+        &RecognizeOptions::from_env(),
+        None,
+    )
+}
+
+/// [`recognize_boxes_collect`] with explicit char-box / squish / worker
+/// knobs and an optional cooperative-cancel flag.
+#[allow(clippy::too_many_arguments)]
+pub fn recognize_boxes_collect_with(
+    image: &DynamicImage,
+    sorted: &[BoundingBox],
+    rotated: &[RotatedBox],
+    rec: Option<std::sync::Arc<RecNet>>,
+    kana_size: Option<std::sync::Arc<crate::kana_size::KanaSizeNet>>,
+    ppocr_vocab: &[String],
+    rec_remap: &[i32],
+    opts: &RecognizeOptions,
+    cancel: Option<std::sync::Arc<AtomicBool>>,
+) -> Result<Vec<(usize, DetectedAnnotation)>> {
     let collected: std::sync::Arc<std::sync::Mutex<Vec<(usize, DetectedAnnotation)>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = std::sync::Arc::clone(&collected);
     recognize_boxes_core(
-        image, sorted, rotated, rec, kana_size, ppocr_vocab, rec_remap,
+        image,
+        sorted,
+        rotated,
+        rec,
+        kana_size,
+        ppocr_vocab,
+        rec_remap,
+        opts,
+        cancel,
         std::sync::Arc::new(move |idx, ann| {
             sink.lock().unwrap().push((idx, ann));
             true
@@ -1022,8 +1210,9 @@ pub fn recognize_boxes_collect(
     Ok(results)
 }
 
-/// Shared fan-out: build one job per box, recognize with `PPOCR_REC_WORKERS`
+/// Shared fan-out: build one job per box, recognize with `opts.workers`
 /// workers and hand each finished annotation to `emit`.
+#[allow(clippy::too_many_arguments)]
 fn recognize_boxes_core(
     image: &DynamicImage,
     sorted: &[BoundingBox],
@@ -1032,10 +1221,15 @@ fn recognize_boxes_core(
     kana_size: Option<std::sync::Arc<crate::kana_size::KanaSizeNet>>,
     ppocr_vocab: &[String],
     rec_remap: &[i32],
+    opts: &RecognizeOptions,
+    cancel: Option<std::sync::Arc<AtomicBool>>,
     emit: std::sync::Arc<ResultEmitter>,
 ) -> Result<()> {
     use std::time::Instant;
     let t_recognize = Instant::now();
+    if cancelled(cancel.as_deref()) {
+        anyhow::bail!("recognition cancelled");
+    }
 
     // Build a single job queue from ALL boxes (horizontal + vertical).
     // Each job carries its orientation so workers can choose the right
@@ -1055,6 +1249,9 @@ fn recognize_boxes_core(
     }
     let mut jobs: Vec<Job> = Vec::with_capacity(sorted.len());
     for (i, bbox) in sorted.iter().enumerate() {
+        if i % 8 == 0 && cancelled(cancel.as_deref()) {
+            anyhow::bail!("recognition cancelled");
+        }
         let rot = rotated.get(i).copied();
         let (crop, crop_x, crop_y, crop_w, crop_h, is_vertical, job_rot) = match rot {
             Some(r) if r.is_rotated() => {
@@ -1118,214 +1315,261 @@ fn recognize_boxes_core(
             let rec = rec.clone().expect("rec is Some");
             // Workers share the one loaded ncnn net; each inference creates
             // its own extractor (the mobile app fans out the same way).
-            let workers = std::env::var("PPOCR_REC_WORKERS")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(DEFAULT_REC_WORKERS)
-                .clamp(1, n_jobs);
+            let workers = opts.workers.clamp(1, n_jobs);
+            let opts = *opts;
             println!(
                 "[PP-OCR] Processing {} boxes ({} workers, ncnn rec)",
                 n_jobs, workers
             );
             for _worker_id in 0..workers {
-            let q = std::sync::Arc::clone(&job_queue);
-            let rec = std::sync::Arc::clone(&rec);
-            let kana = kana_size.clone();
-            let voc = ppocr_vocab.to_vec();
-            let remap = rec_remap.to_vec();
-            let emit = std::sync::Arc::clone(&emit);
+                let q = std::sync::Arc::clone(&job_queue);
+                let rec = std::sync::Arc::clone(&rec);
+                let kana = kana_size.clone();
+                let voc = ppocr_vocab.to_vec();
+                let remap = rec_remap.to_vec();
+                let emit = std::sync::Arc::clone(&emit);
+                let cancel = cancel.clone();
 
-            handles.push(std::thread::spawn(move || loop {
-                let job = { let mut ql = q.lock().unwrap(); ql.pop_front() };
-                let job = match job { Some(j) => j, None => return };
+                handles.push(std::thread::spawn(move || loop {
+                    if cancelled(cancel.as_deref()) {
+                        return;
+                    }
+                    let job = {
+                        let mut ql = q.lock().unwrap();
+                        ql.pop_front()
+                    };
+                    let job = match job {
+                        Some(j) => j,
+                        None => return,
+                    };
 
-                let result = crate::ppocr::recognize_ppocr_batch(
-                    &rec, &[&job.crop], &voc, &remap,
-                );
+                    let result = crate::ppocr::recognize_crop_with_squish(
+                        &rec,
+                        &job.crop,
+                        &voc,
+                        &remap,
+                        opts.rec_squish,
+                        cancel.as_deref(),
+                    );
 
-                if let Ok(mut results) = result {
-                    if let Some(res) = results.pop() {
-                        let mut text = res.text;
-                        let mut alternatives = res.alternatives;
-                        let char_cols = res.char_cols;
-                        let seq_len_total = res.seq_len_total;
-                        let mut raw_alternatives = res.raw_alternatives;
-                        if text.is_empty() { continue; }
+                    if let Ok(res) = result {
+                        {
+                            let mut text = res.text;
+                            let mut alternatives = res.alternatives;
+                            let char_cols = res.char_cols;
+                            let seq_len_total = res.seq_len_total;
+                            let mut raw_alternatives = res.raw_alternatives;
+                            if text.is_empty() {
+                                continue;
+                            }
 
-                        // Vertical punctuation normalisation at emit (#56/#63):
-                        // ASCII `?` and horizontal `…`/`‥` become their vertical
-                        // presentation forms in the text and the alternatives
-                        // BEFORE char boxes, so the substitutes get full-em
-                        // metrics (dictionary lookup folds them back).
-                        if job.is_vertical {
-                            text = crate::util::japanese::vertical_punctuation(&text);
-                            for alts in alternatives.iter_mut() {
-                                for (c, _) in alts.iter_mut() {
-                                    *c = crate::util::japanese::vertical_punctuation_char(*c);
+                            // Vertical punctuation normalisation at emit (#56/#63):
+                            // ASCII `?` and horizontal `…`/`‥` become their vertical
+                            // presentation forms in the text and the alternatives
+                            // BEFORE char boxes, so the substitutes get full-em
+                            // metrics (dictionary lookup folds them back).
+                            if job.is_vertical {
+                                text = crate::util::japanese::vertical_punctuation(&text);
+                                for alts in alternatives.iter_mut() {
+                                    for (c, _) in alts.iter_mut() {
+                                        *c = crate::util::japanese::vertical_punctuation_char(*c);
+                                    }
+                                }
+                                // Cached raw lists get the same treatment (mobile
+                                // `recRaw`), so a later re-decode cannot reintroduce
+                                // the horizontal forms.
+                                for alts in raw_alternatives.iter_mut() {
+                                    for (c, _) in alts.iter_mut() {
+                                        *c = crate::util::japanese::vertical_punctuation_char(*c);
+                                    }
                                 }
                             }
-                            // Cached raw lists get the same treatment (mobile
-                            // `recRaw`), so a later re-decode cannot reintroduce
-                            // the horizontal forms.
-                            for alts in raw_alternatives.iter_mut() {
-                                for (c, _) in alts.iter_mut() {
-                                    *c = crate::util::japanese::vertical_punctuation_char(*c);
+
+                            // #44 kana small/large correction, at the same pipeline
+                            // position as mobile: after recognition (and the
+                            // vertical punctuation normalisation) and before the
+                            // char-box layout. Mobile runs KanaSizeFix.correctPage
+                            // over the ordered page on IO; here results stream one
+                            // line at a time, and a line's windows never cross a
+                            // line boundary, so correcting a one-line page is the
+                            // same decision. Only the text changes: the flip
+                            // preserves the character count, so charCols/char boxes
+                            // and the recogniser's alternatives stay aligned and are
+                            // not rewritten (mobile rewrites text + its `overrides`
+                            // map only, which this port does not have). Running
+                            // before save_line_sample keeps the dataset sidecar
+                            // label matching the displayed text.
+                            if let Some(kana) = kana.as_ref().filter(|_| opts.kana_size_correction)
+                            {
+                                let probe = LineResult {
+                                    text: text.clone(),
+                                    char_boxes: Vec::new(),
+                                    alternatives: Vec::new(),
+                                    raw_alternatives: Vec::new(),
+                                    sample_txt: None,
+                                    is_vertical: job.is_vertical,
+                                    chunk_boxes: Vec::new(),
+                                    ..Default::default()
+                                };
+                                let correction = crate::kana_size::correct_lines(
+                                    std::slice::from_ref(&probe),
+                                    |w, b| kana.logits(w, b).ok(),
+                                    crate::kana_size::EPSILON,
+                                );
+                                if let Some(line) = correction.lines.first() {
+                                    text = line.text.clone();
+                                }
+                                if !correction.flips.is_empty() {
+                                    let flips: Vec<String> = correction
+                                        .flips
+                                        .iter()
+                                        .map(|f| {
+                                            format!(
+                                                "{}→{}@{} p={:.3}",
+                                                f.from, f.to, f.index, f.p_big
+                                            )
+                                        })
+                                        .collect();
+                                    eprintln!(
+                                        "[kana] line {}: {} flip(s): {}",
+                                        job.idx,
+                                        flips.len(),
+                                        flips.join(", ")
+                                    );
+                                }
+                                // Mobile surfaces the declined detail so the
+                                // correction is visible whether or not it fired;
+                                // the summary carries no surrounding text.
+                                if !correction.declined.is_empty() {
+                                    eprintln!(
+                                        "[kana] line {} declined: {}",
+                                        job.idx,
+                                        correction.declined_summary()
+                                    );
                                 }
                             }
-                        }
 
-                        // #44 kana small/large correction, at the same pipeline
-                        // position as mobile: after recognition (and the
-                        // vertical punctuation normalisation) and before the
-                        // char-box layout. Mobile runs KanaSizeFix.correctPage
-                        // over the ordered page on IO; here results stream one
-                        // line at a time, and a line's windows never cross a
-                        // line boundary, so correcting a one-line page is the
-                        // same decision. Only the text changes: the flip
-                        // preserves the character count, so charCols/char boxes
-                        // and the recogniser's alternatives stay aligned and are
-                        // not rewritten (mobile rewrites text + its `overrides`
-                        // map only, which this port does not have). Running
-                        // before save_line_sample keeps the dataset sidecar
-                        // label matching the displayed text.
-                        if let Some(kana) = kana.as_ref() {
-                            let probe = LineResult {
-                                text: text.clone(),
-                                char_boxes: Vec::new(),
-                                alternatives: Vec::new(),
-                                raw_alternatives: Vec::new(),
-                                sample_txt: None,
-                                is_vertical: job.is_vertical,
-                                chunk_boxes: Vec::new(),
-                                ..Default::default()
+                            // Dataset collection: save the line crop + detected text
+                            let sample_txt = if opts.save_samples {
+                                save_line_sample(&job.crop, &text)
+                            } else {
+                                None
                             };
-                            let correction = crate::kana_size::correct_lines(
-                                std::slice::from_ref(&probe),
-                                |w, b| kana.logits(w, b).ok(),
-                                crate::kana_size::EPSILON,
-                            );
-                            if let Some(line) = correction.lines.first() {
-                                text = line.text.clone();
-                            }
-                            if !correction.flips.is_empty() {
-                                let flips: Vec<String> = correction
-                                    .flips
+
+                            // Char boxes: CAP (mobile `PREF_BOX_PLACEMENT_CAP`,
+                            // the CTC-anchored placement) by default,
+                            // computeCharBoxes (#49) under `BOX_PLACEMENT_CAP=0`.
+                            // Rotated lines compute in the upright local crop
+                            // (0,0,localW,localH) and map back through the frame;
+                            // axis lines use the UNCLAMPED rect frame (the crop
+                            // itself stays clamped, D6).
+                            let need_pixels = opts.cap || opts.snap;
+                            let snap_pixels =
+                                if need_pixels && job.crop.width() >= 8 && job.crop.height() >= 8 {
+                                    let rgb = job.crop.to_rgb8();
+                                    Some((rgb.into_raw(), job.crop.width(), job.crop.height()))
+                                } else {
+                                    None
+                                };
+                            let pixels =
+                                snap_pixels.as_ref().map(|(p, w, h)| (p.as_slice(), *w, *h));
+                            let steps = Some(raw_alternatives.as_slice());
+                            let char_boxes = if let Some(r) = job.rot.filter(|r| r.is_rotated()) {
+                                let lw = r.w.round().max(4.0) as u32;
+                                let lh = r.h.round().max(4.0) as u32;
+                                let local = crate::char_boxes::compute_char_boxes_line_opts(
+                                    &text,
+                                    &char_cols,
+                                    seq_len_total,
+                                    0,
+                                    0,
+                                    lw,
+                                    lh,
+                                    job.is_vertical,
+                                    pixels,
+                                    steps,
+                                    opts.cap,
+                                    opts.snap,
+                                    opts.uniform,
+                                );
+                                local
                                     .iter()
-                                    .map(|f| {
-                                        format!(
-                                            "{}→{}@{} p={:.3}",
-                                            f.from, f.to, f.index, f.p_big
+                                    .map(|b| {
+                                        r.map_local_rect(
+                                            b.x as f32, b.y as f32, b.w as f32, b.h as f32,
                                         )
                                     })
-                                    .collect();
-                                eprintln!(
-                                    "[kana] line {}: {} flip(s): {}",
-                                    job.idx,
-                                    flips.len(),
-                                    flips.join(", ")
-                                );
+                                    .collect()
+                            } else {
+                                crate::char_boxes::compute_char_boxes_line_opts(
+                                    &text,
+                                    &char_cols,
+                                    seq_len_total,
+                                    job.bbox.x,
+                                    job.bbox.y,
+                                    job.bbox.w.max(0) as u32,
+                                    job.bbox.h.max(0) as u32,
+                                    job.is_vertical,
+                                    pixels,
+                                    steps,
+                                    opts.cap,
+                                    opts.snap,
+                                    opts.uniform,
+                                )
+                            };
+
+                            let (final_text, final_alts) = (text, alternatives);
+
+                            let annotation = DetectedAnnotation {
+                                bbox: job.bbox.clone(),
+                                quad: job.rot,
+                                line: Some(LineResult {
+                                    text: final_text,
+                                    char_boxes,
+                                    alternatives: final_alts,
+                                    raw_alternatives,
+                                    sample_txt,
+                                    is_vertical: job.is_vertical,
+                                    chunk_boxes: vec![BoundingBox::new(
+                                        job.crop_x as i32,
+                                        job.crop_y as i32,
+                                        job.crop_w as i32,
+                                        job.crop_h as i32,
+                                        1.0,
+                                    )],
+                                    // Mobile `LineResult`: the CTC columns and the
+                                    // crop facts the gap detector converts
+                                    // timestep spacings to pixels with.
+                                    char_cols,
+                                    crop_x: job.crop_x as i32,
+                                    crop_y: job.crop_y as i32,
+                                    crop_w: job.crop_w as i32,
+                                    crop_h: job.crop_h as i32,
+                                    seq_len_total: seq_len_total as i32,
+                                    ..Default::default()
+                                }),
+                            };
+                            if !emit(job.idx, annotation) {
+                                return;
                             }
-                            // Mobile surfaces the declined detail so the
-                            // correction is visible whether or not it fired;
-                            // the summary carries no surrounding text.
-                            if !correction.declined.is_empty() {
-                                eprintln!(
-                                    "[kana] line {} declined: {}",
-                                    job.idx,
-                                    correction.declined_summary()
-                                );
-                            }
+                            std::thread::yield_now();
                         }
-
-                        // Dataset collection: save the line crop + detected text
-                        let sample_txt = save_line_sample(&job.crop, &text);
-
-                        // Char boxes: CAP (mobile `PREF_BOX_PLACEMENT_CAP`,
-                        // the CTC-anchored placement) by default,
-                        // computeCharBoxes (#49) under `BOX_PLACEMENT_CAP=0`.
-                        // Rotated lines compute in the upright local crop
-                        // (0,0,localW,localH) and map back through the frame;
-                        // axis lines use the UNCLAMPED rect frame (the crop
-                        // itself stays clamped, D6).
-                        let need_pixels = box_placement_cap() || box_layout_snap();
-                        let snap_pixels = if need_pixels
-                            && job.crop.width() >= 8
-                            && job.crop.height() >= 8
-                        {
-                            let rgb = job.crop.to_rgb8();
-                            Some((rgb.into_raw(), job.crop.width(), job.crop.height()))
-                        } else {
-                            None
-                        };
-                        let pixels = snap_pixels
-                            .as_ref()
-                            .map(|(p, w, h)| (p.as_slice(), *w, *h));
-                        let steps = Some(raw_alternatives.as_slice());
-                        let char_boxes = if let Some(r) = job.rot.filter(|r| r.is_rotated()) {
-                            let lw = r.w.round().max(4.0) as u32;
-                            let lh = r.h.round().max(4.0) as u32;
-                            let local = compute_char_boxes_line(
-                                &text, &char_cols, seq_len_total,
-                                0, 0, lw, lh, job.is_vertical, pixels, steps,
-                            );
-                            local
-                                .iter()
-                                .map(|b| {
-                                    r.map_local_rect(
-                                        b.x as f32, b.y as f32, b.w as f32, b.h as f32,
-                                    )
-                                })
-                                .collect()
-                        } else {
-                            compute_char_boxes_line(
-                                &text, &char_cols, seq_len_total,
-                                job.bbox.x, job.bbox.y,
-                                job.bbox.w.max(0) as u32, job.bbox.h.max(0) as u32,
-                                job.is_vertical, pixels, steps,
-                            )
-                        };
-
-                        let (final_text, final_alts) = (text, alternatives);
-
-                        let annotation = DetectedAnnotation {
-                            bbox: job.bbox.clone(),
-                            quad: job.rot,
-                            line: Some(LineResult {
-                                text: final_text,
-                                char_boxes,
-                                alternatives: final_alts,
-                                raw_alternatives,
-                                sample_txt,
-                                is_vertical: job.is_vertical,
-                                chunk_boxes: vec![BoundingBox::new(
-                                    job.crop_x as i32, job.crop_y as i32,
-                                    job.crop_w as i32, job.crop_h as i32, 1.0,
-                                )],
-                                // Mobile `LineResult`: the CTC columns and the
-                                // crop facts the gap detector converts
-                                // timestep spacings to pixels with.
-                                char_cols,
-                                crop_x: job.crop_x as i32,
-                                crop_y: job.crop_y as i32,
-                                crop_w: job.crop_w as i32,
-                                crop_h: job.crop_h as i32,
-                                seq_len_total: seq_len_total as i32,
-                                ..Default::default()
-                            }),
-                        };
-                        if !emit(job.idx, annotation) { return; }
-                        std::thread::yield_now();
                     }
-                }
-            }));
+                }));
+            }
         }
+        for h in handles {
+            h.join().unwrap();
         }
-        for h in handles { h.join().unwrap(); }
+    }
+    if cancelled(cancel.as_deref()) {
+        anyhow::bail!("recognition cancelled");
     }
     let recognize_ms = t_recognize.elapsed().as_secs_f64() * 1000.0;
     println!(
         "[OCR timing] Character recognition: {:>8.2} ms  ({} boxes, thread)",
-        recognize_ms, sorted.len()
+        recognize_ms,
+        sorted.len()
     );
     Ok(())
 }
@@ -1371,7 +1615,9 @@ mod tests {
     }
 
     fn components(map: &[f32], w: usize, h: usize, cap: f32) -> (Vec<RotatedBox>, Vec<RotatedBox>) {
-        fit_components(map, w as u32, h as u32, 0.3, 1.5, cap, 0.0, 0.0, 1.0, 1.0)
+        fit_components(
+            map, w as u32, h as u32, 0.3, 1.5, cap, 0.0, 0.0, 1.0, 1.0, None,
+        )
     }
 
     /// D3.1: mobile flood-fills the component, so an interior hole is not a
@@ -1389,7 +1635,10 @@ mod tests {
             (x - 4.5).abs() < 0.01 && (y - 4.5).abs() < 0.01,
             "frame origin {x},{y}"
         );
-        assert!((w - 20.0).abs() < 0.01 && (h - 20.0).abs() < 0.01, "{w}x{h}");
+        assert!(
+            (w - 20.0).abs() < 0.01 && (h - 20.0).abs() < 0.01,
+            "{w}x{h}"
+        );
         // Unclip grows both axes on the frame (no cap).
         assert!(uncl[0].w > pre[0].w && uncl[0].h > pre[0].h);
     }
@@ -1422,12 +1671,17 @@ mod tests {
     #[test]
     fn fit_components_expansion_is_uncapped_by_default() {
         // A 40x10 block: area 400, perimeter 100, expand 6 per side.
-        let map = prob_map(60, 30, |x, y| (10..50).contains(&x) && (10..20).contains(&y));
+        let map = prob_map(60, 30, |x, y| {
+            (10..50).contains(&x) && (10..20).contains(&y)
+        });
         let (pre, uncl) = components(&map, 60, 30, f32::INFINITY);
         assert_eq!(pre.len(), 1);
         assert!((uncl[0].w - pre[0].w - 12.0).abs() < 0.01, "uncapped");
         let (_, capped) = components(&map, 60, 30, 2.0);
-        assert!((capped[0].w - pre[0].w - 4.0).abs() < 0.01, "capped at 2/side");
+        assert!(
+            (capped[0].w - pre[0].w - 4.0).abs() < 0.01,
+            "capped at 2/side"
+        );
     }
 
     /// Mobile's axis-path merge applied to straight frames: overlapping
@@ -1456,7 +1710,10 @@ mod tests {
             (BoundingBox::new(50, 0, 100, 20, 0.8), frame(50, 0, 100, 20)),
         ]);
         assert_eq!(merged.len(), 1, "overlapping halves must merge");
-        assert_eq!((merged[0].0.x, merged[0].0.y, merged[0].0.w, merged[0].0.h), (0, 0, 150, 20));
+        assert_eq!(
+            (merged[0].0.x, merged[0].0.y, merged[0].0.w, merged[0].0.h),
+            (0, 0, 150, 20)
+        );
         assert!(!merged[0].1.is_rotated());
         // A genuinely rotated frame takes no part.
         let mixed = merge_straight_boxes(vec![
@@ -1517,7 +1774,8 @@ mod tests {
         for line in truth["lines"].as_array().unwrap() {
             let file = line["file"].as_str().unwrap();
             let boxes = line["boxes"].as_array().unwrap();
-            let (mut left, mut top, mut right, mut bottom) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+            let (mut left, mut top, mut right, mut bottom) =
+                (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
             for b in boxes {
                 let b = b.as_array().unwrap();
                 let (x, y, w, h) = (
@@ -1531,15 +1789,20 @@ mod tests {
                 right = right.max(x + w);
                 bottom = bottom.max(y + h);
             }
-            let img =
-                image::open(format!("{}/test_images/synth/{file}", concat!(env!("CARGO_MANIFEST_DIR"), "/..")))
-                    .unwrap();
+            let img = image::open(format!(
+                "{}/test_images/synth/{file}",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/..")
+            ))
+            .unwrap();
             let (iw, ih) = img.dimensions();
             let det = eng.detect(&img).unwrap();
             lines += 1;
             for b in &det.boxes {
                 if b.x < 0 || b.y < 0 || b.x + b.w > iw as i32 || b.y + b.h > ih as i32 {
-                    failures.push(format!("{file}: box out of bounds {:?}", (b.x, b.y, b.w, b.h)));
+                    failures.push(format!(
+                        "{file}: box out of bounds {:?}",
+                        (b.x, b.y, b.w, b.h)
+                    ));
                 }
             }
             let best = det.boxes.iter().max_by_key(|b| (b.w as i64) * (b.h as i64));
@@ -1588,9 +1851,11 @@ mod tests {
         )
         .unwrap();
         let file = truth["lines"][0]["file"].as_str().unwrap();
-        let img =
-            image::open(format!("{}/test_images/synth/{file}", concat!(env!("CARGO_MANIFEST_DIR"), "/..")))
-                .unwrap();
+        let img = image::open(format!(
+            "{}/test_images/synth/{file}",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/..")
+        ))
+        .unwrap();
         let area = |b: &BoundingBox| (b.w as i64) * (b.h as i64);
 
         let base = eng.detect(&img).unwrap();
@@ -1602,7 +1867,10 @@ mod tests {
 
         eng.det_thresh_override = Some(1.0);
         let high = eng.detect(&img).unwrap();
-        assert!(high.boxes.is_empty(), "a 1.0 threshold should drop every box");
+        assert!(
+            high.boxes.is_empty(),
+            "a 1.0 threshold should drop every box"
+        );
 
         eng.det_thresh_override = None;
         eng.det_unclip_override = Some(0.0);
@@ -1720,8 +1988,16 @@ mod tests {
         assert_eq!(trim_ruby_gutter_vertical(&mut pairs, &image), 1);
         // Gutter starts at x=56; the frame's local x is the cross width.
         assert_eq!(pairs[0].0.w, 56);
-        assert!((pairs[0].1.w - 56.0).abs() < 0.01, "quad w {}", pairs[0].1.w);
-        assert!((pairs[0].1.cx - 28.0).abs() < 0.01, "quad cx {}", pairs[0].1.cx);
+        assert!(
+            (pairs[0].1.w - 56.0).abs() < 0.01,
+            "quad w {}",
+            pairs[0].1.w
+        );
+        assert!(
+            (pairs[0].1.cx - 28.0).abs() < 0.01,
+            "quad cx {}",
+            pairs[0].1.cx
+        );
         assert_eq!(pairs[1].0.w, 60);
         assert_eq!(pairs[2].0.w, 60);
     }
@@ -1732,7 +2008,10 @@ mod tests {
     fn legacy_cells_use_frame_length_over_seq_len() {
         // L=100, seqLen=4 -> avgColW 25; cross 10 -> half 5.
         let cells = legacy_cells(&[0.0, 1.0, 2.0, 3.0], 4, 100.0, 10.0);
-        assert_eq!(cells, vec![(7.5, 17.5), (32.5, 42.5), (57.5, 67.5), (82.5, 92.5)]);
+        assert_eq!(
+            cells,
+            vec![(7.5, 17.5), (32.5, 42.5), (57.5, 67.5), (82.5, 92.5)]
+        );
         // A fractional column keeps its fraction (peak interpolation).
         let cells = legacy_cells(&[0.5], 4, 100.0, 10.0);
         assert_eq!(cells, vec![(20.0, 30.0)]);
@@ -1758,7 +2037,10 @@ mod tests {
         assert!((sized[0].1 - sized[0].0 - 10.0).abs() < 1e-3, "{sized:?}");
         // Single cell: unchanged (needs 2+).
         let chars: Vec<char> = "日".chars().collect();
-        assert_eq!(uniform_cells(&[(0.0, 40.0)], &chars, 100.0), vec![(0.0, 40.0)]);
+        assert_eq!(
+            uniform_cells(&[(0.0, 40.0)], &chars, 100.0),
+            vec![(0.0, 40.0)]
+        );
     }
 
     /// Mobile #49 vertical punctuation sets (D7.3/D46): the full Android
@@ -1862,22 +2144,42 @@ mod tests {
         let mut position_checked = 0usize;
         for line in truth["lines"].as_array().unwrap() {
             let file = line["file"].as_str().unwrap();
-            let img =
-                image::open(format!("{}/test_images/synth/{file}", concat!(env!("CARGO_MANIFEST_DIR"), "/..")))
-                    .unwrap();
+            let img = image::open(format!(
+                "{}/test_images/synth/{file}",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/..")
+            ))
+            .unwrap();
             let det = eng.detect_lines(&img).unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
             crate::ocr_engine::recognize_boxes_streaming(
-                &img, &det.boxes, &det.rotated,
-                eng.ppocr_rec.clone(), eng.kana_size.clone(), &eng.ppocr_vocab, &eng.rec_remap,
-                4, RecognitionMode::Both, tx, std::path::Path::new("/tmp"),
+                &img,
+                &det.boxes,
+                &det.rotated,
+                eng.ppocr_rec.clone(),
+                eng.kana_size.clone(),
+                &eng.ppocr_vocab,
+                &eng.rec_remap,
+                4,
+                RecognitionMode::Both,
+                tx,
+                std::path::Path::new("/tmp"),
             )
             .unwrap();
-            let truth_boxes: Vec<(f64, f64)> = line["boxes"].as_array().unwrap().iter().map(|b| {
-                let b = b.as_array().unwrap();
-                let (x, y, w, h) = (b[0].as_f64().unwrap(), b[1].as_f64().unwrap(), b[2].as_f64().unwrap(), b[3].as_f64().unwrap());
-                (x + w / 2.0, y + h / 2.0)
-            }).collect();
+            let truth_boxes: Vec<(f64, f64)> = line["boxes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| {
+                    let b = b.as_array().unwrap();
+                    let (x, y, w, h) = (
+                        b[0].as_f64().unwrap(),
+                        b[1].as_f64().unwrap(),
+                        b[2].as_f64().unwrap(),
+                        b[3].as_f64().unwrap(),
+                    );
+                    (x + w / 2.0, y + h / 2.0)
+                })
+                .collect();
             let truth_text = line["text"].as_str().unwrap();
             for (_i, ann) in rx.into_iter() {
                 let quad_present = ann.quad.is_some();
@@ -1897,8 +2199,37 @@ mod tests {
                 // sits off the em centre, and a leading whitespace glyph
                 // shifts the whole detection crop.
                 let is_punct = |ch: char| {
-                    matches!(ch, '\u{3002}'|'\u{002E}'|'\u{FF0E}'|'\u{3001}'|'\u{002C}'|'\u{FF0C}'|')'|'\u{FF09}'|'\u{3017}'|'\u{300D}'|'\u{300F}'|'\u{3015}'|'\u{3011}'|'\u{3009}'|']'|'\u{FF3D}')
-                        || matches!(ch, '('|'\u{FF08}'|'\u{300C}'|'\u{300E}'|'\u{3014}'|'\u{3010}'|'\u{300A}'|'\u{3008}'|'\u{3016}'|'['|'\u{FF3B}')
+                    matches!(
+                        ch,
+                        '\u{3002}'
+                            | '\u{002E}'
+                            | '\u{FF0E}'
+                            | '\u{3001}'
+                            | '\u{002C}'
+                            | '\u{FF0C}'
+                            | ')'
+                            | '\u{FF09}'
+                            | '\u{3017}'
+                            | '\u{300D}'
+                            | '\u{300F}'
+                            | '\u{3015}'
+                            | '\u{3011}'
+                            | '\u{3009}'
+                            | ']'
+                            | '\u{FF3D}'
+                    ) || matches!(
+                        ch,
+                        '(' | '\u{FF08}'
+                            | '\u{300C}'
+                            | '\u{300E}'
+                            | '\u{3014}'
+                            | '\u{3010}'
+                            | '\u{300A}'
+                            | '\u{3008}'
+                            | '\u{3016}'
+                            | '['
+                            | '\u{FF3B}'
+                    )
                 };
                 if line.text == truth_text
                     && line.char_boxes.len() == truth_boxes.len()
@@ -2024,7 +2355,10 @@ mod tests {
                 }
             }
         }
-        assert!(checked >= 80, "expected the full synth set, checked {checked}");
+        assert!(
+            checked >= 80,
+            "expected the full synth set, checked {checked}"
+        );
         assert!(
             position_checked >= 5,
             "expected at least 5 plain-glyph lines for the position check, got {position_checked}"
@@ -2084,9 +2418,15 @@ mod tests {
         assert_eq!(line.alternatives[1][0], ('い', 0.7));
         assert_eq!(line.char_boxes.len(), 2, "one box per emitted character");
         for b in &line.char_boxes {
-            assert!(b.x >= 10 && b.right() <= 130, "boxes stay in the crop frame: {b:?}");
+            assert!(
+                b.x >= 10 && b.right() <= 130,
+                "boxes stay in the crop frame: {b:?}"
+            );
         }
-        assert_eq!(line.raw_alternatives, raw, "the cache is carried, not dropped");
+        assert_eq!(
+            line.raw_alternatives, raw,
+            "the cache is carried, not dropped"
+        );
 
         // Nothing cached: unchanged (mobile returns `oldLine`).
         let bare = DetectedAnnotation {
@@ -2119,20 +2459,33 @@ mod tests {
 
             let (tx, rx) = std::sync::mpsc::channel();
             recognize_boxes_streaming(
-                &img, &det.boxes, &det.rotated,
-                eng.ppocr_rec.clone(), eng.kana_size.clone(),
-                &eng.ppocr_vocab, &eng.rec_remap,
-                4, RecognitionMode::Both, tx, std::path::Path::new("/tmp"),
+                &img,
+                &det.boxes,
+                &det.rotated,
+                eng.ppocr_rec.clone(),
+                eng.kana_size.clone(),
+                &eng.ppocr_vocab,
+                &eng.rec_remap,
+                4,
+                RecognitionMode::Both,
+                tx,
+                std::path::Path::new("/tmp"),
             )
             .unwrap();
             let mut streamed: Vec<(usize, DetectedAnnotation)> = rx.into_iter().collect();
             streamed.sort_by_key(|(idx, _)| *idx);
 
             let collected = recognize_boxes_collect(
-                &img, &det.boxes, &det.rotated,
-                eng.ppocr_rec.clone(), eng.kana_size.clone(),
-                &eng.ppocr_vocab, &eng.rec_remap,
-                4, RecognitionMode::Both, std::path::Path::new("/tmp"),
+                &img,
+                &det.boxes,
+                &det.rotated,
+                eng.ppocr_rec.clone(),
+                eng.kana_size.clone(),
+                &eng.ppocr_vocab,
+                &eng.rec_remap,
+                4,
+                RecognitionMode::Both,
+                std::path::Path::new("/tmp"),
             )
             .unwrap();
 

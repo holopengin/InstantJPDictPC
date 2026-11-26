@@ -58,20 +58,19 @@
 //! with no C++ toolchain, no ncnn sources, and no install prefix.
 
 pub mod app_settings;
-pub mod merge_boxes;
-pub mod gutter_trim;
-pub mod ctc_decode;
 pub mod blank_gaps;
 pub mod char_boxes;
 pub mod char_placement;
-pub mod definition_format;
-pub mod lookup_core;
-pub mod yomitan_parse;
+pub mod ctc_decode;
 pub mod data;
+pub mod definition_format;
 pub mod furigana;
+pub mod gutter_trim;
 pub mod kana_size;
 #[cfg(feature = "db")]
 pub mod lookup;
+pub mod lookup_core;
+pub mod merge_boxes;
 pub mod models;
 pub mod nav_graph;
 mod nav_graph_index;
@@ -81,11 +80,14 @@ pub mod overlay_font;
 #[cfg(feature = "db")]
 pub mod overlay_state;
 #[cfg(feature = "native")]
+pub mod page_ocr;
+#[cfg(feature = "native")]
 pub mod ppocr;
 #[cfg(feature = "native")]
 pub mod ppocr_ncnn;
 pub mod ruby_style;
 pub mod util;
+pub mod yomitan_parse;
 
 #[cfg(all(test, feature = "native", feature = "db"))]
 mod conformance;

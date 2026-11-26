@@ -12,6 +12,7 @@
 use anyhow::{bail, Result};
 use image::{DynamicImage, GenericImageView};
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
 use crate::char_boxes::{re_decode_raw_alternatives, ReDecodedLine};
@@ -122,20 +123,32 @@ fn build_rec_input(pixels: &[u8], content_w: u32, target_h: u32, model_w: u32) -
 /// chunk-and-stitch path (unsquished chunks), everything else takes the
 /// single-pass path with the live squish factor. `remap` length is the
 /// pruned CTC head width.
-pub fn recognize_crop(rec: &RecNet, crop: &DynamicImage, vocab: &[String], remap: &[i32]) -> Result<PpocrResult> {
-    recognize_crop_with_squish(rec, crop, vocab, remap, rec_squish())
+pub fn recognize_crop(
+    rec: &RecNet,
+    crop: &DynamicImage,
+    vocab: &[String],
+    remap: &[i32],
+) -> Result<PpocrResult> {
+    recognize_crop_with_squish(rec, crop, vocab, remap, rec_squish(), None)
 }
 
-fn recognize_crop_with_squish(
+/// One line crop with explicit squish and an optional cooperative-cancel
+/// flag. The page pipeline uses this so a page-level close can stop the
+/// long-line chunk loop instead of running it to completion.
+pub fn recognize_crop_with_squish(
     rec: &RecNet,
     crop: &DynamicImage,
     vocab: &[String],
     remap: &[i32],
     squish: f32,
+    cancel: Option<&AtomicBool>,
 ) -> Result<PpocrResult> {
     let (cw, ch) = crop.dimensions();
     if cw < 4 || ch < 4 {
         return Ok(PpocrResult::empty());
+    }
+    if cancelled(cancel) {
+        bail!("recognition cancelled");
     }
 
     // Portrait crops rotate 270° so the model always sees horizontal text.
@@ -150,13 +163,13 @@ fn recognize_crop_with_squish(
     // crush timesteps in one pass; split into overlapping exact-width chunks
     // and stitch them (#24). After the portrait rotation a long vertical line
     // is a long horizontal one, so the X path carries both in practice.
-    let is_long_horiz = rw >= rh * 3 / 2
-        && (rw as f32 * REC_TARGET_H as f32 / rh as f32) > LONG_LINE_GATE as f32;
-    let is_long_vert = rh >= rw * 3 / 2
-        && (rh as f32 * REC_TARGET_H as f32 / rw as f32) > LONG_LINE_GATE as f32;
+    let is_long_horiz =
+        rw >= rh * 3 / 2 && (rw as f32 * REC_TARGET_H as f32 / rh as f32) > LONG_LINE_GATE as f32;
+    let is_long_vert =
+        rh >= rw * 3 / 2 && (rh as f32 * REC_TARGET_H as f32 / rw as f32) > LONG_LINE_GATE as f32;
     if is_long_horiz || is_long_vert {
         let axis = if is_long_horiz { Axis::X } else { Axis::Y };
-        if let Some(stitched) = stitch_long_line(rec, &rotated, axis, vocab, remap)? {
+        if let Some(stitched) = stitch_long_line(rec, &rotated, axis, vocab, remap, cancel)? {
             return Ok(stitched);
         }
         eprintln!("[PP-OCR] long-line stitch failed rw={rw} rh={rh} — falling through to crush");
@@ -169,7 +182,11 @@ fn recognize_crop_with_squish(
         .max(4)
         .min(LONG_LINE_GATE);
     let squished = squish_target(target_w, squish);
-    let target_w = if squished / REC_STRIDE < 32 { target_w } else { squished };
+    let target_w = if squished / REC_STRIDE < 32 {
+        target_w
+    } else {
+        squished
+    };
     infer_resized(rec, &rotated, target_w, vocab, remap)
 }
 
@@ -202,7 +219,11 @@ fn infer_resized_with_topk(
     // model px (not the zero-padded `model_w`), over `src.width()` source px.
     let step_px = src.width() as f32 * REC_STRIDE as f32 / target_w as f32;
 
-    let resized = src.resize_exact(target_w, REC_TARGET_H, image::imageops::FilterType::Triangle);
+    let resized = src.resize_exact(
+        target_w,
+        REC_TARGET_H,
+        image::imageops::FilterType::Triangle,
+    );
     let rgb = resized.to_rgb8();
     let input = build_rec_input(rgb.as_raw(), target_w, REC_TARGET_H, model_w);
 
@@ -308,12 +329,17 @@ struct Chunk {
 ///
 /// Returns None when there is nothing to stitch or a chunk failed to infer,
 /// so the caller can fall through to the single-pass crush.
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+}
+
 fn stitch_long_line(
     rec: &RecNet,
     rotated: &DynamicImage,
     axis: Axis,
     vocab: &[String],
     remap: &[i32],
+    cancel: Option<&AtomicBool>,
 ) -> Result<Option<PpocrResult>> {
     let (rw, rh) = rotated.dimensions();
     let (along, cross) = if axis == Axis::X { (rw, rh) } else { (rh, rw) };
@@ -328,6 +354,9 @@ fn stitch_long_line(
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut pos: i32 = 0;
     while pos < along as i32 {
+        if cancelled(cancel) {
+            bail!("recognition cancelled");
+        }
         let len = (max_chunk_len as i32).min(along as i32 - pos);
         if len < 16 {
             break;
@@ -401,10 +430,10 @@ fn stitch_long_line(
     // Each timestep is cross/6 px source (48px height / stride 8); all chunks
     // share the size. totalSeqLen rescales the result to the full line.
     let timestep_px = cross as f32 / 6.0;
-    let total_seq_len = ((((along as f32 * REC_TARGET_H as f32) / cross as f32)
-        / REC_STRIDE as f32)
-        .ceil() as usize)
-        .max(1);
+    let total_seq_len =
+        ((((along as f32 * REC_TARGET_H as f32) / cross as f32) / REC_STRIDE as f32).ceil()
+            as usize)
+            .max(1);
     let centers: Vec<Vec<f32>> = chunks
         .iter()
         .map(|c| {
@@ -431,7 +460,11 @@ fn compare_prediction_vectors(alt1: &[(char, f32)], alt2: &[(char, f32)]) -> f32
     }
     if alt1[0].0 == alt2[0].0 {
         let set2: Vec<char> = alt2.iter().take(5).map(|(c, _)| *c).collect();
-        let m = alt1.iter().take(5).filter(|(c, _)| set2.contains(c)).count();
+        let m = alt1
+            .iter()
+            .take(5)
+            .filter(|(c, _)| set2.contains(c))
+            .count();
         return 0.6 + (m as f32 / 5.0) * 0.4;
     }
     let c1 = alt1[0].0;
@@ -491,13 +524,19 @@ fn stitch_phase2(
             let last_px = global.last().copied().unwrap_or(-100.0);
             let offset_geom_t = curr.offset_px / timestep_px;
             for j in 0..curr.alts.len() {
-                let Some(&cand_px) = curr_global.get(j) else { continue };
+                let Some(&cand_px) = curr_global.get(j) else {
+                    continue;
+                };
                 if cand_px > last_px + STITCH_APPEND_GAP_PX {
-                    let Some(&ch) = curr.chars.get(j) else { continue };
+                    let Some(&ch) = curr.chars.get(j) else {
+                        continue;
+                    };
                     if text.last() == Some(&' ') && ch == ' ' {
                         continue;
                     }
-                    let Some(&t) = curr.char_cols.get(j) else { continue };
+                    let Some(&t) = curr.char_cols.get(j) else {
+                        continue;
+                    };
                     text.push(ch);
                     alts.push(curr.alts[j].clone());
                     cols.push(offset_geom_t + t);
@@ -545,11 +584,15 @@ fn stitch_phase2(
             let offset_t = cols[bp] - curr.char_cols[bc];
             let offset_px = global[bp] - curr_global[bc];
             for j in bc + 1..curr.alts.len() {
-                let Some(&ch) = curr.chars.get(j) else { continue };
+                let Some(&ch) = curr.chars.get(j) else {
+                    continue;
+                };
                 if text.last() == Some(&' ') && ch == ' ' {
                     continue;
                 }
-                let Some(&t) = curr.char_cols.get(j) else { continue };
+                let Some(&t) = curr.char_cols.get(j) else {
+                    continue;
+                };
                 text.push(ch);
                 alts.push(curr.alts[j].clone());
                 cols.push(t + offset_t);
@@ -563,11 +606,15 @@ fn stitch_phase2(
                 if cand_px > last_px + STITCH_APPEND_GAP_PX
                     || (appended == 0 && curr.alts.len() == 1)
                 {
-                    let Some(&ch) = curr.chars.get(j) else { continue };
+                    let Some(&ch) = curr.chars.get(j) else {
+                        continue;
+                    };
                     if text.last() == Some(&' ') && ch == ' ' {
                         continue;
                     }
-                    let Some(&t) = curr.char_cols.get(j) else { continue };
+                    let Some(&t) = curr.char_cols.get(j) else {
+                        continue;
+                    };
                     text.push(ch);
                     alts.push(curr.alts[j].clone());
                     cols.push(curr.offset_px / timestep_px + t);
@@ -581,11 +628,15 @@ fn stitch_phase2(
                 let fallback_offset_t = (last_t + 1.0) - curr.char_cols[0];
                 let fallback_offset_px = (last_px2 + timestep_px) - curr_global[0];
                 for j in 0..curr.alts.len() {
-                    let Some(&ch) = curr.chars.get(j) else { continue };
+                    let Some(&ch) = curr.chars.get(j) else {
+                        continue;
+                    };
                     if text.last() == Some(&' ') && ch == ' ' {
                         continue;
                     }
-                    let Some(&t) = curr.char_cols.get(j) else { continue };
+                    let Some(&t) = curr.char_cols.get(j) else {
+                        continue;
+                    };
                     text.push(ch);
                     alts.push(curr.alts[j].clone());
                     cols.push(t + fallback_offset_t);
@@ -661,7 +712,8 @@ mod tests {
         let rec = RecNet::create(&dir.join("rec_dyn.param"), &dir.join("rec_dyn.bin"), 64, 1)
             .expect("rec_dyn load");
         let vocab: Vec<String> =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("vocab.json")).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(dir.join("vocab.json")).unwrap())
+                .unwrap();
         let remap: Vec<i32> = std::fs::read_to_string(dir.join("rec_remap.txt"))
             .unwrap()
             .lines()
@@ -690,7 +742,11 @@ mod tests {
     /// Repeat a synth crop into a strip; the text inside repeats too.
     fn tile(src: &DynamicImage, count: u32, horizontal: bool) -> DynamicImage {
         let (w, h) = src.dimensions();
-        let (ow, oh) = if horizontal { (w * count, h) } else { (w, h * count) };
+        let (ow, oh) = if horizontal {
+            (w * count, h)
+        } else {
+            (w, h * count)
+        };
         let mut out = image::RgbaImage::new(ow, oh);
         for i in 0..count {
             let (x, y) = if horizontal { (i * w, 0) } else { (0, i * h) };
@@ -713,7 +769,8 @@ mod tests {
             target > LONG_LINE_GATE as f32,
             "test strip must exceed the gate (got {target})"
         );
-        let res = recognize_crop_with_squish(&f.rec, &strip, &f.vocab, &f.remap, 0.5).unwrap();
+        let res =
+            recognize_crop_with_squish(&f.rec, &strip, &f.vocab, &f.remap, 0.5, None).unwrap();
         let expected = "漢字".repeat(32);
         // Tile boundaries decode as spaces (the seam is wider than the
         // in-glyph gap); compare the glyphs only.
@@ -754,9 +811,10 @@ mod tests {
     #[test]
     fn synth_pitch_recovers_drawn_em() {
         let f = fixture();
-        let truth: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(repo_path("test_images/synth/truth.json")).unwrap())
-                .unwrap();
+        let truth: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_path("test_images/synth/truth.json")).unwrap(),
+        )
+        .unwrap();
         let mut checked = 0usize;
         for line in truth["lines"].as_array().unwrap() {
             if line["orientation"].as_str() != Some("H") {
@@ -764,7 +822,8 @@ mod tests {
             }
             let file = line["file"].as_str().unwrap();
             let boxes = line["boxes"].as_array().unwrap();
-            let (mut left, mut top, mut right, mut bottom) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+            let (mut left, mut top, mut right, mut bottom) =
+                (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
             for b in boxes {
                 let b = b.as_array().unwrap();
                 let (x, y, w, h) = (
@@ -800,7 +859,11 @@ mod tests {
             // 4+ char lines land within ~1% (the median averages the CTC
             // half-timestep quantization); a 2-char line has a single gap to
             // average, so it gets the wider bound.
-            let tol = if res.text.chars().count() >= 4 { 0.15 } else { 0.25 };
+            let tol = if res.text.chars().count() >= 4 {
+                0.15
+            } else {
+                0.25
+            };
             assert!(
                 (em - 44.0).abs() <= 44.0 * tol,
                 "{file}: em={em:.1} (drawn em 44) text={:?}",
@@ -819,9 +882,10 @@ mod tests {
     #[test]
     fn synth_rec_matches_truth() {
         let f = fixture();
-        let truth: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(repo_path("test_images/synth/truth.json")).unwrap())
-                .unwrap();
+        let truth: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_path("test_images/synth/truth.json")).unwrap(),
+        )
+        .unwrap();
         let mut failures: Vec<String> = Vec::new();
         let mut report: Vec<String> = Vec::new();
         let mut total_dist = 0usize;
@@ -831,7 +895,8 @@ mod tests {
             let file = line["file"].as_str().unwrap();
             let expect = line["text"].as_str().unwrap();
             let boxes = line["boxes"].as_array().unwrap();
-            let (mut left, mut top, mut right, mut bottom) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+            let (mut left, mut top, mut right, mut bottom) =
+                (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
             for b in boxes {
                 let b = b.as_array().unwrap();
                 let (x, y, w, h) = (
@@ -888,18 +953,28 @@ mod tests {
         let (w, h) = img.dimensions();
         let target_w = ((w as f32 * REC_TARGET_H as f32 / h as f32).round() as u32).max(4);
         let model_w = target_w.div_ceil(REC_STRIDE) * REC_STRIDE;
-        let resized = img.resize_exact(target_w, REC_TARGET_H, image::imageops::FilterType::Triangle);
+        let resized = img.resize_exact(
+            target_w,
+            REC_TARGET_H,
+            image::imageops::FilterType::Triangle,
+        );
         let input = build_rec_input(resized.to_rgb8().as_raw(), target_w, REC_TARGET_H, model_w);
 
         // Squish off for a direct preprocessing comparison.
         let via_decode =
-            recognize_crop_with_squish(&f.rec, &img, &f.vocab, &f.remap, 1.0).unwrap();
+            recognize_crop_with_squish(&f.rec, &img, &f.vocab, &f.remap, 1.0, None).unwrap();
 
         let k = top_k();
         let seq_len = (model_w / REC_STRIDE) as usize;
-        let packed = f.rec.infer_topk(&input, model_w as usize, REC_TARGET_H as usize).unwrap();
+        let packed = f
+            .rec
+            .infer_topk(&input, model_w as usize, REC_TARGET_H as usize)
+            .unwrap();
         assert_eq!(packed.len(), seq_len * k * 2, "native top-K layout");
-        let flat = f.rec.infer(&input, model_w as usize, REC_TARGET_H as usize).unwrap();
+        let flat = f
+            .rec
+            .infer(&input, model_w as usize, REC_TARGET_H as usize)
+            .unwrap();
         assert_eq!(flat.len(), seq_len * f.remap.len(), "full logits layout");
 
         let num_out = f.remap.len();
@@ -949,8 +1024,8 @@ mod tests {
         assert_eq!(
             java_topk_order(
                 &[
-                    0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.0, 1.0, 0.9, 0.9,
-                    0.5, 0.5, 0.5, 0.2, 0.2, 0.1
+                    0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.0, 1.0, 0.9, 0.9, 0.5, 0.5,
+                    0.5, 0.2, 0.2, 0.1
                 ],
                 15
             ),
@@ -959,10 +1034,9 @@ mod tests {
         assert_eq!(
             java_topk_order(
                 &[
-                    0.7, 0.7, 0.3, 0.3, 0.9, 0.9, 0.1, 0.1, 0.5, 0.5, 0.5, 0.5, 0.2, 0.8,
-                    0.8, 0.4, 0.4, 0.6, 0.6, 0.6, 0.05, 0.95, 0.95, 0.35, 0.35, 0.75, 0.75,
-                    0.15, 0.15, 0.55, 0.55, 0.25, 0.65, 0.65, 0.45, 0.45, 0.85, 0.85, 0.0,
-                    1.0
+                    0.7, 0.7, 0.3, 0.3, 0.9, 0.9, 0.1, 0.1, 0.5, 0.5, 0.5, 0.5, 0.2, 0.8, 0.8, 0.4,
+                    0.4, 0.6, 0.6, 0.6, 0.05, 0.95, 0.95, 0.35, 0.35, 0.75, 0.75, 0.15, 0.15, 0.55,
+                    0.55, 0.25, 0.65, 0.65, 0.45, 0.45, 0.85, 0.85, 0.0, 1.0
                 ],
                 15
             ),
@@ -1123,7 +1197,10 @@ mod tests {
             "あ must be outside t0's top-K for this pin"
         );
         let expected = 1.0 + peak_offset(0.49, 3.0, 0.0);
-        assert_eq!(live.char_cols[1], expected, "live interpolates the whole row");
+        assert_eq!(
+            live.char_cols[1], expected,
+            "live interpolates the whole row"
+        );
 
         let re = re_decode_raw_alternatives(&live.raw_alternatives, false).unwrap();
         assert_eq!(re.text, live.text);
@@ -1149,7 +1226,10 @@ mod tests {
         assert_eq!(re.text, "ああ い");
         assert_eq!(re.char_cols, vec![0.0, 3.0, 4.0, 6.0]);
         assert_eq!(re.alternatives.len(), 4);
-        assert_eq!(re.alternatives[1], steps[3].1, "repeat after a blank is emitted");
+        assert_eq!(
+            re.alternatives[1], steps[3].1,
+            "repeat after a blank is emitted"
+        );
         assert!(re_decode_raw_alternatives(&[], false).is_none());
     }
 
@@ -1171,8 +1251,7 @@ mod tests {
         assert_eq!(vertical.alternatives[0][0].0, '？');
         assert_eq!(vertical.alternatives[1][0].0, '︙');
         assert_eq!(
-            vertical.alternatives[2][1].0,
-            '？',
+            vertical.alternatives[2][1].0, '？',
             "non-top entries are normalised too"
         );
     }

@@ -268,7 +268,11 @@ pub fn snap_evidence_from_rgb(
             let mut m = 0.0f32;
             for x in x0..x1.min(pw) {
                 let v = lum[y * pw + x];
-                if if bg_light { v < INK_BELOW } else { v > INK_ABOVE } {
+                if if bg_light {
+                    v < INK_BELOW
+                } else {
+                    v > INK_ABOVE
+                } {
                     m += 1.0;
                 }
             }
@@ -280,7 +284,11 @@ pub fn snap_evidence_from_rgb(
             let mut m = 0.0f32;
             for y in y0..y1.min(ph) {
                 let v = lum[y * pw + x];
-                if if bg_light { v < INK_BELOW } else { v > INK_ABOVE } {
+                if if bg_light {
+                    v < INK_BELOW
+                } else {
+                    v > INK_ABOVE
+                } {
                     m += 1.0;
                 }
             }
@@ -476,9 +484,7 @@ fn ink_half_widths(chars: &[char], render_size: f32) -> Vec<f32> {
         .map(|&c| {
             let gid = face.glyph_index(c).unwrap_or(ttf_parser::GlyphId(0));
             match face.glyph_bounding_box(gid) {
-                Some(bb) => {
-                    ((bb.x_max - bb.x_min) as f32 / upem * render_size).max(0.0) / 2.0
-                }
+                Some(bb) => ((bb.x_max - bb.x_min) as f32 / upem * render_size).max(0.0) / 2.0,
                 None => 0.0,
             }
         })
@@ -619,8 +625,7 @@ pub fn compute_char_boxes_with(
     uniform: bool,
     ink_half: &[f32],
 ) -> Vec<BoundingBox> {
-    let evidence =
-        pixels.and_then(|(px, pw, ph)| snap_evidence_from_rgb(px, pw, ph, is_vertical));
+    let evidence = pixels.and_then(|(px, pw, ph)| snap_evidence_from_rgb(px, pw, ph, is_vertical));
     compute_char_boxes_with_evidence(
         text,
         char_cols,
@@ -714,8 +719,14 @@ pub fn compute_char_boxes_with_evidence(
             (true, Some(ev)) => snap_cells_from_profile(&base, &chars, ev, pix_w, pix_h, true, l),
             _ => base,
         };
-        let is_cp: Vec<bool> = chars.iter().map(|&c| is_vertical_closing_punct(c)).collect();
-        let is_op: Vec<bool> = chars.iter().map(|&c| is_vertical_opening_punct(c)).collect();
+        let is_cp: Vec<bool> = chars
+            .iter()
+            .map(|&c| is_vertical_closing_punct(c))
+            .collect();
+        let is_op: Vec<bool> = chars
+            .iter()
+            .map(|&c| is_vertical_opening_punct(c))
+            .collect();
 
         // Resolve overlaps with punctuation rules (always; positions).
         let mut resolved = cells;
@@ -785,7 +796,9 @@ pub fn compute_char_boxes_with_evidence(
 /// resolveInkCollisions → uniformCells` chain bit-for-bit (and the
 /// `BOX_LAYOUT_MODE` / `BOX_UNIFORM_SIZE` knobs to apply to it again).
 pub(crate) fn box_placement_cap() -> bool {
-    std::env::var("BOX_PLACEMENT_CAP").map(|v| v != "0").unwrap_or(true)
+    std::env::var("BOX_PLACEMENT_CAP")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 /// Fullwidth closing marks whose ink sits away from the em centre. Their
@@ -961,6 +974,45 @@ pub fn compute_char_boxes_line(
     )
 }
 
+/// [`compute_char_boxes_line`] with explicit knobs and the desktop font's
+/// ink widths. The page pipeline uses this so a mobile page can carry its own
+/// CAP / snap / uniform switches without rewriting the process environment.
+#[allow(clippy::too_many_arguments)] // mirrors compute_char_boxes_line
+pub fn compute_char_boxes_line_opts(
+    text: &str,
+    char_cols: &[f32],
+    seq_len_total: usize,
+    crop_x: i32,
+    crop_y: i32,
+    crop_w: u32,
+    crop_h: u32,
+    is_vertical: bool,
+    pixels: Option<(&[u8], u32, u32)>,
+    steps: Option<&[Vec<(char, f32)>]>,
+    cap: bool,
+    snap: bool,
+    uniform: bool,
+) -> Vec<BoundingBox> {
+    let chars: Vec<char> = text.chars().collect();
+    let ink = ink_half_widths(&chars, crop_h as f32 * 0.90);
+    compute_char_boxes_line_with(
+        text,
+        char_cols,
+        seq_len_total,
+        crop_x,
+        crop_y,
+        crop_w,
+        crop_h,
+        is_vertical,
+        pixels,
+        steps,
+        cap,
+        snap,
+        uniform,
+        &ink,
+    )
+}
+
 /// [`compute_char_boxes_line`] with the environment behaviour as explicit
 /// parameters (`cap` replaces `BOX_PLACEMENT_CAP`, the rest as in
 /// [`compute_char_boxes_with`]).
@@ -1001,14 +1053,13 @@ pub fn compute_char_boxes_line_with(
             ink_half,
         );
     }
-    let lum: Option<(Vec<f32>, u32, u32)> = pixels
-        .map(|(p, w, h)| (crate::char_placement::luminance_from_rgb(p, w, h), w, h));
-    let steps64: Option<Vec<Vec<(char, f64)>>> = steps
-        .map(|s| {
-            s.iter()
-                .map(|alts| alts.iter().map(|&(c, sc)| (c, sc as f64)).collect())
-                .collect()
-        });
+    let lum: Option<(Vec<f32>, u32, u32)> =
+        pixels.map(|(p, w, h)| (crate::char_placement::luminance_from_rgb(p, w, h), w, h));
+    let steps64: Option<Vec<Vec<(char, f64)>>> = steps.map(|s| {
+        s.iter()
+            .map(|alts| alts.iter().map(|&(c, sc)| (c, sc as f64)).collect())
+            .collect()
+    });
     let boxes = crate::char_placement::place(
         text,
         char_cols,
@@ -1059,9 +1110,7 @@ impl DetectedAnnotation {
         let Some(line) = self.line.as_ref() else {
             return self.clone();
         };
-        let Some(re) =
-            re_decode_raw_alternatives(&line.raw_alternatives, line.is_vertical)
-        else {
+        let Some(re) = re_decode_raw_alternatives(&line.raw_alternatives, line.is_vertical) else {
             return self.clone();
         };
 
@@ -1074,18 +1123,32 @@ impl DetectedAnnotation {
                     let lw = r.w.round().max(4.0) as u32;
                     let lh = r.h.round().max(4.0) as u32;
                     compute_char_boxes_line(
-                        &re.text, &re.char_cols, seq_len_total,
-                        0, 0, lw, lh, line.is_vertical, None, steps,
+                        &re.text,
+                        &re.char_cols,
+                        seq_len_total,
+                        0,
+                        0,
+                        lw,
+                        lh,
+                        line.is_vertical,
+                        None,
+                        steps,
                     )
                     .iter()
                     .map(|b| r.map_local_rect(b.x as f32, b.y as f32, b.w as f32, b.h as f32))
                     .collect()
                 }
                 None => compute_char_boxes_line(
-                    &re.text, &re.char_cols, seq_len_total,
-                    self.bbox.x, self.bbox.y,
-                    self.bbox.w.max(0) as u32, self.bbox.h.max(0) as u32,
-                    line.is_vertical, None, steps,
+                    &re.text,
+                    &re.char_cols,
+                    seq_len_total,
+                    self.bbox.x,
+                    self.bbox.y,
+                    self.bbox.w.max(0) as u32,
+                    self.bbox.h.max(0) as u32,
+                    line.is_vertical,
+                    None,
+                    steps,
                 ),
             }
         } else {
@@ -1175,10 +1238,7 @@ pub fn re_decode_raw_alternatives(
     // Winner score at a neighbouring timestep, matched by character
     // (mobile `wval`; first match wins).
     let wval = |t: usize, ch: char| -> Option<f32> {
-        raw.get(t)?
-            .iter()
-            .find(|(c, _)| *c == ch)
-            .map(|(_, s)| *s)
+        raw.get(t)?.iter().find(|(c, _)| *c == ch).map(|(_, s)| *s)
     };
     let frac_for = |t: usize, ch: char, v1: f32| -> f32 {
         let w0 = if t > 0 { wval(t - 1, ch) } else { None };
@@ -1336,7 +1396,13 @@ mod tests {
     /// A synthetic line crop: paper background, `glyphs` ink blobs of `weight`
     /// columns each, `invert` for the light-on-dark polarity. Deterministic, so
     /// the two entries can be compared bit-for-bit.
-    fn line_crop(w: usize, h: usize, glyphs: &[(usize, usize)], weight: usize, invert: bool) -> Vec<u8> {
+    fn line_crop(
+        w: usize,
+        h: usize,
+        glyphs: &[(usize, usize)],
+        weight: usize,
+        invert: bool,
+    ) -> Vec<u8> {
         let inkc = 0x28u8;
         let mut px = vec![0xFFu8; w * h * 3];
         let paint = |px: &mut Vec<u8>, x: usize, y: usize, c: u8| {
@@ -1369,7 +1435,9 @@ mod tests {
 
     /// A small deterministic LCG, so the sweep below needs no dependency.
     fn lcg(state: &mut u64) -> u32 {
-        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (*state >> 33) as u32
     }
 
@@ -1390,7 +1458,12 @@ mod tests {
             let vertical = case % 3 == 0;
             let pitch = (w / n).max(6);
             let glyphs: Vec<(usize, usize)> = (0..n)
-                .map(|i| (i * pitch + 2 + (lcg(&mut state) as usize % 3), i * pitch + pitch / 2))
+                .map(|i| {
+                    (
+                        i * pitch + 2 + (lcg(&mut state) as usize % 3),
+                        i * pitch + pitch / 2,
+                    )
+                })
                 .collect();
             let px = line_crop(w, h, &glyphs, weight, invert);
             let cols: Vec<f32> = (0..n).map(|i| i as f32).collect();
@@ -1401,12 +1474,33 @@ mod tests {
             let dims = (w as u32, h as u32);
             for &(snap, uniform) in &[(true, true), (true, false), (false, true)] {
                 let via_pixels = compute_char_boxes_with(
-                    &text, &cols, (n + 3) as usize, 0, 0, w as u32, h as u32, vertical,
-                    Some((&px, dims.0, dims.1)), snap, uniform, &ink,
+                    &text,
+                    &cols,
+                    (n + 3) as usize,
+                    0,
+                    0,
+                    w as u32,
+                    h as u32,
+                    vertical,
+                    Some((&px, dims.0, dims.1)),
+                    snap,
+                    uniform,
+                    &ink,
                 );
                 let via_evidence = compute_char_boxes_with_evidence(
-                    &text, &cols, (n + 3) as usize, 0, 0, w as u32, h as u32, vertical,
-                    Some(&ev), dims, snap, uniform, &ink,
+                    &text,
+                    &cols,
+                    (n + 3) as usize,
+                    0,
+                    0,
+                    w as u32,
+                    h as u32,
+                    vertical,
+                    Some(&ev),
+                    dims,
+                    snap,
+                    uniform,
+                    &ink,
                 );
                 assert_eq!(
                     via_pixels, via_evidence,
@@ -1483,7 +1577,10 @@ mod tests {
         let mut ev = SnapEvidence::new(true, vec![1.0, 2.0, 3.0]);
         assert!(ev.validate().is_some());
         ev.counts[1] = SNAP_MAX_COUNT as f32;
-        assert!(ev.validate().is_none(), "a saturated count cannot drive a snap");
+        assert!(
+            ev.validate().is_none(),
+            "a saturated count cannot drive a snap"
+        );
     }
 
     /// The guards the pixel entry already had, on the evidence entry: a
@@ -1497,11 +1594,32 @@ mod tests {
         let cols = [0.0f32, 1.0, 2.0, 3.0];
         let ink = [8.0f32; 4];
         let snapped = compute_char_boxes_with(
-            "あいうえ", &cols, 5, 0, 0, w as u32, h as u32, false,
-            Some((&px, w as u32, h as u32)), true, true, &ink,
+            "あいうえ",
+            &cols,
+            5,
+            0,
+            0,
+            w as u32,
+            h as u32,
+            false,
+            Some((&px, w as u32, h as u32)),
+            true,
+            true,
+            &ink,
         );
         let plain = compute_char_boxes_with(
-            "あいうえ", &cols, 5, 0, 0, w as u32, h as u32, false, None, true, true, &ink,
+            "あいうえ",
+            &cols,
+            5,
+            0,
+            0,
+            w as u32,
+            h as u32,
+            false,
+            None,
+            true,
+            true,
+            &ink,
         );
         assert_ne!(snapped, plain, "the fixture must actually move boxes");
         let ev = snap_evidence_from_rgb(&px, w as u32, h as u32, false).unwrap();
@@ -1510,24 +1628,57 @@ mod tests {
         short.counts.pop();
         assert_eq!(
             compute_char_boxes_with_evidence(
-                "あいうえ", &cols, 5, 0, 0, w as u32, h as u32, false,
-                Some(&short), (w as u32, h as u32), true, true, &ink,
+                "あいうえ",
+                &cols,
+                5,
+                0,
+                0,
+                w as u32,
+                h as u32,
+                false,
+                Some(&short),
+                (w as u32, h as u32),
+                true,
+                true,
+                &ink,
             ),
             plain
         );
         // No record: no snap.
         assert_eq!(
             compute_char_boxes_with_evidence(
-                "あいうえ", &cols, 5, 0, 0, w as u32, h as u32, false,
-                None, (w as u32, h as u32), true, true, &ink,
+                "あいうえ",
+                &cols,
+                5,
+                0,
+                0,
+                w as u32,
+                h as u32,
+                false,
+                None,
+                (w as u32, h as u32),
+                true,
+                true,
+                &ink,
             ),
             plain
         );
         // A sub-8px frame: no snap (the old `pix_w < 8` guard).
         assert_eq!(
             compute_char_boxes_with_evidence(
-                "あいうえ", &cols, 5, 0, 0, w as u32, h as u32, false,
-                Some(&ev), (0, 0), true, true, &ink,
+                "あいうえ",
+                &cols,
+                5,
+                0,
+                0,
+                w as u32,
+                h as u32,
+                false,
+                Some(&ev),
+                (0, 0),
+                true,
+                true,
+                &ink,
             ),
             plain
         );
