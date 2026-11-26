@@ -323,6 +323,10 @@ fn sample_bilinear(src: &RgbaImage, sx: f32, sy: f32) -> Option<Rgba<u8>> {
 /// filtered `createScaledBitmap` approximates); upscales use bilinear. The
 /// intermediate `image` buffer and the separate RGB→ARGB pack pass are gone.
 fn resize_to_argb(image: &DynamicImage, dst_w: u32, dst_h: u32) -> Vec<i32> {
+    use fast_image_resize::{
+        images::Image, FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
+    };
+
     let owned;
     let src = match image.as_rgba8() {
         Some(rgba) => rgba,
@@ -337,51 +341,29 @@ fn resize_to_argb(image: &DynamicImage, dst_w: u32, dst_h: u32) -> Vec<i32> {
     if src_w == 0 || src_h == 0 {
         return Vec::new();
     }
-    if dst_w >= src_w || dst_h >= src_h {
+    let Ok(src_image) =
+        Image::from_vec_u8(src_w, src_h, src.as_raw().clone(), PixelType::U8x4)
+    else {
+        return resize_bilinear_argb(src, dst_w, dst_h);
+    };
+    let mut dst = Image::new(dst_w, dst_h, PixelType::U8x4);
+    let filter = if dst_w < src_w || dst_h < src_h {
+        // Area/box is the downscale analogue of Skia's filtered scale and is
+        // the SIMD path in fast_image_resize.
+        FilterType::Box
+    } else {
+        FilterType::Bilinear
+    };
+    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter));
+    if Resizer::new().resize(&src_image, &mut dst, &opts).is_err() {
         return resize_bilinear_argb(src, dst_w, dst_h);
     }
-
-    // Horizontal pass: src_h rows × dst_w columns, three f32 channels.
-    let raw = src.as_raw();
-    let src_w_us = src_w as usize;
-    let mut tmp = vec![0.0f32; src_h as usize * dst_w as usize * 3];
-    for y in 0..src_h {
-        for dx in 0..dst_w {
-            let mut sum = [0.0f32; 3];
-            let mut wsum = 0.0f32;
-            span(src_w, dst_w, dx, |sx, w| {
-                let at = (y as usize * src_w_us + sx as usize) * 4;
-                sum[0] += raw[at] as f32 * w;
-                sum[1] += raw[at + 1] as f32 * w;
-                sum[2] += raw[at + 2] as f32 * w;
-                wsum += w;
-            });
-            let inv = if wsum > 0.0 { 1.0 / wsum } else { 0.0 };
-            let at = (y as usize * dst_w as usize + dx as usize) * 3;
-            tmp[at] = sum[0] * inv;
-            tmp[at + 1] = sum[1] * inv;
-            tmp[at + 2] = sum[2] * inv;
-        }
-    }
-
-    // Vertical pass into ARGB.
-    let mut out = Vec::with_capacity(dst_w as usize * dst_h as usize);
-    for dy in 0..dst_h {
-        for dx in 0..dst_w {
-            let mut sum = [0.0f32; 3];
-            let mut wsum = 0.0f32;
-            span(src_h, dst_h, dy, |sy, w| {
-                let at = (sy as usize * dst_w as usize + dx as usize) * 3;
-                sum[0] += tmp[at] * w;
-                sum[1] += tmp[at + 1] * w;
-                sum[2] += tmp[at + 2] * w;
-                wsum += w;
-            });
-            let inv = if wsum > 0.0 { 1.0 / wsum } else { 0.0 };
-            out.push(argb(sum[0] * inv, sum[1] * inv, sum[2] * inv));
-        }
-    }
-    out
+    dst.buffer()
+        .chunks_exact(4)
+        .map(|p| {
+            ((0xFFu32 << 24) | ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32) as i32
+        })
+        .collect()
 }
 
 fn resize_bilinear_argb(src: &RgbaImage, dst_w: u32, dst_h: u32) -> Vec<i32> {
@@ -430,19 +412,6 @@ fn argb(r: f32, g: f32, b: f32) -> i32 {
 
 /// Iterate the source pixels covered by destination index `d`, with their
 /// fractional overlap weight. `src_len` and `dst_len` are the axis lengths.
-fn span(src_len: u32, dst_len: u32, d: u32, mut f: impl FnMut(u32, f32)) {
-    let s0 = d as f32 * src_len as f32 / dst_len as f32;
-    let s1 = (d + 1) as f32 * src_len as f32 / dst_len as f32;
-    let i0 = s0.floor() as u32;
-    let i1 = (s1.ceil() as u32).min(src_len);
-    for s in i0..i1 {
-        let w = s1.min((s + 1) as f32) - s0.max(s as f32);
-        if w > 0.0 {
-            f(s, w);
-        }
-    }
-}
-
 fn blit_filtered(dst: &mut RgbaImage, src: &RgbaImage, left: f32, top: f32) {
     let (dw, dh) = dst.dimensions();
     let (sw, sh) = src.dimensions();
