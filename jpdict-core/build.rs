@@ -44,8 +44,16 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", ncnn_lib_dir.display());
     println!("cargo:rustc-link-lib=static=ncnn");
     // The fork is built with OpenMP on (same as the mobile build); libncnn
-    // references GOMP_* symbols, so the final link needs the OpenMP runtime.
+    // references GOMP_*/__kmpc_* symbols, so the final link needs the OpenMP
+    // runtime.
     println!("cargo:rustc-link-arg=-fopenmp");
+    // On Android the ncnn symbols are `__kmpc_*` and must resolve at dlopen
+    // time. `-fopenmp` alone lands before `libncnn.a` under cargo's
+    // --as-needed ordering, so the runtime is dropped and the .so ships with
+    // unresolved symbols. Put libomp after the archive explicitly.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        println!("cargo:rustc-link-lib=dylib=omp");
+    }
     println!("cargo:rerun-if-changed=../native/ppocr_ncnn");
     println!("cargo:rerun-if-env-changed=NCNN_PC_DIR");
 
