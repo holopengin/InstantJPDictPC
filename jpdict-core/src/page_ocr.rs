@@ -163,8 +163,10 @@ impl PageOcr {
     ) -> Result<DetectionResult> {
         let det = self
             .engine
-            .detect_lines_with(image, &opts.detect, Some(cancel.as_ref()))?;
+            .detect_with(image, &opts.detect, Some(cancel.as_ref()))?;
         if opts.det_rotated {
+            // Mobile `detectRotated` does not merge overlapping straight
+            // boxes; only the legacy axis path does.
             return Ok(det);
         }
         // Mobile `PREF_DET_ROTATED=0`: keep the fitted AABBs, merge overlapping
