@@ -260,7 +260,7 @@ impl SettingsWindow {
         match message {
             SettingsMessage::ImportDone(result) => match result {
                 Ok(count) => {
-                    self.status_text = format!("Imported {count} entries");
+                    self.status_text = format!("Imported {} entries", group_digits(count));
                     self.refresh();
                 }
                 Err(e) => {
@@ -273,14 +273,14 @@ impl SettingsWindow {
             },
             SettingsMessage::InstallDone(result) => match result {
                 Ok(count) => {
-                    self.status_text = format!("Installed {count} entries");
+                    self.status_text = format!("Installed {} entries", group_digits(count));
                     self.refresh();
                 }
                 Err(e) => self.status_text = format!("Install failed: {e}"),
             },
             SettingsMessage::RefreshStatus => {
                 self.refresh();
-                self.status_text = "Refreshed".to_string();
+                self.status_text = "Dictionary list refreshed".to_string();
             }
             SettingsMessage::DeleteDictionary(id) => {
                 if self.busy {
@@ -349,7 +349,7 @@ impl SettingsWindow {
                                 .unwrap_or_else(|| "No shortcut registered".to_string()),
                         };
                         if let (Some(note), true) = (setup.note, setup.live) {
-                            self.status_text.push_str(&format!(" — {note}"));
+                            self.status_text.push_str(&format!(". {note}"));
                         }
                     }
                     Err(e) => self.status_text = format!("Capture setup failed: {e}"),
@@ -366,7 +366,7 @@ impl SettingsWindow {
                 // Copy first so the paste step is a single click in Settings.
                 let _ = copy_to_clipboard(&capture::capture_command());
                 self.status_text = match open_capture_shortcut_settings() {
-                    Ok(()) => "Opened Keyboard Shortcuts — paste the command and choose a key"
+                    Ok(()) => "Opened Keyboard Shortcuts. Paste the command and choose a key"
                         .to_string(),
                     Err(e) => format!("Could not open System Settings: {e}"),
                 };
@@ -543,8 +543,7 @@ impl SettingsWindow {
             .font(TextStyle::new(26.0, 700.0))
             .color(TEXT);
         let subtitle = text(
-            "Install a dictionary to start looking up Japanese text. \
-             You can change all of this later in Settings.",
+            "Install a dictionary to start looking up Japanese text.",
         )
         .font(TextStyle::new(14.0, 400.0))
         .color(MUTED)
@@ -605,6 +604,7 @@ impl SettingsWindow {
         content = content.child(action_button::<S>(
             "Import Yomitan Dictionary (.zip)",
             !self.busy,
+            true,
             |s| {
                 s.settings_window_mut()
                     .handle(SettingsMessage::ImportDictionary)
@@ -628,23 +628,21 @@ impl SettingsWindow {
         content = content.child(action_button::<S>(
             "Set Up Capture Shortcut",
             !self.busy,
+            false,
             |s| {
                 s.settings_window_mut()
                     .handle(SettingsMessage::SetupCaptureShortcut)
             },
         ));
         content = content.child(hint(&format!(
-            "Registers {} (or Ctrl+Alt+S if taken). Optional — you can do this later.",
+            "Registers {}, or Ctrl+Alt+S if that key is taken.",
             capture::DEFAULT_CAPTURE_SHORTCUT
         )));
 
         content = content.child(el().h(16.0));
-        content = content.child(action_button::<S>("Continue", true, |s| {
+        content = content.child(action_button::<S>("Continue", true, true, |s| {
             s.finish_wizard()
         }));
-        content = content.child(hint(
-            "You can install, remove or reorder dictionaries later in Settings.",
-        ));
 
         content
             .scroll(ScrollSpec {
@@ -663,9 +661,15 @@ impl SettingsWindow {
             .color(TEXT);
 
         let status = text(format!(
-            "DB contains {} entries in {} dictionaries",
-            self.entry_count,
-            self.dictionaries.len()
+            "{} {} in {} {}",
+            group_digits(self.entry_count),
+            if self.entry_count == 1 { "entry" } else { "entries" },
+            self.dictionaries.len(),
+            if self.dictionaries.len() == 1 {
+                "dictionary"
+            } else {
+                "dictionaries"
+            },
         ))
         .font(TextStyle::new(14.0, 400.0))
         .color(MUTED);
@@ -756,9 +760,9 @@ impl SettingsWindow {
                     .handle(SettingsMessage::SetFuriganaFilter(on));
             },
         ));
-        content = content.child(hint(
-            "Drops small ruby text beside kanji so it does not become its own \
-             result. Applies to the next capture.",
+        content = content.child(checkbox_hint(
+            "Leaves out small ruby text beside kanji. Applies to the next \
+             capture.",
         ));
 
         content = content.child(checkbox_row::<S>(
@@ -771,9 +775,9 @@ impl SettingsWindow {
                     .handle(SettingsMessage::SetPitchAccent(on));
             },
         ));
-        content = content.child(hint(
-            "Draws the pitch-accent line under each entry's headwords. \
-             Takes effect next launch.",
+        content = content.child(checkbox_hint(
+            "Shows the pitch-accent line under headwords. Applies on next \
+             launch.",
         ));
 
         content = content.child(checkbox_row::<S>(
@@ -790,8 +794,8 @@ impl SettingsWindow {
                     }));
             },
         ));
-        content = content.child(hint(
-            "Overlay & dictionary panel — takes effect next launch.",
+        content = content.child(checkbox_hint(
+            "Applies to the overlay and dictionary panel on next launch.",
         ));
 
         content = content.child(el().h(16.0));
@@ -803,9 +807,8 @@ impl SettingsWindow {
                 .color(TEXT),
         );
         content = content.child(hint(
-            "Capture the focused window and look up its Japanese text without \
-             leaving the keyboard. This also authorizes KWin to hand \
-             screenshots directly to InstantJPDict.",
+            "Captures the focused window and looks up its Japanese text. This \
+             also authorizes KWin to pass screenshots to InstantJPDict.",
         ));
         content = content.child(hint(&format!(
             "Command: {}",
@@ -820,6 +823,7 @@ impl SettingsWindow {
         content = content.child(action_button::<S>(
             "Set Up Capture Shortcut",
             !disabled,
+            true,
             |s| {
                 s.settings_window_mut()
                     .handle(SettingsMessage::SetupCaptureShortcut)
@@ -828,6 +832,7 @@ impl SettingsWindow {
         content = content.child(action_button::<S>(
             "Copy Capture Command",
             !disabled,
+            false,
             |s| {
                 s.settings_window_mut()
                     .handle(SettingsMessage::CopyCaptureCommand)
@@ -836,21 +841,21 @@ impl SettingsWindow {
         content = content.child(action_button::<S>(
             "Open Keyboard Shortcuts",
             !disabled,
+            false,
             |s| {
                 s.settings_window_mut()
                     .handle(SettingsMessage::OpenCaptureShortcutSettings)
             },
         ));
         content = content.child(hint(&format!(
-            "One click registers {}. If that key is taken, the fallback is \
-             Ctrl+Alt+S. To use another key: Add → Command or Script in \
-             System Settings and paste the command above.",
+            "Registers {}, or Ctrl+Alt+S if that key is taken. To use another \
+             key, add the command above in System Settings → Keyboard → \
+             Shortcuts.",
             capture::DEFAULT_CAPTURE_SHORTCUT
         )));
         content = content.child(hint(
-            "KWin scans its screenshot allow-list at startup. A fresh install \
-             may need one logout/login; upgrades are already covered by the \
-             compatibility entry.",
+            "KWin reads its screenshot allow-list at startup. A fresh install \
+             may need a logout and login.",
         ));
 
         content = content.child(el().h(16.0));
@@ -859,15 +864,21 @@ impl SettingsWindow {
         content = content.child(action_button::<S>(
             "Import Yomitan Dictionary (.zip)",
             !disabled,
+            true,
             |s| {
                 s.settings_window_mut()
                     .handle(SettingsMessage::ImportDictionary)
             },
         ));
-        content = content.child(action_button::<S>("Refresh Status", !disabled, |s| {
-            s.settings_window_mut()
-                .handle(SettingsMessage::RefreshStatus)
-        }));
+        content = content.child(action_button::<S>(
+            "Refresh Dictionary List",
+            !disabled,
+            false,
+            |s| {
+                s.settings_window_mut()
+                    .handle(SettingsMessage::RefreshStatus)
+            },
+        ));
 
         content = content.child(el().h(16.0));
         content = content.child(
@@ -966,6 +977,25 @@ fn hint(body: &str) -> El {
         .w_full()
 }
 
+/// A checkbox description, indented to the label's text column (the 18 pt box
+/// plus the row's 6 pt gap).
+fn checkbox_hint(body: &str) -> El {
+    hint(body).pl(24.0)
+}
+
+/// `571073` → `571,073`, for entry and dictionary counts.
+fn group_digits(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Put text on the Wayland/X11 clipboard. Returns an error string when none of
 /// the usual tools is available, so the caller can show the command instead.
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
@@ -1018,7 +1048,16 @@ fn open_capture_shortcut_settings() -> Result<(), String> {
     Err("neither kcmshell6 nor systemsettings is available".to_string())
 }
 
-fn action_button<S: SettingsHost>(label: &'static str, enabled: bool, on_press: fn(&mut S)) -> El {
+/// A full-width action. Primary actions carry the accent fill; secondary ones
+/// stay on the card surface with a hairline border, so one action per group
+/// reads as the main one.
+fn action_button<S: SettingsHost>(
+    label: &'static str,
+    enabled: bool,
+    primary: bool,
+    on_press: fn(&mut S),
+) -> El {
+    let fill = if enabled && primary { ACCENT } else { CARD };
     let mut b = el()
         .key(label)
         .role("button")
@@ -1026,19 +1065,28 @@ fn action_button<S: SettingsHost>(label: &'static str, enabled: bool, on_press: 
         .w_full()
         .padding(10.0)
         .radius(8.0)
-        .fill(if enabled { ACCENT } else { CARD })
+        .fill(fill)
         .center();
+    if !primary {
+        b = b.border(1.0, CARD_BORDER);
+    }
     if enabled {
         b = b
-            .hover(lighten(ACCENT, 0.08))
-            .press(lighten(ACCENT, 0.16))
+            .hover(lighten(fill, 0.08))
+            .press(lighten(fill, 0.16))
             .cursor(rune::Cursor::Pointer)
             .on_press(on_press);
     }
     b.child(
         text(label)
             .font(TextStyle::new(15.0, 500.0))
-            .color(if enabled { Color::WHITE } else { MUTED })
+            .color(if !enabled {
+                MUTED
+            } else if primary {
+                Color::WHITE
+            } else {
+                TEXT
+            })
             .a11y_hidden(),
     )
 }
@@ -1058,9 +1106,15 @@ fn catalog_row<S: SettingsHost>(entry: &CatalogEntry, installed: bool, disabled:
                 .w_full(),
         )
         .child(
+            text(entry.description.clone())
+                .font(TextStyle::new(12.0, 400.0))
+                .color(MUTED)
+                .wrap()
+                .w_full(),
+        )
+        .child(
             text(format!(
-                "{} · {:.1} MB · {}",
-                entry.description,
+                "{:.1} MB, {}",
                 entry.bytes as f64 / 1_048_576.0,
                 entry.license
             ))
@@ -1142,8 +1196,18 @@ fn dict_row<S: SettingsHost>(dict: &DictionaryMeta, disabled: bool) -> El {
                 .color(Color::WHITE),
         );
 
-    let up_btn = small_button("▲", !disabled, send::<S>(SettingsMessage::MoveUp(id)));
-    let down_btn = small_button("▼", !disabled, send::<S>(SettingsMessage::MoveDown(id)));
+    let up_btn = small_button(
+        "Move up",
+        "▲",
+        !disabled,
+        send::<S>(SettingsMessage::MoveUp(id)),
+    );
+    let down_btn = small_button(
+        "Move down",
+        "▼",
+        !disabled,
+        send::<S>(SettingsMessage::MoveDown(id)),
+    );
 
     // The bundled dictionary has no Delete: it is app state, not a user
     // import (mobile hides built-ins from the manager entirely).
@@ -1187,6 +1251,7 @@ fn dict_row<S: SettingsHost>(dict: &DictionaryMeta, disabled: bool) -> El {
 
 fn small_button<S: SettingsHost>(
     label: &'static str,
+    glyph: &'static str,
     enabled: bool,
     on_press: impl Fn(&mut S) + 'static,
 ) -> El {
@@ -1204,7 +1269,7 @@ fn small_button<S: SettingsHost>(
             .cursor(rune::Cursor::Pointer)
             .on_press(on_press);
     }
-    b.child(text(label).font(TextStyle::new(14.0, 500.0)).color(TEXT))
+    b.child(text(glyph).font(TextStyle::new(14.0, 500.0)).color(TEXT))
 }
 
 fn text_button<S: SettingsHost>(
@@ -1245,10 +1310,16 @@ fn import_progress_lines(progress: &ImportProgress, mut content: El) -> El {
     let progress_text = if progress.banks_total > 0 {
         format!(
             "Importing: {} entries ({} / {} banks, {:.0}%)",
-            progress.entries_imported, progress.banks_done, progress.banks_total, percentage
+            group_digits(progress.entries_imported),
+            progress.banks_done,
+            progress.banks_total,
+            percentage
         )
     } else {
-        format!("Importing: {} entries...", progress.entries_imported)
+        format!(
+            "Importing: {} entries",
+            group_digits(progress.entries_imported)
+        )
     };
     content = content.child(
         text(progress_text)

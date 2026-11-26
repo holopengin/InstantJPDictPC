@@ -247,7 +247,7 @@ fn app_view(s: &FrontendApp, cx: &mut Cx<FrontendApp>) -> El {
                 .child(
                     row()
                         .w_full()
-                        .px(16.0)
+                        .px(12.0)
                         .py(10.0)
                         .center_y()
                         .child(back_button("← Back to Menu", |s: &mut FrontendApp| {
@@ -302,6 +302,8 @@ fn menu_view(s: &FrontendApp) -> El {
 /// opens a file picker, which also works on Wayland (winit does not deliver
 /// file drags there).
 fn drop_hint(on_press: fn(&mut FrontendApp)) -> El {
+    // The arrow marks where files land; it is the drop target's own graphic,
+    // not a decoration beside a label.
     let icon = canvas(
         Shape::new()
             .line([12.0, 4.0], [12.0, 15.0], 2.0, LineCap::Round, MUTED)
@@ -328,7 +330,7 @@ fn drop_hint(on_press: fn(&mut FrontendApp)) -> El {
                 .gap(6.0)
                 .child(icon)
                 .child(
-                    text("Drop an image here, or click to choose one")
+                    text("Drop an image or click to choose one")
                         .font(type_::BODY)
                         .color(MUTED),
                 ),
