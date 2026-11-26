@@ -318,6 +318,131 @@ fn sample_bilinear(src: &RgbaImage, sx: f32, sy: f32) -> Option<Rgba<u8>> {
 /// `(left, top)` — mobile draws the resized det bitmap at the float centering
 /// offset with filtering, so a `.5` offset blends the content edge with the
 /// gray letterbox pad.
+/// Resize an image directly into the ARGB content the detector's C++ core
+/// takes. Downscales use a separable area average (the same shape Skia's
+/// filtered `createScaledBitmap` approximates); upscales use bilinear. The
+/// intermediate `image` buffer and the separate RGB→ARGB pack pass are gone.
+fn resize_to_argb(image: &DynamicImage, dst_w: u32, dst_h: u32) -> Vec<i32> {
+    let owned;
+    let src = match image.as_rgba8() {
+        Some(rgba) => rgba,
+        None => {
+            owned = image.to_rgba8();
+            &owned
+        }
+    };
+    let (src_w, src_h) = src.dimensions();
+    let dst_w = dst_w.max(1);
+    let dst_h = dst_h.max(1);
+    if src_w == 0 || src_h == 0 {
+        return Vec::new();
+    }
+    if dst_w >= src_w || dst_h >= src_h {
+        return resize_bilinear_argb(src, dst_w, dst_h);
+    }
+
+    // Horizontal pass: src_h rows × dst_w columns, three f32 channels.
+    let raw = src.as_raw();
+    let src_w_us = src_w as usize;
+    let mut tmp = vec![0.0f32; src_h as usize * dst_w as usize * 3];
+    for y in 0..src_h {
+        for dx in 0..dst_w {
+            let mut sum = [0.0f32; 3];
+            let mut wsum = 0.0f32;
+            span(src_w, dst_w, dx, |sx, w| {
+                let at = (y as usize * src_w_us + sx as usize) * 4;
+                sum[0] += raw[at] as f32 * w;
+                sum[1] += raw[at + 1] as f32 * w;
+                sum[2] += raw[at + 2] as f32 * w;
+                wsum += w;
+            });
+            let inv = if wsum > 0.0 { 1.0 / wsum } else { 0.0 };
+            let at = (y as usize * dst_w as usize + dx as usize) * 3;
+            tmp[at] = sum[0] * inv;
+            tmp[at + 1] = sum[1] * inv;
+            tmp[at + 2] = sum[2] * inv;
+        }
+    }
+
+    // Vertical pass into ARGB.
+    let mut out = Vec::with_capacity(dst_w as usize * dst_h as usize);
+    for dy in 0..dst_h {
+        for dx in 0..dst_w {
+            let mut sum = [0.0f32; 3];
+            let mut wsum = 0.0f32;
+            span(src_h, dst_h, dy, |sy, w| {
+                let at = (sy as usize * dst_w as usize + dx as usize) * 3;
+                sum[0] += tmp[at] * w;
+                sum[1] += tmp[at + 1] * w;
+                sum[2] += tmp[at + 2] * w;
+                wsum += w;
+            });
+            let inv = if wsum > 0.0 { 1.0 / wsum } else { 0.0 };
+            out.push(argb(sum[0] * inv, sum[1] * inv, sum[2] * inv));
+        }
+    }
+    out
+}
+
+fn resize_bilinear_argb(src: &RgbaImage, dst_w: u32, dst_h: u32) -> Vec<i32> {
+    let (src_w, src_h) = src.dimensions();
+    let raw = src.as_raw();
+    let src_w_us = src_w as usize;
+    let mut out = Vec::with_capacity(dst_w as usize * dst_h as usize);
+    let x_scale = src_w as f32 / dst_w as f32;
+    let y_scale = src_h as f32 / dst_h as f32;
+    let pixel = |x: u32, y: u32| -> [u8; 3] {
+        let at = (y as usize * src_w_us + x as usize) * 4;
+        [raw[at], raw[at + 1], raw[at + 2]]
+    };
+    for dy in 0..dst_h {
+        let sy = ((dy as f32 + 0.5) * y_scale - 0.5).max(0.0);
+        let y0 = (sy.floor() as u32).min(src_h.saturating_sub(1));
+        let y1 = (y0 + 1).min(src_h.saturating_sub(1));
+        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+        for dx in 0..dst_w {
+            let sx = ((dx as f32 + 0.5) * x_scale - 0.5).max(0.0);
+            let x0 = (sx.floor() as u32).min(src_w.saturating_sub(1));
+            let x1 = (x0 + 1).min(src_w.saturating_sub(1));
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let p00 = pixel(x0, y0);
+            let p10 = pixel(x1, y0);
+            let p01 = pixel(x0, y1);
+            let p11 = pixel(x1, y1);
+            let mut c = [0.0f32; 3];
+            for k in 0..3 {
+                let top = p00[k] as f32 * (1.0 - fx) + p10[k] as f32 * fx;
+                let bot = p01[k] as f32 * (1.0 - fx) + p11[k] as f32 * fx;
+                c[k] = top * (1.0 - fy) + bot * fy;
+            }
+            out.push(argb(c[0], c[1], c[2]));
+        }
+    }
+    out
+}
+
+fn argb(r: f32, g: f32, b: f32) -> i32 {
+    let r = r.clamp(0.0, 255.0).round() as u32;
+    let g = g.clamp(0.0, 255.0).round() as u32;
+    let b = b.clamp(0.0, 255.0).round() as u32;
+    (0xFF00_0000u32 | (r << 16) | (g << 8) | b) as i32
+}
+
+/// Iterate the source pixels covered by destination index `d`, with their
+/// fractional overlap weight. `src_len` and `dst_len` are the axis lengths.
+fn span(src_len: u32, dst_len: u32, d: u32, mut f: impl FnMut(u32, f32)) {
+    let s0 = d as f32 * src_len as f32 / dst_len as f32;
+    let s1 = (d + 1) as f32 * src_len as f32 / dst_len as f32;
+    let i0 = s0.floor() as u32;
+    let i1 = (s1.ceil() as u32).min(src_len);
+    for s in i0..i1 {
+        let w = s1.min((s + 1) as f32) - s0.max(s as f32);
+        if w > 0.0 {
+            f(s, w);
+        }
+    }
+}
+
 fn blit_filtered(dst: &mut RgbaImage, src: &RgbaImage, left: f32, top: f32) {
     let (dw, dh) = dst.dimensions();
     let (sw, sh) = src.dimensions();
@@ -723,16 +848,7 @@ impl OcrEngine {
         //   old Kotlin JNI detector used, so the page pipeline neither pays
         //   for a Rust letterbox image nor drifts from the mobile geometry.
         let (raw_map, img_left, img_top) = if opts.mobile_letterbox {
-            let resized =
-                image.resize_exact(resize_w, resize_h, image::imageops::FilterType::Triangle);
-            let rgb = resized.to_rgb8();
-            let argb: Vec<i32> = rgb
-                .pixels()
-                .map(|p| {
-                    ((0xFFu32 << 24) | ((p.0[0] as u32) << 16) | ((p.0[1] as u32) << 8) | p.0[2] as u32)
-                        as i32
-                })
-                .collect();
+            let argb = resize_to_argb(image, resize_w, resize_h);
             let pad_x = (model_size - resize_w + 1) / 2;
             let pad_y = (model_size - resize_h + 1) / 2;
             let map = self
