@@ -84,9 +84,20 @@ impl PageLine {
     }
 }
 
+/// Wall-clock split of one page run. `recognize` covers inference, kana
+/// correction and char-box placement; `detect` covers detection and its
+/// post-processing. `total` includes the small hand-off between them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PageTimings {
+    pub detect_ms: u64,
+    pub recognize_ms: u64,
+    pub total_ms: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PageResult {
     pub lines: Vec<PageLine>,
+    pub timings: PageTimings,
 }
 
 /// A loaded page engine. Construction loads the det/rec/kana nets once; every
@@ -132,13 +143,18 @@ impl PageOcr {
     /// inside long-line chunk loops. A cancelled run returns an error with
     /// `cancelled` in the message.
     pub fn recognize(&mut self, image: &DynamicImage, opts: &PageOcrOptions) -> Result<PageResult> {
+        use std::time::Instant;
         self.cancel.store(false, Ordering::SeqCst);
         let cancel = Arc::clone(&self.cancel);
+        let total_start = Instant::now();
 
+        let detect_start = Instant::now();
         let det = self.detect_page(image, opts, &cancel)?;
+        let detect_ms = detect_start.elapsed().as_millis() as u64;
         if self.is_cancelled() {
             anyhow::bail!("page recognition cancelled");
         }
+        let recognize_start = Instant::now();
         let annotations = crate::ocr_engine::recognize_boxes_collect_with(
             image,
             &det.boxes,
@@ -150,6 +166,7 @@ impl PageOcr {
             &opts.recognize,
             Some(Arc::clone(&cancel)),
         )?;
+        let recognize_ms = recognize_start.elapsed().as_millis() as u64;
 
         let mut lines = Vec::with_capacity(annotations.len());
         for (idx, ann) in annotations {
@@ -158,7 +175,14 @@ impl PageOcr {
             let bbox = det.boxes.get(idx).cloned().unwrap_or(ann.bbox);
             lines.push(PageLine::from_annotation(bbox, quad, line));
         }
-        Ok(PageResult { lines })
+        Ok(PageResult {
+            lines,
+            timings: PageTimings {
+                detect_ms,
+                recognize_ms,
+                total_ms: total_start.elapsed().as_millis() as u64,
+            },
+        })
     }
 
     fn detect_page(
