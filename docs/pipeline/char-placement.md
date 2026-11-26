@@ -21,6 +21,21 @@
   `compute_char_boxes_line` (`jpdict-core/src/ocr_engine.rs`), with the shipped
   chain's conventions: horizontal `(crop + edge).round()` with the line bbox's
   full cross span, vertical likewise on x.
+- **A line's final closing punctuation takes the advance cell after its
+  predecessor.** The overlay draws every glyph centred in its character box,
+  so a box is the glyph's advance cell. An ink-tight detection crop ends at a
+  trailing `。`'s ink, so CAP's CTC column and template put it close to the
+  previous glyph (its ink is offset to the left of its em centre, and the ink
+  pass can only centre the box in the gap between the two glyphs). Drawn
+  centred, the dot lands on the previous character. The post-pass
+  `char_boxes::place_trailing_punct_cell` runs after `place` and gives the
+  last fullwidth closing mark (`。`, `、`, closing brackets) the cell that
+  follows its predecessor, extending that predecessor to the shared boundary
+  so the line still tiles. `place` itself stays bit-identical to the Python
+  reference; the new last box can extend past the crop's reading-axis end by
+  up to one cell (the crop ends at the ink, not at the cell). Lines ending in
+  any other character are untouched, and the legacy chain
+  (`BOX_PLACEMENT_CAP=0`) keeps its boxes.
 - **Kill switch**: `BOX_PLACEMENT_CAP=0` restores the shipped
   `legacyCells → snapCells → resolveInkCollisions → uniformCells` chain
   (`compute_char_boxes`) bit-for-bit; `BOX_LAYOUT_MODE` / `BOX_UNIFORM_SIZE`
@@ -61,15 +76,19 @@
   (`boxesContainTheirCharactersInkCentre`, ±0.5 px) and reports Tier-2-style
   metrics per case under `CONFORMANCE_DUMP=1`. Format: `FORMAT.md`
   (`char_placement` section), tolerance authority `TOLERANCES.md`.
-- **Unit** (`jpdict-core/src/char_placement.rs`): the edge-window regression
-  (`last_glyph_window_reaching_the_line_end_does_not_walk_past_the_profile`),
+- **Unit** (`jpdict-core/src/char_boxes.rs`): the trailing-cell post-pass
+  (`trailing_period_takes_the_cell_after_its_predecessor`,
+  `trailing_period_takes_the_cell_below_in_vertical_text`,
+  `trailing_kana_is_left_alone`), plus the edge-window regression
+  (`char_placement::last_glyph_window_reaching_the_line_end_does_not_walk_past_the_profile`),
   the guard-rail set, full-cross-axis spans in both orientations.
 - **Pipeline**: `synth_char_boxes_cap_span_and_position`
   (`jpdict-core/src/ocr_engine.rs`) — one box per character, cross span, frame
-  containment, and synth truth-centre positions end-to-end; the `recognition`
-  kind's machine-generated `char_boxes` pins (regenerate wholesale with
-  `CONFORMANCE_DUMP=1` after an intentional algorithm change, spot-check the
-  texts first).
+  containment (a trailing closing mark's cell may reach past an ink-tight
+  frame), and synth truth-centre positions end-to-end, including a trailing
+  mark's cell centre; the `recognition` kind's machine-generated `char_boxes`
+  pins (regenerate with `CONFORMANCE_DUMP=1` after an intentional algorithm
+  change, spot-check the texts first).
 - **Tier-2 (quality, spec §4–5)**: dump a `synthesize.py` corpus
   (seed defaults to 7) with
   `cargo run -p jpdict-core --example cap_dump -- <data_dir> <out.jsonl>`,

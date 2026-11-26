@@ -1838,8 +1838,12 @@ mod tests {
 
     /// End-to-end: every char box the streaming path emits must follow the
     /// CAP placement contract — one box per character, full cross-axis span,
-    /// reading axis inside the line's frame — and plain-glyph lines must
-    /// land on the synth truth centres along the reading axis. The legacy
+    /// reading axis inside the line's frame except a line-ending closing
+    /// mark's advance cell, which can reach past an ink-tight frame — and
+    /// plain-glyph lines must land on the synth truth centres along the
+    /// reading axis. A line-ending closing mark's cell centre is checked too
+    /// (its ink is offset, so only the cell can land on the drawn em centre).
+    /// The legacy
     /// chain's uniform-em sizing (mobile #49) is superseded by CAP and stays
     /// pinned by the direct `compute_char_boxes` / `uniform_cells` tests
     /// above (reachable end-to-end via `BOX_PLACEMENT_CAP=0`).
@@ -1912,6 +1916,31 @@ mod tests {
                         );
                     }
                     position_checked += 1;
+                } else if line.text == truth_text
+                    && line.char_boxes.len() == truth_boxes.len()
+                    && line
+                        .text
+                        .chars()
+                        .last()
+                        .is_some_and(crate::char_boxes::is_closing_cell_mark)
+                {
+                    // A line-ending closing mark now takes its advance cell
+                    // (`char_boxes::place_trailing_punct_cell`), so its box
+                    // centre is the drawn em centre even though its ink is
+                    // offset. Mid-line punctuation keeps the reference's
+                    // ink-centred box and stays out of the position check.
+                    let ci = line.char_boxes.len() - 1;
+                    let b = &line.char_boxes[ci];
+                    let (tcx, tcy) = truth_boxes[ci];
+                    let cx = b.x as f64 + b.w as f64 / 2.0;
+                    let cy = b.y as f64 + b.h as f64 / 2.0;
+                    let err = if line.is_vertical { cy - tcy } else { cx - tcx };
+                    assert!(
+                        err.abs() <= 13.0,
+                        "{file} trailing mark ({:?}): along error {err:.1}px",
+                        line.text.chars().last()
+                    );
+                    position_checked += 1;
                 }
                 let chars: Vec<char> = line.text.chars().collect();
                 let vertical = line.is_vertical;
@@ -1929,6 +1958,11 @@ mod tests {
                 for (ci, b) in line.char_boxes.iter().enumerate() {
                     let along = if vertical { b.h } else { b.w };
                     assert!(along >= 1, "{file} char {ci}: empty box");
+                    // A line-ending closing mark takes the advance cell after
+                    // its predecessor, which can reach past an ink-tight
+                    // frame; every other box stays inside it.
+                    let trailing_mark = ci + 1 == chars.len()
+                        && crate::char_boxes::is_closing_cell_mark(chars[ci]);
                     if vertical {
                         assert_eq!(
                             (b.x, b.w),
@@ -1940,13 +1974,23 @@ mod tests {
                             ann.bbox.right()
                         );
                         assert!(
-                            b.y >= ann.bbox.y && b.bottom() <= ann.bbox.bottom(),
+                            b.y >= ann.bbox.y,
                             "{file} char {ci}: y {}..{} outside bbox {}..{}",
                             b.y,
                             b.bottom(),
                             ann.bbox.y,
                             ann.bbox.bottom()
                         );
+                        if !trailing_mark {
+                            assert!(
+                                b.bottom() <= ann.bbox.bottom(),
+                                "{file} char {ci}: y {}..{} outside bbox {}..{}",
+                                b.y,
+                                b.bottom(),
+                                ann.bbox.y,
+                                ann.bbox.bottom()
+                            );
+                        }
                     } else {
                         assert_eq!(
                             (b.y, b.h),
@@ -1958,13 +2002,23 @@ mod tests {
                             ann.bbox.bottom()
                         );
                         assert!(
-                            b.x >= ann.bbox.x && b.right() <= ann.bbox.right(),
+                            b.x >= ann.bbox.x,
                             "{file} char {ci}: x {}..{} outside bbox {}..{}",
                             b.x,
                             b.right(),
                             ann.bbox.x,
                             ann.bbox.right()
                         );
+                        if !trailing_mark {
+                            assert!(
+                                b.right() <= ann.bbox.right(),
+                                "{file} char {ci}: x {}..{} outside bbox {}..{}",
+                                b.x,
+                                b.right(),
+                                ann.bbox.x,
+                                ann.bbox.right()
+                            );
+                        }
                     }
                     checked += 1;
                 }

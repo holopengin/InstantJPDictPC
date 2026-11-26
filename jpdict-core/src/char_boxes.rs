@@ -788,6 +788,133 @@ pub(crate) fn box_placement_cap() -> bool {
     std::env::var("BOX_PLACEMENT_CAP").map(|v| v != "0").unwrap_or(true)
 }
 
+/// Fullwidth closing marks whose ink sits away from the em centre. Their
+/// advance cell is the right thing to place, not their ink.
+pub(crate) fn is_closing_cell_mark(ch: char) -> bool {
+    "。．、，）〕〉》」』】〙〗〟’”］".contains(ch)
+}
+
+/// Median of `values` (sorts them in place). Empty input has no median.
+fn median_of(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        0.5 * (values[mid - 1] + values[mid])
+    } else {
+        values[mid]
+    })
+}
+
+/// Give a line's final closing punctuation the advance cell that follows its
+/// predecessor.
+///
+/// The overlay draws every glyph centred in its character box, so it reads a
+/// box as the glyph's advance cell. A final `。`, `、` or closing bracket is
+/// mostly blank to its right, and an ink-tight detection crop ends at its
+/// ink: the CTC column and CAP's template then sit close to the previous
+/// glyph, and the ink pass can only centre the box in the gap between the two
+/// glyphs. Drawn centred, the period's dot lands on the previous character
+/// (the reported line-ending `。` overlap). Re-place the last box as one
+/// advance cell after its predecessor, extending that predecessor to the
+/// shared boundary so the line still tiles.
+///
+/// `boxes` are `[l, t, r, b]` in crop pixels, one per character in text order,
+/// after [`crate::char_placement::place`]. The new last box may extend past
+/// the crop's reading-axis end, which is the point: the crop ends at the
+/// punctuation's ink, not at its cell. A line whose last character is not a
+/// fullwidth closing mark is untouched, and so is every box before the last
+/// pair.
+pub fn place_trailing_punct_cell(
+    text: &str,
+    boxes: &mut [[f64; 4]],
+    is_vertical: bool,
+    crop_w: u32,
+    crop_h: u32,
+) {
+    let chars: Vec<char> = text.chars().collect();
+    let n = boxes.len().min(chars.len());
+    if n < 2 {
+        return;
+    }
+    let last = chars[n - 1];
+    if crate::util::japanese::is_half_width(last) || !is_closing_cell_mark(last) {
+        return;
+    }
+
+    // Robust em: the median fullwidth, non-punctuation cell on this line, so
+    // tracking and the fitted size carry over. A line without one falls back
+    // to the crop length spread over the text's advance units.
+    let mut widths: Vec<f64> = Vec::with_capacity(n);
+    for (ch, b) in chars[..n].iter().zip(boxes.iter()) {
+        if crate::util::japanese::is_half_width(*ch)
+            || is_closing_cell_mark(*ch)
+            || is_vertical_opening_punct(*ch)
+        {
+            continue;
+        }
+        let (a, c) = if is_vertical {
+            (b[1], b[3])
+        } else {
+            (b[0], b[2])
+        };
+        if c > a {
+            widths.push(c - a);
+        }
+    }
+    let em = median_of(&mut widths).unwrap_or_else(|| {
+        let units: f64 = chars[..n]
+            .iter()
+            .map(|ch| {
+                if crate::util::japanese::is_half_width(*ch) {
+                    0.5
+                } else {
+                    1.0
+                }
+            })
+            .sum();
+        (if is_vertical { crop_h } else { crop_w }) as f64 / units.max(0.5)
+    });
+    if !(em > 0.0) {
+        return;
+    }
+
+    let prev = chars[n - 2];
+    let prev_units = if crate::util::japanese::is_half_width(prev) {
+        0.5
+    } else {
+        1.0
+    };
+    let last_units = if crate::util::japanese::is_half_width(last) {
+        0.5
+    } else {
+        1.0
+    };
+    let (prev_start, prev_end) = if is_vertical {
+        (boxes[n - 2][1], boxes[n - 2][3])
+    } else {
+        (boxes[n - 2][0], boxes[n - 2][2])
+    };
+    let prev_centre = 0.5 * (prev_start + prev_end);
+    let cell_start = (prev_centre + 0.5 * prev_units * em).max(prev_end);
+    let cell_end = cell_start + last_units * em;
+    if !(cell_end > cell_start) {
+        return;
+    }
+
+    if is_vertical {
+        boxes[n - 2][3] = cell_start;
+        boxes[n - 1][1] = cell_start;
+        boxes[n - 1][3] = cell_end;
+    } else {
+        boxes[n - 2][2] = cell_start;
+        boxes[n - 1][0] = cell_start;
+        boxes[n - 1][2] = cell_end;
+    }
+}
+
 /// Char boxes for one line: CAP when enabled (default), the shipped chain
 /// otherwise. `pixels` is the RGB8 crop (CAP needs it for the ink pass;
 /// the shipped chain still gates its own snap stage on `BOX_LAYOUT_MODE`),
@@ -892,6 +1019,8 @@ pub fn compute_char_boxes_line_with(
         lum.as_ref().map(|(l, w, h)| (l.as_slice(), *w, *h)),
         steps64.as_deref(),
     );
+    let mut boxes = boxes;
+    place_trailing_punct_cell(text, &mut boxes, is_vertical, crop_w, crop_h);
     boxes
         .iter()
         .map(|b| {
@@ -1132,6 +1261,46 @@ pub fn sort_order(boxes: &[BoundingBox]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reported line-ending period: an ink-tight crop compresses the last
+    /// box (19 px against a 43 px em) and the overlay paints the dot over the
+    /// preceding す. The post-pass gives the period the cell after す, and す
+    /// is extended to the shared boundary so the line still tiles.
+    #[test]
+    fn trailing_period_takes_the_cell_after_its_predecessor() {
+        let text = "日本語を勉強しています。";
+        let mut boxes: Vec<[f64; 4]> = (0..11)
+            .map(|i| {
+                let a = i as f64 * 43.0;
+                [a, 0.0, a + 43.0, 35.0]
+            })
+            .collect();
+        boxes.push([461.0, 0.0, 480.0, 35.0]); // squeezed between す and the crop end
+        place_trailing_punct_cell(text, &mut boxes, false, 483, 35);
+        assert_eq!(boxes[10], [430.0, 0.0, 473.0, 35.0]);
+        assert_eq!(boxes[11], [473.0, 0.0, 516.0, 35.0]);
+    }
+
+    /// A line ending in a kana keeps its reference boxes: the post-pass names
+    /// a closing punctuation, not "the last character".
+    #[test]
+    fn trailing_kana_is_left_alone() {
+        let text = "あい";
+        let mut boxes = vec![[0.0, 0.0, 40.0, 35.0], [40.0, 0.0, 80.0, 35.0]];
+        let before = boxes.clone();
+        place_trailing_punct_cell(text, &mut boxes, false, 80, 35);
+        assert_eq!(boxes, before);
+    }
+
+    /// Vertical text: the cell follows the previous glyph down the column.
+    #[test]
+    fn trailing_period_takes_the_cell_below_in_vertical_text() {
+        let text = "あ。";
+        let mut boxes = vec![[0.0, 0.0, 35.0, 43.0], [0.0, 30.0, 35.0, 49.0]];
+        place_trailing_punct_cell(text, &mut boxes, true, 35, 60);
+        assert_eq!(boxes[0], [0.0, 0.0, 35.0, 43.0]);
+        assert_eq!(boxes[1], [0.0, 43.0, 35.0, 86.0]);
+    }
 
     /// Mobile reading order on plain rects: two horizontal rows sort
     /// top-to-bottom/left-to-right, two vertical columns right-edge-first —
