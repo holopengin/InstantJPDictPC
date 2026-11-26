@@ -115,6 +115,12 @@ impl PageOcr {
         self.cancel.store(true, Ordering::SeqCst);
     }
 
+    /// A handle that can be stored outside a lock around the whole engine, so
+    /// a binding's `cancel()` does not block behind the in-flight page call.
+    pub fn cancel_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
