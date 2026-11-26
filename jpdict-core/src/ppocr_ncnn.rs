@@ -58,6 +58,17 @@ mod ffi {
             out_len: *mut c_int,
         ) -> *mut f32;
 
+        pub fn ppocr_det_infer_letterboxed(
+            det: *mut ppocr_det_t,
+            argb: *const c_int,
+            resize_w: c_int,
+            resize_h: c_int,
+            model_size: c_int,
+            pad_x: c_int,
+            pad_y: c_int,
+            out_len: *mut c_int,
+        ) -> *mut f32;
+
         pub fn ppocr_floats_free(data: *mut f32);
     }
 }
@@ -183,6 +194,37 @@ impl DetNet {
                 input.len(),
                 w as c_int,
                 h as c_int,
+                &mut len,
+            )
+        };
+        unsafe { take_floats(ptr, len) }
+    }
+
+    /// The mobile/det-core letterbox path: `argb` is the already-resized
+    /// content (`resize_w × resize_h`), placed at the integer pad. The shared
+    /// C++ core does the gray padding and ImageNet normalisation in one
+    /// vectorised pass, so Rust does not allocate a letterbox image or walk
+    /// `model_size²` pixels a second time.
+    #[allow(clippy::too_many_arguments)] // mirrors the core geometry
+    pub fn infer_letterboxed(
+        &mut self,
+        argb: &[i32],
+        resize_w: usize,
+        resize_h: usize,
+        model_size: usize,
+        pad_x: usize,
+        pad_y: usize,
+    ) -> Result<Vec<f32>> {
+        let mut len: c_int = -1;
+        let ptr = unsafe {
+            ffi::ppocr_det_infer_letterboxed(
+                self.ptr,
+                argb.as_ptr(),
+                resize_w as c_int,
+                resize_h as c_int,
+                model_size as c_int,
+                pad_x as c_int,
+                pad_y as c_int,
                 &mut len,
             )
         };

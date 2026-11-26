@@ -55,6 +55,11 @@ pub struct DetectOptions {
     pub v_trim: f32,
     pub ruby_trim_vertical: bool,
     pub split_overlap: bool,
+    /// Use the shared core's integer-pad letterbox (`det_build_input`: gray
+    /// padding + ImageNet normalisation in one C++ pass) instead of the
+    /// desktop float-offset bilinear blit. The mobile page path sets this;
+    /// the desktop viewer keeps its existing preprocessing.
+    pub mobile_letterbox: bool,
 }
 
 impl Default for DetectOptions {
@@ -93,6 +98,7 @@ impl DetectOptions {
                 .map(|v| v != "0")
                 .unwrap_or(false),
             split_overlap: std::env::var("DET_SPLIT_OVERLAP").is_ok(),
+            mobile_letterbox: false,
         }
     }
 }
@@ -707,43 +713,78 @@ impl OcrEngine {
         let scale = target_long as f32 / orig_w.max(orig_h);
         let resize_w = ((orig_w * scale).round() as u32).max(32);
         let resize_h = ((orig_h * scale).round() as u32).max(32);
-        // Mobile draws the resized bitmap at the exact float centering offset
-        // (`(modelSize - resizeW) / 2f`, e.g. 261.5) with a filtered blit, so
-        // a half-pixel offset shifts/blends the content edge with the gray
-        // pad. Keep the same float offset and bilinear-blit instead of the
-        // old integer `replace`.
-        let img_left = (model_size - resize_w) as f32 / 2.0;
-        let img_top = (model_size - resize_h) as f32 / 2.0;
+        // Two letterbox implementations share this point:
+        //
+        // * desktop (default): the resized bitmap is bilinearly blitted at the
+        //   exact float centering offset, then normalised pixel by pixel;
+        // * mobile page: the resized content is packed as ARGB and handed to
+        //   the shared core's `det_build_input`, which pads with gray and
+        //   normalises in one vectorised C++ pass. This is the same path the
+        //   old Kotlin JNI detector used, so the page pipeline neither pays
+        //   for a Rust letterbox image nor drifts from the mobile geometry.
+        let (raw_map, img_left, img_top) = if opts.mobile_letterbox {
+            let resized =
+                image.resize_exact(resize_w, resize_h, image::imageops::FilterType::Triangle);
+            let rgb = resized.to_rgb8();
+            let argb: Vec<i32> = rgb
+                .pixels()
+                .map(|p| {
+                    ((0xFFu32 << 24) | ((p.0[0] as u32) << 16) | ((p.0[1] as u32) << 8) | p.0[2] as u32)
+                        as i32
+                })
+                .collect();
+            let pad_x = (model_size - resize_w + 1) / 2;
+            let pad_y = (model_size - resize_h + 1) / 2;
+            let map = self
+                .det_net
+                .infer_letterboxed(
+                    &argb,
+                    resize_w as usize,
+                    resize_h as usize,
+                    model_size as usize,
+                    pad_x as usize,
+                    pad_y as usize,
+                )
+                .with_context(|| {
+                    format!("PP-OCRv6 det ncnn inference failed ({model_size}x{model_size})")
+                })?;
+            (map, pad_x as f32, pad_y as f32)
+        } else {
+            let img_left = (model_size - resize_w) as f32 / 2.0;
+            let img_top = (model_size - resize_h) as f32 / 2.0;
+            let resized =
+                image.resize_exact(resize_w, resize_h, image::imageops::FilterType::Triangle);
+            let mut letterbox = RgbaImage::from_pixel(
+                model_size,
+                model_size,
+                Rgba([128u8, 128u8, 128u8, 255u8]),
+            );
+            blit_filtered(&mut letterbox, &resized.to_rgba8(), img_left, img_top);
 
-        let resized = image.resize_exact(resize_w, resize_h, image::imageops::FilterType::Triangle);
-        let mut letterbox =
-            RgbaImage::from_pixel(model_size, model_size, Rgba([128u8, 128u8, 128u8, 255u8]));
-        blit_filtered(&mut letterbox, &resized.to_rgba8(), img_left, img_top);
-
-        // 2. Convert to NCHW float with ImageNet normalization, same per-pixel
-        // math as the mobile DET_NORM_LUT ((v/255 - mean) / std per channel).
+            let w = model_size as usize;
+            let h = w;
+            let mut data = vec![0.0f32; 3 * h * w];
+            let mean = [0.485f32, 0.456, 0.406];
+            let std = [0.229f32, 0.224, 0.225];
+            for y in 0..h {
+                for x in 0..w {
+                    let px = letterbox.get_pixel(x as u32, y as u32);
+                    let r = (px.0[0] as f32 / 255.0 - mean[0]) / std[0];
+                    let g = (px.0[1] as f32 / 255.0 - mean[1]) / std[1];
+                    let b = (px.0[2] as f32 / 255.0 - mean[2]) / std[2];
+                    let idx = y * w + x;
+                    data[idx] = r;
+                    data[h * w + idx] = g;
+                    data[2 * h * w + idx] = b;
+                }
+            }
+            let map = self.det_net.infer(&data, w, h).with_context(|| {
+                format!("PP-OCRv6 det ncnn inference failed ({model_size}x{model_size})")
+            })?;
+            (map, img_left, img_top)
+        };
         let w = model_size as usize;
         let h = w;
-        let mut data = vec![0.0f32; 3 * h * w];
-        let mean = [0.485f32, 0.456, 0.406];
-        let std = [0.229f32, 0.224, 0.225];
-        for y in 0..h {
-            for x in 0..w {
-                let px = letterbox.get_pixel(x as u32, y as u32);
-                let r = (px.0[0] as f32 / 255.0 - mean[0]) / std[0];
-                let g = (px.0[1] as f32 / 255.0 - mean[1]) / std[1];
-                let b = (px.0[2] as f32 / 255.0 - mean[2]) / std[2];
-                let idx = y * w + x;
-                data[idx] = r;
-                data[h * w + idx] = g;
-                data[2 * h * w + idx] = b;
-            }
-        }
-
-        // 3. Run the shared ncnn DB segmentation net.
-        let raw_map = self.det_net.infer(&data, w, h).with_context(|| {
-            format!("PP-OCRv6 det ncnn inference failed ({model_size}x{model_size})")
-        })?;
 
         // The net should emit model_size²; a smaller square (stride) gets
         // nearest-upsampled like mobile, so downstream coords are always in

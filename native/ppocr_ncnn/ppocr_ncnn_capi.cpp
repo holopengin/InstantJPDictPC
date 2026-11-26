@@ -67,6 +67,15 @@ float* ppocr_det_infer(ppocr_det_t* det, const float* data, size_t data_floats, 
     return dup_floats(out, out_len);
 }
 
+float* ppocr_det_infer_letterboxed(ppocr_det_t* det, const int* argb, int resize_w, int resize_h,
+                                   int model_size, int pad_x, int pad_y, int* out_len) {
+    *out_len = -1;
+    std::vector<float> out;
+    if (!ppocr_ncnn::det_infer_letterboxed((ppocr_ncnn::DetNet*) det, argb, resize_w, resize_h,
+                                           model_size, pad_x, pad_y, out)) return nullptr;
+    return dup_floats(out, out_len);
+}
+
 void ppocr_floats_free(float* data) {
     std::free(data);
 }
