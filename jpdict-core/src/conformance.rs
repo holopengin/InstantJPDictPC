@@ -145,6 +145,7 @@ fn run_detection(
         0.0,
         1.0,
         1.0,
+        None,
     );
     let kept = filter_fitted_quads(&pre, &quads, w as i32, h as i32, furigana);
     let pairs: Vec<(BoundingBox, RotatedBox)> =

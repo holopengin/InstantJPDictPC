@@ -769,16 +769,26 @@ impl OcrEngine {
         self.det_unclip_override.unwrap_or_else(default_det_unclip)
     }
 
+    /// The detection knobs for one viewer run: the environment defaults with
+    /// this engine's live overrides applied (the `-`/`=` and `[`/`]` tuning
+    /// keys, and the furigana switch). The page pipeline passes its own
+    /// [`DetectOptions`] straight to [`detect_with`](Self::detect_with)
+    /// instead of going through the viewer's overrides.
+    fn detect_options(&self) -> DetectOptions {
+        let mut opts = DetectOptions::from_env();
+        opts.thresh = self.det_thresh();
+        opts.unclip = self.det_unclip();
+        opts.furigana = self.det_furigana;
+        opts
+    }
+
     /// Detects bounding boxes using PP-OCRv6 segmentation-based detection model.
     /// The model outputs a probability map [1,1,H,W]. Post-processing:
     /// threshold → connected components → min-area rotated rects (PP-OCR's
     /// minAreaRect) → sort. Returns axis-aligned boxes for display plus the
     /// rotated rects for crop un-rotation.
     pub fn detect(&mut self, image: &DynamicImage) -> Result<DetectionResult> {
-        let mut opts = DetectOptions::from_env();
-        opts.thresh = self.det_thresh();
-        opts.unclip = self.det_unclip();
-        opts.furigana = self.det_furigana;
+        let opts = self.detect_options();
         self.detect_with(image, &opts, None)
     }
 
@@ -1166,7 +1176,8 @@ impl OcrEngine {
     /// Just line detection — returns raw bounding boxes (fast, no character recognition).
     /// Used by the streaming OCR pipeline to show the image immediately.
     pub fn detect_lines(&mut self, image: &DynamicImage) -> Result<DetectionResult> {
-        self.detect_lines_with(image, &DetectOptions::from_env(), None)
+        let opts = self.detect_options();
+        self.detect_lines_with(image, &opts, None)
     }
 
     /// [`detect_lines`](Self::detect_lines) with explicit knobs and cancel.
