@@ -2655,4 +2655,79 @@ mod tests {
             }
         }
     }
+
+    /// Measurement only: run the desktop float-offset letterbox and the
+    /// mobile/shared C++ letterbox over the recognition corpus and report how
+    /// far the detection boxes move. Run with
+    /// `cargo test -p jpdict-core --lib det_letterbox_paths_agree -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement: prints the letterbox-path delta, asserts nothing"]
+    fn det_letterbox_paths_agree() {
+        let mut eng = test_engine();
+        let dir = format!(
+            "{}/../tests/conformance/images/recognition",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("recognition corpus")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                matches!(
+                    p.extension().and_then(|e| e.to_str()),
+                    Some("png" | "jpg" | "jpeg")
+                )
+            })
+            .collect();
+        files.sort();
+        let mut worst_centre = 0.0f32;
+        let mut deltas = Vec::new();
+        for path in files {
+            let img = image::open(&path).expect("corpus image");
+            let mut desktop = DetectOptions::from_env();
+            desktop.model_size = 896;
+            desktop.mobile_letterbox = false;
+            let mut mobile = desktop;
+            mobile.mobile_letterbox = true;
+            let a = eng.detect_with(&img, &desktop, None).expect("desktop path");
+            let b = eng.detect_with(&img, &mobile, None).expect("mobile path");
+            let name = path.file_name().unwrap().to_string_lossy();
+            if a.boxes.len() != b.boxes.len() {
+                println!(
+                    "{name}: box count {} -> {}",
+                    a.boxes.len(),
+                    b.boxes.len()
+                );
+                continue;
+            }
+            let mut max_c = 0.0f32;
+            let mut sum_c = 0.0f32;
+            for (x, y) in a.boxes.iter().zip(b.boxes.iter()) {
+                let dx = (x.x + x.w / 2) as f32 - (y.x + y.w / 2) as f32;
+                let dy = (x.y + x.h / 2) as f32 - (y.y + y.h / 2) as f32;
+                let c = (dx * dx + dy * dy).sqrt();
+                max_c = max_c.max(c);
+                sum_c += c;
+            }
+            let mean_c = sum_c / a.boxes.len() as f32;
+            deltas.extend(a.boxes.iter().zip(b.boxes.iter()).map(|(x, y)| {
+                let dx = (x.x + x.w / 2) as f32 - (y.x + y.w / 2) as f32;
+                let dy = (x.y + x.h / 2) as f32 - (y.y + y.h / 2) as f32;
+                (dx * dx + dy * dy).sqrt()
+            }));
+            worst_centre = worst_centre.max(max_c);
+            println!(
+                "{name}: {} boxes, centre mean {mean_c:.2}px max {max_c:.2}px",
+                a.boxes.len()
+            );
+        }
+        if !deltas.is_empty() {
+            deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p95 = deltas[(deltas.len() as f32 * 0.95) as usize];
+            println!(
+                "overall: {} boxes, centre mean {:.2}px p95 {p95:.2}px max {worst_centre:.2}px",
+                deltas.len(),
+                deltas.iter().sum::<f32>() / deltas.len() as f32
+            );
+        }
+    }
 }
