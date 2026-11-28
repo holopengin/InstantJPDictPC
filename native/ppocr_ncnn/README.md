@@ -63,15 +63,19 @@ The shared backend is deliberately three layers:
    reading order, lookup and formatting; Android consumes it through
    `nav_graph_core`'s UniFFI boundary.
 3. **Platform I/O and hot pixel loops.** Capture/decoding, `Bitmap`/`Canvas`
-   scaling, det/rec pixel packing, and the long-line inference orchestration
-   stay per-platform. They are bound to each platform's image type, and
-   crossing a full pixel/logit buffer per line over UniFFI costs more than the
-   duplicated code.
+   scaling for recognition crops, rec input packing, and the long-line
+   inference orchestration stay per-platform. They are bound to each platform's
+   image type, and crossing a full pixel/logit buffer per line over UniFFI
+   costs more than the duplicated code. Detection input is no longer in this
+   list: both platforms resize with `jpdict-core`'s plain-bilinear
+   `resize_to_argb` and hand the ARGB to the shared `det_build_input` (integer
+   pad + ImageNet normalisation), matching the old Android
+   `createScaledBitmap(..., true)` filter.
 
-The duplicated stages (det letterbox, rec input packing, long-line stitch)
-are pinned by `tests/conformance` and the synth parity tests. If a parity bug
-ever originates in one of them, move **that stage** into `jpdict-core` rather
-than porting the whole pipeline at once.
+The remaining duplicated stages (rec input packing, long-line stitch, the
+platform recognition scalers) are pinned by `tests/conformance` and the synth
+parity tests. If a parity bug ever originates in one of them, move **that
+stage** into `jpdict-core` rather than porting the whole pipeline at once.
 
 No shared repo or submodule is planned: the two-file C++ mirror is now
 enforced by `.githooks/pre-commit` and the `shared-ocr-sync` workflow, which

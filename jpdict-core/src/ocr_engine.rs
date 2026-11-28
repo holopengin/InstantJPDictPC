@@ -56,9 +56,10 @@ pub struct DetectOptions {
     pub ruby_trim_vertical: bool,
     pub split_overlap: bool,
     /// Use the shared core's integer-pad letterbox (`det_build_input`: gray
-    /// padding + ImageNet normalisation in one C++ pass) instead of the
-    /// desktop float-offset bilinear blit. The mobile page path sets this;
-    /// the desktop viewer keeps its existing preprocessing.
+    /// padding + ImageNet normalisation in one C++ pass) instead of the legacy
+    /// desktop float-offset bilinear blit. Both platforms now default to this
+    /// path; `DET_LETTERBOX=desktop` restores the old viewer preprocessing for
+    /// one release.
     pub mobile_letterbox: bool,
 }
 
@@ -774,6 +775,11 @@ impl OcrEngine {
     /// instead of going through the viewer's overrides.
     fn detect_options(&self) -> DetectOptions {
         let mut opts = DetectOptions::from_env();
+        // Both platforms now build the det input the same way: plain
+        // bilinear resize + the shared C++ integer-pad letterbox. The old
+        // desktop float-offset blit stays behind DET_LETTERBOX=desktop for a
+        // release, so a curve ball can be bisected without a rebuild.
+        opts.mobile_letterbox = std::env::var("DET_LETTERBOX").as_deref() != Ok("desktop");
         opts.thresh = self.det_thresh();
         opts.unclip = self.det_unclip();
         opts.furigana = self.det_furigana;
