@@ -315,13 +315,17 @@ fn sample_bilinear(src: &RgbaImage, sx: f32, sy: f32) -> Option<Rgba<u8>> {
 }
 
 /// Bilinear-blit `src` into `dst` with its top-left at the exact float offset
-/// `(left, top)` — mobile draws the resized det bitmap at the float centering
-/// offset with filtering, so a `.5` offset blends the content edge with the
-/// gray letterbox pad.
 /// Resize an image directly into the ARGB content the detector's C++ core
-/// takes. Downscales use a separable area average (the same shape Skia's
-/// filtered `createScaledBitmap` approximates); upscales use bilinear. The
-/// intermediate `image` buffer and the separate RGB→ARGB pack pass are gone.
+/// takes.
+///
+/// The reference is the old Android detector's
+/// `Bitmap.createScaledBitmap(bitmap, resizeW, resizeH, true)`: Skia's
+/// `FILTER_BITMAP_FLAG`, i.e. bilinear sampling with a fixed 2x2 kernel and no
+/// mipmap. Use fast_image_resize's fixed-kernel `Interpolation`, not
+/// `Convolution` (which widens the kernel when downscaling) and not `Box`
+/// (an area average, which the phone never did). The intermediate `image`
+/// buffer and the separate RGB→ARGB pack pass are gone; the fallback is the
+/// same plain bilinear written out by hand.
 fn resize_to_argb(image: &DynamicImage, dst_w: u32, dst_h: u32) -> Vec<i32> {
     use fast_image_resize::{
         images::Image, FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
@@ -347,14 +351,8 @@ fn resize_to_argb(image: &DynamicImage, dst_w: u32, dst_h: u32) -> Vec<i32> {
         return resize_bilinear_argb(src, dst_w, dst_h);
     };
     let mut dst = Image::new(dst_w, dst_h, PixelType::U8x4);
-    let filter = if dst_w < src_w || dst_h < src_h {
-        // Area/box is the downscale analogue of Skia's filtered scale and is
-        // the SIMD path in fast_image_resize.
-        FilterType::Box
-    } else {
-        FilterType::Bilinear
-    };
-    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter));
+    let opts =
+        ResizeOptions::new().resize_alg(ResizeAlg::Interpolation(FilterType::Bilinear));
     if Resizer::new().resize(&src_image, &mut dst, &opts).is_err() {
         return resize_bilinear_argb(src, dst_w, dst_h);
     }
@@ -2656,9 +2654,10 @@ mod tests {
         }
     }
 
-    /// Measurement only: run the desktop float-offset letterbox and the
-    /// mobile/shared C++ letterbox over the recognition corpus and report how
-    /// far the detection boxes move. Run with
+    /// Measurement only: run the desktop float-offset letterbox (Triangle) and
+    /// the page pipeline's shared C++ letterbox (Skia-style plain bilinear)
+    /// over the recognition corpus and report how far the detection boxes
+    /// move. Run with
     /// `cargo test -p jpdict-core --lib det_letterbox_paths_agree -- --ignored --nocapture`.
     #[test]
     #[ignore = "measurement: prints the letterbox-path delta, asserts nothing"]

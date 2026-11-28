@@ -25,7 +25,9 @@ use crate::ocr_engine::{DetectOptions, OcrEngine, RecognizeOptions};
 
 /// Every knob one page run needs. The desktop derives these from its live
 /// keys and `DET_*` / `BOX_*` environment; a mobile host passes its own
-/// preferences explicitly.
+/// preferences explicitly. [`Default`] is the mobile page setup (shared
+/// letterbox, rotated detection); start from [`DetectOptions::from_env`] for
+/// the desktop preprocessing instead.
 #[derive(Clone, Copy, Debug)]
 pub struct PageOcrOptions {
     pub detect: DetectOptions,
@@ -37,9 +39,16 @@ pub struct PageOcrOptions {
 }
 
 impl Default for PageOcrOptions {
+    /// The page pipeline is the mobile-shaped entry point, so its defaults are
+    /// the mobile ones: the shared C++ letterbox (Skia bilinear, integer pad)
+    /// rather than the desktop's float-offset blit, and rotated detection on.
+    /// A caller that wants the desktop preprocessing can start from
+    /// [`DetectOptions::from_env`] instead.
     fn default() -> Self {
+        let mut detect = DetectOptions::from_env();
+        detect.mobile_letterbox = true;
         PageOcrOptions {
-            detect: DetectOptions::from_env(),
+            detect,
             recognize: RecognizeOptions::from_env(),
             det_rotated: true,
         }
