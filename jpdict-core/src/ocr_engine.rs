@@ -2699,25 +2699,40 @@ mod tests {
                 );
                 continue;
             }
+            // Match by nearest centre, not by index: the two paths can emit
+            // the same boxes in a different order (notably vertical columns).
+            let mut used = vec![false; b.boxes.len()];
+            let mut matched = 0usize;
             let mut max_c = 0.0f32;
             let mut sum_c = 0.0f32;
-            for (x, y) in a.boxes.iter().zip(b.boxes.iter()) {
-                let dx = (x.x + x.w / 2) as f32 - (y.x + y.w / 2) as f32;
-                let dy = (x.y + x.h / 2) as f32 - (y.y + y.h / 2) as f32;
-                let c = (dx * dx + dy * dy).sqrt();
-                max_c = max_c.max(c);
-                sum_c += c;
+            for x in &a.boxes {
+                let ax = (x.x + x.w / 2) as f32;
+                let ay = (x.y + x.h / 2) as f32;
+                let mut best = (usize::MAX, f32::MAX);
+                for (j, y) in b.boxes.iter().enumerate() {
+                    if used[j] {
+                        continue;
+                    }
+                    let dx = ax - (y.x + y.w / 2) as f32;
+                    let dy = ay - (y.y + y.h / 2) as f32;
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d < best.1 {
+                        best = (j, d);
+                    }
+                }
+                if best.0 != usize::MAX {
+                    used[best.0] = true;
+                    matched += 1;
+                    max_c = max_c.max(best.1);
+                    sum_c += best.1;
+                    deltas.push(best.1);
+                }
             }
-            let mean_c = sum_c / a.boxes.len() as f32;
-            deltas.extend(a.boxes.iter().zip(b.boxes.iter()).map(|(x, y)| {
-                let dx = (x.x + x.w / 2) as f32 - (y.x + y.w / 2) as f32;
-                let dy = (x.y + x.h / 2) as f32 - (y.y + y.h / 2) as f32;
-                (dx * dx + dy * dy).sqrt()
-            }));
             worst_centre = worst_centre.max(max_c);
             println!(
-                "{name}: {} boxes, centre mean {mean_c:.2}px max {max_c:.2}px",
-                a.boxes.len()
+                "{name}: {} boxes, {matched} matched, centre mean {:.2}px max {max_c:.2}px",
+                a.boxes.len(),
+                sum_c / matched.max(1) as f32
             );
         }
         if !deltas.is_empty() {
